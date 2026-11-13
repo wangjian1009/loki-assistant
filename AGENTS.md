@@ -3,10 +3,19 @@
 Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作提供支持。
 
 ## 第一阶段
-
 实现 macOS 菜单栏应用对 Emacs agent-shell 的控制：查看会话列表、切换对应 buffer、向指定会话发送需求，并展示连接或操作失败的原因。
+第一阶段只实现本机控制。
 
-采用 SwiftUI + 必要的 AppKit 开发 Mac 应用，通过 `emacsclient --eval` 调用 Emacs 插件并获取函数返回值。第一阶段只实现本机控制。
+## 项目选型
+- 采用 SwiftUI + 必要的 AppKit 开发 Mac 应用
+- 通过 `emacsclient --eval` 调用 Emacs 插件并获取函数返回值。
+
+## 文档规范
+
+- 项目中的文档说明、设计决策、注释性段落和面向用户的文本使用中文。
+- 代码、命令、路径、协议名、API 名称、字段名和技术专有名词保留其原始英文形式。
+- 项目文档统一使用 Org 格式，放置于 `docs/*.org`；不得新增 Markdown 文档。
+- UML 使用 LaTeX `TikZ` 与 `tikz-uml` 绘制，与说明紧邻的 `\begin{tikzpicture}` 源码内嵌维护；不保留独立 `.puml` 或 `.tex` 文件。
 
 ## 顶层目录职责
 
