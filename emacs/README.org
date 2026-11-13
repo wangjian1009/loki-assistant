@@ -1,0 +1,53 @@
+#+TITLE: Loki Assistant Emacs 插件
+
+* 作用与状态
+
+插件加载到 Emacs 后，为主程序提供统一请求入口。当前已实现 ~ping~ 连接检查、请求校验与协议错误响应。
+
+会话列表、显示指定会话的 buffer、发送需求仍待实现。
+
+* 使用前提
+
+- Emacs 28.1 及以上，需具备原生 JSON 支持。
+- 连接检查不依赖 agent-shell，后续会话控制需要安装 agent-shell。
+- Emacs server 已启动，例如在现有 Emacs 中执行 ~M-x server-start~ 。
+- ~emacsclient~ 能连接到该 server；配置了多个 server 时，主程序须选择相同目标。
+
+* 验证函数返回值
+
+以下命令可在插件实现前验证通信通路，不依赖本项目函数：
+
+#+begin_src sh
+emacsclient --alternate-editor=false --eval '
+  (funcall (lambda () (+ 1 2)))
+'
+#+end_src
+
+标准输出应为 ~3~ 。 ~--eval~ 会等待求值并打印返回值；需要读取返回值时，不使用 ~--no-wait~ 或 ~--suppress-output~ 。
+
+字符串默认按 Elisp 字符串格式输出，带外层引号及必要转义。项目采用 JSON 与 Base64 封装传输，详见 [[file:../docs/agent-shell-control.org][控制协议]]。
+
+* 安装与配置
+
+将以下路径替换为仓库的实际位置，然后在现有 Emacs 中求值，或加入个人配置：
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/loki-assistant/emacs/lisp")
+(require 'loki-assistant)
+#+end_src
+
+首次使用时，执行 ~M-x server-start~ 启动 server。插件不会自动启动 agent-shell 会话或修改用户配置。
+
+* 测试
+
+在仓库根目录执行，通过已有 Emacs server 运行 ERT：
+
+#+begin_src sh
+make test-emacs
+#+end_src
+
+测试成功时命令返回 ~t~ ，详细结果在 Emacs 的 ~*Messages*~ 中；测试失败时返回非零退出状态。此入口会重新加载当前源码，不会退出用户的 Emacs。
+
+可通过 ~EMACSCLIENT~ 覆盖可执行文件路径。执行 ~make test~ 可同时检查 Mac 和 Emacs 两部分。
+
+开发目录及模块约定见 ~AGENTS.md~ 。

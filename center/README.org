@@ -1,0 +1,84 @@
+#+TITLE: Loki Assistant 主程序
+
+* 功能与状态
+
+此目录承载各平台应用。目前已建立可构建的 macOS 菜单栏应用，提供设置、退出与 Emacs 连接检查。
+
+后续接入 agent-shell 会话列表、刷新、切换会话及发送需求，当前版本尚未提供这些操作。
+
+* 技术路线
+
+| 部分           | 选型                                              |
+|----------------+---------------------------------------------------|
+| 语言与工程     | Swift 6，CMake 管理并生成 Xcode macOS App 工程     |
+| 系统版本       | macOS 14 及以上                                   |
+| 应用生命周期   | SwiftUI App                                       |
+| 菜单栏与面板   | MenuBarExtra，使用 window 样式                     |
+| 界面控件       | SwiftUI List、TextEditor、Settings                 |
+| 界面状态       | Observation，主 actor 管理                        |
+| Emacs 通信     | Foundation Process / Pipe，Swift Concurrency      |
+| 数据编码       | Codable JSON，UTF-8 与 Base64                      |
+| 系统应用激活   | AppKit NSWorkspace / NSRunningApplication          |
+| 本地配置       | UserDefaults / AppStorage                         |
+
+菜单栏面板包含会话列表、需求输入及操作按钮，选用 ~MenuBarExtra~ 的 window 样式承载自定义 SwiftUI 界面。由系统管理面板展示与关闭，第一阶段不自行维护 ~NSStatusItem~ 和 ~NSPopover~ 。
+
+应用启动后常驻菜单栏，不显示 Dock 图标或默认主窗口。后续会话界面需在关闭面板时保留选定会话和未发送输入。
+
+通过异步子进程调用 ~emacsclient --eval~ 并读取函数返回值，具体控制由 Emacs 插件执行，见 [[file:../docs/agent-shell-control.org][控制协议]]。
+
+第一阶段使用 Apple 原生框架，以个人本机运行方式开发，关闭 App Sandbox。相关开发约定集中在 ~mac/AGENTS.md~ 。
+
+* 运行前提
+
+- 本机 Emacs server 可用。
+- 可找到 ~emacsclient~ 可执行文件，并能连接目标 server。
+- Emacs 已加载本项目插件；连接检查不依赖 agent-shell，后续会话控制需要安装 agent-shell。
+
+GUI 应用启动时的环境可能与终端不同，后续实现需支持配置 ~emacsclient~ 路径及目标 server。
+
+* 构建与运行
+
+需要 CMake 3.30 及以上，以及支持 Swift 6 的 Xcode。以下命令均在仓库根目录执行。
+
+根目录 Makefile 统一编排操作，Mac 构建配置由 CMake 管理。构建会自动生成或更新 Xcode 工程：
+
+#+begin_src sh
+make build
+#+end_src
+
+运行构建产物：
+
+#+begin_src sh
+make run
+#+end_src
+
+也可以打开生成的工程，选择 ~LokiAssistant~ scheme，直接运行：
+
+#+begin_src sh
+make xcode
+#+end_src
+
+默认使用本机临时签名，无需配置开发者团队。工程和 scheme 由 CMake 生成，请在 ~CMakeLists.txt~ 修改源码列表与构建配置；生成目录已被 Git 忽略。仅生成工程可执行 ~make configure~ 。
+
+应用启动后，点击菜单栏的终端图标，进入“设置”确认可执行文件路径和 server；留空 server 表示默认实例。点击“检查连接”后应显示 Emacs 版本。
+
+* 测试
+
+#+begin_src sh
+make test-mac
+#+end_src
+
+默认启用测试 target，CTest 通过 Xcode 启动应用并执行 XCTest。测试构建启用 testability，关闭 hardened runtime，以支持本机临时签名的测试 bundle 加载。
+
+XCTest 覆盖请求文本编码、响应版本和标识校验、无效输出与协议错误。测试不依赖运行中的 Emacs。
+
+仅构建应用的 Release 版本可使用独立目录：
+
+#+begin_src sh
+make release
+#+end_src
+
+默认输出到 ~center/mac/.build/release/Release/LokiAssistant.app~ 。执行 ~make clean~ 清理当前配置和 Release 构建产物，保留生成工程；完整操作及变量见 [[file:../README.org][项目说明]]。
+
+开发目录约定见 ~AGENTS.md~ 和 ~mac/AGENTS.md~ 。

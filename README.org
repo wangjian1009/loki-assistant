@@ -1,0 +1,68 @@
+#+TITLE: Loki Assistant
+
+* 项目简介
+
+个人使用的助理程序，为手机与电脑协同工作提供支持。
+
+* 当前阶段
+
+项目已完成初始化：Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查已可构建及验证。
+
+当前应用支持检查 Emacs 连接，尚未接入 agent-shell 的会话列表、buffer 切换和需求发送。
+
+第一阶段计划提供 macOS 菜单栏入口，控制本机 Emacs 中的 agent-shell：
+
+- 查看 agent-shell 会话列表。
+- 选择会话，在 Emacs 中显示对应 buffer。
+- 向指定会话发送需求。
+- 提示 Emacs 不可连接、会话失效或发送失败等情况。
+
+Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调用 Emacs 插件。函数返回值可经标准输出读取，结构化数据使用 JSON，传输细节见控制协议。
+
+* 使用前提
+
+- macOS，已安装并配置可运行的 ~emacsclient~ 。
+- Emacs 已启动 server，并安装 agent-shell。
+- 加载本项目的 Emacs 插件，见 [[file:emacs/README.org][插件安装与配置]]。
+
+* 快速开始
+
+1. 按 Emacs 插件说明配置加载路径，在已有 Emacs 中加载插件并启动 server。
+2. 在仓库根目录执行 ~make run~ 构建并运行 Mac 应用，详见 [[file:center/README.org][主程序说明]]。
+3. 点击菜单栏图标，在设置中确认 emacsclient 路径及 server，点击“检查连接”。
+
+连接检查本身不需要安装 agent-shell；后续会话控制需要它。
+
+* 开发操作
+
+根目录 Makefile 是统一入口。需要系统自带的 GNU Make、CMake 3.30 及以上和支持 Swift 6 的 Xcode。
+
+| 命令              | 操作                                      |
+|-------------------+-------------------------------------------|
+| make help         | 查看可用操作                              |
+| make configure    | 生成 Xcode 工程                           |
+| make build        | 构建 Mac 应用，默认 Debug                 |
+| make run          | 构建并启动 Mac 应用                       |
+| make xcode        | 生成并打开 Xcode 工程                     |
+| make test         | 执行 Mac XCTest 和 Emacs ERT               |
+| make test-mac     | 构建并执行 Mac XCTest                     |
+| make test-emacs   | 通过已有 Emacs server 执行 ERT            |
+| make release      | 构建不含测试的 Release 应用               |
+| make clean        | 清理当前配置及 Release 产物，保留生成工程 |
+
+~make test~ 需要已有 Emacs server；仅检查 Mac 部分可执行 ~make test-mac~ 。
+
+可通过 ~CONFIG~ 选择构建配置，通过 ~BUILD_DIR~ 和 ~RELEASE_BUILD_DIR~ 指定输出目录；工具路径支持 ~CMAKE~ 、 ~CTEST~ 、 ~EMACSCLIENT~ 和 ~OPEN~ 覆盖。例如：
+
+#+begin_src sh
+make build CONFIG=Release
+make test-emacs EMACSCLIENT=/opt/homebrew/bin/emacsclient
+#+end_src
+
+* 文档入口
+
+- [[file:center/README.org][主程序与 Mac 应用]]
+- [[file:emacs/README.org][Emacs 插件]]
+- [[file:docs/agent-shell-control.org][第一阶段需求与控制协议]]
+
+开发时从所在目录的 ~AGENTS.md~ 阅读目录结构与协作约定。

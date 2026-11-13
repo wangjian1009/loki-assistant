@@ -1,0 +1,7 @@
+*.local.md
+.DS_Store
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.elc
