@@ -19,7 +19,7 @@ help:
 	  'make test        执行 Mac XCTest 和 Emacs ERT' \
 	  'make test-mac    构建并执行 Mac XCTest' \
 	  'make test-emacs  通过已有 Emacs server 执行 ERT' \
-	  'make test-connection 加载插件并验证应用到真实 Emacs 的连接及失败恢复' \
+	  'make test-connection 加载插件并验证真实连接、会话列表与点击激活' \
 	  'make run         构建并启动 Mac 应用' \
 	  'make xcode       生成并打开 Xcode 工程' \
 	  'make release     构建不含测试的 Release 应用' \
@@ -44,7 +44,7 @@ test-emacs:
 
 test-connection: build
 	"$(EMACSCLIENT)" --alternate-editor=false --timeout=5 $(if $(strip $(EMACS_SOCKET)),--socket-name "$(EMACS_SOCKET)",) --eval \
-	  "$$(printf '\n  (progn\n    (add-to-list (quote load-path) "%s")\n    (load "loki-assistant-protocol" nil t)\n    (load "loki-assistant" nil t)\n    loki-assistant-version)\n' '$(PROJECT_ROOT)/emacs/lisp')"
+	  "$$(printf '\n  (progn\n    (add-to-list (quote load-path) "%s")\n    (load "loki-assistant-protocol" nil t)\n    (load "loki-assistant-agent-shell" nil t)\n    (load "loki-assistant" nil t)\n    loki-assistant-version)\n' '$(PROJECT_ROOT)/emacs/lisp')"
 	TEST_RUNNER_LOKI_TEST_CONNECTION=1 \
 	TEST_RUNNER_LOKI_EMACSCLIENT="$$(command -v "$(EMACSCLIENT)")" \
 	TEST_RUNNER_LOKI_EMACS_SOCKET="$(EMACS_SOCKET)" \

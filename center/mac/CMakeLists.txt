@@ -52,6 +52,7 @@ if(BUILD_TESTING)
     set_property(TARGET LokiAssistant PROPERTY XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME NO)
     find_package(XCTest REQUIRED)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
+        Tests/AgentShellPanelIntegrationTests.swift
         Tests/EmacsProtocolCodecTests.swift
         Tests/EmacsConnectionIntegrationTests.swift
     )

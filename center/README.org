@@ -23,7 +23,7 @@
 
 菜单栏面板当前提供连接检查、会话列表、自动与手动刷新、会话切换、需求输入、设置和退出入口。面板选用 ~MenuBarExtra~ 的 window 样式承载自定义 SwiftUI 界面，由系统管理展示与关闭。
 
-应用启动后常驻菜单栏，不显示 Dock 图标或默认主窗口。后续会话界面需在关闭面板时保留选定会话和未发送输入。
+应用启动后常驻菜单栏，不显示 Dock 图标或默认主窗口。每次打开面板都会刷新会话列表，关闭后保留选定会话和未发送输入。列表显示会话名称、项目路径与中文状态；点击整行可在 Emacs 显示目标 buffer 并激活 Emacs。
 
 通过异步子进程调用 ~emacsclient --eval~ 并读取函数返回值，具体控制由 Emacs 插件执行，见 [[file:../docs/agent-shell-control.org][控制协议]]。
 
@@ -71,7 +71,7 @@ make test-mac
 
 默认启用测试 target，CTest 通过 Xcode 启动应用并执行 XCTest。测试构建启用 testability，关闭 hardened runtime，以支持本机临时签名的测试 bundle 加载。
 
-默认 XCTest 覆盖请求文本编码、响应版本和标识校验、无效输出与协议错误，不依赖运行中的 Emacs。需要验证真实通信时，在根目录执行 ~make test-connection~ ，配置参数及加载行为见 [[file:../README.org][项目说明]]。
+默认 XCTest 覆盖请求文本编码、响应版本和标识校验、无效输出与协议错误，不依赖运行中的 Emacs。~make test-connection~ 还会呈现实际会话界面，验证列表高度、整行点击、目标 buffer 与 Emacs 前台进程，以及面板重开后的刷新和草稿保留；配置参数及加载行为见 [[file:../README.org][项目说明]]。
 
 仅构建应用的 Release 版本可使用独立目录：
 

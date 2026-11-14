@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct AgentShellView: View {
@@ -94,13 +95,14 @@ struct AgentShellView: View {
                                 .opacity(model.selectedSessionID == session.id ? 1 : 0)
                                 .foregroundStyle(.tint)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .contentShape(Rectangle())
                     .disabled(model.isSelectingSession)
                 }
                 .listStyle(.plain)
-                .frame(maxHeight: 220)
+                .frame(height: 220)
             } else {
                 Text(model.sessionMessage)
                     .font(.caption)
@@ -141,10 +143,45 @@ struct AgentShellView: View {
         }
         .padding(20)
         .frame(width: 360)
-        .onAppear {
-            Task {
-                await model.refreshSessions(configuration: configuration)
+        .background {
+            PanelVisibilityObserver {
+                Task {
+                    await model.refreshSessions(configuration: configuration)
+                }
             }
+        }
+    }
+}
+
+private struct PanelVisibilityObserver: NSViewRepresentable {
+    let onShow: @MainActor () -> Void
+
+    func makeNSView(context: Context) -> VisibilityView {
+        let view = VisibilityView()
+        view.onShow = onShow
+        return view
+    }
+
+    func updateNSView(_ view: VisibilityView, context: Context) {
+        view.onShow = onShow
+    }
+
+    final class VisibilityView: NSView {
+        var onShow: (@MainActor () -> Void)?
+        private var subscription: AnyCancellable?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            subscription = nil
+            guard let window else { return }
+            // 面板内容可能被系统保留，重新显示窗口时仍需刷新会话。
+            subscription = window.publisher(for: \.isVisible, options: [.initial, .new])
+                .filter { $0 }
+                .sink { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.onShow?()
+                    }
+                }
         }
     }
 }

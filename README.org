@@ -47,13 +47,13 @@ Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调�
 | make test         | 执行 Mac XCTest 和 Emacs ERT               |
 | make test-mac     | 构建并执行 Mac XCTest                     |
 | make test-emacs   | 通过已有 Emacs server 执行 ERT            |
-| make test-connection | 加载插件并验证应用到真实 Emacs 的连接及失败恢复 |
+| make test-connection | 加载插件并验证真实连接、会话列表与点击激活 |
 | make release      | 构建不含测试的 Release 应用               |
 | make clean        | 清理当前配置及 Release 产物，保留生成工程 |
 
 ~make test~ 需要已有 Emacs server；仅检查 Mac 部分可执行 ~make test-mac~ 。
 
-~make test-connection~ 使用已有 Emacs server，重新加载当前插件源码，在 Mac 应用宿主中执行真实连接与失败恢复检查。它不启动或退出 Emacs，也不要求安装 agent-shell。普通 ~make test-mac~ 跳过依赖真实 Emacs 的联调检查。
+~make test-connection~ 使用已有 Emacs server，重新加载当前插件源码，在 Mac 应用宿主中检查真实连接、失败恢复、会话列表显示和整行点击激活。会话检查需要安装 agent-shell；存在会话时，还会验证重新打开面板后的刷新、选中项及草稿保留，结束后恢复 Emacs 窗口布局。没有会话时跳过点击验证。此入口不启动或退出 Emacs，也不发送需求。普通 ~make test-mac~ 跳过依赖真实 Emacs 的联调检查。
 
 可通过 ~CONFIG~ 选择构建配置，通过 ~BUILD_DIR~ 和 ~RELEASE_BUILD_DIR~ 指定输出目录；工具路径支持 ~CMAKE~ 、 ~CTEST~ 、 ~EMACSCLIENT~ 和 ~OPEN~ 覆盖。~EMACS_SOCKET~ 可为 Emacs 测试及联调指定 server 名称或 socket 路径，留空使用默认 server。例如：
 
