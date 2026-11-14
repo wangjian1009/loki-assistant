@@ -13,6 +13,7 @@
        (load-path (cons (expand-file-name "../lisp" test-directory) load-path)))
   ;; Reload production code so repeat runs test current source, not cached features.
   (load "loki-assistant-protocol" nil t)
+  (load "loki-assistant-agent-shell" nil t)
   (load "loki-assistant" nil t)
   (load (expand-file-name "loki-assistant-protocol-test.el" test-directory) nil t)
   (let* ((stats (ert-run-tests-batch "^loki-assistant-"))

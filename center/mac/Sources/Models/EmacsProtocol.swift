@@ -17,6 +17,24 @@ struct ConnectionInfo: Decodable, Sendable {
     }
 }
 
+struct AgentSession: Decodable, Identifiable, Sendable {
+    let id: String
+    let bufferName: String
+    let projectPath: String?
+    let status: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case bufferName = "buffer_name"
+        case projectPath = "project_path"
+        case status
+    }
+}
+
+struct SessionList: Decodable, Sendable {
+    let sessions: [AgentSession]
+}
+
 struct EmacsResponse<Result: Decodable & Sendable>: Decodable, Sendable {
     let version: Int
     let id: String?

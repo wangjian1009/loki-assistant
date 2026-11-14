@@ -3,6 +3,19 @@ import Foundation
 struct EmacsClient: Sendable {
     func ping(configuration: EmacsConfiguration) async throws -> ConnectionInfo {
         let request = EmacsRequest(id: UUID().uuidString, operation: "ping")
+        return try await execute(request, configuration: configuration, as: ConnectionInfo.self)
+    }
+
+    func listSessions(configuration: EmacsConfiguration) async throws -> SessionList {
+        let request = EmacsRequest(id: UUID().uuidString, operation: "list-sessions")
+        return try await execute(request, configuration: configuration, as: SessionList.self)
+    }
+
+    private func execute<Result: Decodable & Sendable>(
+        _ request: EmacsRequest,
+        configuration: EmacsConfiguration,
+        as resultType: Result.Type
+    ) async throws -> Result {
         let expression = try EmacsProtocolCodec.expression(for: request)
 
         // Process waiting and pipe reads run off the main actor.
@@ -54,6 +67,6 @@ struct EmacsClient: Sendable {
             return data
         }.value
 
-        return try EmacsProtocolCodec.decode(output, requestID: request.id, as: ConnectionInfo.self)
+        return try EmacsProtocolCodec.decode(output, requestID: request.id, as: resultType)
     }
 }

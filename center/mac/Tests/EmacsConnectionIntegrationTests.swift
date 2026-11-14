@@ -15,6 +15,12 @@ final class EmacsConnectionIntegrationTests: XCTestCase {
         XCTAssertFalse(info.emacsVersion.isEmpty)
         XCTAssertFalse(info.pluginVersion.isEmpty)
 
+        let sessionList = try await EmacsClient().listSessions(configuration: configuration)
+        XCTAssertTrue(sessionList.sessions.allSatisfy { session in
+            !session.id.isEmpty && !session.bufferName.isEmpty
+                && ["ready", "busy", "unknown"].contains(session.status)
+        })
+
         let model = ApplicationModel()
         await model.checkConnection(configuration: EmacsConfiguration(
             executablePath: "/loki-assistant-missing/emacsclient", socketName: configuration.socketName

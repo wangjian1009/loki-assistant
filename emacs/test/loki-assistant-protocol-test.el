@@ -26,6 +26,24 @@
     (should (equal (gethash "id" response) "ping-1"))
     (should (equal (gethash "emacs_version" result) emacs-version))))
 
+(ert-deftest loki-assistant-agent-shell-list-sessions ()
+  (let* ((response (loki-assistant-test--request
+                    (list :version 1 :id "sessions-1"
+                          :operation "list-sessions"
+                          :params (make-hash-table :test 'equal))))
+         (result (gethash "result" response))
+         (sessions (gethash "sessions" result)))
+    (should (eq (gethash "ok" response) t))
+    (should (vectorp sessions))
+    (mapc (lambda (session)
+            (should (stringp (gethash "id" session)))
+            (should (stringp (gethash "buffer_name" session)))
+            (should (or (null (gethash "project_path" session))
+                        (stringp (gethash "project_path" session))))
+            (should (member (gethash "status" session)
+                            '("ready" "busy" "unknown"))))
+          sessions)))
+
 (ert-deftest loki-assistant-protocol-invalid-transport ()
   (dolist (invalid '("%%%" "" "e30=\n" 123))
     (let ((response (json-parse-string

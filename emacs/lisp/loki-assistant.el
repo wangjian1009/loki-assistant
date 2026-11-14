@@ -11,6 +11,7 @@
 ;;; Code:
 
 (require 'loki-assistant-protocol)
+(require 'loki-assistant-agent-shell)
 
 (defconst loki-assistant-version "0.1.0"
   "Version of the Loki Assistant Emacs plugin.")
@@ -20,6 +21,7 @@
   (pcase operation
     ("ping" (list :emacs_version emacs-version
                   :plugin_version loki-assistant-version))
+    ("list-sessions" (loki-assistant-agent-shell-list-sessions))
     (_ (loki-assistant-protocol--fail "unknown-operation" "不支持此操作"))))
 
 ;;;###autoload

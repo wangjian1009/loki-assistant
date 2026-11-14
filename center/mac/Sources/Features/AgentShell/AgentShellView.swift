@@ -28,9 +28,54 @@ struct AgentShellView: View {
             }
             .disabled(model.isCheckingConnection)
 
-            Text("会话列表与需求发送将在后续版本提供。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack {
+                Text("agent-shell 会话")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    Task {
+                        await model.refreshSessions(configuration: EmacsConfiguration(
+                            executablePath: executablePath,
+                            socketName: socketName
+                        ))
+                    }
+                } label: {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                }
+                .labelStyle(.iconOnly)
+                .disabled(model.isLoadingSessions)
+                .help("刷新会话列表")
+            }
+
+            if model.isLoadingSessions {
+                ProgressView()
+                    .controlSize(.small)
+            } else if !model.sessions.isEmpty {
+                List(model.sessions) { session in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(session.bufferName)
+                            .font(.body)
+                        HStack(spacing: 6) {
+                            Text(session.status)
+                            if let projectPath = session.projectPath {
+                                Text(projectPath)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listStyle(.plain)
+                .frame(maxHeight: 220)
+            } else {
+                Text(model.sessionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
 
             Divider()
             HStack {

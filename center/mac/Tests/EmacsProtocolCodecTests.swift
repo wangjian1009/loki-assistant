@@ -30,6 +30,23 @@ final class EmacsProtocolCodecTests: XCTestCase {
         XCTAssertThrowsError(try EmacsProtocolCodec.decode(unsupported, requestID: "test-1", as: ConnectionInfo.self))
     }
 
+    func testSessionListDecodes() throws {
+        let response = try output([
+            "version": 1, "id": "sessions-1", "ok": true,
+            "result": ["sessions": [[
+                "id": "session-1",
+                "buffer_name": "Codex Agent @ project",
+                "project_path": "/tmp/project",
+                "status": "ready"
+            ]]]
+        ])
+        let result = try EmacsProtocolCodec.decode(response, requestID: "sessions-1", as: SessionList.self)
+        XCTAssertEqual(result.sessions.count, 1)
+        XCTAssertEqual(result.sessions[0].id, "session-1")
+        XCTAssertEqual(result.sessions[0].bufferName, "Codex Agent @ project")
+        XCTAssertEqual(result.sessions[0].status, "ready")
+    }
+
     func testMalformedResponseAndRemoteError() throws {
         XCTAssertThrowsError(try EmacsProtocolCodec.decode(
             Data("\"not base64\"\n".utf8), requestID: "test-1", as: ConnectionInfo.self

@@ -10,15 +10,16 @@
 lisp/
   loki-assistant.el               插件入口、配置与统一请求函数
   loki-assistant-protocol.el      请求校验、JSON 编解码与错误响应
+  loki-assistant-agent-shell.el   agent-shell 会话发现适配
 test/
   loki-assistant-protocol-test.el 协议 ERT 测试
   run-tests.el                   make test-emacs 的加载与执行入口
 README.org                       安装、配置、调试与使用说明
 ```
 
-统一请求函数为 `loki-assistant-request`，当前支持 `ping` 连接检查，协议见 `../docs/agent-shell-control.org`。
+统一请求函数为 `loki-assistant-request`，当前支持 `ping` 连接检查和 `list-sessions` 会话发现，协议见 `../docs/agent-shell-control.org`。
 
-agent-shell 适配尚未实现，接入时再创建 `lisp/loki-assistant-agent-shell.el`，承载会话发现与控制，不提前建立空模块。
+当前已创建 `lisp/loki-assistant-agent-shell.el` 承载会话发现；buffer 切换和需求发送仍待实现。
 
 ## 实现约定
 
