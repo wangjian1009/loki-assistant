@@ -25,6 +25,10 @@
     ("select-session"
      (loki-assistant-agent-shell-select-session
       (gethash "session_id" params)))
+    ("send-prompt"
+     (loki-assistant-agent-shell-send-prompt
+      (gethash "session_id" params)
+      (gethash "prompt" params)))
     (_ (loki-assistant-protocol--fail "unknown-operation" "不支持此操作"))))
 
 ;;;###autoload

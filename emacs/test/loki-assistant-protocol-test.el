@@ -6,6 +6,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'loki-assistant)
 
 (defun loki-assistant-test--request (object)
@@ -66,6 +67,47 @@
       (should (eq (gethash "ok" response) :false))
       (should (equal (gethash "code" (gethash "error" response))
                      "session-not-found")))))
+
+(ert-deftest loki-assistant-agent-shell-send-prompt ()
+  (let* ((ready-buffer
+          (cl-loop for buffer in (agent-shell-buffers)
+                   when (eq (agent-shell-status :shell-buffer buffer) 'ready)
+                   return buffer))
+         (busy-buffer
+          (cl-loop for buffer in (agent-shell-buffers)
+                   when (eq (agent-shell-status :shell-buffer buffer) 'busy)
+                   return buffer)))
+    (unless (and ready-buffer busy-buffer)
+      (ert-skip "需要同时存在 ready 和 busy 的 agent-shell 会话"))
+    (let* ((ready-id (agent-shell-session-id :shell-buffer ready-buffer))
+           (busy-id (agent-shell-session-id :shell-buffer busy-buffer))
+           (prompt "中文、\"引号\"、反斜线\\与换行\n第二行")
+           submitted)
+      (cl-letf (((symbol-function 'shell-maker-submit)
+                 (lambda (&rest args)
+                   (setq submitted args))))
+        (let ((params (make-hash-table :test 'equal)))
+          (puthash "session_id" ready-id params)
+          (puthash "prompt" prompt params)
+          (let* ((response (loki-assistant-test--request
+                            (list :version 1 :id "send-1"
+                                  :operation "send-prompt"
+                                  :params params)))
+                 (result (gethash "result" response)))
+            (should (eq (gethash "ok" response) t))
+            (should (equal (gethash "session_id" result) ready-id))
+            (should (eq (gethash "accepted" result) t))
+            (should (equal (plist-get submitted :input) prompt)))))
+      (let* ((params (make-hash-table :test 'equal)))
+        (puthash "session_id" busy-id params)
+        (puthash "prompt" prompt params)
+        (let ((response (loki-assistant-test--request
+                         (list :version 1 :id "send-2"
+                               :operation "send-prompt"
+                               :params params))))
+          (should (eq (gethash "ok" response) :false))
+          (should (equal (gethash "code" (gethash "error" response))
+                         "session-not-ready")))))))
 
 (ert-deftest loki-assistant-protocol-invalid-transport ()
   (dolist (invalid '("%%%" "" "e30=\n" 123))

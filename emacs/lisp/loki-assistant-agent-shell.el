@@ -76,5 +76,31 @@
        (loki-assistant-protocol--fail
         "internal-error" "无法显示目标 agent-shell 会话")))))
 
+(defun loki-assistant-agent-shell-send-prompt (session-id prompt)
+  "Send PROMPT to the ready agent-shell session SESSION-ID."
+  (loki-assistant-agent-shell--require)
+  (unless (and (stringp session-id) (not (string-empty-p session-id)))
+    (loki-assistant-protocol--fail
+     "invalid-request" "缺少有效会话标识"))
+  (unless (and (stringp prompt) (not (string-empty-p prompt)))
+    (loki-assistant-protocol--fail
+     "invalid-request" "需求不能为空"))
+  (let ((buffer (loki-assistant-agent-shell--find-buffer session-id)))
+    (unless buffer
+      (loki-assistant-protocol--fail "session-not-found" "目标会话已失效"))
+    (unless (eq (agent-shell-status :shell-buffer buffer) 'ready)
+      (loki-assistant-protocol--fail
+       "session-not-ready" "目标会话当前无法接收需求"))
+    (condition-case err
+        (with-current-buffer buffer
+          ;; `shell-maker-submit' is the documented programmatic entry point;
+          ;; the ready-state check above prevents implicit queueing or steering.
+          (shell-maker-submit :input prompt)
+          (list :session_id session-id :accepted t))
+      (error
+       (message "Loki Assistant agent-shell send failed: %S" err)
+       (loki-assistant-protocol--fail
+        "send-failed" "需求未能提交给 agent-shell")))))
+
 (provide 'loki-assistant-agent-shell)
 ;;; loki-assistant-agent-shell.el ends here

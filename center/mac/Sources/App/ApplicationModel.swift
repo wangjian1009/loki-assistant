@@ -12,6 +12,8 @@ final class ApplicationModel {
     private(set) var isLoadingSessions = false
     private(set) var selectedSessionID: String?
     private(set) var isSelectingSession = false
+    var promptText = ""
+    private(set) var isSendingPrompt = false
 
     func checkConnection(configuration: EmacsConfiguration) async {
         guard !isCheckingConnection else { return }
@@ -67,5 +69,40 @@ final class ApplicationModel {
                 || application.localizedName == "Emacs"
         }
         _ = application?.activate()
+    }
+
+    func sendPrompt(configuration: EmacsConfiguration) async {
+        guard !isSendingPrompt else { return }
+        guard let selectedSessionID else {
+            sessionMessage = "请先选择 agent-shell 会话"
+            return
+        }
+        guard !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            sessionMessage = "需求不能为空"
+            return
+        }
+
+        let prompt = promptText
+        isSendingPrompt = true
+        sessionMessage = "正在发送需求…"
+        defer { isSendingPrompt = false }
+
+        do {
+            let result = try await EmacsClient().sendPrompt(
+                configuration: configuration,
+                sessionID: selectedSessionID,
+                prompt: prompt
+            )
+            guard result.accepted else {
+                sessionMessage = "agent-shell 未接受需求"
+                return
+            }
+            if promptText == prompt {
+                promptText = ""
+            }
+            sessionMessage = "需求已提交"
+        } catch {
+            sessionMessage = error.localizedDescription
+        }
     }
 }

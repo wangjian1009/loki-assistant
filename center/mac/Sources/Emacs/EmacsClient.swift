@@ -20,6 +20,19 @@ struct EmacsClient: Sendable {
         return try await execute(request, configuration: configuration, as: SelectedSession.self)
     }
 
+    func sendPrompt(
+        configuration: EmacsConfiguration,
+        sessionID: String,
+        prompt: String
+    ) async throws -> AcceptedPrompt {
+        let request = EmacsRequest(
+            id: UUID().uuidString,
+            operation: "send-prompt",
+            params: ["session_id": sessionID, "prompt": prompt]
+        )
+        return try await execute(request, configuration: configuration, as: AcceptedPrompt.self)
+    }
+
     private func execute<Result: Decodable & Sendable>(
         _ request: EmacsRequest,
         configuration: EmacsConfiguration,

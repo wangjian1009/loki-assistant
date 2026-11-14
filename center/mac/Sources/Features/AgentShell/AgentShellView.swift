@@ -10,6 +10,8 @@ struct AgentShellView: View {
     private var socketName = ""
 
     var body: some View {
+        @Bindable var model = model
+
         VStack(alignment: .leading, spacing: 16) {
             Text("Loki Assistant")
                 .font(.headline)
@@ -96,6 +98,26 @@ struct AgentShellView: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
+
+            Text("发送需求")
+                .font(.headline)
+            TextEditor(text: $model.promptText)
+                .font(.body)
+                .frame(minHeight: 72, maxHeight: 120)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(.quaternary)
+                }
+            Button("发送") {
+                Task {
+                    await model.sendPrompt(configuration: EmacsConfiguration(
+                        executablePath: executablePath,
+                        socketName: socketName
+                    ))
+                }
+            }
+            .disabled(model.isSendingPrompt || model.selectedSessionID == nil
+                      || model.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Divider()
             HStack {

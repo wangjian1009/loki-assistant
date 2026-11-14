@@ -43,6 +43,16 @@ struct SelectedSession: Decodable, Sendable {
     }
 }
 
+struct AcceptedPrompt: Decodable, Sendable {
+    let sessionID: String
+    let accepted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case accepted
+    }
+}
+
 struct EmacsResponse<Result: Decodable & Sendable>: Decodable, Sendable {
     let version: Int
     let id: String?

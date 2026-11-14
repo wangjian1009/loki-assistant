@@ -60,6 +60,20 @@ final class EmacsProtocolCodecTests: XCTestCase {
         XCTAssertEqual(result.sessionID, "session-1")
     }
 
+    func testAcceptedPromptDecodes() throws {
+        let response = try output([
+            "version": 1, "id": "send-1", "ok": true,
+            "result": ["session_id": "session-1", "accepted": true]
+        ])
+        let result = try EmacsProtocolCodec.decode(
+            response,
+            requestID: "send-1",
+            as: AcceptedPrompt.self
+        )
+        XCTAssertEqual(result.sessionID, "session-1")
+        XCTAssertTrue(result.accepted)
+    }
+
     func testMalformedResponseAndRemoteError() throws {
         XCTAssertThrowsError(try EmacsProtocolCodec.decode(
             Data("\"not base64\"\n".utf8), requestID: "test-1", as: ConnectionInfo.self

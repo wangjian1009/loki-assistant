@@ -8,7 +8,7 @@
 
 项目已实现 Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查。真实通信的验证范围与结果见 [[file:docs/agent-shell-control.org][第一阶段设计]]。
 
-当前应用支持检查 Emacs 连接、刷新 agent-shell 会话列表和切换会话，尚未接入需求发送。
+当前应用支持检查 Emacs 连接、刷新和切换 agent-shell 会话，并向选定会话发送需求。
 
 第一阶段计划提供 macOS 菜单栏入口，控制本机 Emacs 中的 agent-shell：
 
