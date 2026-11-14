@@ -53,6 +53,7 @@ if(BUILD_TESTING)
     find_package(XCTest REQUIRED)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
         Tests/EmacsProtocolCodecTests.swift
+        Tests/EmacsConnectionIntegrationTests.swift
     )
     set_target_properties(LokiAssistantTests PROPERTIES
         XCODE_GENERATE_SCHEME YES

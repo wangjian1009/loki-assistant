@@ -21,7 +21,7 @@
 | 系统应用激活   | AppKit NSWorkspace / NSRunningApplication          |
 | 本地配置       | UserDefaults / AppStorage                         |
 
-菜单栏面板包含会话列表、需求输入及操作按钮，选用 ~MenuBarExtra~ 的 window 样式承载自定义 SwiftUI 界面。由系统管理面板展示与关闭，第一阶段不自行维护 ~NSStatusItem~ 和 ~NSPopover~ 。
+菜单栏面板当前提供连接检查、设置和退出入口，计划接入会话列表及需求输入。面板选用 ~MenuBarExtra~ 的 window 样式承载自定义 SwiftUI 界面，由系统管理展示与关闭。
 
 应用启动后常驻菜单栏，不显示 Dock 图标或默认主窗口。后续会话界面需在关闭面板时保留选定会话和未发送输入。
 
@@ -35,7 +35,7 @@
 - 可找到 ~emacsclient~ 可执行文件，并能连接目标 server。
 - Emacs 已加载本项目插件；连接检查不依赖 agent-shell，后续会话控制需要安装 agent-shell。
 
-GUI 应用启动时的环境可能与终端不同，后续实现需支持配置 ~emacsclient~ 路径及目标 server。
+GUI 应用启动时的环境可能与终端不同，设置中已支持配置 ~emacsclient~ 的绝对路径及目标 server。
 
 * 构建与运行
 
@@ -61,7 +61,7 @@ make xcode
 
 默认使用本机临时签名，无需配置开发者团队。工程和 scheme 由 CMake 生成，请在 ~CMakeLists.txt~ 修改源码列表与构建配置；生成目录已被 Git 忽略。仅生成工程可执行 ~make configure~ 。
 
-应用启动后，点击菜单栏的终端图标，进入“设置”确认可执行文件路径和 server；留空 server 表示默认实例。点击“检查连接”后应显示 Emacs 版本。
+应用启动后，点击菜单栏的终端图标，进入“设置”确认可执行文件路径和 server；留空 server 表示默认实例。点击“检查连接”后应显示 Emacs 和插件版本。路径错误或 server 不可达时显示失败原因，修正配置后可再次检查。
 
 * 测试
 
@@ -71,7 +71,7 @@ make test-mac
 
 默认启用测试 target，CTest 通过 Xcode 启动应用并执行 XCTest。测试构建启用 testability，关闭 hardened runtime，以支持本机临时签名的测试 bundle 加载。
 
-XCTest 覆盖请求文本编码、响应版本和标识校验、无效输出与协议错误。测试不依赖运行中的 Emacs。
+默认 XCTest 覆盖请求文本编码、响应版本和标识校验、无效输出与协议错误，不依赖运行中的 Emacs。需要验证真实通信时，在根目录执行 ~make test-connection~ ，配置参数及加载行为见 [[file:../README.org][项目说明]]。
 
 仅构建应用的 Release 版本可使用独立目录：
 

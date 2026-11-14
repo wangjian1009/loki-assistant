@@ -15,7 +15,7 @@ final class ApplicationModel {
 
         do {
             let info = try await EmacsClient().ping(configuration: configuration)
-            connectionMessage = "已连接 Emacs \(info.emacsVersion)"
+            connectionMessage = "已连接 Emacs \(info.emacsVersion) · 插件 \(info.pluginVersion)"
         } catch {
             connectionMessage = error.localizedDescription
         }

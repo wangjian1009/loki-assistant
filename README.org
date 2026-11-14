@@ -6,7 +6,7 @@
 
 * 当前阶段
 
-项目已完成初始化：Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查已可构建及验证。
+项目已实现 Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查。真实通信的验证范围与结果见 [[file:docs/agent-shell-control.org][第一阶段设计]]。
 
 当前应用支持检查 Emacs 连接，尚未接入 agent-shell 的会话列表、buffer 切换和需求发送。
 
@@ -22,7 +22,7 @@ Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调�
 * 使用前提
 
 - macOS，已安装并配置可运行的 ~emacsclient~ 。
-- Emacs 已启动 server，并安装 agent-shell。
+- Emacs 已启动 server；会话控制需要安装 agent-shell，连接检查不需要。
 - 加载本项目的 Emacs 插件，见 [[file:emacs/README.org][插件安装与配置]]。
 
 * 快速开始
@@ -47,16 +47,20 @@ Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调�
 | make test         | 执行 Mac XCTest 和 Emacs ERT               |
 | make test-mac     | 构建并执行 Mac XCTest                     |
 | make test-emacs   | 通过已有 Emacs server 执行 ERT            |
+| make test-connection | 加载插件并验证应用到真实 Emacs 的连接及失败恢复 |
 | make release      | 构建不含测试的 Release 应用               |
 | make clean        | 清理当前配置及 Release 产物，保留生成工程 |
 
 ~make test~ 需要已有 Emacs server；仅检查 Mac 部分可执行 ~make test-mac~ 。
 
-可通过 ~CONFIG~ 选择构建配置，通过 ~BUILD_DIR~ 和 ~RELEASE_BUILD_DIR~ 指定输出目录；工具路径支持 ~CMAKE~ 、 ~CTEST~ 、 ~EMACSCLIENT~ 和 ~OPEN~ 覆盖。例如：
+~make test-connection~ 使用已有 Emacs server，重新加载当前插件源码，在 Mac 应用宿主中执行真实连接与失败恢复检查。它不启动或退出 Emacs，也不要求安装 agent-shell。普通 ~make test-mac~ 跳过依赖真实 Emacs 的联调检查。
+
+可通过 ~CONFIG~ 选择构建配置，通过 ~BUILD_DIR~ 和 ~RELEASE_BUILD_DIR~ 指定输出目录；工具路径支持 ~CMAKE~ 、 ~CTEST~ 、 ~EMACSCLIENT~ 和 ~OPEN~ 覆盖。~EMACS_SOCKET~ 可为 Emacs 测试及联调指定 server 名称或 socket 路径，留空使用默认 server。例如：
 
 #+begin_src sh
 make build CONFIG=Release
 make test-emacs EMACSCLIENT=/opt/homebrew/bin/emacsclient
+make test-connection EMACSCLIENT=/opt/homebrew/bin/emacsclient EMACS_SOCKET=server
 #+end_src
 
 * 文档入口

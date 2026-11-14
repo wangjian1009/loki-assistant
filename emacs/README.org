@@ -50,4 +50,6 @@ make test-emacs
 
 可通过 ~EMACSCLIENT~ 覆盖可执行文件路径。执行 ~make test~ 可同时检查 Mac 和 Emacs 两部分。
 
+~make test-connection~ 会将本目录的 ~lisp/~ 加入已有 Emacs 的 ~load-path~ ，重新加载当前协议和插件源码，并执行 Mac 应用到 Emacs 的真实连接检查。此加载仅作用于当前 Emacs 进程，不修改个人启动配置；重启后仍需按安装说明加载。可用 ~EMACS_SOCKET~ 指定目标 server，详见 [[file:../README.org][根目录操作说明]]。
+
 开发目录及模块约定见 ~AGENTS.md~ 。
