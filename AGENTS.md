@@ -2,10 +2,6 @@
 
 Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作提供支持。
 
-## 第一阶段
-实现 macOS 菜单栏应用对 Emacs agent-shell 的控制：查看会话列表、切换对应 buffer、向指定会话发送需求，并展示连接或操作失败的原因。
-第一阶段只实现本机控制。
-
 ## 项目选型
 - 采用 SwiftUI + 必要的 AppKit 开发 Mac 应用
 - 通过 `emacsclient --eval` 调用 Emacs 插件并获取函数返回值。
