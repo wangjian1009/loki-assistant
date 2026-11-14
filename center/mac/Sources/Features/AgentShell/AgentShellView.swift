@@ -9,6 +9,18 @@ struct AgentShellView: View {
     @AppStorage(EmacsConfiguration.socketNameKey)
     private var socketName = ""
 
+    private var configuration: EmacsConfiguration {
+        EmacsConfiguration(executablePath: executablePath, socketName: socketName)
+    }
+
+    private func statusText(_ status: String) -> String {
+        switch status {
+        case "ready": return "就绪"
+        case "busy": return "运行中"
+        default: return "状态未知"
+        }
+    }
+
     var body: some View {
         @Bindable var model = model
 
@@ -23,9 +35,7 @@ struct AgentShellView: View {
             Button("检查连接") {
                 Task {
                     await model.checkConnection(configuration: EmacsConfiguration(
-                        executablePath: executablePath,
-                        socketName: socketName
-                    ))
+                        executablePath: executablePath, socketName: socketName))
                 }
             }
             .disabled(model.isCheckingConnection)
@@ -33,13 +43,15 @@ struct AgentShellView: View {
             HStack {
                 Text("agent-shell 会话")
                     .font(.headline)
+                if !model.sessions.isEmpty {
+                    Text("\(model.sessions.count) 个")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button {
                     Task {
-                        await model.refreshSessions(configuration: EmacsConfiguration(
-                            executablePath: executablePath,
-                            socketName: socketName
-                        ))
+                        await model.refreshSessions(configuration: configuration)
                     }
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
@@ -58,10 +70,7 @@ struct AgentShellView: View {
                         Task {
                             await model.selectSession(
                                 sessionID: session.id,
-                                configuration: EmacsConfiguration(
-                                    executablePath: executablePath,
-                                    socketName: socketName
-                                )
+                                configuration: configuration
                             )
                         }
                     } label: {
@@ -70,7 +79,7 @@ struct AgentShellView: View {
                                 Text(session.bufferName)
                                     .font(.body)
                                 HStack(spacing: 6) {
-                                    Text(session.status)
+                                    Text(statusText(session.status))
                                     if let projectPath = session.projectPath {
                                         Text(projectPath)
                                             .lineLimit(1)
@@ -99,6 +108,13 @@ struct AgentShellView: View {
                     .textSelection(.enabled)
             }
 
+            if !model.sessionMessage.isEmpty && !model.sessions.isEmpty {
+                Text(model.sessionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
             Text("发送需求")
                 .font(.headline)
             TextEditor(text: $model.promptText)
@@ -110,10 +126,7 @@ struct AgentShellView: View {
                 }
             Button("发送") {
                 Task {
-                    await model.sendPrompt(configuration: EmacsConfiguration(
-                        executablePath: executablePath,
-                        socketName: socketName
-                    ))
+                    await model.sendPrompt(configuration: configuration)
                 }
             }
             .disabled(model.isSendingPrompt || model.selectedSessionID == nil
@@ -128,5 +141,10 @@ struct AgentShellView: View {
         }
         .padding(20)
         .frame(width: 360)
+        .onAppear {
+            Task {
+                await model.refreshSessions(configuration: configuration)
+            }
+        }
     }
 }

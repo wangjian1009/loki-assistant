@@ -56,19 +56,24 @@ final class ApplicationModel {
             )
             selectedSessionID = result.sessionID
             let bufferName = sessions.first { $0.id == result.sessionID }?.bufferName ?? result.sessionID
-            sessionMessage = "已显示会话：\(bufferName)"
-            activateEmacs()
+            if activateEmacs() {
+                sessionMessage = "已激活会话：\(bufferName)"
+            } else {
+                sessionMessage = "已显示会话，但无法激活 Emacs：\(bufferName)"
+            }
         } catch {
             sessionMessage = error.localizedDescription
         }
     }
 
-    private func activateEmacs() {
-        let application = NSWorkspace.shared.runningApplications.first { application in
+    private func activateEmacs() -> Bool {
+        guard let application = NSWorkspace.shared.runningApplications.first(where: { application in
             application.bundleIdentifier?.hasPrefix("org.gnu.Emacs") == true
                 || application.localizedName == "Emacs"
+        }) else {
+            return false
         }
-        _ = application?.activate()
+        return application.activate()
     }
 
     func sendPrompt(configuration: EmacsConfiguration) async {
