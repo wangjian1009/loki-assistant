@@ -5,8 +5,8 @@
 ;; Keywords: convenience, processes
 
 ;;; Commentary:
-;; Load this package in an existing Emacs server.  The initial endpoint
-;; supports a connection handshake; agent-shell operations are not yet wired.
+;; Load this package in an existing Emacs server.  The endpoint supports the
+;; connection handshake and agent-shell session discovery and selection.
 
 ;;; Code:
 
@@ -16,12 +16,15 @@
 (defconst loki-assistant-version "0.1.0"
   "Version of the Loki Assistant Emacs plugin.")
 
-(defun loki-assistant--dispatch (operation _params)
-  "Dispatch the validated OPERATION with _PARAMS."
+(defun loki-assistant--dispatch (operation params)
+  "Dispatch the validated OPERATION with PARAMS."
   (pcase operation
     ("ping" (list :emacs_version emacs-version
                   :plugin_version loki-assistant-version))
     ("list-sessions" (loki-assistant-agent-shell-list-sessions))
+    ("select-session"
+     (loki-assistant-agent-shell-select-session
+      (gethash "session_id" params)))
     (_ (loki-assistant-protocol--fail "unknown-operation" "不支持此操作"))))
 
 ;;;###autoload

@@ -11,6 +11,15 @@ struct EmacsClient: Sendable {
         return try await execute(request, configuration: configuration, as: SessionList.self)
     }
 
+    func selectSession(configuration: EmacsConfiguration, sessionID: String) async throws -> SelectedSession {
+        let request = EmacsRequest(
+            id: UUID().uuidString,
+            operation: "select-session",
+            params: ["session_id": sessionID]
+        )
+        return try await execute(request, configuration: configuration, as: SelectedSession.self)
+    }
+
     private func execute<Result: Decodable & Sendable>(
         _ request: EmacsRequest,
         configuration: EmacsConfiguration,

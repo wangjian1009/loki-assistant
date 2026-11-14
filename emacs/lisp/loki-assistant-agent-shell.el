@@ -51,5 +51,30 @@
      (loki-assistant-protocol--fail
       "agent-shell-unavailable" "无法读取 agent-shell 会话"))))
 
+(defun loki-assistant-agent-shell--find-buffer (session-id)
+  "Find the live agent-shell buffer identified by SESSION-ID."
+  (catch 'found
+    (dolist (buffer (agent-shell-buffers))
+      (when (equal session-id (agent-shell-session-id :shell-buffer buffer))
+        (throw 'found buffer)))))
+
+(defun loki-assistant-agent-shell-select-session (session-id)
+  "Display the agent-shell session identified by SESSION-ID."
+  (loki-assistant-agent-shell--require)
+  (unless (and (stringp session-id) (not (string-empty-p session-id)))
+    (loki-assistant-protocol--fail
+     "invalid-request" "缺少有效会话标识"))
+  (let ((buffer (loki-assistant-agent-shell--find-buffer session-id)))
+    (unless buffer
+      (loki-assistant-protocol--fail "session-not-found" "目标会话已失效"))
+    (condition-case err
+        (progn
+          (pop-to-buffer buffer)
+          (list :session_id session-id))
+      (error
+       (message "Loki Assistant agent-shell select failed: %S" err)
+       (loki-assistant-protocol--fail
+        "internal-error" "无法显示目标 agent-shell 会话")))))
+
 (provide 'loki-assistant-agent-shell)
 ;;; loki-assistant-agent-shell.el ends here

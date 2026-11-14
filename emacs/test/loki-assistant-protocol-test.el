@@ -44,6 +44,29 @@
                             '("ready" "busy" "unknown"))))
           sessions)))
 
+(ert-deftest loki-assistant-agent-shell-select-session ()
+  (let* ((buffer (car (agent-shell-buffers)))
+         (session-id (agent-shell-session-id :shell-buffer buffer))
+         (params (make-hash-table :test 'equal)))
+    (puthash "session_id" session-id params)
+    (save-window-excursion
+      (let* ((response (loki-assistant-test--request
+                        (list :version 1 :id "select-1"
+                              :operation "select-session"
+                              :params params)))
+             (result (gethash "result" response)))
+        (should (eq (gethash "ok" response) t))
+        (should (equal (gethash "session_id" result) session-id)))))
+  (let* ((params (make-hash-table :test 'equal)))
+    (puthash "session_id" "missing-session" params)
+    (let ((response (loki-assistant-test--request
+                     (list :version 1 :id "select-2"
+                           :operation "select-session"
+                           :params params))))
+      (should (eq (gethash "ok" response) :false))
+      (should (equal (gethash "code" (gethash "error" response))
+                     "session-not-found")))))
+
 (ert-deftest loki-assistant-protocol-invalid-transport ()
   (dolist (invalid '("%%%" "" "e30=\n" 123))
     (let ((response (json-parse-string

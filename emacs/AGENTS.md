@@ -19,7 +19,7 @@ README.org                       安装、配置、调试与使用说明
 
 统一请求函数为 `loki-assistant-request`，当前支持 `ping` 连接检查和 `list-sessions` 会话发现，协议见 `../docs/agent-shell-control.org`。
 
-当前已创建 `lisp/loki-assistant-agent-shell.el` 承载会话发现；buffer 切换和需求发送仍待实现。
+当前已创建 `lisp/loki-assistant-agent-shell.el` 承载会话发现和 buffer 切换；需求发送仍待实现。
 
 ## 实现约定
 

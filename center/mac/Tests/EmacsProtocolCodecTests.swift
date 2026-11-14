@@ -47,6 +47,19 @@ final class EmacsProtocolCodecTests: XCTestCase {
         XCTAssertEqual(result.sessions[0].status, "ready")
     }
 
+    func testSelectedSessionDecodes() throws {
+        let response = try output([
+            "version": 1, "id": "select-1", "ok": true,
+            "result": ["session_id": "session-1"]
+        ])
+        let result = try EmacsProtocolCodec.decode(
+            response,
+            requestID: "select-1",
+            as: SelectedSession.self
+        )
+        XCTAssertEqual(result.sessionID, "session-1")
+    }
+
     func testMalformedResponseAndRemoteError() throws {
         XCTAssertThrowsError(try EmacsProtocolCodec.decode(
             Data("\"not base64\"\n".utf8), requestID: "test-1", as: ConnectionInfo.self

@@ -35,6 +35,14 @@ struct SessionList: Decodable, Sendable {
     let sessions: [AgentSession]
 }
 
+struct SelectedSession: Decodable, Sendable {
+    let sessionID: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+    }
+}
+
 struct EmacsResponse<Result: Decodable & Sendable>: Decodable, Sendable {
     let version: Int
     let id: String?

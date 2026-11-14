@@ -2,7 +2,7 @@
 
 * 状态与目标
 
-本文记录已实现的基础协议、会话列表和待接入的会话控制约定。统一入口、编解码、请求校验、错误响应、~ping~ 连接检查及 ~list-sessions~ 已实现；选择会话和发送需求尚未实现。
+本文记录已实现的基础协议、会话列表、会话切换和待接入的需求发送约定。统一入口、编解码、请求校验、错误响应、~ping~ 连接检查、~list-sessions~ 及 ~select-session~ 已实现；发送需求尚未实现。
 
 第一阶段通过 Mac 菜单栏应用查看本机 Emacs 的 agent-shell 会话、显示指定 buffer，并发送需求。
 
@@ -21,7 +21,7 @@
 
 - 已实现：菜单栏入口、连接设置、异步子进程通信、协议校验和连接结果显示。
 - 已验证：2026-11-14，macOS 27.2.1、Xcode 27.2；~make run~ 构建启动成功。应用宿主内真实调用返回 Emacs 31.1、插件 0.1.0，无效路径、不可达 server 和修正配置后重试检查通过。
-- 自动检查：默认 server 和显式指定 ~server~ 的真实联调通过；Mac 协议单元测试 4 项、Emacs ERT 5 项通过。普通 Mac 测试跳过真实联调检查。
+- 自动检查：默认 server 和显式指定 ~server~ 的真实联调通过；Mac 协议单元测试 5 项、Emacs ERT 6 项通过。普通 Mac 测试跳过真实联调检查。
 - 人工验收：2026-11-14，用户确认菜单栏面板点击“检查连接”成功，显示 Emacs 31.1 和插件 0.1.0。本任务已完成真实通信检查与菜单栏点击验收。
 
 * DONE agent-shell 会话列表
@@ -30,11 +30,22 @@
 
 - Emacs 端通过 agent-shell 的公开 API 枚举当前会话，返回稳定 session ID、buffer 名、项目路径和规范化状态。
 - Mac 端通过同一套 Base64 / JSON 请求链路刷新列表，界面显示空列表、加载中和失败状态。
-- 当前版本不提供选择会话或发送需求。
+- 当前版本不提供发送需求。
 
 ** 验证状态
 
 - 已验证：当前安装的 agent-shell 版本为 ~20261113.738~，真实 Emacs 返回会话列表；Mac XCTest 覆盖列表解码和真实列表请求。
+
+* DONE agent-shell 会话切换
+
+** 实现范围
+
+- Emacs 端按稳定 session ID 重新查找存活 buffer，显示目标 buffer；目标失效时返回 ~session-not-found~。
+- Mac 端发送 ~select-session~ 请求，成功后保留选中会话并尝试激活 Emacs 应用。
+
+** 验证状态
+
+- 已验证：Emacs ERT 覆盖成功选择和失效会话；Mac XCTest 覆盖选择结果解码，Mac 构建通过。
 
 真实联调入口为根目录 ~make test-connection~ ，运行前提、配置和加载行为见 [[file:../README.org][项目说明]]。默认 Mac 单元测试不连接真实 Emacs；不能以其通过代替真实联调结论。
 
@@ -114,7 +125,7 @@ Mac 应用以独立子进程执行 ~emacsclient --eval~ ，从标准输出获取
 | select-session   | session_id               | session_id             | 在 Emacs 中显示目标 buffer   |
 | send-prompt      | session_id, prompt       | session_id, accepted   | 向目标会话提交需求           |
 
-当前已实现 ~ping~ 和 ~list-sessions~；~select-session~ 与 ~send-prompt~ 仍为规划，调用将返回 ~unknown-operation~ 。请求标识必须为 1 至 128 个字符的字符串，参数必须为 JSON 对象。
+当前已实现 ~ping~、~list-sessions~ 和 ~select-session~；~send-prompt~ 仍为规划，调用将返回 ~unknown-operation~ 。请求标识必须为 1 至 128 个字符的字符串，参数必须为 JSON 对象。
 
 会话包含 ~id~ 、 ~buffer_name~ 、 ~project_path~ 和 ~status~ 。项目路径无法获取时为 ~null~ ；状态为 ~ready~ 、 ~busy~ 或 ~unknown~ ，适配时须依据真实 API 判断。
 

@@ -52,21 +52,41 @@ struct AgentShellView: View {
                     .controlSize(.small)
             } else if !model.sessions.isEmpty {
                 List(model.sessions) { session in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(session.bufferName)
-                            .font(.body)
-                        HStack(spacing: 6) {
-                            Text(session.status)
-                            if let projectPath = session.projectPath {
-                                Text(projectPath)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
+                    Button {
+                        Task {
+                            await model.selectSession(
+                                sessionID: session.id,
+                                configuration: EmacsConfiguration(
+                                    executablePath: executablePath,
+                                    socketName: socketName
+                                )
+                            )
                         }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(session.bufferName)
+                                    .font(.body)
+                                HStack(spacing: 6) {
+                                    Text(session.status)
+                                    if let projectPath = session.projectPath {
+                                        Text(projectPath)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "checkmark")
+                                .opacity(model.selectedSessionID == session.id ? 1 : 0)
+                                .foregroundStyle(.tint)
+                        }
                     }
-                    .padding(.vertical, 2)
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
+                    .disabled(model.isSelectingSession)
                 }
                 .listStyle(.plain)
                 .frame(maxHeight: 220)
