@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::{
-    modules::{config, discover, health},
+    modules::{config, discover, emacs, health},
     runtime::RuntimeState,
 };
 
@@ -13,6 +13,7 @@ pub struct Services {
     pub health: health::Module,
     pub discover: discover::Module,
     pub config: config::Module,
+    pub emacs: emacs::Module,
 }
 
 /// 与需求文档中的 CoreService 名称兼容的别名。
@@ -23,11 +24,13 @@ impl Services {
         let health = health::Module::new();
         let discover = discover::Module::new();
         let config = config::Module::new();
+        let emacs = emacs::Module::new(config.service());
 
         Self {
             health,
             discover,
             config,
+            emacs,
         }
     }
 
@@ -36,5 +39,6 @@ impl Services {
             .merge(self.health.router(runtime))
             .merge(self.discover.router())
             .merge(self.config.router())
+            .merge(self.emacs.router())
     }
 }

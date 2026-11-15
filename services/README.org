@@ -4,9 +4,9 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。配置数据当前使用内存存储，业务模块可通过 ~ConfigService~ 读取和订阅变化。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏自动启动、监控和重启流程尚未接入。其他业务模块等待重新设计后再接入。
+当前已完成核心服务器骨架、服务发现模块、配置模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。配置数据当前使用内存存储，业务模块可通过 ~ConfigService~ 读取和订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏自动启动、监控和重启流程尚未接入。
 
-服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
+服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
 模块边界、分阶段计划和后续目录见 [[file:../docs/control-center-services.org][控制中心 services 模块规划]]。
 
@@ -44,9 +44,39 @@ curl http://127.0.0.1:47321/data/config
 
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
 
-LaunchAgent label 为 ~cc.loki-assistant.services~；修改 label 后需要先取消旧服务注册，再重新执行 ~make install-service~。
+* Emacs
 
-~make install-service~ 会使用当前 Debug 可执行文件注册用户级 LaunchAgent，并将日志写入 ~/Library/Logs/LokiAssistant/；~make uninstall-service~ 可取消注册。安装和卸载会调用系统的 ~launchctl~，需要用户显式执行。
+先安装 Emacs，确保 ~emacsclient~ 可通过 services 进程的 ~PATH~ 找到，或通过配置中心指定完整路径：
+
+#+begin_src sh
+curl -X PUT http://127.0.0.1:47321/data/emacs/emacsclient_path \
+  -H 'Content-Type: application/json' \
+  -d '"/opt/homebrew/bin/emacsclient"'
+
+curl -X POST http://127.0.0.1:47321/emacs/eval \
+  -H 'Content-Type: application/json' \
+  -d '{"script":"(+ 1 2)"}'
+
+curl http://127.0.0.1:47321/emacs/buffers
+
+curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"任务完成","icon":"✓","buffer":"*scratch*"}'
+#+end_src
+
+路径修改从下次调用开始生效；当前配置在 services 重启后需要重新设置。不展开路径中的 ~ 和环境变量。server 不可用时，~emacsclient --alternate-editor=~ 自动启动 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置仍须在 services 运行环境中可用。
+
+通知上报接口为 ~POST /emacs/receiver/notification~ 。默认由 Loki Assistant 菜单栏应用展示 macOS 系统通知，点击只激活 Emacs 应用。~buffer~ 暂时仅保留为元数据，后续再实现指定 buffer 的定位。~icon~ 可省略，支持文本或本地图片的绝对路径。传入 ~module_id~ 可将上报交给已注册的 Rust 模块处理器；默认值为 ~emacs~ 。
+
+使用前先执行 ~make restart-center~ 加载新版菜单栏应用并注册通知 URL scheme。首次上报时，macOS 会请求 Loki Assistant 的通知权限；未授权时需在系统设置中允许通知。HTTP 返回 ~status: "forwarded"~ 只表示已交给菜单栏应用，不表示系统已经展示。
+
+完整请求、响应、错误码和 Rust 处理器接入方式见 [[file:../docs/control-center-services.org::*Emacs 模块][Emacs 模块协议]]。
+
+* macOS 服务管理
+
+LaunchAgent label 为 ~cc.loki-assistant.services~ ；修改 label 后需要先取消旧服务注册，再重新执行 ~make install-service~ 。
+
+~make install-service~ 会使用当前 Debug 可执行文件注册用户级 LaunchAgent，并将日志写入 ~~/Library/Logs/LokiAssistant/~ ；~make uninstall-service~ 可取消注册。安装和卸载会调用系统的 ~launchctl~ ，需要用户显式执行。
 
 已注册服务可以使用 ~make start-service~、~make stop-service~、~make restart-service~ 和 ~make service-status~ 管理。停止操作会卸载当前用户 domain 中的 LaunchAgent，但保留 plist，之后可以再次启动。
 
@@ -57,4 +87,4 @@ make restart-service
 make service-status
 #+end_src
 
-~make restart-service~ 会先由 Cargo 编译当前 Debug binary，再让 launchd 重启同一路径的可执行文件。修改服务 label、可执行文件路径或 LaunchAgent 配置时，需要重新执行 ~make install-service~。
+~make restart-service~ 会先由 Cargo 编译当前 Debug binary，再让 launchd 重启同一路径的可执行文件。修改服务 label、可执行文件路径或 LaunchAgent 配置时，需要重新执行 ~make install-service~ 。

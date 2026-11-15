@@ -4,7 +4,7 @@
 
 ## 范围
 
-当前只实现控制中心所需的服务框架。菜单栏状态界面属于 `apps/center/`，`emacs/` 目前是预留空目录。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
+当前实现控制中心服务框架、配置中心与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 目前仍是预留空目录。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
@@ -32,6 +32,12 @@ src/
     │   ├── model.rs     模块元数据和 API 描述接口
     │   ├── protocol.rs  发现接口响应模型
     │   └── routes.rs    /discover 路由
+    ├── emacs/
+    │   ├── mod.rs       Emacs 模块入口、配置和发现元数据
+    │   ├── protocol.rs  求值、buffer、通知请求响应与协议版本
+    │   ├── routes.rs    /emacs 路由
+    │   ├── service.rs   可注入进程 gateway 与异步通知处理器
+    │   └── tests.rs     gateway 与 HTTP 协议测试
     └── config/
         ├── mod.rs       配置模块入口和路由挂载
         ├── model.rs     配置模块、配置项和检查器元数据
@@ -41,7 +47,8 @@ src/
 ├── platform/
 │   └── macos/
     ├── mod.rs           macOS 平台能力导出
-    └── launchd.rs       LaunchAgent plist 和 launchctl 管理
+    ├── launchd.rs       LaunchAgent plist 和 launchctl 管理
+    └── notification.rs  通过 URL scheme 转交 macOS 系统通知
 macros/
 └── src/lib.rs          #[loki_api] API 声明过程宏
 ```
@@ -65,7 +72,7 @@ src/modules/<module>/
 | `http`                  | loopback listener、公共 middleware、请求体限制和 server 生命周期 | `runtime`；不拥有业务协议                  |
 | `modules/health`        | 服务健康检查和基础运行状态                                       | `runtime`、`serde`                         |
 | `modules/discover`      | 返回完整模块目录、模块列表和单模块元数据                         | `linkme` 静态模块/API 描述切片             |
-| `modules/emacs`         | `emacsclient` gateway、连接检查、会话操作和事件入口              | 本模块 `protocol`、平台进程 trait          |
+| `modules/emacs`         | `emacsclient` gateway、buffer 查询和通知分发                    | 本模块 `protocol`、`CommandRunner` trait、配置服务 |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
 | `platform/macos`        | LaunchAgent plist、launchctl 安装/卸载/启停/状态管理               | macOS API；不提供业务 HTTP 路由             |
@@ -83,6 +90,8 @@ modules/<module>
 `http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 使用 `#[loki_api(...)]` 声明接口信息；`Services::build()` 只负责路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
 
 `platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。
+
+Emacs 通知上报入口为 `POST /emacs/receiver/notification`。默认处理器通过可注入的 `NotificationLauncher` 调用 `/usr/bin/open -g`，将通知交给菜单栏应用展示。通知单元测试必须注入 fake，不调用真实通知 API；点击只激活 Emacs，`buffer` 暂时仅作为元数据保留。
 
 ## Rust 约定
 

@@ -24,5 +24,14 @@
     <true/>
     <key>LSMultipleInstancesProhibited</key>
     <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>cc.loki-assistant.center.notification</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>loki-assistant</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>

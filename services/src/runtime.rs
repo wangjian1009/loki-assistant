@@ -1,7 +1,5 @@
 use std::{
-    env,
-    fs,
-    io,
+    env, fs, io,
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
@@ -68,8 +66,12 @@ impl ServicePfile {
 
     pub fn remove_if_owner(&self) -> Result<(), RuntimeConfigError> {
         let path = Self::path()?;
-        let Ok(data) = fs::read(&path) else { return Ok(()) };
-        let Ok(current) = serde_json::from_slice::<ServicePfile>(&data) else { return Ok(()) };
+        let Ok(data) = fs::read(&path) else {
+            return Ok(());
+        };
+        let Ok(current) = serde_json::from_slice::<ServicePfile>(&data) else {
+            return Ok(());
+        };
         if current.pid == self.pid {
             fs::remove_file(path).map_err(|source| RuntimeConfigError::Io {
                 operation: "删除 services 信息",

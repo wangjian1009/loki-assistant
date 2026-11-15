@@ -2,4 +2,5 @@
 
 pub mod config;
 pub mod discover;
+pub mod emacs;
 pub mod health;

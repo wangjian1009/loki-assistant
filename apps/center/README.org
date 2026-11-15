@@ -6,6 +6,10 @@
 
 应用通过系统的 ~launchctl~ 查询 LaunchAgent 是否运行；随后读取 ~~/.assistant/service~ 获取服务端口，再通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色启动按钮。不包含 Emacs 会话、语音输入或其他旧版功能。
 
+应用承接 services 的 Emacs 通知上报，通过 ~UNUserNotificationCenter~ 展示 macOS 系统通知。首次接收时会请求通知权限；点击通知只激活 Emacs 应用，~buffer~ 当前仅作为元数据保留。文本 ~icon~ 放在标题前，本地图片作为附件展示。完整上报协议见 [[file:../../docs/control-center-services.org::*Emacs 模块][Emacs 模块协议]]。
+
+通过 ~loki-assistant~ URL scheme 后台接收通知；运行新版应用后由 LaunchServices 注册该 scheme。macOS 禁止通知或启用勿扰模式时可能不显示横幅，权限与处理错误记录在系统日志中。
+
 * 构建与运行
 
 在仓库根目录执行：
@@ -16,7 +20,7 @@ make run
 make restart-center
 #+end_src
 
-修改菜单栏 App 后使用 ~make restart-center~，确保旧实例退出并加载新的 binary。
+修改菜单栏 App 后使用 ~make restart-center~ ，确保旧实例退出并加载新的 binary。
 
 需要 macOS、CMake 3.30 及以上和支持 Swift 6 的 Xcode。构建配置及源文件列表以 [[file:mac/CMakeLists.txt][CMakeLists.txt]] 为准。
 
@@ -26,4 +30,4 @@ make restart-center
 make test-mac
 #+end_src
 
-测试覆盖 services 健康响应解码和状态模型，不要求 services 正在运行。
+测试覆盖 services 健康响应、状态模型、通知 URL 解码和展示内容，不要求 services 正在运行，也不发送真实系统通知。

@@ -26,6 +26,7 @@ private final class CenterInstanceLock {
 
 @main
 struct LokiAssistantApp: App {
+    @NSApplicationDelegateAdaptor(CenterAppDelegate.self) private var appDelegate
     private let instanceLock: CenterInstanceLock?
     @State private var status: ServiceStatusModel
 

@@ -1,0 +1,436 @@
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+use crate::platform::macos::notification::{
+    NotificationContent, NotificationFuture, NotificationLauncher,
+};
+use crate::{modules::config::service::ConfigService, runtime::RuntimeState};
+
+use super::{
+    Module,
+    protocol::Notification,
+    routes,
+    service::{CommandOutput, CommandRunner, EmacsError, EmacsService, ServiceFuture},
+};
+
+#[derive(Debug, Default)]
+struct FakeRunner {
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+    outputs: Mutex<VecDeque<Result<CommandOutput, EmacsError>>>,
+}
+
+impl CommandRunner for FakeRunner {
+    fn run<'a>(&'a self, program: &'a str, args: &'a [String]) -> ServiceFuture<'a, CommandOutput> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((program.to_owned(), args.to_vec()));
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("必须提供模拟输出")
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeNotificationLauncher {
+    calls: Mutex<Vec<NotificationContent>>,
+    error: Option<String>,
+}
+
+impl NotificationLauncher for FakeNotificationLauncher {
+    fn launch(&self, content: NotificationContent) -> NotificationFuture<'_> {
+        self.calls.lock().unwrap().push(content);
+        Box::pin(async { self.error.clone().map_or(Ok(()), Err) })
+    }
+}
+
+fn wire(envelope: Value) -> CommandOutput {
+    CommandOutput {
+        success: true,
+        status: Some(0),
+        stdout: serde_json::to_string(&envelope.to_string()).unwrap(),
+        stderr: String::new(),
+    }
+}
+
+fn service(
+    outputs: Vec<Result<CommandOutput, EmacsError>>,
+) -> (Arc<EmacsService>, Arc<FakeRunner>, Arc<ConfigService>) {
+    let config = Arc::new(ConfigService::new(Module::config_metadata()));
+    let runner = Arc::new(FakeRunner {
+        outputs: Mutex::new(outputs.into()),
+        ..Default::default()
+    });
+    (
+        Arc::new(
+            EmacsService::with_runner(config.clone(), runner.clone(), Duration::from_millis(100))
+                .with_notification_launcher(Arc::new(FakeNotificationLauncher::default())),
+        ),
+        runner,
+        config,
+    )
+}
+
+fn notification(module_id: &str) -> Notification {
+    Notification {
+        module_id: module_id.to_owned(),
+        title: "任务完成".to_owned(),
+        icon: Some("✓".to_owned()),
+        buffer: "*scratch*".to_owned(),
+        payload: json!({"task": 42}),
+    }
+}
+
+#[tokio::test]
+async fn eval_uses_argument_boundary_auto_start_and_latest_config() {
+    let mut startup_output = wire(json!({"result":"3"}));
+    startup_output.stdout = format!("Starting Emacs daemon.\n{}\n", startup_output.stdout);
+    let (service, runner, config) =
+        service(vec![Ok(startup_output), Ok(wire(json!({"result":"nil"})))]);
+    assert_eq!(service.eval("(+ 1 2)").await.unwrap(), "3");
+    config
+        .replace(
+            "emacs",
+            "emacsclient_path",
+            json!("/tmp/Emacs App/emacsclient"),
+        )
+        .await
+        .unwrap();
+    let script = "(message \"中文\")\n(list \"\\\"\" \"$(touch /tmp/nope)\")";
+    assert_eq!(service.eval(script).await.unwrap(), "nil");
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls[0].0, "emacsclient");
+    assert_eq!(calls[1].0, "/tmp/Emacs App/emacsclient");
+    assert_eq!(&calls[1].1[..2], ["--alternate-editor=", "--eval"]);
+    assert_eq!(calls[1].1.len(), 3);
+    assert!(
+        calls[1].1[2].contains(&serde_json::to_string(&format!("(progn\n{script}\n)")).unwrap())
+    );
+}
+
+#[tokio::test]
+async fn distinguishes_lisp_process_and_transport_failures() {
+    let (service, _, _) = service(vec![
+        Ok(wire(
+            json!({"error":"Symbol’s function definition is void: missing"}),
+        )),
+        Ok(CommandOutput {
+            success: false,
+            status: Some(7),
+            stdout: "stdout".to_owned(),
+            stderr: "连接失败".to_owned(),
+        }),
+        Err(EmacsError::Process("找不到可执行文件".to_owned())),
+        Ok(CommandOutput {
+            success: true,
+            status: Some(0),
+            stdout: "invalid".to_owned(),
+            stderr: String::new(),
+        }),
+    ]);
+    assert!(
+        matches!(service.eval("(missing)").await, Err(EmacsError::Lisp(message)) if message.contains("missing"))
+    );
+    assert!(
+        matches!(service.eval("t").await, Err(EmacsError::CommandFailed { status: Some(7), message }) if message == "连接失败")
+    );
+    assert!(matches!(
+        service.eval("t").await,
+        Err(EmacsError::Process(_))
+    ));
+    assert!(matches!(
+        service.eval("t").await,
+        Err(EmacsError::InvalidResponse(_))
+    ));
+}
+
+#[derive(Debug)]
+struct StallingRunner;
+
+impl CommandRunner for StallingRunner {
+    fn run<'a>(&'a self, _: &'a str, _: &'a [String]) -> ServiceFuture<'a, CommandOutput> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn times_out_and_releases_evaluation_lock() {
+    let service = EmacsService::with_runner(
+        Arc::new(ConfigService::new(Module::config_metadata())),
+        Arc::new(StallingRunner),
+        Duration::from_millis(1),
+    );
+    for _ in 0..2 {
+        assert!(matches!(service.eval("t").await, Err(EmacsError::Timeout)));
+    }
+}
+
+#[tokio::test]
+async fn decodes_unicode_buffer_names_null_files_and_boolean_flags() {
+    let buffers = json!([{"name":"中文\"\\\n", "file":null, "modified":false, "major_mode":"fundamental-mode"}, {"name":"代码", "file":"/tmp/代码.rs", "modified":true, "major_mode":"rust-mode"}]);
+    let printed = serde_json::to_string(&buffers.to_string()).unwrap();
+    let (service, _, _) = service(vec![Ok(wire(json!({"result":printed})))]);
+    let result = service.buffers().await.unwrap();
+    assert_eq!(result[0].name, "中文\"\\\n");
+    assert!(result[0].file.is_none());
+    assert!(!result[0].modified);
+    assert_eq!(result[1].file.as_deref(), Some("/tmp/代码.rs"));
+    assert!(result[1].modified);
+}
+
+#[tokio::test]
+async fn dispatches_only_to_target_and_releases_registry_lock() {
+    let (service, _, _) = service(vec![]);
+    let weak = Arc::downgrade(&service);
+    service
+        .register_notification_handler(
+            "tasks",
+            Arc::new(move |notification: Notification| {
+                let service = weak.upgrade().unwrap();
+                async move {
+                    assert!(service.unregister_notification_handler("tasks").await);
+                    Ok(json!({"title":notification.title,"payload":notification.payload}))
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.notify(notification("other")).await,
+        Err(EmacsError::HandlerNotFound(_))
+    ));
+    assert!(matches!(
+        service
+            .register_notification_handler(
+                "tasks",
+                Arc::new(|_: Notification| async { Ok(Value::Null) })
+            )
+            .await,
+        Err(EmacsError::HandlerAlreadyRegistered(_))
+    ));
+    let result = service.notify(notification("tasks")).await.unwrap();
+    assert_eq!(result["title"], "任务完成");
+    assert_eq!(result["payload"]["task"], 42);
+    assert!(matches!(
+        service.notify(notification("tasks")).await,
+        Err(EmacsError::HandlerNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn rejects_invalid_input_before_executing_anything() {
+    let (service, runner, config) = service(vec![]);
+    assert!(matches!(
+        service.eval(" \n").await,
+        Err(EmacsError::InvalidRequest(_))
+    ));
+    let mut request = notification("tasks");
+    request.title.clear();
+    assert!(matches!(
+        service.notify(request).await,
+        Err(EmacsError::InvalidRequest(_))
+    ));
+    assert!(
+        config
+            .replace("emacs", "emacsclient_path", json!(""))
+            .await
+            .is_err()
+    );
+    assert!(
+        config
+            .replace("emacs", "emacsclient_path", json!("bad\u{0}path"))
+            .await
+            .is_err()
+    );
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+async fn request(
+    service: Arc<EmacsService>,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = routes::router(service)
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn http_exposes_all_three_routes_with_versioned_json() {
+    let (service, _, _) = service(vec![
+        Ok(wire(json!({"result":"3"}))),
+        Ok(wire(json!({"result":"\"[]\""}))),
+    ]);
+    let (status, body) = request(
+        service.clone(),
+        "POST",
+        "/emacs/eval",
+        json!({"script":"(+ 1 2)"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"api_version":"1", "result":"3"}));
+    let (status, body) = request(service.clone(), "GET", "/emacs/buffers", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["buffers"], json!([]));
+    let (status, body) = request(
+        service,
+        "POST",
+        "/emacs/receiver/notification",
+        json!({"title":"通知", "buffer":"*scratch*"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["module_id"], "emacs");
+    assert_eq!(
+        body["result"],
+        json!({"display":"macos", "status":"forwarded", "activation":"emacs"})
+    );
+}
+
+#[tokio::test]
+async fn http_maps_errors_to_stable_json_codes() {
+    let (service, _, _) = service(vec![Ok(wire(json!({"error":"测试 Lisp 错误"})))]);
+    let (status, body) = request(
+        service.clone(),
+        "POST",
+        "/emacs/eval",
+        json!({"script":"(error \"测试\")"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["code"], "lisp-error");
+    let (status, body) =
+        request(service.clone(), "POST", "/emacs/eval", json!({"script":42})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["api_version"], "1");
+    assert_eq!(body["code"], "invalid-request");
+    let (status, body) = request(
+        service,
+        "POST",
+        "/emacs/receiver/notification",
+        serde_json::to_value(notification("missing")).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "notification-handler-not-found");
+}
+
+#[tokio::test]
+async fn composition_registers_emacs_routes_metadata_and_config() {
+    let app = crate::http::router(Arc::new(RuntimeState::default()));
+    for path in ["/discover/modules/emacs", "/meta/emacs", "/data/emacs"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        if path == "/discover/modules/emacs" {
+            assert_eq!(body["apis"].as_array().unwrap().len(), 3);
+            let notification = body["apis"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|api| api["id"] == "notification")
+                .unwrap();
+            assert_eq!(notification["path"], "/emacs/receiver/notification");
+        } else if path == "/meta/emacs" {
+            assert_eq!(body["items"][0]["key"], "emacsclient_path");
+        }
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/emacs/eval")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"script\":\"\"}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/emacs/notification")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn notification_forwards_content_without_running_emacs_lisp() {
+    let config = Arc::new(ConfigService::new(Module::config_metadata()));
+    let runner = Arc::new(FakeRunner::default());
+    let launcher = Arc::new(FakeNotificationLauncher::default());
+    let service = EmacsService::with_runner(config, runner.clone(), Duration::from_millis(100))
+        .with_notification_launcher(launcher.clone());
+    let result = service.notify(notification("emacs")).await.unwrap();
+    assert_eq!(result["activation"], "emacs");
+    assert!(runner.calls.lock().unwrap().is_empty());
+    let calls = launcher.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].title, "任务完成");
+    assert_eq!(calls[0].icon.as_deref(), Some("✓"));
+    assert_eq!(calls[0].buffer, "*scratch*");
+}
+
+#[tokio::test]
+async fn notification_reports_launch_failure_as_json_error() {
+    let config = Arc::new(ConfigService::new(Module::config_metadata()));
+    let service = Arc::new(
+        EmacsService::with_runner(
+            config,
+            Arc::new(FakeRunner::default()),
+            Duration::from_millis(100),
+        )
+        .with_notification_launcher(Arc::new(FakeNotificationLauncher {
+            error: Some("菜单栏应用不可用".to_owned()),
+            ..Default::default()
+        })),
+    );
+    let (status, body) = request(
+        service,
+        "POST",
+        "/emacs/receiver/notification",
+        serde_json::to_value(notification("emacs")).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["code"], "notification-failed");
+}
