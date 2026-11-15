@@ -8,12 +8,11 @@ mod tests;
 use std::sync::Arc;
 
 use axum::Router;
-use serde_json::json;
+use loki_services_macros::loki_config;
 
 use crate::modules::{
     config::{
         model::{CheckerMetadata, ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata},
-        registry::ConfigModuleRegistration,
         service::ConfigService,
     },
     discover::registry::ModuleRegistration,
@@ -22,6 +21,12 @@ use crate::modules::{
 use self::service::EmacsService;
 
 pub const DEFAULT_EMACSCLIENT: &str = "emacsclient";
+const EMACSCLIENT_SEARCH_PATHS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/Applications/Emacs.app/Contents/MacOS/bin",
+    "/Applications/Emacs.app/Contents/MacOS",
+];
 
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static EMACS_MODULE: ModuleRegistration = ModuleRegistration {
@@ -31,10 +36,10 @@ static EMACS_MODULE: ModuleRegistration = ModuleRegistration {
     version: env!("CARGO_PKG_VERSION"),
 };
 
-#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_MODULES)]
-static EMACS_CONFIG: ConfigModuleRegistration = ConfigModuleRegistration {
-    metadata: Module::config_metadata,
-};
+#[loki_config]
+fn emacs_config_metadata() -> ConfigModuleMetadata {
+    Module::config_metadata()
+}
 
 #[derive(Clone, Debug)]
 pub struct Module {
@@ -65,10 +70,12 @@ impl Module {
             items: vec![ConfigItemMetadata {
                 key: "emacsclient_path".to_owned(),
                 name: "emacsclient 位置".to_owned(),
-                description: "可执行文件路径或 PATH 中的命令名；不展开 ~ 和环境变量。".to_owned(),
-                data_type: ConfigDataType::FilePath,
+                description:
+                    "请选择 emacsclient 可执行文件，也可输入 PATH 中的命令名；不展开 ~ 和环境变量。"
+                        .to_owned(),
+                data_type: ConfigDataType::Executable,
                 required: false,
-                default: Some(json!(DEFAULT_EMACSCLIENT)),
+                default: None,
                 dictionary: None,
                 list: None,
                 checker: Some(CheckerMetadata {
@@ -76,9 +83,16 @@ impl Module {
                     description: "路径不能为空或包含 NUL。".to_owned(),
                 }),
                 file_path: Some(crate::modules::config::model::FilePathMetadata {
-                    default: Some(DEFAULT_EMACSCLIENT.to_owned()),
+                    default: None,
                     must_exist: true,
                     directory: false,
+                }),
+                executable: Some(crate::modules::config::model::ExecutableMetadata {
+                    default_program: DEFAULT_EMACSCLIENT.to_owned(),
+                    search_paths: EMACSCLIENT_SEARCH_PATHS
+                        .iter()
+                        .map(|path| (*path).to_owned())
+                        .collect(),
                 }),
             }],
         }

@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。配置数据当前使用内存存储，业务模块可通过 ~ConfigService~ 读取和订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏自动启动、监控和重启流程尚未接入。
+当前已完成核心服务器骨架、服务发现模块、配置模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏应用提供 services 状态监控和启动入口，托盘登录启动由配置编辑器管理。
 
 服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
@@ -44,9 +44,26 @@ curl http://127.0.0.1:47321/data/config
 
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
 
+* 配置存储
+
+services 启动时加载 ~~/.assistant/config.yml~ ，首次成功保存时按需创建文件。文件只保存用户设置，按模块和配置项组织，例如：
+
+#+begin_src yaml
+emacs:
+  emacsclient_path: /opt/homebrew/bin/emacsclient
+control-center:
+  center_auto_start: false
+#+end_src
+
+通过配置接口保存后，services 原子替换 YAML 文件，成功后更新内存并发出变化通知；写入失败不会更新生效值。文件权限为 ~0600~ 。直接手工修改文件后需重启 services。配置文件无法读取、YAML 无效或已知配置值校验失败时，服务启动会报错。
+
+读取接口返回 ~{value, source}~，其中 ~source~ 为 ~user~ 或 ~default~ 。没有用户设置时使用静态默认值或按元数据搜索得到的程序路径；这些默认值不写入文件。完整协议见 [[file:../docs/control-center-services.org::*配置中心][配置中心协议]]。
+
+~POST /config/validate~ 可提前校验配置而不保存。保存接口也执行相同检查；~Executable~ 必须指向存在、可执行的普通文件，输入程序名时按 ~PATH~ 和元数据建议目录解析并保存为绝对路径。无效输入返回错误，原有值及 YAML 文件不变。
+
 * Emacs
 
-先安装 Emacs，确保 ~emacsclient~ 可通过 services 进程的 ~PATH~ 找到，或通过配置中心指定完整路径：
+~emacsclient_path~ 的类型为 ~Executable~，默认程序名为 ~emacsclient~。配置模块先按 services 进程的 ~PATH~ 搜索，再检查模块声明的 Homebrew 和 Emacs App 目录；找到的绝对路径作为默认值返回。也可在配置编辑器中使用“选择可执行文件…”按钮，或通过接口指定路径：
 
 #+begin_src sh
 curl -X PUT http://127.0.0.1:47321/data/emacs/emacsclient_path \
@@ -64,7 +81,7 @@ curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
   -d '{"title":"任务完成","icon":"✓","buffer":"*scratch*"}'
 #+end_src
 
-路径修改从下次调用开始生效；当前配置在 services 重启后需要重新设置。不展开路径中的 ~ 和环境变量。server 不可用时，~emacsclient --alternate-editor=~ 自动启动 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置仍须在 services 运行环境中可用。
+路径修改从下次调用开始生效，并保存到 ~~/.assistant/config.yml~。不展开路径中的 ~ 和环境变量。server 不可用时，~emacsclient --alternate-editor=~ 自动启动 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置仍须在 services 运行环境中可用。
 
 通知上报接口为 ~POST /emacs/receiver/notification~ 。默认由 Loki Assistant 菜单栏应用展示 macOS 系统通知，点击只激活 Emacs 应用。~buffer~ 暂时仅保留为元数据，后续再实现指定 buffer 的定位。~icon~ 可省略，支持文本或本地图片的绝对路径。传入 ~module_id~ 可将上报交给已注册的 Rust 模块处理器；默认值为 ~emacs~ 。
 

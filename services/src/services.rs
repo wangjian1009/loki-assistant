@@ -21,9 +21,16 @@ pub type CoreService = Services;
 
 impl Services {
     pub fn build() -> Self {
+        Self::with_config(config::Module::new())
+    }
+
+    pub fn load() -> Result<Self, config::service::ConfigServiceError> {
+        Ok(Self::with_config(config::Module::load()?))
+    }
+
+    fn with_config(config: config::Module) -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
-        let config = config::Module::new();
         let emacs = emacs::Module::new(config.service());
 
         Self {

@@ -1,7 +1,9 @@
-use serde::Serialize;
-use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
-use super::model::ConfigModuleMetadata;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::model::{ConfigModuleMetadata, ConfigValue};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MetaResponse {
@@ -11,18 +13,37 @@ pub struct MetaResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct ModuleDataResponse {
     pub module_id: String,
-    pub values: Map<String, Value>,
+    pub values: BTreeMap<String, ConfigValue>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ValueResponse {
     pub module_id: String,
     pub key: String,
-    pub value: Value,
+    #[serde(flatten)]
+    pub data: ConfigValue,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ConfigErrorResponse {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ValidateRequest {
+    pub module_id: String,
+    pub key: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ValidateResponse {
+    pub module_id: String,
+    pub key: String,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ConfigErrorResponse>,
 }

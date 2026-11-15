@@ -29,7 +29,7 @@ services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该�
 
 #+begin_src text
 services/
-├── macros/                 #[loki_api] 过程宏
+├── macros/                 #[loki_api] 与 #[loki_config] 过程宏
 └── src/
     ├── http/               公共 HTTP server
     ├── modules/
@@ -56,15 +56,102 @@ emacs/                      预留空目录
 | GET | ~/discover/modules/{module_id}~ | 单个模块描述 |
 | GET | ~/meta~ | 配置模型 |
 | GET | ~/meta/{module_id}~ | 单个配置模块模型 |
-| GET | ~/data/{module_id}~ | 已设置配置数据 |
-| GET | ~/data/{module_id}/{key}~ | 单个配置值 |
+| GET | ~/data/{module_id}~ | 生效配置值及来源 |
+| GET | ~/data/{module_id}/{key}~ | 单个生效配置值及来源 |
 | PUT | ~/data/{module_id}/{key}~ | 替换完整配置值 |
 | POST | ~/data/{module_id}/{key}~ | 合并字典或追加列表 |
+| POST | ~/config/validate~ | 预检配置值，不修改配置 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
 | POST | ~/emacs/receiver/notification~ | 接收 Emacs 通知上报，默认展示 macOS 系统通知 |
 | GET | ~/emacs/buffers~ | 查询当前 Emacs buffer 列表 |
 
-未设置的配置不会自动返回默认值，调用方从配置模型获取默认值。
+* 配置中心
+
+** 静态元数据
+
+配置元数据函数通过 ~#[loki_config]~ 声明。该过程宏与 ~#[loki_api]~ 一样在编译期生成 ~linkme~ 注册项，服务组合根不执行运行时注册。元数据函数须为无参数、无泛型的同步函数，返回 ~ConfigModuleMetadata~ ；当前配置中心、控制中心和 Emacs 模块均采用这一方式。
+
+#+begin_src rust
+#[loki_services_macros::loki_config]
+fn emacs_config_metadata() -> ConfigModuleMetadata {
+    Module::config_metadata()
+}
+#+end_src
+
+配置项的 ~data_type~ 支持 ~string~、~integer~、~number~、~boolean~、~dictionary~、~list~、~file_path~ 和 ~executable~。~Executable~ 的值仍是 JSON string，允许完整路径或程序名。元数据还可声明默认程序名与建议搜索目录 (~search_paths~)；建议目录可以通过程序内常量静态定义，Emacs 模块使用 ~EMACSCLIENT_SEARCH_PATHS~ ，随模块元数据返回。
+
+#+begin_src json
+{
+  "key": "emacsclient_path",
+  "data_type": "executable",
+  "default": null,
+  "executable": {
+    "default_program": "emacsclient",
+    "search_paths": ["/opt/homebrew/bin", "/usr/local/bin", "/Applications/Emacs.app/Contents/MacOS/bin", "/Applications/Emacs.app/Contents/MacOS"]
+  }
+}
+#+end_src
+
+没有用户设置和静态 ~default~ 时，配置模块按 services 启动时的 ~PATH~ 顺序搜索，再按 ~search_paths~ 的顺序补充查找。只接受实际可执行的普通文件（允许符号链接），返回绝对路径；不通过 shell，不执行待查找的程序，也不展开 ~ 和环境变量。每次读取重新查找，因此安装或移除程序后，下次读取即可反映变化。找不到程序时不生成默认值，配置编辑器显示“未设置”并提供文件选择入口。
+
+** 生效值与来源
+
+~GET /data/{module_id}~ 中的每个值包含 ~value~ 和 ~source~ ：
+
+#+begin_src json
+{"module_id":"emacs","values":{"emacsclient_path":{"value":"/opt/homebrew/bin/emacsclient","source":"default"}}}
+#+end_src
+
+~GET /data/{module_id}/{key}~ 以及写入成功的响应保留模块和配置项标识，同时返回 ~value~ 与 ~source~ ：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","value":"/opt/homebrew/bin/emacsclient","source":"user"}
+#+end_src
+
+~source~ 只支持 ~user~ 与 ~default~。显式设置的值优先，即使与默认值相同也标记为 ~user~；否则返回静态默认值或发现的程序路径，并标记为 ~default~。未设置且没有默认值的项不出现在模块数据中，单项读取返回 404 ~config-not-set~。默认值中的 ~false~、~0~ 或空字符串均是有效值，不按真假判断是否存在。
+
+~PUT~ 和 ~POST~ 的请求体仍为原始 JSON 值，不接收来源包装。字典合并或列表追加以当前生效值为基础，包括默认值，完成后整项标记为 ~user~ 。变更订阅只通知用户写入，自动发现的默认值不触发用户配置变更。
+
+** 统一校验
+
+~POST /config/validate~ 接受模块、配置项和待校验值，供客户端或其他程序使用：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","value":"emacsclient"}
+#+end_src
+
+接口与配置保存共用校验实现。~Executable~ 检查目标存在、是普通文件并具有执行权限，允许指向普通文件的符号链接。程序名先按服务进程 ~PATH~，再按元数据 ~search_paths~ 查找；有效值规范化为绝对路径。整个检查不会执行目标程序。
+
+校验通过时返回 HTTP 200 与规范化后的值：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","valid":true,"value":"/opt/homebrew/bin/emacsclient"}
+#+end_src
+
+配置值无效时仍返回 HTTP 200，使用 ~valid: false~ 和错误说明表示预检结果：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","valid":false,"error":{"code":"invalid-config","message":"配置值无效：emacsclient 位置：文件不存在：/missing/emacsclient"}}
+#+end_src
+
+不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
+
+配置 App 按服务端结果将无效值标红。列表单行显示名称、当前值和选择按钮；默认来源通过当前值的样式区分，配置描述、字段名和独立默认值文字不展示。
+
+** YAML 存储
+
+用户配置保存到 ~~/.assistant/config.yml~ ，文件内容按模块和键组织，仅存用户值：
+
+#+begin_src yaml
+emacs:
+  emacsclient_path: /opt/homebrew/bin/emacsclient
+control-center:
+  center_auto_start: false
+#+end_src
+
+文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
+
+启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
 
 * Emacs 模块
 
@@ -72,9 +159,9 @@ Emacs 模块的协议版本为 ~1~，成功和错误响应均包含 ~api_version
 
 ** 配置和连接
 
-配置元数据通过 ~GET /meta/emacs~ 获取，~emacsclient_path~ 使用配置中心的通用读写接口。默认值为 ~emacsclient~，按服务进程的 ~PATH~ 查找；也可指定包含空格的完整可执行文件路径。不展开 ~ 和环境变量，也不接受附加命令行参数。
+配置元数据通过 ~GET /meta/emacs~ 获取，~emacsclient_path~ 使用配置中心的通用读写接口。其类型为 ~Executable~，默认程序名为 ~emacsclient~，由配置模块按规则发现实际路径；也可指定包含空格的完整可执行文件路径。不展开 ~ 和环境变量，也不接受附加命令行参数。
 
-每次求值读取最新配置，不需要重启服务或启动配置订阅任务。配置中心当前只有内存存储，重启后回到默认值。
+每次求值读取最新生效配置，不需要重启服务或启动配置订阅任务。用户值保存在 ~~/.assistant/config.yml~ ，重启后继续生效；未配置且无法找到默认程序时返回配置错误。
 
 调用固定传入 ~--alternate-editor=~ 和 ~--eval~ 。server 不可用时，由 emacsclient 启动 Emacs daemon 并连接；不会因为普通 Lisp 错误重复求值。已打开但未运行 server 的 Emacs 与新 daemon 可能是两个进程。Emacs daemon 的启动依赖服务运行环境中的 Emacs 可执行程序和用户配置。
 

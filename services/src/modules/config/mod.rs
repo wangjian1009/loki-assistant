@@ -1,13 +1,16 @@
 pub mod model;
 pub mod registry;
 
+mod executable;
 mod protocol;
 mod routes;
 pub mod service;
+mod storage;
 
 use std::sync::Arc;
 
 use axum::Router;
+use loki_services_macros::loki_config;
 
 use crate::modules::discover::registry::ModuleRegistration;
 
@@ -16,16 +19,15 @@ use self::{
     service::{ConfigService, ModuleSubscription},
 };
 
-#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_MODULES)]
-static CONFIG_METADATA: registry::ConfigModuleRegistration = registry::ConfigModuleRegistration {
-    metadata: Module::config_metadata,
-};
+#[loki_config]
+fn config_metadata() -> ConfigModuleMetadata {
+    Module::config_metadata()
+}
 
-#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_MODULES)]
-static CONTROL_CENTER_METADATA: registry::ConfigModuleRegistration =
-    registry::ConfigModuleRegistration {
-        metadata: Module::control_center_metadata,
-    };
+#[loki_config]
+fn control_center_metadata() -> ConfigModuleMetadata {
+    Module::control_center_metadata()
+}
 
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static CONFIG_MODULE: ModuleRegistration = ModuleRegistration {
@@ -45,6 +47,12 @@ impl Module {
         Self {
             service: Arc::new(ConfigService::from_registry()),
         }
+    }
+
+    pub fn load() -> Result<Self, service::ConfigServiceError> {
+        Ok(Self {
+            service: Arc::new(ConfigService::load(ConfigService::storage_path()?)?),
+        })
     }
 
     pub fn router(&self) -> Router {
@@ -100,6 +108,7 @@ impl Module {
                 list: None,
                 checker: None,
                 file_path: None,
+                executable: None,
             }],
         }
     }

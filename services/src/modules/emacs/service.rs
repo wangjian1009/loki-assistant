@@ -8,15 +8,12 @@ use tokio::{
     time::timeout,
 };
 
-use crate::modules::config::service::{ConfigService, ConfigServiceError};
+use crate::modules::config::service::ConfigService;
 use crate::platform::macos::notification::{
     MacNotificationLauncher, NotificationContent, NotificationLauncher,
 };
 
-use super::{
-    DEFAULT_EMACSCLIENT,
-    protocol::{Buffer, Notification},
-};
+use super::protocol::{Buffer, Notification};
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
 
@@ -153,11 +150,11 @@ impl EmacsService {
         let _guard = self.evaluation.lock().await;
         let program = match self.config.value("emacs", "emacsclient_path").await {
             Ok(value) => value
+                .value
                 .as_str()
                 .filter(|path| !path.trim().is_empty() && !path.contains('\0'))
                 .ok_or_else(|| EmacsError::Config("emacsclient_path 必须是非空路径".to_owned()))?
                 .to_owned(),
-            Err(ConfigServiceError::ValueNotSet { .. }) => DEFAULT_EMACSCLIENT.to_owned(),
             Err(error) => return Err(EmacsError::Config(error.to_string())),
         };
         let args = vec![

@@ -5,20 +5,24 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use loki_services_macros::loki_api;
 use serde_json::Value;
 
 use super::{
-    model::ConfigModuleMetadata,
-    protocol::{ConfigErrorResponse, MetaResponse, ModuleDataResponse, ValueResponse},
+    model::{ConfigModuleMetadata, ConfigValue, ConfigValueSource},
+    protocol::{
+        ConfigErrorResponse, MetaResponse, ModuleDataResponse, ValidateRequest, ValidateResponse,
+        ValueResponse,
+    },
     service::{ConfigService, ConfigServiceError},
 };
 
 pub fn router(service: Arc<ConfigService>) -> Router {
     Router::new()
         .route("/meta", get(meta))
+        .route("/config/validate", post(validate))
         .route("/meta/{module_id}", get(module_meta))
         .route("/data/{module_id}", get(module_data))
         .route(
@@ -26,6 +30,41 @@ pub fn router(service: Arc<ConfigService>) -> Router {
             get(get_value).put(put_value).post(post_value),
         )
         .with_state(service)
+}
+
+#[loki_api(
+    module = "config",
+    id = "validate",
+    method = "POST",
+    path = "/config/validate",
+    summary = "校验配置值",
+    description = "校验 module_id、key 对应的 value，不修改配置；成功返回规范化 value，失败返回 valid=false 和错误说明。保存接口执行相同校验。"
+)]
+async fn validate(
+    State(service): State<Arc<ConfigService>>,
+    Json(request): Json<ValidateRequest>,
+) -> Result<Json<ValidateResponse>, Response> {
+    let (value, error) = match service
+        .validate_value(&request.module_id, &request.key, &request.value)
+        .await
+    {
+        Ok(value) => (Some(value), None),
+        Err(error @ ConfigServiceError::InvalidValue(_)) => (
+            None,
+            Some(ConfigErrorResponse {
+                code: error_code(&error).to_owned(),
+                message: error.to_string(),
+            }),
+        ),
+        Err(error) => return Err(error_response(error)),
+    };
+    Ok(Json(ValidateResponse {
+        module_id: request.module_id,
+        key: request.key,
+        valid: error.is_none(),
+        value,
+        error,
+    }))
 }
 
 #[loki_api(
@@ -69,7 +108,7 @@ async fn module_meta(
     method = "GET",
     path = "/data/{module_id}",
     summary = "获取模块配置数据",
-    description = "只返回已经设置的配置值，不填充元数据中的默认值。"
+    description = "返回模块生效配置；每项包含 value 和 source，source 为 user 或 default。"
 )]
 async fn module_data(
     Path(module_id): Path<String>,
@@ -88,7 +127,7 @@ async fn module_data(
     method = "GET",
     path = "/data/{module_id}/{key}",
     summary = "获取配置项",
-    description = "返回单个已经设置的配置值。"
+    description = "返回单个生效配置的 value 和 source；用户设置优先，否则返回默认值。"
 )]
 async fn get_value(
     Path((module_id, key)): Path<(String, String)>,
@@ -101,7 +140,7 @@ async fn get_value(
             Json(ValueResponse {
                 module_id,
                 key,
-                value,
+                data: value,
             })
         })
         .map_err(error_response)
@@ -127,7 +166,10 @@ async fn put_value(
             Json(ValueResponse {
                 module_id,
                 key,
-                value,
+                data: ConfigValue {
+                    value,
+                    source: ConfigValueSource::User,
+                },
             })
         })
         .map_err(error_response)
@@ -153,7 +195,10 @@ async fn post_value(
             Json(ValueResponse {
                 module_id,
                 key,
-                value,
+                data: ConfigValue {
+                    value,
+                    source: ConfigValueSource::User,
+                },
             })
         })
         .map_err(error_response)
@@ -166,6 +211,7 @@ fn error_response(error: ConfigServiceError) -> Response {
         }
         ConfigServiceError::ValueNotSet { .. } => StatusCode::NOT_FOUND,
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
+        ConfigServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
         status,
@@ -183,6 +229,7 @@ fn error_code(error: &ConfigServiceError) -> &'static str {
         ConfigServiceError::ItemNotFound { .. } => "config-not-found",
         ConfigServiceError::ValueNotSet { .. } => "config-not-set",
         ConfigServiceError::InvalidValue(_) => "invalid-config",
+        ConfigServiceError::Storage(_) => "config-storage-error",
     }
 }
 
@@ -213,6 +260,7 @@ mod tests {
                     list: None,
                     checker: None,
                     file_path: None,
+                    executable: None,
                 },
                 ConfigItemMetadata {
                     key: "config_b".to_owned(),
@@ -225,6 +273,7 @@ mod tests {
                     list: None,
                     checker: None,
                     file_path: None,
+                    executable: None,
                 },
             ],
         }))
@@ -274,6 +323,7 @@ mod tests {
         )
         .await;
         assert_eq!(body["value"], "已设置");
+        assert_eq!(body["source"], "user");
 
         let body = json_request(
             config_service,
@@ -283,6 +333,7 @@ mod tests {
         )
         .await;
         assert_eq!(body["value"], "已设置");
+        assert_eq!(body["source"], "user");
     }
 
     #[tokio::test]
@@ -303,5 +354,116 @@ mod tests {
         )
         .await;
         assert_eq!(body["value"], json!({"a": 1, "b": 2}));
+        assert_eq!(body["source"], "user");
+    }
+
+    #[tokio::test]
+    async fn read_routes_return_effective_values_with_sources() {
+        let service = service();
+        let body = json_request(service.clone(), "GET", "/data/module_a", Value::Null).await;
+        assert_eq!(
+            body["values"],
+            json!({"config_a":{"value":"默认值","source":"default"}})
+        );
+        let body = json_request(
+            service.clone(),
+            "GET",
+            "/data/module_a/config_a",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(body["value"], "默认值");
+        assert_eq!(body["source"], "default");
+        json_request(
+            service.clone(),
+            "PUT",
+            "/data/module_a/config_a",
+            json!("用户值"),
+        )
+        .await;
+        let body = json_request(service, "GET", "/data/module_a", Value::Null).await;
+        assert_eq!(
+            body["values"]["config_a"],
+            json!({"value":"用户值","source":"user"})
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_route_is_read_only_and_invalid_writes_preserve_the_existing_value() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let directory =
+            std::env::temp_dir().join(format!("loki-config-http-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let executable = directory.join("emacsclient");
+        fs::write(&executable, "测试文件，不执行").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("config.yml");
+        let service = Arc::new(
+            ConfigService::load_with_metadata(
+                &path,
+                vec![crate::modules::emacs::Module::config_metadata()],
+            )
+            .unwrap()
+            .with_executable_search_path(vec![directory.clone()]),
+        );
+        let mut changes = service.subscribe();
+        let body = json_request(
+            service.clone(),
+            "POST",
+            "/config/validate",
+            json!({"module_id":"emacs","key":"emacsclient_path","value":"emacsclient"}),
+        )
+        .await;
+        assert_eq!(body["valid"], true);
+        assert_eq!(body["value"], json!(executable));
+        assert!(!path.exists());
+        assert!(changes.try_recv().is_err());
+        let body = json_request(
+            service.clone(),
+            "POST",
+            "/config/validate",
+            json!({"module_id":"emacs","key":"emacsclient_path","value":42}),
+        )
+        .await;
+        assert_eq!(body["valid"], false);
+        assert_eq!(body["error"]["code"], "invalid-config");
+
+        json_request(
+            service.clone(),
+            "PUT",
+            "/data/emacs/emacsclient_path",
+            json!(executable),
+        )
+        .await;
+        changes.try_recv().unwrap();
+        let original = fs::read(&path).unwrap();
+        let response = router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/data/emacs/emacsclient_path")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!(directory.join("missing")).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["code"], "invalid-config");
+        assert!(body["message"].as_str().unwrap().contains("文件不存在"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            service
+                .value("emacs", "emacsclient_path")
+                .await
+                .unwrap()
+                .value,
+            json!(executable)
+        );
+        assert!(changes.try_recv().is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

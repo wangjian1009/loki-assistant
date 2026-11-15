@@ -13,7 +13,9 @@ project(LokiConfigEditor VERSION 0.1.0 LANGUAGES Swift)
 set(EDITOR_SOURCES
     Sources/App/ConfigEditorApp.swift
     Sources/Model/ConfigEditorModel.swift
+    Sources/Model/CenterAutostartManager.swift
     Sources/Views/ConfigEditorView.swift
+    Sources/Views/ConfigFilePicker.swift
 )
 list(TRANSFORM EDITOR_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 
@@ -43,6 +45,8 @@ if(BUILD_TESTING)
     find_package(XCTest REQUIRED)
     xctest_add_bundle(LokiConfigEditorTests LokiConfigEditor
         Tests/ConfigEditorModelTests.swift
+        Tests/ConfigEditorLoadingTests.swift
+        Tests/CenterAutostartTests.swift
     )
     set_target_properties(LokiConfigEditorTests PROPERTIES
         XCODE_GENERATE_SCHEME YES

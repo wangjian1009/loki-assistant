@@ -70,7 +70,7 @@ fn wire(envelope: Value) -> CommandOutput {
 fn service(
     outputs: Vec<Result<CommandOutput, EmacsError>>,
 ) -> (Arc<EmacsService>, Arc<FakeRunner>, Arc<ConfigService>) {
-    let config = Arc::new(ConfigService::new(Module::config_metadata()));
+    let config = Arc::new(ConfigService::new(test_metadata()));
     let runner = Arc::new(FakeRunner {
         outputs: Mutex::new(outputs.into()),
         ..Default::default()
@@ -85,6 +85,12 @@ fn service(
     )
 }
 
+fn test_metadata() -> crate::modules::config::model::ConfigModuleMetadata {
+    let mut metadata = Module::config_metadata();
+    metadata.items[0].default = Some(json!("/default/emacsclient"));
+    metadata
+}
+
 fn notification(module_id: &str) -> Notification {
     Notification {
         module_id: module_id.to_owned(),
@@ -97,29 +103,34 @@ fn notification(module_id: &str) -> Notification {
 
 #[tokio::test]
 async fn eval_uses_argument_boundary_auto_start_and_latest_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::env::temp_dir()
+        .join(format!("loki-emacs-program-{}", std::process::id()))
+        .join("Emacs App");
+    std::fs::create_dir_all(&directory).unwrap();
+    let executable = directory.join("emacsclient");
+    std::fs::write(&executable, "测试文件，不执行").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut startup_output = wire(json!({"result":"3"}));
     startup_output.stdout = format!("Starting Emacs daemon.\n{}\n", startup_output.stdout);
     let (service, runner, config) =
         service(vec![Ok(startup_output), Ok(wire(json!({"result":"nil"})))]);
     assert_eq!(service.eval("(+ 1 2)").await.unwrap(), "3");
     config
-        .replace(
-            "emacs",
-            "emacsclient_path",
-            json!("/tmp/Emacs App/emacsclient"),
-        )
+        .replace("emacs", "emacsclient_path", json!(executable))
         .await
         .unwrap();
     let script = "(message \"中文\")\n(list \"\\\"\" \"$(touch /tmp/nope)\")";
     assert_eq!(service.eval(script).await.unwrap(), "nil");
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls[0].0, "emacsclient");
-    assert_eq!(calls[1].0, "/tmp/Emacs App/emacsclient");
+    assert_eq!(calls[0].0, "/default/emacsclient");
+    assert_eq!(calls[1].0, executable.to_str().unwrap());
     assert_eq!(&calls[1].1[..2], ["--alternate-editor=", "--eval"]);
     assert_eq!(calls[1].1.len(), 3);
     assert!(
         calls[1].1[2].contains(&serde_json::to_string(&format!("(progn\n{script}\n)")).unwrap())
     );
+    std::fs::remove_dir_all(directory.parent().unwrap()).unwrap();
 }
 
 #[tokio::test]
@@ -170,7 +181,7 @@ impl CommandRunner for StallingRunner {
 #[tokio::test]
 async fn times_out_and_releases_evaluation_lock() {
     let service = EmacsService::with_runner(
-        Arc::new(ConfigService::new(Module::config_metadata())),
+        Arc::new(ConfigService::new(test_metadata())),
         Arc::new(StallingRunner),
         Duration::from_millis(1),
     );
@@ -365,6 +376,11 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
             assert_eq!(notification["path"], "/emacs/receiver/notification");
         } else if path == "/meta/emacs" {
             assert_eq!(body["items"][0]["key"], "emacsclient_path");
+            assert_eq!(body["items"][0]["data_type"], "executable");
+            assert_eq!(
+                body["items"][0]["executable"]["default_program"],
+                "emacsclient"
+            );
         }
     }
     let response = app
@@ -395,7 +411,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
 
 #[tokio::test]
 async fn notification_forwards_content_without_running_emacs_lisp() {
-    let config = Arc::new(ConfigService::new(Module::config_metadata()));
+    let config = Arc::new(ConfigService::new(test_metadata()));
     let runner = Arc::new(FakeRunner::default());
     let launcher = Arc::new(FakeNotificationLauncher::default());
     let service = EmacsService::with_runner(config, runner.clone(), Duration::from_millis(100))
@@ -412,7 +428,7 @@ async fn notification_forwards_content_without_running_emacs_lisp() {
 
 #[tokio::test]
 async fn notification_reports_launch_failure_as_json_error() {
-    let config = Arc::new(ConfigService::new(Module::config_metadata()));
+    let config = Arc::new(ConfigService::new(test_metadata()));
     let service = Arc::new(
         EmacsService::with_runner(
             config,

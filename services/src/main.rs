@@ -28,8 +28,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_config = RuntimeConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(runtime_config.http_addr).await?;
     let service_pfile = ServicePfile::for_listener(listener.local_addr()?);
+    let services = Arc::new(Services::load()?);
     let service_path = service_pfile.write()?;
-    let services = Arc::new(Services::build());
     let runtime = Arc::new(RuntimeState::new(services));
 
     eprintln!(
