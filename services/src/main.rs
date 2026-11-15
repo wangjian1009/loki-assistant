@@ -11,6 +11,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match env::args().nth(1).as_deref() {
         Some("install-service") => install_service()?,
         Some("uninstall-service") => uninstall_service()?,
+        Some("start-service") => start_service()?,
+        Some("stop-service") => stop_service()?,
+        Some("restart-service") => restart_service()?,
+        Some("service-status") => service_status()?,
         Some("--help") | Some("-h") => print_help(),
         Some(command) => {
             return Err(format!("未知命令：{command}，使用 --help 查看支持的命令").into());
@@ -52,6 +56,33 @@ fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn start_service() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = service_spec()?;
+    LaunchdManager::new()?.start(&spec)?;
+    println!("已启动 LaunchAgent：{}", spec.label);
+    Ok(())
+}
+
+fn stop_service() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = service_spec()?;
+    LaunchdManager::new()?.stop(&spec)?;
+    println!("已停止 LaunchAgent：{}", spec.label);
+    Ok(())
+}
+
+fn restart_service() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = service_spec()?;
+    LaunchdManager::new()?.restart(&spec)?;
+    println!("已重启 LaunchAgent：{}", spec.label);
+    Ok(())
+}
+
+fn service_status() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = service_spec()?;
+    println!("{:?}", LaunchdManager::new()?.status(&spec)?);
+    Ok(())
+}
+
 fn service_spec() -> Result<LaunchdServiceSpec, Box<dyn std::error::Error>> {
     let executable = env::current_exe()?;
     let mut spec = LaunchdServiceSpec::new("personal.loki-assistant.services", executable);
@@ -74,4 +105,8 @@ fn print_help() {
     println!("  无参数       启动本地 HTTP 服务");
     println!("  install-service   注册当前可执行文件为用户级 LaunchAgent");
     println!("  uninstall-service 取消注册用户级 LaunchAgent");
+    println!("  start-service      启动用户级 LaunchAgent");
+    println!("  stop-service       停止用户级 LaunchAgent");
+    println!("  restart-service    重启用户级 LaunchAgent");
+    println!("  service-status     查询用户级 LaunchAgent 状态");
 }

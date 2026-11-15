@@ -53,6 +53,10 @@ Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调�
 | make services-run  | 运行 services 本地服务                  |
 | make install-service | 注册 services 用户级 LaunchAgent       |
 | make uninstall-service | 取消注册 services 用户级 LaunchAgent |
+| make start-service | 启动 services 用户级 LaunchAgent      |
+| make stop-service | 停止 services 用户级 LaunchAgent       |
+| make restart-service | 重启 services 用户级 LaunchAgent  |
+| make service-status | 查询 services 用户级 LaunchAgent 状态 |
 | make test-connection | 加载插件并验证真实连接、会话列表与点击激活 |
 | make release      | 构建不含测试的 Release 应用               |
 | make clean        | 清理当前配置及 Release 产物，保留生成工程 |

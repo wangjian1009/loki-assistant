@@ -226,24 +226,65 @@ impl<R: CommandRunner> LaunchdManager<R> {
     }
 
     pub fn start(&self, spec: &LaunchdServiceSpec) -> Result<(), LaunchdError> {
-        self.run_launchctl(
-            "启动 LaunchAgent",
-            &["kickstart".to_owned(), self.target(spec)],
-        )
+        let path = self.plist_path(spec);
+        if !path.exists() {
+            return Err(LaunchdError::InvalidSpec(format!(
+                "LaunchAgent 尚未注册：{}",
+                spec.label
+            )));
+        }
+        let target = self.target(spec);
+        let output = self
+            .runner
+            .run(&self.launchctl, &["print".to_owned(), target.clone()])?;
+        if output.success {
+            self.run_launchctl("启动 LaunchAgent", &["kickstart".to_owned(), target])
+        } else {
+            self.run_launchctl(
+                "加载并启动 LaunchAgent",
+                &[
+                    "bootstrap".to_owned(),
+                    self.domain(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            )
+        }
     }
 
     pub fn stop(&self, spec: &LaunchdServiceSpec) -> Result<(), LaunchdError> {
         self.run_launchctl(
             "停止 LaunchAgent",
-            &["kill".to_owned(), "SIGTERM".to_owned(), self.target(spec)],
+            &["bootout".to_owned(), self.target(spec)],
         )
     }
 
     pub fn restart(&self, spec: &LaunchdServiceSpec) -> Result<(), LaunchdError> {
-        self.run_launchctl(
-            "重启 LaunchAgent",
-            &["kickstart".to_owned(), "-k".to_owned(), self.target(spec)],
-        )
+        let path = self.plist_path(spec);
+        if !path.exists() {
+            return Err(LaunchdError::InvalidSpec(format!(
+                "LaunchAgent 尚未注册：{}",
+                spec.label
+            )));
+        }
+        let target = self.target(spec);
+        let output = self
+            .runner
+            .run(&self.launchctl, &["print".to_owned(), target.clone()])?;
+        if output.success {
+            self.run_launchctl(
+                "重启 LaunchAgent",
+                &["kickstart".to_owned(), "-k".to_owned(), target],
+            )
+        } else {
+            self.run_launchctl(
+                "加载并启动 LaunchAgent",
+                &[
+                    "bootstrap".to_owned(),
+                    self.domain(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            )
+        }
     }
 
     pub fn status(&self, spec: &LaunchdServiceSpec) -> Result<LaunchdStatus, LaunchdError> {

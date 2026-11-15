@@ -11,7 +11,7 @@ EMACSCLIENT ?= emacsclient
 EMACS_SOCKET ?=
 OPEN ?= open
 
-.PHONY: help configure build test test-mac test-emacs services-test services-fmt services-run install-service uninstall-service test-connection run xcode release clean
+.PHONY: help configure build test test-mac test-emacs services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status test-connection run xcode release clean
 
 help:
 	@printf '%s\n' \
@@ -25,6 +25,10 @@ help:
 	  'make services-run  运行 services 本地服务' \
 	  'make install-service 注册 services 用户级 LaunchAgent' \
 	  'make uninstall-service 取消注册 services 用户级 LaunchAgent' \
+	  'make start-service 启动 services 用户级 LaunchAgent' \
+	  'make stop-service 停止 services 用户级 LaunchAgent' \
+	  'make restart-service 重启 services 用户级 LaunchAgent' \
+	  'make service-status 查询 services 用户级 LaunchAgent 状态' \
 	  'make test-connection 加载插件并验证真实连接、会话列表与点击激活' \
 	  'make run         构建并启动 Mac 应用' \
 	  'make xcode       生成并打开 Xcode 工程' \
@@ -62,6 +66,18 @@ install-service:
 
 uninstall-service:
 	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- uninstall-service
+
+start-service:
+	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- start-service
+
+stop-service:
+	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- stop-service
+
+restart-service:
+	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- restart-service
+
+service-status:
+	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- service-status
 
 test-connection: build
 	"$(EMACSCLIENT)" --alternate-editor=false --timeout=5 $(if $(strip $(EMACS_SOCKET)),--socket-name "$(EMACS_SOCKET)",) --eval \

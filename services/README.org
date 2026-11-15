@@ -43,3 +43,14 @@ curl http://127.0.0.1:47321/data/config
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
 
 ~make install-service~ 会使用当前 Debug 可执行文件注册用户级 LaunchAgent，并将日志写入 ~/Library/Logs/LokiAssistant/；~make uninstall-service~ 可取消注册。安装和卸载会调用系统的 ~launchctl~，需要用户显式执行。
+
+已注册服务可以使用 ~make start-service~、~make stop-service~、~make restart-service~ 和 ~make service-status~ 管理。停止操作会卸载当前用户 domain 中的 LaunchAgent，但保留 plist，之后可以再次启动。
+
+修改 services 源码后，执行以下命令刷新正在运行的服务：
+
+#+begin_src sh
+make restart-service
+make service-status
+#+end_src
+
+~make restart-service~ 会先由 Cargo 编译当前 Debug binary，再让 launchd 重启同一路径的可执行文件。修改服务 label、可执行文件路径或 LaunchAgent 配置时，需要重新执行 ~make install-service~。

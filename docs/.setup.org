@@ -1,0 +1,1 @@
+#+STARTUP: show2levels hidestars indent hideblocks
