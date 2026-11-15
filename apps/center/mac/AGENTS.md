@@ -2,6 +2,7 @@
 
 - 使用 CMake 3.30 及以上生成 Xcode macOS App 工程。
 - 使用 Swift 6、SwiftUI `MenuBarExtra` 和必要的 AppKit。
+- macOS 27 的菜单项图标默认隐藏；`MenuBarExtra` 内容必须设置 `.labelStyle(.titleAndIcon)`。
 - 最低支持 macOS 14；应用设置 `LSUIElement = YES`，不显示 Dock 图标。
 - 通过 `URLSession` 请求 services 的 loopback `/healthz`，不启动外部进程。
 

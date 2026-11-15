@@ -12,11 +12,12 @@ final class ServiceStatusTests: XCTestCase {
     }
 
     func testDecodesServiceEndpoint() throws {
-        let data = Data(#"{"host":"127.0.0.1","port":47321,"pid":42,"version":"0.1.0"}"#.utf8)
+        let data = Data(#"{"host":"127.0.0.1","port":47321,"pid":42,"version":"0.1.0","started_at":100}"#.utf8)
         let endpoint = try JSONDecoder().decode(ServiceEndpoint.self, from: data)
 
         XCTAssertEqual(endpoint.host, "127.0.0.1")
         XCTAssertEqual(endpoint.port, 47321)
         XCTAssertEqual(endpoint.version, "0.1.0")
+        XCTAssertEqual(endpoint.startedAt, 100)
     }
 }

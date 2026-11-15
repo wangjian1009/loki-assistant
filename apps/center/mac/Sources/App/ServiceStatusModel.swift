@@ -21,6 +21,12 @@ struct ServiceEndpoint: Codable, Equatable, Sendable {
     let port: UInt16
     let pid: UInt32
     let version: String
+    let startedAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case host, port, pid, version
+        case startedAt = "started_at"
+    }
 }
 
 enum ServiceStatus: Equatable, Sendable {
@@ -46,14 +52,21 @@ final class ServiceStatusModel {
 
     private(set) var status: ServiceStatus = .unknown
     private(set) var lastUpdated: Date?
+    private(set) var uptimeSeconds: Int?
     @ObservationIgnored private var monitoringTask: Task<Void, Never>?
 
     func startMonitoring() {
         guard monitoringTask == nil else { return }
         monitoringTask = Task { @MainActor [weak self] in
+            var tick = 0
             while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(for: .seconds(5))
+                if tick % 5 == 0 {
+                    await self?.refresh()
+                } else {
+                    self?.advanceUptime()
+                }
+                tick += 1
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
@@ -69,11 +82,22 @@ final class ServiceStatusModel {
             let endpoint = try readEndpoint()
             let health = try await fetchHealth(endpoint: endpoint)
             status = .healthy(health)
+            uptimeSeconds = currentUptime(startedAt: endpoint.startedAt)
             lastUpdated = Date()
         } catch {
             status = .unavailable(error.localizedDescription)
+            uptimeSeconds = nil
             lastUpdated = Date()
         }
+    }
+
+    private func advanceUptime() {
+        guard case .healthy = status, let endpoint = try? readEndpoint() else { return }
+        uptimeSeconds = currentUptime(startedAt: endpoint.startedAt)
+    }
+
+    private func currentUptime(startedAt: UInt64) -> Int {
+        max(0, Int(Date().timeIntervalSince1970) - Int(startedAt))
     }
 
     func start() async {

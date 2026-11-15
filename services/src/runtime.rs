@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ pub struct ServicePfile {
     pub port: u16,
     pub pid: u32,
     pub version: String,
+    pub started_at: u64,
 }
 
 impl ServicePfile {
@@ -35,6 +36,10 @@ impl ServicePfile {
             port: address.port(),
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         }
     }
 

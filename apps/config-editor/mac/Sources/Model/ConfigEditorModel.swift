@@ -115,6 +115,12 @@ struct ServiceEndpoint: Codable, Sendable {
     let port: UInt16
     let pid: UInt32
     let version: String
+    let startedAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case host, port, pid, version
+        case startedAt = "started_at"
+    }
 }
 
 struct ModuleDataResponse: Codable, Sendable {

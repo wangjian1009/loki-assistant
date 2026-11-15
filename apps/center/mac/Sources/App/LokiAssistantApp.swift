@@ -19,6 +19,6 @@ struct LokiAssistantApp: App {
                     }
                 }
         }
-        .menuBarExtraStyle(.window)
+        .menuBarExtraStyle(.menu)
     }
 }

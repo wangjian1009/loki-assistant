@@ -25,6 +25,7 @@ struct DashboardView: View {
         }
         .padding(8)
         .frame(width: 130, alignment: .leading)
+        .labelStyle(.titleAndIcon)
     }
 
     private func openConfigEditor() {
@@ -45,7 +46,7 @@ struct DashboardView: View {
             Button {
             } label: {
                 Label {
-                    Text("\(health.version) · \(formatUptime(health.uptimeSeconds))")
+                    Text("\(health.version) · \(formatUptime(status.uptimeSeconds ?? health.uptimeSeconds))")
                 } icon: {
                     statusDot
                 }
