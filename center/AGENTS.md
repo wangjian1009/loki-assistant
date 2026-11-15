@@ -1,19 +1,11 @@
 ## 职责
 
-本目录承载助理主程序及各平台应用，继承根目录的开发约定。
+`center/` 承载新的 macOS 菜单栏入口。当前只展示控制中心 `services` 的运行状态；会话、Emacs 控制、语音输入和其他交互能力等待后续重新设计。
 
-第一阶段交付 macOS 菜单栏应用，负责会话展示、用户输入、Emacs 连接与错误提示。agent-shell 的具体操作由 `emacs/` 插件执行。
+## 约定
 
-## 目录结构
-
-- `mac/`：macOS 原生应用，内部结构见 `mac/AGENTS.md`。
-- `README.org`：主程序技术路线、运行前提与实现状态。
-
-其他平台目录及跨平台公共模块待实际需求出现后再建立。
-
-## 开发约定
-
-- 平台界面、应用生命周期与系统集成放在所属平台目录。
-- 通信数据遵循 `../docs/agent-shell-control.org`，不得依赖 agent-shell 的私有实现。
-- 不在本目录实现另一套 agent 会话引擎或独立 Emacs 控制服务。
-- 构建、资源与测试由各平台自行管理；Mac 使用 CMake 生成 Xcode 工程，不提前引入多平台构建框架。
+- macOS 应用使用 SwiftUI 与必要的 AppKit，工程由 `mac/CMakeLists.txt` 管理。
+- 菜单栏应用通过 `GET http://127.0.0.1:47321/healthz` 查询 services 状态，不直接调用 Emacs。
+- 菜单栏应用通过 `launchctl` 查询用户级 LaunchAgent 状态，并在服务运行时请求 `/healthz`；后台每 5 秒轮询一次。
+- 应用启动后不创建 Dock 主窗口；菜单栏菜单显示连接状态和版本，后台自动监控 services；停止时提供灰色启动按钮。
+- 新增服务调用前先确认 `services` 的 HTTP 元数据，不在应用内复制服务逻辑。

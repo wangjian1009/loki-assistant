@@ -4,7 +4,7 @@
 
 ## 范围
 
-当前只实现控制中心所需的服务框架。菜单栏界面属于 `center/`，agent-shell 的会话执行属于 `emacs/`。不得在此目录复制 SwiftUI 界面或实现另一套 agent-shell 会话引擎。
+当前只实现控制中心所需的服务框架。菜单栏状态界面属于 `center/`，`emacs/` 目前是预留空目录。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
@@ -94,4 +94,4 @@ modules/<module>
 
 ## 检查
 
-在 `services/` 目录执行 `cargo fmt --check` 和 `cargo test --workspace`。修改跨模块协议时，同时检查 `docs/agent-shell-control.org` 及调用方；纯文档变更不增加实现测试。
+在 `services/` 目录执行 `cargo fmt --check` 和 `cargo test --workspace`。修改跨模块协议时，同时检查 `docs/control-center-services.org` 及调用方；纯文档变更不增加实现测试。

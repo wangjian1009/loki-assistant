@@ -1,82 +1,21 @@
-#+TITLE: Loki Assistant 主程序
+#+TITLE: Loki Assistant 菜单栏入口
 
-* 功能与状态
+* 当前状态
 
-此目录承载各平台应用。目前已建立可构建的 macOS 菜单栏应用，提供状态仪表盘、独立会话窗口、设置与退出入口。
+当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本和运行时间，并可手动刷新；services 不可达时显示失败原因。
 
-当前版本已接入 agent-shell 会话列表、名称及项目路径搜索、状态筛选、自动与手动刷新、在 Emacs 中打开和需求发送。
-
-* 技术路线
-
-| 部分           | 选型                                              |
-|----------------+---------------------------------------------------|
-| 语言与工程     | Swift 6，CMake 管理并生成 Xcode macOS App 工程     |
-| 系统版本       | macOS 14 及以上                                   |
-| 应用生命周期   | SwiftUI App                                       |
-| 菜单栏与面板   | MenuBarExtra，使用 window 样式                     |
-| 界面控件       | SwiftUI HSplitView、List、TextEditor、Settings     |
-| 会话窗口       | 按需创建和复用 NSWindow，内容使用 SwiftUI         |
-| 界面状态       | Observation，主 actor 管理                        |
-| Emacs 通信     | Foundation Process / Pipe，Swift Concurrency      |
-| 数据编码       | Codable JSON，UTF-8 与 Base64                      |
-| 系统应用激活   | AppKit NSWorkspace / NSRunningApplication          |
-| 本地配置       | UserDefaults / AppStorage                         |
-
-菜单栏弹出框是只读状态仪表盘，显示 Emacs 连接、全部会话数、运行中与就绪数量、最近成功更新时间。每次打开时自动检查连接并刷新会话；更新失败时标明保留的是上次数据。底部仅提供打开会话管理、设置与退出入口。
-
-点击“打开会话管理”会收起仪表盘，并置前独立会话窗口。窗口采用 ChatGPT、Claude 常见的左侧会话导航与右侧工作区布局：
-
-- 左侧按会话名称或项目路径搜索，按全部、就绪、运行中筛选；列表显示会话名称、项目及中文状态。
-- 右侧显示当前会话及项目目录，底部固定需求输入框，持续标明发送目标。
-- 点击列表整行只选择发送目标；点击“在 Emacs 中打开”才显示目标 buffer，并按插件返回的 PID 激活该 Emacs 进程。
-- 输入支持多行，~⌘ Return~ 发送，~Return~ 换行；只有选中就绪会话且输入非空时可以发送。~⌘R~ 刷新连接与会话状态。
-- 完整对话与执行结果在 Emacs 中查看，当前窗口不显示历史对话。
-
-应用启动后常驻菜单栏，不显示 Dock 图标或默认主窗口。会话窗口可缩放、最小化，记住位置和大小；重复打开复用同一窗口。仪表盘及会话窗口每次显示时自动更新状态，关闭后保留选定会话和未发送输入。从会话窗口打开设置时保留工作窗口。
-
-刷新或操作确认会话失效后，应用清除对应的选中状态并保留草稿。连接暂时失败时保留原列表及选中项，修复连接后可重新刷新。
-
-修改 ~emacsclient~ 路径或 server 会清空旧连接的列表和选中项，草稿保留。重新打开仪表盘、会话窗口或手动刷新后加载新连接的会话，发送前需重新选择目标；旧连接的迟到结果不会覆盖当前界面。
-
-通过异步子进程调用 ~emacsclient --eval~ 并读取函数返回值，具体控制由 Emacs 插件执行，见 [[file:../docs/agent-shell-control.org][控制协议]]。
-
-第一阶段使用 Apple 原生框架，以个人本机运行方式开发，关闭 App Sandbox。相关开发约定集中在 ~mac/AGENTS.md~ 。
-
-* 运行前提
-
-- 本机 Emacs server 可用。
-- 可找到 ~emacsclient~ 可执行文件，并能连接目标 server。
-- Emacs 已加载本项目插件 ~0.2.0~ 及以上版本；连接检查不依赖 agent-shell，会话控制需要安装 agent-shell。
-
-GUI 应用启动时的环境可能与终端不同，设置中已支持配置 ~emacsclient~ 的绝对路径及目标 server。
+应用通过系统的 ~launchctl~ 查询 LaunchAgent 是否运行；服务运行时再通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色启动按钮。不包含 Emacs 会话、语音输入或其他旧版功能。
 
 * 构建与运行
 
-需要 CMake 3.30 及以上，以及支持 Swift 6 的 Xcode。以下命令均在仓库根目录执行。
-
-根目录 Makefile 统一编排操作，Mac 构建配置由 CMake 管理。构建会自动生成或更新 Xcode 工程：
+在仓库根目录执行：
 
 #+begin_src sh
 make build
-#+end_src
-
-运行构建产物：
-
-#+begin_src sh
 make run
 #+end_src
 
-也可以打开生成的工程，选择 ~LokiAssistant~ scheme，直接运行：
-
-#+begin_src sh
-make xcode
-#+end_src
-
-默认使用本机临时签名，无需配置开发者团队。工程和 scheme 由 CMake 生成，请在 ~CMakeLists.txt~ 修改源码列表与构建配置；生成目录已被 Git 忽略。仅生成工程可执行 ~make configure~ 。
-
-应用启动后，点击菜单栏的终端图标，进入“设置”确认可执行文件路径和 server；留空 server 表示默认实例。重新打开仪表盘后自动检查并显示 Emacs 和插件版本；独立会话窗口也提供“检查连接”。路径错误或 server 不可达时显示失败原因，修正配置后可再次检查。
-
-在仪表盘点击“设置…”会收起菜单栏面板，并打开、置前原生设置窗口；窗口已在后台时，再次点击会将其抬到前面，关闭后仍可重新打开。
+需要 macOS、CMake 3.30 及以上和支持 Swift 6 的 Xcode。构建配置及源文件列表以 [[file:mac/CMakeLists.txt][CMakeLists.txt]] 为准。
 
 * 测试
 
@@ -84,16 +23,4 @@ make xcode
 make test-mac
 #+end_src
 
-默认启用测试 target，CTest 通过 Xcode 启动应用并执行 XCTest。测试构建启用 testability，关闭 hardened runtime，以支持本机临时签名的测试 bundle 加载。
-
-默认 XCTest 覆盖请求文本编码、响应版本和标识校验、无效输出与协议错误，不依赖运行中的 Emacs。XCTest 还覆盖仪表盘不承载列表或编辑器、独立会话窗口首次打开置前、复用、关闭后重开刷新及草稿保留，并保留默认和最小尺寸的视图快照。~make test-connection~ 还会呈现实际会话界面，验证列表高度、整行选择、显式打开后的目标 buffer 与 Emacs 前台进程，以及窗口重开后的刷新和草稿保留；配置参数及加载行为见 [[file:../README.org][项目说明]]。
-
-仅构建应用的 Release 版本可使用独立目录：
-
-#+begin_src sh
-make release
-#+end_src
-
-默认输出到 ~center/mac/.build/release/Release/LokiAssistant.app~ 。执行 ~make clean~ 清理当前配置和 Release 构建产物，保留生成工程；完整操作及变量见 [[file:../README.org][项目说明]]。
-
-开发目录约定见 ~AGENTS.md~ 和 ~mac/AGENTS.md~ 。
+测试覆盖 services 健康响应解码和状态模型，不要求 services 正在运行。
