@@ -135,7 +135,8 @@ struct AgentShellView: View {
 
             Divider()
             HStack {
-                SettingsLink { Text("设置…") }
+                SettingsButton()
+                    .fixedSize()
                 Spacer()
                 Button("退出") { NSApplication.shared.terminate(nil) }
             }

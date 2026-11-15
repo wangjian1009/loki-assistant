@@ -57,6 +57,7 @@ if(BUILD_TESTING)
         Tests/ApplicationModelConfigurationTests.swift
         Tests/EmacsProtocolCodecTests.swift
         Tests/EmacsConnectionIntegrationTests.swift
+        Tests/SettingsWindowTests.swift
     )
     set_target_properties(LokiAssistantTests PROPERTIES
         XCODE_GENERATE_SCHEME YES
