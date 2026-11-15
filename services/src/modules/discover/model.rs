@@ -44,9 +44,13 @@ pub struct ApiMetadata {
 
 impl ApiMetadata {
     pub fn get(id: &str, path: &str, summary: &str, description: &str) -> Self {
+        Self::new(id, "GET", path, summary, description)
+    }
+
+    pub fn new(id: &str, method: &str, path: &str, summary: &str, description: &str) -> Self {
         Self {
             id: id.to_owned(),
-            method: "GET".to_owned(),
+            method: method.to_owned(),
             path: path.to_owned(),
             summary: summary.to_owned(),
             description: description.to_owned(),

@@ -18,7 +18,7 @@
 | ~modules/discover~ | 模块元数据和 HTTP API 发现 | 首步实现三个 ~/discover~ 接口 |
 | ~modules/emacs~ | 调用 ~emacsclient~、连接检查、请求转发和事件入口 | 下一步 |
 | ~modules/voice~ | 录音状态、识别结果和确认流程 | 后续；先定义状态边界 |
-| ~modules/configuration~ | 配置中心业务能力 | 后续；当前不建立目录 |
+| ~modules/config~ | 配置模型、配置数据读写和变化订阅 | 已实现基础内存存储 |
 | ~platform/macos~ | 登录启动、服务监控、自动重启和音频设备适配 | 后续 |
 | 各业务模块的 ~protocol.rs~ | 本模块请求、响应、错误码和版本 | 随模块实现，不设集中式协议目录 |
 
@@ -45,11 +45,17 @@ services/
         │   ├── mod.rs       模块入口和路由挂载
         │   ├── protocol.rs  健康响应 DTO
         │   └── routes.rs    GET /healthz
-        └── discover/
+        ├── discover/
+        │   ├── mod.rs       模块入口和路由挂载
+        │   ├── model.rs     模块元数据和 API 描述接口
+        │   ├── protocol.rs  发现接口响应模型
+        │   └── routes.rs    /discover 路由
+        └── config/
             ├── mod.rs       模块入口和路由挂载
-            ├── model.rs     模块元数据和 API 描述接口
-            ├── protocol.rs  发现接口响应模型
-            └── routes.rs    /discover 路由
+            ├── model.rs     配置模型和元数据接口
+            ├── protocol.rs  配置接口响应模型
+            ├── routes.rs    /meta 和 /data 路由
+            └── service.rs   配置存储和变化订阅
 #+end_src
 
 业务模块实现时再按下面的边界新增目录：
@@ -74,6 +80,7 @@ src/
 - 默认只绑定 ~127.0.0.1:47321~，可通过 ~LOKI_ASSISTANT_HTTP_ADDR~ 覆盖。
 - 提供 ~GET /healthz~，返回服务名称、状态、版本和运行秒数。
 - 提供 ~GET /discover~、~GET /discover/modules~ 和 ~GET /discover/modules/{module_id}~。
+- 注册 ~modules/config~，提供配置模型、配置读取、完整设置、部分更新和订阅能力。
 - 使用 tokio/axum 处理 HTTP，支持 Ctrl-C 优雅退出。
 - 配置解析和健康响应具备单元测试。
 
@@ -109,8 +116,16 @@ src/
 | GET | ~/discover/modules~ | 模块摘要列表 |
 | GET | ~/discover/modules/{module_id}~ | 指定模块的完整元数据 |
 | GET | ~/healthz~ | 服务健康状态 |
+| GET | ~/meta~ | 完整配置模型描述 |
+| GET | ~/meta/{module_id}~ | 单个配置模块描述 |
+| GET | ~/data/{module_id}~ | 已设置的模块配置值 |
+| GET | ~/data/{module_id}/{key}~ | 单个已设置配置值 |
+| PUT | ~/data/{module_id}/{key}~ | 替换配置项完整值 |
+| POST | ~/data/{module_id}/{key}~ | 合并字典或追加列表值 |
 
 ~discover~ 模块也在模块目录中注册自身，因此 ~/discover/modules/discover~ 返回发现模块的完整描述。
+
+配置数据没有设置时，数据接口返回未设置错误，不会自动返回元数据中的默认值；调用方应从 ~/meta~ 获取默认值。业务模块可以通过配置模块的 ~ConfigService~ 获取模块值、读取单项值并订阅指定模块的变化。
 
 #+begin_src json
 {

@@ -4,7 +4,7 @@ use axum::Router;
 
 use crate::modules::discover::model::ModuleDescriptor;
 use crate::{
-    modules::{discover, health},
+    modules::{config, discover, health},
     runtime::RuntimeState,
 };
 
@@ -13,6 +13,7 @@ use crate::{
 pub struct Services {
     pub health: health::Module,
     pub discover: discover::Module,
+    pub config: config::Module,
 }
 
 /// 与需求文档中的 CoreService 名称兼容的别名。
@@ -22,11 +23,13 @@ impl Services {
     pub fn build() -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
-        let catalog = vec![health.metadata(), discover.metadata()];
+        let config = config::Module::new();
+        let catalog = vec![health.metadata(), discover.metadata(), config.metadata()];
 
         Self {
             health,
             discover: discover.with_catalog(catalog),
+            config,
         }
     }
 
@@ -34,5 +37,6 @@ impl Services {
         Router::new()
             .merge(self.health.router(runtime))
             .merge(self.discover.router())
+            .merge(self.config.router())
     }
 }

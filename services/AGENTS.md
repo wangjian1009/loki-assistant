@@ -27,11 +27,17 @@ src/
     │   ├── mod.rs       健康模块入口和路由挂载
     │   ├── protocol.rs  健康响应 DTO
     │   └── routes.rs    GET /healthz handler
-    └── discover/
-        ├── mod.rs       发现模块入口和路由挂载
-        ├── model.rs     模块元数据和 API 描述接口
-        ├── protocol.rs  发现接口响应模型
-        └── routes.rs    /discover 路由
+    ├── discover/
+    │   ├── mod.rs       发现模块入口和路由挂载
+    │   ├── model.rs     模块元数据和 API 描述接口
+    │   ├── protocol.rs  发现接口响应模型
+    │   └── routes.rs    /discover 路由
+    └── config/
+        ├── mod.rs       配置模块入口和路由挂载
+        ├── model.rs     配置模块、配置项和检查器元数据
+        ├── protocol.rs  配置接口响应模型
+        ├── routes.rs    /meta 和 /data 路由
+        └── service.rs   配置数据存储和变化订阅
 ```
 
 每个业务模块必须独立拥有自己的交互协议和路由。新增模块时，最大努力将实现限制在一个 `src/modules/<module>/` 目录中：
@@ -46,17 +52,17 @@ src/modules/<module>/
 
 只有确实被多个模块复用的运行设施才能放在模块目录之外。后续按实际实现新增以下模块，不提前建立空目录：
 
-| 模块             | 职责                                                             | 允许依赖                                   |
-|------------------|------------------------------------------------------------------|--------------------------------------------|
-| `runtime`        | 读取 loopback 启动地址、启停、关闭信号和运行代次                  | 标准库、Tokio                              |
-| `services`       | 创建并持有所有业务模块，统一注册模块路由                           | `modules/*`、`runtime`                     |
-| `http`           | loopback listener、公共 middleware、请求体限制和 server 生命周期 | `runtime`；不拥有业务协议                  |
-| `modules/health` | 服务健康检查和基础运行状态                                       | `runtime`、`serde`                         |
-| `modules/discover` | 返回完整模块目录、模块列表和单模块元数据                        | 各模块 `ModuleDescriptor`                  |
-| `modules/emacs`  | `emacsclient` gateway、连接检查、会话操作和事件入口              | 本模块 `protocol`、平台进程 trait          |
-| `modules/voice`  | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
-| `modules/configuration` | 未来的配置中心业务能力（尚未建立）                        | 本模块 `protocol`、平台存储 trait          |
-| `platform/macos` | launch agent、进程监控、自动重启、音频设备适配                   | macOS API；实现 `emacs`/`voice` 所需 trait |
+| 模块                    | 职责                                                             | 允许依赖                                   |
+|-------------------------|------------------------------------------------------------------|--------------------------------------------|
+| `runtime`               | 读取 loopback 启动地址、启停、关闭信号和运行代次                 | 标准库、Tokio                              |
+| `services`              | 创建并持有所有业务模块，统一注册模块路由                         | `modules/*`、`runtime`                     |
+| `http`                  | loopback listener、公共 middleware、请求体限制和 server 生命周期 | `runtime`；不拥有业务协议                  |
+| `modules/health`        | 服务健康检查和基础运行状态                                       | `runtime`、`serde`                         |
+| `modules/discover`      | 返回完整模块目录、模块列表和单模块元数据                         | 各模块 `ModuleDescriptor`                  |
+| `modules/emacs`         | `emacsclient` gateway、连接检查、会话操作和事件入口              | 本模块 `protocol`、平台进程 trait          |
+| `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
+| `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
+| `platform/macos`        | launch agent、进程监控、自动重启、音频设备适配                   | macOS API；实现 `emacs`/`voice` 所需 trait |
 
 依赖方向固定为：
 
@@ -68,7 +74,7 @@ modules/<module>
 └── service ──> runtime/platform trait
 ```
 
-`http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。`Services::build()` 是新增模块后的唯一组合入口，`RuntimeState` 持有它。当前启动配置属于 `runtime`，未来配置中心使用 `modules/configuration`，不得新增顶层 `config.rs`。
+`http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。`Services::build()` 是新增模块后的唯一组合入口，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
 
 ## Rust 约定
 
