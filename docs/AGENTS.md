@@ -5,6 +5,7 @@
 ## 文档划分
 
 - `agent-shell-control.org`：第一阶段范围、操作语义、通信协议与验收条件。
+- `control-center-services.org`：控制中心服务层的范围、模块边界与分阶段实现。
 - 后续独立主题出现时再增加文档；各代码目录的内部结构由其自身的 `AGENTS.md` 定义。
 
 ## 写作约定

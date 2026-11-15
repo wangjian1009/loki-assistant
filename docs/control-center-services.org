@@ -1,0 +1,118 @@
+#+TITLE: 控制中心 services 模块规划
+
+* 范围
+
+本文只规划电脑端控制中心的服务层。控制中心是开机后常驻的本机服务，为菜单栏应用和未来的手机应用提供统一的本地 HTTP 能力；SwiftUI 菜单栏应用负责展示和交互，Emacs 插件负责在 Emacs 内执行 agent-shell 操作。
+
+本模块当前不包含 AI 会话管理的界面、手机端、跨设备同步、任务协作、通知中心、密码管理和独立的云端服务。已有的 Mac 应用仍直接通过 ~emacsclient~ 通信，服务层完成迁移前先保持两条链路互不影响。
+
+* 目标边界
+
+服务层对外提供稳定的业务接口，对内管理平台资源和外部进程。HTTP 层不直接调用 ~emacsclient~，菜单栏应用也不应依赖内部模块；两者之间只使用版本化的 JSON API。
+
+| 模块 | 职责 | 当前阶段 |
+|------+------|----------|
+| ~runtime~ | 读取启动地址、管理进程生命周期和运行状态 | 首步实现环境变量配置 |
+| ~http~ | 仅监听 loopback、路由、请求解码和响应编码 | 首步实现 ~GET /healthz~ |
+| ~modules/health~ | 健康检查和基础运行状态 | 首步实现 ~GET /healthz~ |
+| ~modules/emacs~ | 调用 ~emacsclient~、连接检查、请求转发和事件入口 | 下一步 |
+| ~modules/voice~ | 录音状态、识别结果和确认流程 | 后续；先定义状态边界 |
+| ~modules/configuration~ | 配置中心业务能力 | 后续；当前不建立目录 |
+| ~platform/macos~ | 登录启动、服务监控、自动重启和音频设备适配 | 后续 |
+| 各业务模块的 ~protocol.rs~ | 本模块请求、响应、错误码和版本 | 随模块实现，不设集中式协议目录 |
+
+每个业务模块在自己的目录中同时维护 ~protocol.rs~、~routes.rs~ 和业务逻辑；~mod.rs~ 对外提供 router 并挂载本模块路由。~http~ 只负责公共 server 能力，平台适配只能被业务模块依赖。~emacs~ 不依赖 HTTP，~voice~ 不依赖菜单栏 UI；新增模块最大努力限制在一个目录中。
+
+* 目录规划
+
+目录按实现需要创建，不为尚未实现的能力建立空目录。第一步的实际目录如下：
+
+#+begin_src text
+services/
+├── Cargo.toml
+├── Cargo.lock
+├── AGENTS.md
+├── README.org
+└── src/
+    ├── lib.rs             crate 的模块边界和公共组装入口
+    ├── main.rs            服务进程入口和优雅退出
+    ├── runtime.rs         启动配置及进程级运行时状态
+    ├── http/mod.rs        公共 HTTP server
+    └── modules/
+        └── health/
+            ├── mod.rs       模块入口和路由挂载
+            ├── protocol.rs  健康响应 DTO
+            └── routes.rs    GET /healthz
+#+end_src
+
+业务模块实现时再按下面的边界新增目录：
+
+#+begin_src text
+src/
+├── modules/
+│   ├── emacs/              protocol、routes、service 均由本目录维护
+│   ├── voice/              protocol、routes、service 均由本目录维护
+│   └── ...                 其他业务模块，各自维护本目录协议和路由
+└── platform/macos/         launch agent、监控和系统能力
+#+end_src
+
+这些目录是规划，不代表当前已经具备对应能力。服务层不复制 agent-shell 的会话引擎；会话识别、切换和提交仍由 Emacs 插件执行。不存在集中式 ~protocol~ 目录；只有被多个模块稳定复用的基础类型才可上移。
+
+* 分阶段实现
+
+** INPROGRESS 第一步：可运行的核心服务器骨架
+
+- 使用 Rust crate 建立服务进程入口。
+- 默认只绑定 ~127.0.0.1:47321~，可通过 ~LOKI_ASSISTANT_HTTP_ADDR~ 覆盖。
+- 提供 ~GET /healthz~，返回服务名称、状态、版本和运行秒数。
+- 使用 tokio/axum 处理 HTTP，支持 Ctrl-C 优雅退出。
+- 配置解析和健康响应具备单元测试。
+
+自动格式检查、单元测试和本机 HTTP 请求已通过；按项目约定，人工验收后再将本节标记为 ~DONE~。
+
+** TODO 第二步：运行状态与 Mac 应用管理
+
+- 新增控制中心运行状态模块和 ~platform/macos~ 适配模块。
+- 定义服务启动、停止、失败和重启状态。
+- 由 Mac 能力实现登录启动、进程存活监控和受控自动重启。
+- 菜单栏应用通过本地 API 展示服务状态；在迁移完成前保留现有直连实现。
+
+** TODO 第三步：Emacs gateway
+
+- 将现有控制协议封装为服务层的 ~emacs~ 模块。
+- 通过独立参数调用配置的 ~emacsclient~，复用 [[file:agent-shell-control.org][agent-shell 控制协议]] 的 Base64/JSON 约定。
+- 首先迁移 ~ping~ 和会话查询，再迁移切换和需求发送。
+- 迁移期间以请求标识和连接代次隔离迟到响应，不能让旧连接覆盖新状态。
+
+** TODO 第四步：语音输入
+
+- 由 ~voice~ 模块维护录音中、识别完成、待确认、已取消和失败状态。
+- macOS 音频采集和语音识别放在 ~platform/macos~ 适配层，业务层不依赖具体框架。
+- 只有用户确认后才调用会话发送用例；识别失败或结果待确认时保留文本。
+
+* HTTP 约定
+
+第一步只承诺健康检查。服务只监听 loopback，尚未提供跨设备访问、认证或业务写操作。
+
+#+begin_src json
+{
+  "service": "loki-services",
+  "status": "ok",
+  "version": "0.1.0",
+  "uptime_seconds": 12
+}
+#+end_src
+
+后续 API 统一置于 ~/api/v1~，请求和响应使用 JSON；每个业务模块在自己的 ~protocol.rs~ 中定义请求、响应、错误结构、请求标识和版本校验，再由本模块 ~routes.rs~ 挂载。公共 HTTP 层不拥有业务协议。
+
+* 验证
+
+服务层检查使用：
+
+#+begin_src sh
+cargo test --manifest-path services/Cargo.toml
+cargo run --manifest-path services/Cargo.toml
+curl http://127.0.0.1:47321/healthz
+#+end_src
+
+当前骨架验证只覆盖配置、路由和健康响应；不会替代根目录 ~make test~ 对 Mac 应用和 Emacs 插件的检查。

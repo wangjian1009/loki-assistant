@@ -1,0 +1,35 @@
+#+TITLE: 控制中心服务层
+
+* 作用与状态
+
+本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
+
+当前只完成核心服务器骨架：服务默认监听 ~127.0.0.1:47321~，提供 ~GET /healthz~，支持配置地址和 Ctrl-C 优雅退出。Emacs 控制、语音输入、登录启动和自动重启尚未迁移到这里；当前 Mac 应用仍按 [[file:../docs/agent-shell-control.org][控制协议]] 直接调用 ~emacsclient~。
+
+模块边界、分阶段计划和后续目录见 [[file:../docs/control-center-services.org][控制中心 services 模块规划]]。
+
+业务模块各自维护交互协议和 HTTP 路由：在 ~src/modules/<module>/~ 内放置 ~protocol.rs~、~routes.rs~ 及需要的 ~service.rs~，由模块入口提供 router 并注册到服务。~http~ 只提供 loopback server 和公共 HTTP 能力，不设集中式 ~protocol~ 目录。新增模块应尽量只新增一个目录，跨模块只共享稳定的基础设施。
+
+* 开发
+
+需要 Rust stable 与 Cargo：
+
+#+begin_src sh
+cargo fmt --manifest-path services/Cargo.toml
+cargo test --manifest-path services/Cargo.toml
+cargo run --manifest-path services/Cargo.toml
+#+end_src
+
+可使用环境变量覆盖监听地址，例如：
+
+#+begin_src sh
+LOKI_ASSISTANT_HTTP_ADDR=127.0.0.1:47322 cargo run --manifest-path services/Cargo.toml
+#+end_src
+
+服务启动后可检查：
+
+#+begin_src sh
+curl http://127.0.0.1:47321/healthz
+#+end_src
+
+服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。

@@ -1,6 +1,7 @@
 *.local.md
 .DS_Store
 .build/
+services/target/
 DerivedData/
 *.xcuserstate
 xcuserdata/
