@@ -47,7 +47,7 @@ test-emacs:
 	  "$$(printf '\n  (load "%s" nil t)\n' '$(PROJECT_ROOT)/emacs/test/run-tests.el')"
 
 services-test:
-	"$(CARGO)" test --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml"
+	"$(CARGO)" test --workspace --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml"
 
 services-fmt:
 	"$(CARGO)" fmt --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- --check

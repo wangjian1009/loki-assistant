@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use loki_services_macros::loki_api;
 use serde_json::Value;
 
 use super::{
@@ -27,12 +28,28 @@ pub fn router(service: Arc<ConfigService>) -> Router {
         .with_state(service)
 }
 
+#[loki_api(
+    module = "config",
+    id = "meta",
+    method = "GET",
+    path = "/meta",
+    summary = "获取完整配置模型",
+    description = "返回所有配置模块及配置项类型、默认值和检查器描述。"
+)]
 async fn meta(State(service): State<Arc<ConfigService>>) -> Json<MetaResponse> {
     Json(MetaResponse {
         modules: service.metadata().await,
     })
 }
 
+#[loki_api(
+    module = "config",
+    id = "module-meta",
+    method = "GET",
+    path = "/meta/{module_id}",
+    summary = "获取模块配置模型",
+    description = "返回单个配置模块的完整描述。"
+)]
 async fn module_meta(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
@@ -46,6 +63,14 @@ async fn module_meta(
         .ok_or_else(|| error_response(ConfigServiceError::ModuleNotFound(module_id)))
 }
 
+#[loki_api(
+    module = "config",
+    id = "module-data",
+    method = "GET",
+    path = "/data/{module_id}",
+    summary = "获取模块配置数据",
+    description = "只返回已经设置的配置值，不填充元数据中的默认值。"
+)]
 async fn module_data(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
@@ -57,6 +82,14 @@ async fn module_data(
         .map_err(error_response)
 }
 
+#[loki_api(
+    module = "config",
+    id = "value",
+    method = "GET",
+    path = "/data/{module_id}/{key}",
+    summary = "获取配置项",
+    description = "返回单个已经设置的配置值。"
+)]
 async fn get_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
@@ -74,6 +107,14 @@ async fn get_value(
         .map_err(error_response)
 }
 
+#[loki_api(
+    module = "config",
+    id = "set-value",
+    method = "PUT",
+    path = "/data/{module_id}/{key}",
+    summary = "设置完整配置值",
+    description = "替换一个配置项的完整值。"
+)]
 async fn put_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
@@ -92,6 +133,14 @@ async fn put_value(
         .map_err(error_response)
 }
 
+#[loki_api(
+    module = "config",
+    id = "patch-value",
+    method = "POST",
+    path = "/data/{module_id}/{key}",
+    summary = "部分更新配置值",
+    description = "合并字典或追加列表项。"
+)]
 async fn post_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,

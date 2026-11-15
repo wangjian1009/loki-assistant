@@ -78,5 +78,5 @@ pub struct FilePathMetadata {
 
 /// 配置模块向业务模块提供元数据的接口。
 pub trait ConfigMetadataProvider {
-    fn config_metadata(&self) -> ConfigModuleMetadata;
+    fn config_metadata() -> ConfigModuleMetadata;
 }

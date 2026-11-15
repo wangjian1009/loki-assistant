@@ -8,7 +8,7 @@
 
 模块边界、分阶段计划和后续目录见 [[file:../docs/control-center-services.org][控制中心 services 模块规划]]。
 
-业务模块各自维护交互协议和 HTTP 路由：在 ~src/modules/<module>/~ 内放置 ~protocol.rs~、~routes.rs~ 及需要的 ~service.rs~，由模块入口提供 router 并注册到服务。~http~ 只提供 loopback server 和公共 HTTP 能力，不设集中式 ~protocol~ 目录。新增模块应尽量只新增一个目录，跨模块只共享稳定的基础设施。
+业务模块各自维护交互协议和 HTTP 路由：在 ~src/modules/<module>/~ 内放置 ~protocol.rs~、~routes.rs~ 及需要的 ~service.rs~，handler 使用 ~#[loki_api(...)]~ 声明接口信息，并用 ~linkme~ 静态切片提交模块描述。~http~ 只提供 loopback server 和公共 HTTP 能力，不设集中式 ~protocol~ 目录。~Services::build~ 只组合路由，不负责运行时注册元数据。新增模块应尽量只新增一个目录，跨模块只共享稳定的基础设施。
 
 * 开发
 
@@ -16,7 +16,7 @@
 
 #+begin_src sh
 cargo fmt --manifest-path services/Cargo.toml
-cargo test --manifest-path services/Cargo.toml
+cargo test --workspace --manifest-path services/Cargo.toml
 cargo run --manifest-path services/Cargo.toml
 #+end_src
 

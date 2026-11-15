@@ -48,29 +48,24 @@ pub enum ConfigServiceError {
 
 impl ConfigService {
     pub fn new(metadata: ConfigModuleMetadata) -> Self {
+        Self::with_metadata(vec![metadata])
+    }
+
+    pub fn from_registry() -> Self {
+        Self::with_metadata(super::registry::metadata())
+    }
+
+    fn with_metadata(metadata: Vec<ConfigModuleMetadata>) -> Self {
         let (changes, _) = broadcast::channel(32);
-        let mut modules = HashMap::new();
-        modules.insert(metadata.id.clone(), metadata);
+        let modules = metadata
+            .into_iter()
+            .map(|metadata| (metadata.id.clone(), metadata))
+            .collect();
         Self {
             metadata: Arc::new(RwLock::new(modules)),
             values: Arc::new(RwLock::new(HashMap::new())),
             changes,
         }
-    }
-
-    pub async fn register_module(
-        &self,
-        metadata: ConfigModuleMetadata,
-    ) -> Result<(), ConfigServiceError> {
-        let mut modules = self.metadata.write().await;
-        if modules.contains_key(&metadata.id) {
-            return Err(ConfigServiceError::InvalidValue(format!(
-                "配置模块已存在：{}",
-                metadata.id
-            )));
-        }
-        modules.insert(metadata.id.clone(), metadata);
-        Ok(())
     }
 
     pub async fn metadata(&self) -> Vec<ConfigModuleMetadata> {

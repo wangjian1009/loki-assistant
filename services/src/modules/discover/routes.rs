@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -11,37 +9,60 @@ use axum::{
 use super::{
     model::ModuleMetadata,
     protocol::{DiscoverError, DiscoverResponse, ModuleListResponse},
+    registry,
 };
 
-type Catalog = Arc<Vec<ModuleMetadata>>;
+use loki_services_macros::loki_api;
 
-pub fn router(catalog: Catalog) -> Router {
+pub fn router() -> Router {
     Router::new()
         .route("/discover", get(discover))
         .route("/discover/modules", get(list_modules))
         .route("/discover/modules/{module_id}", get(get_module))
-        .with_state(catalog)
 }
 
-async fn discover(State(catalog): State<Catalog>) -> Json<DiscoverResponse> {
+#[loki_api(
+    module = "discover",
+    id = "discover",
+    method = "GET",
+    path = "/discover",
+    summary = "获取完整服务描述",
+    description = "返回所有模块及其 HTTP API 的完整元数据。"
+)]
+async fn discover() -> Json<DiscoverResponse> {
+    let catalog = registry::metadata();
     Json(DiscoverResponse {
         service: "loki-services".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        modules: catalog.as_ref().clone(),
+        modules: catalog,
     })
 }
 
-async fn list_modules(State(catalog): State<Catalog>) -> Json<ModuleListResponse> {
+#[loki_api(
+    module = "discover",
+    id = "list-modules",
+    method = "GET",
+    path = "/discover/modules",
+    summary = "获取模块列表",
+    description = "返回模块名称、版本和简要描述。"
+)]
+async fn list_modules() -> Json<ModuleListResponse> {
+    let catalog = registry::metadata();
     Json(ModuleListResponse {
         modules: catalog.iter().map(ModuleMetadata::summary).collect(),
     })
 }
 
-async fn get_module(
-    Path(module_id): Path<String>,
-    State(catalog): State<Catalog>,
-) -> Result<Json<ModuleMetadata>, Response> {
-    catalog
+#[loki_api(
+    module = "discover",
+    id = "get-module",
+    method = "GET",
+    path = "/discover/modules/{module_id}",
+    summary = "获取模块描述",
+    description = "根据模块标识返回单个模块的完整元数据。"
+)]
+async fn get_module(Path(module_id): Path<String>) -> Result<Json<ModuleMetadata>, Response> {
+    registry::metadata()
         .iter()
         .find(|module| module.id == module_id)
         .cloned()
@@ -65,11 +86,10 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::*;
-    use crate::modules::discover::{Module, model::ModuleDescriptor};
+    use crate::modules::discover::Module;
 
     fn app() -> Router {
-        let discover = Module::new();
-        router(Arc::new(vec![discover.metadata()]))
+        Module::new().router()
     }
 
     async fn get_json(path: &str) -> (StatusCode, Value) {
@@ -86,16 +106,39 @@ mod tests {
     async fn returns_full_module_catalog() {
         let (status, body) = get_json("/discover").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["modules"][0]["id"], "discover");
-        assert!(body["modules"][0]["apis"].is_array());
+        let discover = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["id"] == "discover")
+            .unwrap();
+        assert!(discover["apis"].is_array());
+        let config = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["id"] == "config")
+            .unwrap();
+        let get_module = config["apis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|api| api["id"] == "module-meta")
+            .unwrap();
+        assert_eq!(get_module["parameters"][0]["name"], "module_id");
     }
 
     #[tokio::test]
     async fn returns_module_summaries() {
         let (status, body) = get_json("/discover/modules").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["modules"][0]["id"], "discover");
-        assert!(body["modules"][0].get("apis").is_none());
+        let discover = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["id"] == "discover")
+            .unwrap();
+        assert!(discover.get("apis").is_none());
     }
 
     #[tokio::test]

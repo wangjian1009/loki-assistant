@@ -116,8 +116,3 @@ impl FieldMetadata {
         }
     }
 }
-
-/// 业务模块用于向 discover 注册自身元数据的接口。
-pub trait ModuleDescriptor {
-    fn metadata(&self) -> ModuleMetadata;
-}

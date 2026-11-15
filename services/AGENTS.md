@@ -38,6 +38,8 @@ src/
         ├── protocol.rs  配置接口响应模型
         ├── routes.rs    /meta 和 /data 路由
         └── service.rs   配置数据存储和变化订阅
+macros/
+└── src/lib.rs          #[loki_api] API 声明过程宏
 ```
 
 每个业务模块必须独立拥有自己的交互协议和路由。新增模块时，最大努力将实现限制在一个 `src/modules/<module>/` 目录中：
@@ -58,7 +60,7 @@ src/modules/<module>/
 | `services`              | 创建并持有所有业务模块，统一注册模块路由                         | `modules/*`、`runtime`                     |
 | `http`                  | loopback listener、公共 middleware、请求体限制和 server 生命周期 | `runtime`；不拥有业务协议                  |
 | `modules/health`        | 服务健康检查和基础运行状态                                       | `runtime`、`serde`                         |
-| `modules/discover`      | 返回完整模块目录、模块列表和单模块元数据                         | 各模块 `ModuleDescriptor`                  |
+| `modules/discover`      | 返回完整模块目录、模块列表和单模块元数据                         | `linkme` 静态模块/API 描述切片             |
 | `modules/emacs`         | `emacsclient` gateway、连接检查、会话操作和事件入口              | 本模块 `protocol`、平台进程 trait          |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
@@ -74,7 +76,7 @@ modules/<module>
 └── service ──> runtime/platform trait
 ```
 
-`http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。`Services::build()` 是新增模块后的唯一组合入口，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
+`http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 使用 `#[loki_api(...)]` 声明接口信息；`Services::build()` 只负责路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
 
 ## Rust 约定
 
@@ -86,4 +88,4 @@ modules/<module>
 
 ## 检查
 
-在 `services/` 目录执行 `cargo fmt --check` 和 `cargo test`。修改跨模块协议时，同时检查 `docs/agent-shell-control.org` 及调用方；纯文档变更不增加实现测试。
+在 `services/` 目录执行 `cargo fmt --check` 和 `cargo test --workspace`。修改跨模块协议时，同时检查 `docs/agent-shell-control.org` 及调用方；纯文档变更不增加实现测试。

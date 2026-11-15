@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::modules::discover::model::ModuleDescriptor;
 use crate::{
     modules::{config, discover, health},
     runtime::RuntimeState,
@@ -24,11 +23,10 @@ impl Services {
         let health = health::Module::new();
         let discover = discover::Module::new();
         let config = config::Module::new();
-        let catalog = vec![health.metadata(), discover.metadata(), config.metadata()];
 
         Self {
             health,
-            discover: discover.with_catalog(catalog),
+            discover,
             config,
         }
     }
