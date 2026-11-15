@@ -47,13 +47,14 @@ struct DashboardView: View {
             } label: {
                 Label {
                     Text("\(health.version) · \(formatUptime(status.uptimeSeconds ?? health.uptimeSeconds))")
+                        .monospacedDigit()
                 } icon: {
                     statusDot
                 }
             }
             .disabled(true)
             .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(width: 170, alignment: .leading)
         case .stopped:
             Button {
                 Task { await status.start() }
@@ -64,7 +65,7 @@ struct DashboardView: View {
             }
             .help("启动 services")
             .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(width: 170, alignment: .leading)
         case .unknown:
             statusInfoButton("检查中…")
         case .starting:
@@ -85,7 +86,7 @@ struct DashboardView: View {
         }
         .disabled(true)
         .buttonStyle(.borderless)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: 170, alignment: .leading)
     }
 
     private var statusDot: some View {

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -149,6 +150,11 @@ final class ConfigEditorModel {
     private(set) var message: String?
     private(set) var loading = false
     private(set) var serviceAvailable: Bool?
+    private var selectionHistory: [String] = []
+    private var historyIndex = -1
+
+    var canGoBack: Bool { historyIndex > 0 }
+    var canGoForward: Bool { historyIndex >= 0 && historyIndex < selectionHistory.count - 1 }
 
     func load() async {
         loading = true
@@ -161,6 +167,10 @@ final class ConfigEditorModel {
                 selectedModuleID = modules.first?.id
             }
             if let selectedModuleID {
+                if historyIndex < 0 {
+                    selectionHistory = [selectedModuleID]
+                    historyIndex = 0
+                }
                 try await loadData(for: selectedModuleID)
             }
             message = nil
@@ -171,6 +181,35 @@ final class ConfigEditorModel {
     }
 
     func select(moduleID: String) async {
+        if historyIndex < 0 || selectionHistory[historyIndex] != moduleID {
+            selectionHistory = Array(selectionHistory.prefix(historyIndex + 1))
+            selectionHistory.append(moduleID)
+            historyIndex = selectionHistory.count - 1
+        }
+        selectedModuleID = moduleID
+        do {
+            try await loadData(for: moduleID)
+            serviceAvailable = true
+            message = nil
+        } catch {
+            serviceAvailable = false
+            message = nil
+        }
+    }
+
+    func goBack() async {
+        guard canGoBack else { return }
+        historyIndex -= 1
+        await selectFromHistory(selectionHistory[historyIndex])
+    }
+
+    func goForward() async {
+        guard canGoForward else { return }
+        historyIndex += 1
+        await selectFromHistory(selectionHistory[historyIndex])
+    }
+
+    private func selectFromHistory(_ moduleID: String) async {
         selectedModuleID = moduleID
         do {
             try await loadData(for: moduleID)
@@ -199,6 +238,10 @@ final class ConfigEditorModel {
                 body: value
             )
             values[item.key] = value
+            if moduleID == "control-center", item.key == "center_auto_start",
+               case let .boolean(enabled) = value {
+                try await CenterAutostartManager.setEnabled(enabled)
+            }
             message = "已保存"
         } catch {
             message = error.localizedDescription
@@ -233,5 +276,86 @@ final class ConfigEditorModel {
             throw URLError(.badServerResponse)
         }
         return try JSONDecoder().decode(Response.self, from: data)
+    }
+}
+
+private enum CenterAutostartManager {
+    private static let label = "cc.loki-assistant.center"
+    private static let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
+
+    static func setEnabled(_ enabled: Bool) async throws {
+        if enabled {
+            let plist = try writePlist()
+            _ = try await run(["bootstrap", "gui/\(getuid())", plist.path])
+        } else {
+            _ = try await run(["bootout", "gui/\(getuid())/\(label)"])
+            try? FileManager.default.removeItem(at: plistURL)
+        }
+    }
+
+    private static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/LaunchAgents")
+            .appending(path: "\(label).plist")
+    }
+
+    private static func centerExecutableURL() -> URL {
+        Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "center/mac/.build/Debug/LokiAssistant.app/Contents/MacOS/LokiAssistant")
+    }
+
+    private static func writePlist() throws -> URL {
+        let executable = centerExecutableURL()
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>Label</key><string>\(label)</string>
+        <key>ProgramArguments</key><array><string>\(executable.path)</string></array>
+        <key>RunAtLoad</key><true/>
+        <key>KeepAlive</key><false/>
+        </dict></plist>
+        """
+        try FileManager.default.createDirectory(
+            at: plistURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+        return plistURL
+    }
+
+    private static func run(_ arguments: [String]) async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = launchctlURL
+            process.arguments = arguments
+            process.terminationHandler = { process in
+                if process.terminationStatus == 0 {
+                    continuation.resume(returning: process.terminationStatus)
+                } else {
+                    continuation.resume(throwing: AutostartError.failed(arguments.joined(separator: " ")))
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+}
+
+private enum AutostartError: LocalizedError {
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .failed(command): "无法更新菜单栏程序自动启动：\(command)"
+        }
     }
 }

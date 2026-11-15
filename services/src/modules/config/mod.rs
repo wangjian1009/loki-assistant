@@ -21,6 +21,12 @@ static CONFIG_METADATA: registry::ConfigModuleRegistration = registry::ConfigMod
     metadata: Module::config_metadata,
 };
 
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_MODULES)]
+static CONTROL_CENTER_METADATA: registry::ConfigModuleRegistration =
+    registry::ConfigModuleRegistration {
+        metadata: Module::control_center_metadata,
+    };
+
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static CONFIG_MODULE: ModuleRegistration = ModuleRegistration {
     id: "config",
@@ -74,6 +80,27 @@ impl Module {
             description: "提供配置模型、配置数据读取、更新和变化订阅。".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             items: Vec::new(),
+        }
+    }
+
+    pub fn control_center_metadata() -> ConfigModuleMetadata {
+        ConfigModuleMetadata {
+            id: "control-center".to_owned(),
+            name: "控制中心".to_owned(),
+            description: "控制菜单栏程序的启动行为。".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            items: vec![model::ConfigItemMetadata {
+                key: "center_auto_start".to_owned(),
+                name: "登录时自动启动".to_owned(),
+                description: "登录 macOS 后自动启动菜单栏程序。".to_owned(),
+                data_type: model::ConfigDataType::Boolean,
+                required: false,
+                default: Some(serde_json::Value::Bool(false)),
+                dictionary: None,
+                list: None,
+                checker: None,
+                file_path: None,
+            }],
         }
     }
 }
