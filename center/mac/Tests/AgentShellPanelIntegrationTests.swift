@@ -82,15 +82,28 @@ final class AgentShellPanelIntegrationTests: XCTestCase {
         ), "t")
 
         window.orderOut(nil)
-        await model.refreshSessions(configuration: EmacsConfiguration(
-            executablePath: "/loki-panel-test-missing/emacsclient", socketName: ""
-        ))
-        XCTAssertEqual(model.sessionMessage, EmacsClientError.executableNotFound.localizedDescription)
+        XCTAssertEqual(model.selectedSessionID, session.id)
+        XCTAssertFalse(model.sessionMessage.isEmpty)
         window.makeKeyAndOrderFront(nil)
         try await waitUntil { !model.isLoadingSessions && model.sessionMessage.isEmpty }
         XCTAssertEqual(model.selectedSessionID, session.id)
         XCTAssertEqual(model.promptText, "界面验收草稿")
-        print("真实界面联调：列出 \(model.sessions.count) 个会话，整行点击已激活 Emacs，重新打开面板已自动刷新并保留草稿")
+
+        defaults.set("loki-panel-test-missing-server", forKey: EmacsConfiguration.socketNameKey)
+        try await waitUntil {
+            model.configuration?.socketName == "loki-panel-test-missing-server"
+                && model.sessions.isEmpty && model.selectedSessionID == nil
+        }
+        XCTAssertEqual(model.promptText, "界面验收草稿")
+        defaults.set(configuration.socketName, forKey: EmacsConfiguration.socketNameKey)
+        // 确认视图已读取恢复后的配置，再重开窗口触发刷新。
+        try await waitUntil { model.configuration == configuration }
+        window.orderOut(nil)
+        window.makeKeyAndOrderFront(nil)
+        try await waitUntil { !model.isLoadingSessions && !model.sessions.isEmpty }
+        XCTAssertNil(model.selectedSessionID)
+        XCTAssertEqual(model.promptText, "界面验收草稿")
+        print("真实界面联调：列出 \(model.sessions.count) 个会话，整行点击已激活 Emacs；重开刷新及连接设置切换后恢复通过，草稿保留")
     }
 
     @MainActor

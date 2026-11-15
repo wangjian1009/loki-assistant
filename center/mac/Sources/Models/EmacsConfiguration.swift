@@ -1,6 +1,6 @@
 import Foundation
 
-struct EmacsConfiguration: Sendable {
+struct EmacsConfiguration: Equatable, Sendable {
     static let executablePathKey = "emacsclientPath"
     static let socketNameKey = "emacsSocketName"
 

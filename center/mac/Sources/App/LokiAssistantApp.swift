@@ -12,7 +12,7 @@ struct LokiAssistantApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView()
+            SettingsView(model: model)
         }
     }
 }

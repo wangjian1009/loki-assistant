@@ -1,10 +1,16 @@
 import SwiftUI
 
 struct SettingsView: View {
+    let model: ApplicationModel
+
     @AppStorage(EmacsConfiguration.executablePathKey)
     private var executablePath = EmacsConfiguration.defaultExecutablePath
     @AppStorage(EmacsConfiguration.socketNameKey)
     private var socketName = ""
+
+    private var configuration: EmacsConfiguration {
+        EmacsConfiguration(executablePath: executablePath, socketName: socketName)
+    }
 
     var body: some View {
         Form {
@@ -17,5 +23,8 @@ struct SettingsView: View {
         .textFieldStyle(.roundedBorder)
         .padding(24)
         .frame(width: 540)
+        .onChange(of: configuration, initial: true) { _, configuration in
+            model.updateConfiguration(configuration)
+        }
     }
 }

@@ -40,7 +40,7 @@
 ** 实现范围
 
 - Emacs 端按稳定 session ID 重新查找存活 buffer，显示目标 buffer；目标失效时返回 ~session-not-found~ 。
-- Mac 端发送 ~select-session~ 请求，成功后保留选中会话并尝试激活 Emacs 应用。
+- Mac 端发送 ~select-session~ 请求，成功后保留选中会话，并按响应中的 ~emacs_pid~ 激活所属 Emacs 进程。
 
 ** 验证状态
 
@@ -53,6 +53,21 @@
 - 已验证：应用宿主内以 ~NSHostingView~ 呈现实际 ~AgentShellView~ ，自动列出当前 4 个真实会话。点击行右侧空白区域后，目标 Emacs 的前台进程与选中 buffer 会话标识均符合预期。
 - 已验证：关闭并重开同一窗口后，自动刷新成功，选中项和草稿保留；联调结束恢复原有 Emacs 窗口布局。~make test-connection~ 的 8 项 XCTest 通过。
 - 上述覆盖实际视图与真实 Emacs；系统菜单栏图标的人工点击验收仍待确认。
+
+** 会话失效与目标进程（2026-11-15）
+
+- 刷新成功后，原选会话不在列表中时清除选中项；切换或发送返回 ~session-not-found~ 时移除对应条目及其选中状态。草稿始终保留。
+- 连接或刷新暂时失败时保留原列表、选中项及草稿，显示错误；下一次成功刷新后按实际会话重新校验。
+- 插件 ~0.2.0~ 的切换响应新增必填 ~emacs_pid~ ，值为执行请求的 Emacs 进程 PID。Mac 使用此 PID 激活目标进程，激活失败时提示原因。
+- 已验证：5 项 Mac 状态测试覆盖失效清理、空列表、失败恢复、草稿保留、目标 PID 及激活失败提示。编码测试拒绝缺失、零或负数 PID；Emacs ERT 校验返回值等于 ~emacs-pid~ 。
+- ~make test~ 通过；显式指定 ~server~ 的真实联调中，13 项 XCTest 全部通过，插件返回版本 ~0.2.0~ 。
+
+** 连接设置切换（2026-11-15）
+
+- 修改 ~emacsclient~ 路径或 server 后，立即清理旧连接的列表、选中项与连接提示，保留未发送草稿。重新打开面板或手动刷新后加载新连接的会话，需重新选择发送目标。
+- 每次设置变更都会使先前请求的界面结果失效。旧列表、切换、发送及连接检查的迟到响应不能覆盖当前状态、清空草稿、结束新请求的加载提示或激活旧 Emacs；切回原设置时仍须遵守此约定。
+- 忽略旧响应不表示 Emacs 内已经执行的操作被撤销；不因设置切换自动重发需求。
+- 已验证：6 项并发状态测试通过可控响应顺序验证上述行为，包含不同 server 返回相同会话 ID 的情况。真实视图验证了配置变化后清理旧选择、恢复设置后重新加载会话及保留草稿；19 项 XCTest 通过。
 
 * DONE agent-shell 需求发送
 
@@ -141,10 +156,14 @@ Mac 应用以独立子进程执行 ~emacsclient --eval~ ，从标准输出获取
 |------------------+--------------------------+------------------------+------------------------------|
 | ping             | 空对象                   | emacs_version, plugin_version | 检查插件连接与版本      |
 | list-sessions    | 空对象                   | sessions 数组          | 返回当前 agent-shell 会话    |
-| select-session   | session_id               | session_id             | 在 Emacs 中显示目标 buffer   |
+| select-session   | session_id               | session_id, emacs_pid  | 在 Emacs 中显示目标 buffer   |
 | send-prompt      | session_id, prompt       | session_id, accepted   | 向目标会话提交需求           |
 
 当前已实现 ~ping~、~list-sessions~、~select-session~ 和 ~send-prompt~ 。请求标识必须为 1 至 128 个字符的字符串，参数必须为 JSON 对象。
+
+~select-session~ 成功结果的 ~emacs_pid~ 为正整数，由插件返回 ~emacs-pid~ 的实际值。Mac 必须按此 PID 激活所属 Emacs，不按应用名选择其他实例。进程不存在或无法激活时，保留已选会话并明确提示激活失败。
+
+协议版本保持 ~1~；~emacs_pid~ 从插件 ~0.2.0~ 起提供。当前 Mac 应用需要同步加载该版本插件，缺失或无效的 PID 按无效响应处理，不能回退到按名称激活。
 
 会话包含 ~id~ 、 ~buffer_name~ 、 ~project_path~ 和 ~status~ 。项目路径无法获取时为 ~null~ ；状态为 ~ready~ 、 ~busy~ 或 ~unknown~ ，适配时须依据真实 API 判断。
 

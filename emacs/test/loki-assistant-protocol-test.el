@@ -57,7 +57,8 @@
                               :params params)))
              (result (gethash "result" response)))
         (should (eq (gethash "ok" response) t))
-        (should (equal (gethash "session_id" result) session-id)))))
+        (should (equal (gethash "session_id" result) session-id))
+        (should (equal (gethash "emacs_pid" result) (emacs-pid))))))
   (let* ((params (make-hash-table :test 'equal)))
     (puthash "session_id" "missing-session" params)
     (let ((response (loki-assistant-test--request

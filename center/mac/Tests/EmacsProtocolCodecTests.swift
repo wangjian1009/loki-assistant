@@ -50,7 +50,7 @@ final class EmacsProtocolCodecTests: XCTestCase {
     func testSelectedSessionDecodes() throws {
         let response = try output([
             "version": 1, "id": "select-1", "ok": true,
-            "result": ["session_id": "session-1"]
+            "result": ["session_id": "session-1", "emacs_pid": 1234]
         ])
         let result = try EmacsProtocolCodec.decode(
             response,
@@ -58,6 +58,20 @@ final class EmacsProtocolCodecTests: XCTestCase {
             as: SelectedSession.self
         )
         XCTAssertEqual(result.sessionID, "session-1")
+        XCTAssertEqual(result.emacsPID, 1234)
+        let invalidPayloads: [[String: Any]] = [
+            ["session_id": "session-1"],
+            ["session_id": "session-1", "emacs_pid": 0],
+            ["session_id": "session-1", "emacs_pid": -1]
+        ]
+        for payload in invalidPayloads {
+            let invalid = try output([
+                "version": 1, "id": "select-1", "ok": true, "result": payload
+            ])
+            XCTAssertThrowsError(try EmacsProtocolCodec.decode(
+                invalid, requestID: "select-1", as: SelectedSession.self
+            ))
+        }
     }
 
     func testAcceptedPromptDecodes() throws {

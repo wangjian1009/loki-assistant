@@ -37,9 +37,24 @@ struct SessionList: Decodable, Sendable {
 
 struct SelectedSession: Decodable, Sendable {
     let sessionID: String
+    let emacsPID: Int32
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
+        case emacsPID = "emacs_pid"
+    }
+}
+
+extension SelectedSession {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        emacsPID = try values.decode(Int32.self, forKey: .emacsPID)
+        guard emacsPID > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .emacsPID, in: values, debugDescription: "Emacs PID 必须为正整数"
+            )
+        }
     }
 }
 

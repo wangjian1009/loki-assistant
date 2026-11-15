@@ -1,6 +1,6 @@
 ;;; loki-assistant.el --- Local control endpoint for Loki Assistant -*- lexical-binding: t; -*-
 
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, processes
 
@@ -13,7 +13,7 @@
 (require 'loki-assistant-protocol)
 (require 'loki-assistant-agent-shell)
 
-(defconst loki-assistant-version "0.1.0"
+(defconst loki-assistant-version "0.2.0"
   "Version of the Loki Assistant Emacs plugin.")
 
 (defun loki-assistant--dispatch (operation params)

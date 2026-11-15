@@ -1,6 +1,13 @@
 import Foundation
 
-struct EmacsClient: Sendable {
+protocol EmacsCommunicating: Sendable {
+    func ping(configuration: EmacsConfiguration) async throws -> ConnectionInfo
+    func listSessions(configuration: EmacsConfiguration) async throws -> SessionList
+    func selectSession(configuration: EmacsConfiguration, sessionID: String) async throws -> SelectedSession
+    func sendPrompt(configuration: EmacsConfiguration, sessionID: String, prompt: String) async throws -> AcceptedPrompt
+}
+
+struct EmacsClient: EmacsCommunicating {
     func ping(configuration: EmacsConfiguration) async throws -> ConnectionInfo {
         let request = EmacsRequest(id: UUID().uuidString, operation: "ping")
         return try await execute(request, configuration: configuration, as: ConnectionInfo.self)

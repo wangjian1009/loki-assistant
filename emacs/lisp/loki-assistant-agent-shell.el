@@ -70,7 +70,7 @@
     (condition-case err
         (progn
           (pop-to-buffer buffer)
-          (list :session_id session-id))
+          (list :session_id session-id :emacs_pid (emacs-pid)))
       (error
        (message "Loki Assistant agent-shell select failed: %S" err)
        (loki-assistant-protocol--fail

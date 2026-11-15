@@ -35,8 +35,7 @@ struct AgentShellView: View {
 
             Button("检查连接") {
                 Task {
-                    await model.checkConnection(configuration: EmacsConfiguration(
-                        executablePath: executablePath, socketName: socketName))
+                    await model.checkConnection(configuration: configuration)
                 }
             }
             .disabled(model.isCheckingConnection)
@@ -143,6 +142,9 @@ struct AgentShellView: View {
         }
         .padding(20)
         .frame(width: 360)
+        .onChange(of: configuration, initial: true) { _, configuration in
+            model.updateConfiguration(configuration)
+        }
         .background {
             PanelVisibilityObserver {
                 Task {

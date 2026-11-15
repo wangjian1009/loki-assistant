@@ -5,6 +5,10 @@ import Observation
 @MainActor
 @Observable
 final class ApplicationModel {
+    private let client: any EmacsCommunicating
+    private let activateApplication: @MainActor (Int32) -> Bool
+    private(set) var configuration: EmacsConfiguration?
+    private var configurationGeneration = UUID()
     private(set) var connectionMessage = "尚未连接 Emacs"
     private(set) var isCheckingConnection = false
     private(set) var sessions: [AgentSession] = []
@@ -15,68 +19,122 @@ final class ApplicationModel {
     var promptText = ""
     private(set) var isSendingPrompt = false
 
+    init(
+        client: any EmacsCommunicating = EmacsClient(),
+        activateApplication: @escaping @MainActor (Int32) -> Bool = { processID in
+            NSRunningApplication(processIdentifier: processID)?.activate() ?? false
+        }
+    ) {
+        self.client = client
+        self.activateApplication = activateApplication
+    }
+
+    func updateConfiguration(_ configuration: EmacsConfiguration) {
+        guard self.configuration != configuration else { return }
+        let hadConfiguration = self.configuration != nil
+        self.configuration = configuration
+        configurationGeneration = UUID()
+        connectionMessage = "尚未连接 Emacs"
+        sessions = []
+        selectedSessionID = nil
+        sessionMessage = hadConfiguration ? "连接设置已更改，请刷新会话" : "尚未加载会话"
+        isCheckingConnection = false
+        isLoadingSessions = false
+        isSelectingSession = false
+        isSendingPrompt = false
+    }
+
     func checkConnection(configuration: EmacsConfiguration) async {
+        updateConfiguration(configuration)
         guard !isCheckingConnection else { return }
+        let generation = configurationGeneration
         isCheckingConnection = true
         connectionMessage = "正在连接…"
-        defer { isCheckingConnection = false }
+        defer {
+            if configurationGeneration == generation { isCheckingConnection = false }
+        }
 
         do {
-            let info = try await EmacsClient().ping(configuration: configuration)
+            let info = try await client.ping(configuration: configuration)
+            guard configurationGeneration == generation else { return }
             connectionMessage = "已连接 Emacs \(info.emacsVersion) · 插件 \(info.pluginVersion)"
         } catch {
+            guard configurationGeneration == generation else { return }
             connectionMessage = error.localizedDescription
         }
     }
 
     func refreshSessions(configuration: EmacsConfiguration) async {
+        updateConfiguration(configuration)
         guard !isLoadingSessions else { return }
+        let generation = configurationGeneration
         isLoadingSessions = true
         sessionMessage = "正在读取会话…"
-        defer { isLoadingSessions = false }
+        defer {
+            if configurationGeneration == generation { isLoadingSessions = false }
+        }
 
         do {
-            let result = try await EmacsClient().listSessions(configuration: configuration)
+            let result = try await client.listSessions(configuration: configuration)
+            guard configurationGeneration == generation else { return }
             sessions = result.sessions
             sessionMessage = result.sessions.isEmpty ? "当前没有 agent-shell 会话" : ""
+            if let selectedSessionID, !sessions.contains(where: { $0.id == selectedSessionID }) {
+                self.selectedSessionID = nil
+                if !sessions.isEmpty {
+                    sessionMessage = "原选会话已失效，请重新选择"
+                }
+            }
         } catch {
+            guard configurationGeneration == generation else { return }
             sessionMessage = error.localizedDescription
         }
     }
 
     func selectSession(sessionID: String, configuration: EmacsConfiguration) async {
+        updateConfiguration(configuration)
         guard !isSelectingSession else { return }
+        guard sessions.contains(where: { $0.id == sessionID }) else {
+            sessionMessage = "请先刷新会话列表并重新选择"
+            return
+        }
+        let generation = configurationGeneration
         isSelectingSession = true
-        defer { isSelectingSession = false }
+        defer {
+            if configurationGeneration == generation { isSelectingSession = false }
+        }
 
         do {
-            let result = try await EmacsClient().selectSession(
+            let result = try await client.selectSession(
                 configuration: configuration,
                 sessionID: sessionID
             )
+            guard configurationGeneration == generation else { return }
             selectedSessionID = result.sessionID
             let bufferName = sessions.first { $0.id == result.sessionID }?.bufferName ?? result.sessionID
-            if activateEmacs() {
+            if activateApplication(result.emacsPID) {
                 sessionMessage = "已激活会话：\(bufferName)"
             } else {
                 sessionMessage = "已显示会话，但无法激活 Emacs：\(bufferName)"
             }
         } catch {
+            guard configurationGeneration == generation else { return }
+            if case EmacsClientError.remote(code: "session-not-found", message: _) = error {
+                removeSession(sessionID)
+            }
             sessionMessage = error.localizedDescription
         }
     }
 
-    private func activateEmacs() -> Bool {
-        guard let application = NSWorkspace.shared.runningApplications.first(where: { application in
-            application.bundleIdentifier?.hasPrefix("org.gnu.Emacs") == true
-                || application.localizedName == "Emacs"
-        }) else {
-            return false
+    private func removeSession(_ sessionID: String) {
+        sessions.removeAll { $0.id == sessionID }
+        if selectedSessionID == sessionID {
+            selectedSessionID = nil
         }
-        return application.activate()
     }
 
     func sendPrompt(configuration: EmacsConfiguration) async {
+        updateConfiguration(configuration)
         guard !isSendingPrompt else { return }
         guard let selectedSessionID else {
             sessionMessage = "请先选择 agent-shell 会话"
@@ -88,16 +146,20 @@ final class ApplicationModel {
         }
 
         let prompt = promptText
+        let generation = configurationGeneration
         isSendingPrompt = true
         sessionMessage = "正在发送需求…"
-        defer { isSendingPrompt = false }
+        defer {
+            if configurationGeneration == generation { isSendingPrompt = false }
+        }
 
         do {
-            let result = try await EmacsClient().sendPrompt(
+            let result = try await client.sendPrompt(
                 configuration: configuration,
                 sessionID: selectedSessionID,
                 prompt: prompt
             )
+            guard configurationGeneration == generation else { return }
             guard result.accepted else {
                 sessionMessage = "agent-shell 未接受需求"
                 return
@@ -107,6 +169,10 @@ final class ApplicationModel {
             }
             sessionMessage = "需求已提交"
         } catch {
+            guard configurationGeneration == generation else { return }
+            if case EmacsClientError.remote(code: "session-not-found", message: _) = error {
+                removeSession(selectedSessionID)
+            }
             sessionMessage = error.localizedDescription
         }
     }

@@ -53,6 +53,8 @@ if(BUILD_TESTING)
     find_package(XCTest REQUIRED)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
         Tests/AgentShellPanelIntegrationTests.swift
+        Tests/ApplicationModelTests.swift
+        Tests/ApplicationModelConfigurationTests.swift
         Tests/EmacsProtocolCodecTests.swift
         Tests/EmacsConnectionIntegrationTests.swift
     )
