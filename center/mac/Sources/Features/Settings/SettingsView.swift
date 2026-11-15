@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 struct SettingsButton: NSViewRepresentable {
+    var dismissSourceWindow = true
     @Environment(\.openSettings) private var openSettings
 
     func makeNSView(context: Context) -> NSButton {
@@ -17,22 +18,27 @@ struct SettingsButton: NSViewRepresentable {
 
     func updateNSView(_ button: NSButton, context: Context) {
         context.coordinator.openSettings = { openSettings() }
+        context.coordinator.dismissSourceWindow = dismissSourceWindow
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(openSettings: { openSettings() })
+        Coordinator(openSettings: { openSettings() }, dismissSourceWindow: dismissSourceWindow)
     }
 
     @MainActor
     final class Coordinator: NSObject {
         var openSettings: () -> Void
+        var dismissSourceWindow: Bool
 
-        init(openSettings: @escaping () -> Void) {
+        init(openSettings: @escaping () -> Void, dismissSourceWindow: Bool) {
             self.openSettings = openSettings
+            self.dismissSourceWindow = dismissSourceWindow
         }
 
         @objc func showSettings(_ sender: NSButton) {
-            SettingsWindowPresenter.shared.show(from: sender.window, openSettings: openSettings)
+            SettingsWindowPresenter.shared.show(
+                from: dismissSourceWindow ? sender.window : nil, openSettings: openSettings
+            )
         }
     }
 }
@@ -63,7 +69,7 @@ final class SettingsWindowPresenter {
             guard let self, self.isRequested, let window = self.window else { return }
             self.isRequested = false
             if window.isMiniaturized { window.deminiaturize(nil) }
-            NSRunningApplication.current.activate()
+            NSApplication.shared.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
         }

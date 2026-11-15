@@ -111,11 +111,13 @@ final class SettingsWindowTests: XCTestCase {
     }
 
     @MainActor
-    private func waitUntil(_ condition: () -> Bool) async throws {
+    private func waitUntil(
+        file: StaticString = #filePath, line: UInt = #line, _ condition: () -> Bool
+    ) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while !condition() {
             guard ContinuousClock.now < deadline else {
-                XCTFail("等待设置窗口置前超时")
+                XCTFail("等待设置窗口置前超时", file: file, line: line)
                 throw EmacsClientError.timedOut
             }
             try await Task.sleep(for: .milliseconds(50))

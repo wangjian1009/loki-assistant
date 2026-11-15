@@ -5,6 +5,29 @@ final class ApplicationModelTests: XCTestCase {
     private let configuration = EmacsConfiguration(executablePath: "/unused/emacsclient", socketName: "")
 
     @MainActor
+    func testBrowsingSessionDoesNotActivateEmacsAndCanSendToFocusedTarget() async {
+        let client = SessionClientStub()
+        var activatedPIDs: [Int32] = []
+        let model = ApplicationModel(client: client, activateApplication: {
+            activatedPIDs.append($0)
+            return true
+        })
+        await model.refreshSessions(configuration: configuration)
+        model.focusSession(sessionID: "first")
+        XCTAssertEqual(model.selectedSessionID, "first")
+        XCTAssertTrue(activatedPIDs.isEmpty)
+        model.focusSession(sessionID: "missing")
+        XCTAssertEqual(model.selectedSessionID, "first")
+        model.promptText = "发送到浏览中的会话"
+        await model.sendPrompt(configuration: configuration)
+        let sendCount = await client.sendCount
+        XCTAssertEqual(sendCount, 1)
+        let sentSessionIDs = await client.sentSessionIDs
+        XCTAssertEqual(sentSessionIDs, ["first"])
+        XCTAssertTrue(activatedPIDs.isEmpty)
+    }
+
+    @MainActor
     func testRefreshClearsClosedSelectionAndPreservesDraft() async {
         let client = SessionClientStub()
         let model = ApplicationModel(client: client, activateApplication: { _ in true })
@@ -65,6 +88,8 @@ final class ApplicationModelTests: XCTestCase {
         XCTAssertEqual(model.sessions.count, 2)
         XCTAssertEqual(model.sessionMessage, EmacsClientError.timedOut.localizedDescription)
         XCTAssertFalse(model.isLoadingSessions)
+        XCTAssertNotNil(model.sessionRefreshError)
+        XCTAssertNotNil(model.lastSessionsRefresh, "失败后保留上次成功刷新的时间")
 
         await client.setListError(nil)
         await client.setSessions([])
@@ -73,6 +98,7 @@ final class ApplicationModelTests: XCTestCase {
         XCTAssertTrue(model.sessions.isEmpty)
         XCTAssertEqual(model.sessionMessage, "当前没有 agent-shell 会话")
         XCTAssertEqual(model.promptText, "草稿")
+        XCTAssertNil(model.sessionRefreshError)
     }
 
     @MainActor
@@ -118,6 +144,7 @@ private actor SessionClientStub: EmacsCommunicating {
     private var sessions = [first, second]
     private var listError: EmacsClientError?
     private(set) var sendCount = 0
+    private(set) var sentSessionIDs: [String] = []
 
     func setSessions(_ sessions: [AgentSession]) { self.sessions = sessions }
     func setListError(_ error: EmacsClientError?) { listError = error }
@@ -140,6 +167,7 @@ private actor SessionClientStub: EmacsCommunicating {
 
     func sendPrompt(configuration: EmacsConfiguration, sessionID: String, prompt: String) async throws -> AcceptedPrompt {
         sendCount += 1
+        sentSessionIDs.append(sessionID)
         throw EmacsClientError.remote(code: "session-not-found", message: "目标会话已失效")
     }
 }

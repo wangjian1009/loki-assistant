@@ -7,7 +7,7 @@ struct LokiAssistantApp: App {
 
     var body: some Scene {
         MenuBarExtra("Loki Assistant", systemImage: "terminal") {
-            AgentShellView(model: model)
+            DashboardView(model: model)
         }
         .menuBarExtraStyle(.window)
 

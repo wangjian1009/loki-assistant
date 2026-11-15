@@ -15,9 +15,12 @@ project(LokiAssistant VERSION 0.1.0 LANGUAGES Swift)
 set(LOKI_APP_SOURCES
     Sources/App/ApplicationModel.swift
     Sources/App/LokiAssistantApp.swift
+    Sources/App/WindowVisibilityObserver.swift
     Sources/Emacs/EmacsClient.swift
     Sources/Emacs/EmacsProtocolCodec.swift
     Sources/Features/AgentShell/AgentShellView.swift
+    Sources/Features/AgentShell/AgentShellWindowPresenter.swift
+    Sources/Features/Dashboard/DashboardView.swift
     Sources/Features/Settings/SettingsView.swift
     Sources/Models/EmacsConfiguration.swift
     Sources/Models/EmacsProtocol.swift
@@ -52,7 +55,8 @@ if(BUILD_TESTING)
     set_property(TARGET LokiAssistant PROPERTY XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME NO)
     find_package(XCTest REQUIRED)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
-        Tests/AgentShellPanelIntegrationTests.swift
+        Tests/AgentShellWindowIntegrationTests.swift
+        Tests/AgentShellWindowTests.swift
         Tests/ApplicationModelTests.swift
         Tests/ApplicationModelConfigurationTests.swift
         Tests/EmacsProtocolCodecTests.swift

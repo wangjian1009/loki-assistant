@@ -3,9 +3,9 @@ import SwiftUI
 import XCTest
 @testable import LokiAssistant
 
-final class AgentShellPanelIntegrationTests: XCTestCase {
+final class AgentShellWindowIntegrationTests: XCTestCase {
     @MainActor
-    func testSessionPanelLoadsSelectsAndRefreshesOnReopen() async throws {
+    func testSessionWindowBrowsesOpensInEmacsAndRefreshesOnReopen() async throws {
         let environment = ProcessInfo.processInfo.environment
         try XCTSkipUnless(environment["LOKI_TEST_CONNECTION"] == "1", "通过 make test-connection 验证真实会话界面")
         let configuration = EmacsConfiguration(
@@ -22,8 +22,8 @@ final class AgentShellPanelIntegrationTests: XCTestCase {
         model.promptText = "界面验收草稿"
         let host = NSHostingView(rootView: AgentShellView(model: model).defaultAppStorage(defaults))
         let window = NSWindow(
-            contentRect: NSRect(x: 200, y: 200, width: 360, height: 650),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false
+            contentRect: NSRect(x: 200, y: 200, width: 1040, height: 720),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
         window.isReleasedWhenClosed = false
         window.contentView = host
@@ -73,6 +73,8 @@ final class AgentShellPanelIntegrationTests: XCTestCase {
             NSApplication.shared.sendEvent(event)
         }
         try await waitUntil { !model.isSelectingSession && model.selectedSessionID == session.id }
+        // 列表选择只浏览；显式打开操作才请求切换 buffer 并激活 Emacs。
+        await model.selectSession(sessionID: session.id, configuration: configuration)
         try await waitUntil { NSWorkspace.shared.frontmostApplication?.processIdentifier == emacsPID }
         XCTAssertTrue(model.sessionMessage.hasPrefix("已激活会话："), model.sessionMessage)
         let encodedID = Data(session.id.utf8).base64EncodedString()
@@ -103,7 +105,7 @@ final class AgentShellPanelIntegrationTests: XCTestCase {
         try await waitUntil { !model.isLoadingSessions && !model.sessions.isEmpty }
         XCTAssertNil(model.selectedSessionID)
         XCTAssertEqual(model.promptText, "界面验收草稿")
-        print("真实界面联调：列出 \(model.sessions.count) 个会话，整行点击已激活 Emacs；重开刷新及连接设置切换后恢复通过，草稿保留")
+        print("真实界面联调：列出 \(model.sessions.count) 个会话，整行点击浏览、显式打开激活 Emacs；重开刷新及连接设置切换后恢复通过，草稿保留")
     }
 
     @MainActor

@@ -8,7 +8,7 @@
 
 项目已实现 Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查。真实通信的验证范围与结果见 [[file:docs/agent-shell-control.org][第一阶段设计]]。
 
-当前应用支持检查 Emacs 连接、刷新和切换 agent-shell 会话，并向选定会话发送需求。
+菜单栏弹出框作为只读状态仪表盘，显示 Emacs 连接、会话数量及更新时间。独立会话窗口支持搜索、状态筛选、刷新、在 Emacs 中打开会话，以及向选定会话发送需求。
 
 第一阶段计划提供 macOS 菜单栏入口，控制本机 Emacs 中的 agent-shell：
 
@@ -29,7 +29,8 @@ Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调�
 
 1. 按 Emacs 插件说明配置加载路径，在已有 Emacs 中加载插件并启动 server。
 2. 在仓库根目录执行 ~make run~ 构建并运行 Mac 应用，详见 [[file:center/README.org][主程序说明]]。
-3. 点击菜单栏图标，在设置中确认 emacsclient 路径及 server，点击“检查连接”。
+3. 点击菜单栏图标，在设置中确认 emacsclient 路径及 server；重开仪表盘自动检查连接。
+4. 点击“打开会话管理”，在独立窗口中选择会话并发送需求；点击“在 Emacs 中打开”可查看完整对话。
 
 连接检查本身不需要安装 agent-shell；后续会话控制需要它。
 
@@ -53,7 +54,7 @@ Mac 应用使用 SwiftUI 与必要的 AppKit，通过 ~emacsclient --eval~ 调�
 
 ~make test~ 需要已有 Emacs server；仅检查 Mac 部分可执行 ~make test-mac~ 。
 
-~make test-connection~ 使用已有 Emacs server，重新加载当前插件源码，在 Mac 应用宿主中检查真实连接、失败恢复、会话列表显示和整行点击激活。会话检查需要安装 agent-shell；存在会话时，还会验证重新打开面板后的刷新、选中项及草稿保留，结束后恢复 Emacs 窗口布局。没有会话时跳过点击验证。此入口不启动或退出 Emacs，也不发送需求。普通 ~make test-mac~ 跳过依赖真实 Emacs 的联调检查。
+~make test-connection~ 使用已有 Emacs server，重新加载当前插件源码，在 Mac 应用宿主中检查真实连接、失败恢复、会话列表显示、整行选择与显式打开激活。会话检查需要安装 agent-shell；存在会话时，还会验证重新打开会话窗口后的刷新、选中项及草稿保留，结束后恢复 Emacs 窗口布局。没有会话时跳过点击验证。此入口不启动或退出 Emacs，也不发送需求。普通 ~make test-mac~ 跳过依赖真实 Emacs 的联调检查。
 
 可通过 ~CONFIG~ 选择构建配置，通过 ~BUILD_DIR~ 和 ~RELEASE_BUILD_DIR~ 指定输出目录；工具路径支持 ~CMAKE~ 、 ~CTEST~ 、 ~EMACSCLIENT~ 和 ~OPEN~ 覆盖。~EMACS_SOCKET~ 可为 Emacs 测试及联调指定 server 名称或 socket 路径，留空使用默认 server。例如：
 
