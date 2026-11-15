@@ -15,6 +15,7 @@
 | ~runtime~ | 读取启动地址、管理进程生命周期和运行状态 | 首步实现环境变量配置 |
 | ~http~ | 仅监听 loopback、路由、请求解码和响应编码 | 首步实现 ~GET /healthz~ |
 | ~modules/health~ | 健康检查和基础运行状态 | 首步实现 ~GET /healthz~ |
+| ~modules/discover~ | 模块元数据和 HTTP API 发现 | 首步实现三个 ~/discover~ 接口 |
 | ~modules/emacs~ | 调用 ~emacsclient~、连接检查、请求转发和事件入口 | 下一步 |
 | ~modules/voice~ | 录音状态、识别结果和确认流程 | 后续；先定义状态边界 |
 | ~modules/configuration~ | 配置中心业务能力 | 后续；当前不建立目录 |
@@ -36,13 +37,19 @@ services/
 └── src/
     ├── lib.rs             crate 的模块边界和公共组装入口
     ├── main.rs            服务进程入口和优雅退出
+    ├── services.rs        Services 组合根和模块路由注册
     ├── runtime.rs         启动配置及进程级运行时状态
     ├── http/mod.rs        公共 HTTP server
     └── modules/
-        └── health/
+        ├── health/
+        │   ├── mod.rs       模块入口和路由挂载
+        │   ├── protocol.rs  健康响应 DTO
+        │   └── routes.rs    GET /healthz
+        └── discover/
             ├── mod.rs       模块入口和路由挂载
-            ├── protocol.rs  健康响应 DTO
-            └── routes.rs    GET /healthz
+            ├── model.rs     模块元数据和 API 描述接口
+            ├── protocol.rs  发现接口响应模型
+            └── routes.rs    /discover 路由
 #+end_src
 
 业务模块实现时再按下面的边界新增目录：
@@ -63,8 +70,10 @@ src/
 ** INPROGRESS 第一步：可运行的核心服务器骨架
 
 - 使用 Rust crate 建立服务进程入口。
+- 由 ~Services::build~ 组装业务模块，~RuntimeState~ 持有服务组合对象。
 - 默认只绑定 ~127.0.0.1:47321~，可通过 ~LOKI_ASSISTANT_HTTP_ADDR~ 覆盖。
 - 提供 ~GET /healthz~，返回服务名称、状态、版本和运行秒数。
+- 提供 ~GET /discover~、~GET /discover/modules~ 和 ~GET /discover/modules/{module_id}~。
 - 使用 tokio/axum 处理 HTTP，支持 Ctrl-C 优雅退出。
 - 配置解析和健康响应具备单元测试。
 
@@ -92,7 +101,16 @@ src/
 
 * HTTP 约定
 
-第一步只承诺健康检查。服务只监听 loopback，尚未提供跨设备访问、认证或业务写操作。
+服务只监听 loopback，尚未提供跨设备访问、认证或业务写操作。
+
+| 方法 | 路径 | 返回内容 |
+|------+------|----------|
+| GET | ~/discover~ | 服务及全部模块的完整元数据 |
+| GET | ~/discover/modules~ | 模块摘要列表 |
+| GET | ~/discover/modules/{module_id}~ | 指定模块的完整元数据 |
+| GET | ~/healthz~ | 服务健康状态 |
+
+~discover~ 模块也在模块目录中注册自身，因此 ~/discover/modules/discover~ 返回发现模块的完整描述。
 
 #+begin_src json
 {

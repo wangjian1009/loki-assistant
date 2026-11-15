@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::{modules, runtime::RuntimeState};
+use crate::runtime::RuntimeState;
 
 pub fn router(runtime: Arc<RuntimeState>) -> Router {
-    Router::new().merge(modules::router(runtime))
+    Router::new().merge(runtime.services().router(runtime))
 }
 
 pub async fn serve(
@@ -27,7 +27,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_returns_json() {
-        let app = router(Arc::new(RuntimeState::new()));
+        let app = router(Arc::new(RuntimeState::default()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -48,7 +48,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_is_not_exposed() {
-        let app = router(Arc::new(RuntimeState::new()));
+        let app = router(Arc::new(RuntimeState::default()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -59,5 +59,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn services_registry_mounts_discover_module() {
+        let app = router(Arc::new(RuntimeState::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/discover/modules/discover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
     }
 }

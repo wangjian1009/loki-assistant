@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::services::Services;
+
 const HTTP_ADDR_ENV: &str = "LOKI_ASSISTANT_HTTP_ADDR";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:47321";
 
@@ -59,23 +61,29 @@ impl RuntimeConfig {
 #[derive(Debug)]
 pub struct RuntimeState {
     started_at: Instant,
+    services: std::sync::Arc<Services>,
 }
 
 impl RuntimeState {
-    pub fn new() -> Self {
+    pub fn new(services: std::sync::Arc<Services>) -> Self {
         Self {
             started_at: Instant::now(),
+            services,
         }
     }
 
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
+
+    pub fn services(&self) -> std::sync::Arc<Services> {
+        std::sync::Arc::clone(&self.services)
+    }
 }
 
 impl Default for RuntimeState {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::sync::Arc::new(Services::build()))
     }
 }
 

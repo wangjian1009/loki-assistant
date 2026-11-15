@@ -6,7 +6,7 @@
 
 * 当前阶段
 
-项目已实现 Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查，并建立了控制中心 Rust 服务层骨架。真实通信的验证范围与结果见 [[file:docs/agent-shell-control.org][第一阶段设计]]；服务层边界与进度见 [[file:docs/control-center-services.org][控制中心 services 模块规划]]。
+项目已实现 Mac 菜单栏应用、连接配置、Emacs 插件入口和连接检查，并建立了控制中心 Rust 服务层骨架及服务发现接口。真实通信的验证范围与结果见 [[file:docs/agent-shell-control.org][第一阶段设计]]；服务层边界与进度见 [[file:docs/control-center-services.org][控制中心 services 模块规划]]。
 
 菜单栏弹出框作为只读状态仪表盘，显示 Emacs 连接、会话数量及更新时间。独立会话窗口支持搜索、状态筛选、刷新、在 Emacs 中打开会话，以及向选定会话发送需求。
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use loki_services::{
-    http,
+    Services, http,
     runtime::{RuntimeConfig, RuntimeState},
 };
 
@@ -9,7 +9,8 @@ use loki_services::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_config = RuntimeConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(runtime_config.http_addr).await?;
-    let runtime = Arc::new(RuntimeState::new());
+    let services = Arc::new(Services::build());
+    let runtime = Arc::new(RuntimeState::new(services));
 
     eprintln!(
         "loki-services listening on http://{} (health: /healthz)",

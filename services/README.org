@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前只完成核心服务器骨架：服务默认监听 ~127.0.0.1:47321~，提供 ~GET /healthz~，支持配置地址和 Ctrl-C 优雅退出。Emacs 控制、语音输入、登录启动和自动重启尚未迁移到这里；当前 Mac 应用仍按 [[file:../docs/agent-shell-control.org][控制协议]] 直接调用 ~emacsclient~。
+当前已完成核心服务器骨架和服务发现模块：服务默认监听 ~127.0.0.1:47321~，提供 ~GET /healthz~ 以及 ~GET /discover~、~GET /discover/modules~、~GET /discover/modules/{module_id}~，支持配置地址和 Ctrl-C 优雅退出。Emacs 控制、语音输入、登录启动和自动重启尚未迁移到这里；当前 Mac 应用仍按 [[file:../docs/agent-shell-control.org][控制协议]] 直接调用 ~emacsclient~。
 
 模块边界、分阶段计划和后续目录见 [[file:../docs/control-center-services.org][控制中心 services 模块规划]]。
 
@@ -30,6 +30,9 @@ LOKI_ASSISTANT_HTTP_ADDR=127.0.0.1:47322 cargo run --manifest-path services/Carg
 
 #+begin_src sh
 curl http://127.0.0.1:47321/healthz
+curl http://127.0.0.1:47321/discover
+curl http://127.0.0.1:47321/discover/modules
+curl http://127.0.0.1:47321/discover/modules/discover
 #+end_src
 
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
