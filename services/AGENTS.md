@@ -38,6 +38,10 @@ src/
         ├── protocol.rs  配置接口响应模型
         ├── routes.rs    /meta 和 /data 路由
         └── service.rs   配置数据存储和变化订阅
+├── platform/
+│   └── macos/
+    ├── mod.rs           macOS 平台能力导出
+    └── launchd.rs       LaunchAgent plist 和 launchctl 管理
 macros/
 └── src/lib.rs          #[loki_api] API 声明过程宏
 ```
@@ -64,7 +68,7 @@ src/modules/<module>/
 | `modules/emacs`         | `emacsclient` gateway、连接检查、会话操作和事件入口              | 本模块 `protocol`、平台进程 trait          |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
-| `platform/macos`        | launch agent、进程监控、自动重启、音频设备适配                   | macOS API；实现 `emacs`/`voice` 所需 trait |
+| `platform/macos`        | LaunchAgent plist、launchctl 安装/卸载/启停/状态管理               | macOS API；不提供业务 HTTP 路由             |
 
 依赖方向固定为：
 
@@ -77,6 +81,8 @@ modules/<module>
 ```
 
 `http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 使用 `#[loki_api(...)]` 声明接口信息；`Services::build()` 只负责路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
+
+`platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。
 
 ## Rust 约定
 

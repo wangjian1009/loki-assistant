@@ -19,7 +19,7 @@
 | ~modules/emacs~ | 调用 ~emacsclient~、连接检查、请求转发和事件入口 | 下一步 |
 | ~modules/voice~ | 录音状态、识别结果和确认流程 | 后续；先定义状态边界 |
 | ~modules/config~ | 配置模型、配置数据读写和变化订阅 | 已实现基础内存存储 |
-| ~platform/macos~ | 登录启动、服务监控、自动重启和音频设备适配 | 后续 |
+| ~platform/macos~ | LaunchAgent plist、launchctl 安装/卸载/启停/状态管理 | 已实现基础管理器 |
 | 各业务模块的 ~protocol.rs~ | 本模块请求、响应、错误码和版本 | 随模块实现，不设集中式协议目录 |
 
 每个业务模块在自己的目录中同时维护 ~protocol.rs~、~routes.rs~ 和业务逻辑；handler 使用 ~#[loki_api(...)]~ 声明接口信息，模块元数据通过 ~linkme~ distributed slice 在编译/链接阶段收集。~mod.rs~ 对外提供 router 并挂载本模块路由。~http~ 只负责公共 server 能力，平台适配只能被业务模块依赖。~emacs~ 不依赖 HTTP，~voice~ 不依赖菜单栏 UI；新增模块最大努力限制在一个目录中。
@@ -40,7 +40,7 @@ services/
     ├── services.rs        Services 组合根和模块路由注册
     ├── runtime.rs         启动配置及进程级运行时状态
     ├── http/mod.rs        公共 HTTP server
-    └── modules/
+    ├── modules/
         ├── health/
         │   ├── mod.rs       模块入口和路由挂载
         │   ├── protocol.rs  健康响应 DTO
@@ -56,6 +56,9 @@ services/
             ├── protocol.rs  配置接口响应模型
             ├── routes.rs    /meta 和 /data 路由
             └── service.rs   配置存储和变化订阅
+    └── platform/macos/
+        ├── mod.rs           macOS 平台能力导出
+        └── launchd.rs       LaunchAgent plist 和 launchctl 管理
 #+end_src
 
 业务模块实现时再按下面的边界新增目录：
@@ -86,12 +89,15 @@ src/
 
 自动格式检查、单元测试和本机 HTTP 请求已通过；按项目约定，人工验收后再将本节标记为 ~DONE~。
 
-** TODO 第二步：运行状态与 Mac 应用管理
+** INPROGRESS 第二步：运行状态与 Mac 应用管理
 
 - 新增控制中心运行状态模块和 ~platform/macos~ 适配模块。
+- 已实现用户级 LaunchAgent plist 生成及 ~launchctl~ 安装、卸载、启动、停止、重启和状态查询。
 - 定义服务启动、停止、失败和重启状态。
 - 由 Mac 能力实现登录启动、进程存活监控和受控自动重启。
 - 菜单栏应用通过本地 API 展示服务状态；在迁移完成前保留现有直连实现。
+
+当前已提供 ~make install-service~ 和 ~make uninstall-service~ 作为显式入口；菜单栏应用尚未接入安装、监控和自动重启，也不会在服务启动时自动修改用户的 launchd 配置。
 
 ** TODO 第三步：Emacs gateway
 
