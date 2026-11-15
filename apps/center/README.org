@@ -4,7 +4,7 @@
 
 当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本和运行时间，并可手动刷新；services 不可达时显示失败原因。
 
-应用通过系统的 ~launchctl~ 查询 LaunchAgent 是否运行；服务运行时再通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色启动按钮。不包含 Emacs 会话、语音输入或其他旧版功能。
+应用通过系统的 ~launchctl~ 查询 LaunchAgent 是否运行；随后读取 ~~/.assistant/service~ 获取服务端口，再通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色启动按钮。不包含 Emacs 会话、语音输入或其他旧版功能。
 
 * 构建与运行
 

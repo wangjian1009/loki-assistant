@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, sync::Arc};
 use loki_services::{
     Services, http,
     platform::macos::{LaunchdManager, LaunchdServiceSpec},
-    runtime::{RuntimeConfig, RuntimeState},
+    runtime::{RuntimeConfig, RuntimeState, ServicePfile},
 };
 
 #[tokio::main]
@@ -27,6 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_config = RuntimeConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(runtime_config.http_addr).await?;
+    let service_pfile = ServicePfile::for_listener(listener.local_addr()?);
+    let service_path = service_pfile.write()?;
     let services = Arc::new(Services::build());
     let runtime = Arc::new(RuntimeState::new(services));
 
@@ -39,6 +41,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         result = http::serve(listener, runtime) => result?,
         _ = tokio::signal::ctrl_c() => {}
     }
+    service_pfile.remove_if_owner()?;
+    eprintln!("services information removed: {}", service_path.display());
     Ok(())
 }
 
@@ -85,7 +89,7 @@ fn service_status() -> Result<(), Box<dyn std::error::Error>> {
 
 fn service_spec() -> Result<LaunchdServiceSpec, Box<dyn std::error::Error>> {
     let executable = env::current_exe()?;
-    let mut spec = LaunchdServiceSpec::new("personal.loki-assistant.services", executable);
+    let mut spec = LaunchdServiceSpec::new("cc.loki-assistant.services", executable);
     if let Some(address) = env::var_os("LOKI_ASSISTANT_HTTP_ADDR") {
         spec.environment.insert(
             "LOKI_ASSISTANT_HTTP_ADDR".to_owned(),

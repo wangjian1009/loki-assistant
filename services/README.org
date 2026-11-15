@@ -6,6 +6,8 @@
 
 当前已完成核心服务器骨架、服务发现模块、配置模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。配置数据当前使用内存存储，业务模块可通过 ~ConfigService~ 读取和订阅变化。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏自动启动、监控和重启流程尚未接入。其他业务模块等待重新设计后再接入。
 
+服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
+
 模块边界、分阶段计划和后续目录见 [[file:../docs/control-center-services.org][控制中心 services 模块规划]]。
 
 业务模块各自维护交互协议和 HTTP 路由：在 ~src/modules/<module>/~ 内放置 ~protocol.rs~、~routes.rs~ 及需要的 ~service.rs~，handler 使用 ~#[loki_api(...)]~ 声明接口信息，并用 ~linkme~ 静态切片提交模块描述。~http~ 只提供 loopback server 和公共 HTTP 能力，不设集中式 ~protocol~ 目录。~Services::build~ 只组合路由，不负责运行时注册元数据。新增模块应尽量只新增一个目录，跨模块只共享稳定的基础设施。
@@ -41,6 +43,8 @@ curl http://127.0.0.1:47321/data/config
 #+end_src
 
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
+
+LaunchAgent label 为 ~cc.loki-assistant.services~；修改 label 后需要先取消旧服务注册，再重新执行 ~make install-service~。
 
 ~make install-service~ 会使用当前 Debug 可执行文件注册用户级 LaunchAgent，并将日志写入 ~/Library/Logs/LokiAssistant/；~make uninstall-service~ 可取消注册。安装和卸载会调用系统的 ~launchctl~，需要用户显式执行。
 

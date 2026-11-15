@@ -26,6 +26,13 @@ make build
 make run
 #+end_src
 
+构建并运行通用配置编辑器：
+
+#+begin_src sh
+make build-config-editor
+make run-config-editor
+#+end_src
+
 注册、启动和停止 services 用户级 LaunchAgent：
 
 #+begin_src sh
@@ -44,6 +51,9 @@ make stop-service
 | make run | 启动 Mac 菜单栏应用 |
 | make test | 执行 Mac XCTest 和 services Rust 测试 |
 | make test-mac | 执行 Mac XCTest |
+| make build-config-editor | 构建通用配置编辑器 |
+| make test-config-editor | 执行配置编辑器 XCTest |
+| make run-config-editor | 启动通用配置编辑器 |
 | make services-test | 执行 services workspace 测试 |
 | make services-fmt | 检查 services Rust 格式 |
 | make services-run | 运行 services |
@@ -57,7 +67,8 @@ make stop-service
 
 * 文档入口
 
-- [[file:center/README.org][Mac 菜单栏入口]]
+- [[file:apps/center/README.org][Mac 菜单栏入口]]
+- [[file:apps/config-editor/README.org][通用配置编辑器]]
 - [[file:services/README.org][控制中心服务层]]
 - [[file:docs/control-center-services.org][控制中心 services 模块规划]]
 

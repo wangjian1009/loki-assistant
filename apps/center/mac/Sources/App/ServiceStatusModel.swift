@@ -16,6 +16,13 @@ struct HealthResponse: Codable, Equatable, Sendable {
     }
 }
 
+struct ServiceEndpoint: Codable, Equatable, Sendable {
+    let host: String
+    let port: UInt16
+    let pid: UInt32
+    let version: String
+}
+
 enum ServiceStatus: Equatable, Sendable {
     case unknown
     case starting
@@ -32,8 +39,9 @@ private struct LaunchctlResult: Sendable {
 @MainActor
 @Observable
 final class ServiceStatusModel {
-    nonisolated static let healthURL = URL(string: "http://127.0.0.1:47321/healthz")!
-    nonisolated static let serviceLabel = "personal.loki-assistant.services"
+    nonisolated static let serviceFileURL = FileManager.default.homeDirectoryForCurrentUser
+        .appending(path: ".assistant/service")
+    nonisolated static let serviceLabel = "cc.loki-assistant.services"
     nonisolated static let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
 
     private(set) var status: ServiceStatus = .unknown
@@ -58,7 +66,8 @@ final class ServiceStatusModel {
                 lastUpdated = Date()
                 return
             }
-            let health = try await fetchHealth()
+            let endpoint = try readEndpoint()
+            let health = try await fetchHealth(endpoint: endpoint)
             status = .healthy(health)
             lastUpdated = Date()
         } catch {
@@ -101,8 +110,11 @@ final class ServiceStatusModel {
             .appending(path: "\(serviceLabel).plist")
     }
 
-    private func fetchHealth() async throws -> HealthResponse {
-        let (data, response) = try await URLSession.shared.data(from: Self.healthURL)
+    private func fetchHealth(endpoint: ServiceEndpoint) async throws -> HealthResponse {
+        guard let url = URL(string: "http://\(endpoint.host):\(endpoint.port)/healthz") else {
+            throw URLError(.badURL)
+        }
+        let (data, response) = try await URLSession.shared.data(from: url)
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
             throw URLError(.badServerResponse)
@@ -112,6 +124,11 @@ final class ServiceStatusModel {
             throw URLError(.cannotParseResponse)
         }
         return health
+    }
+
+    private func readEndpoint() throws -> ServiceEndpoint {
+        let data = try Data(contentsOf: Self.serviceFileURL)
+        return try JSONDecoder().decode(ServiceEndpoint.self, from: data)
     }
 
     private func runLaunchctl(_ arguments: [String]) async throws -> LaunchctlResult {

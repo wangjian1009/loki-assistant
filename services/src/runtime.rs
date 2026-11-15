@@ -1,19 +1,100 @@
 use std::{
     env,
+    fs,
+    io,
     net::SocketAddr,
+    path::PathBuf,
     str::FromStr,
     time::{Duration, Instant},
 };
+
+use serde::{Deserialize, Serialize};
 
 use crate::services::Services;
 
 const HTTP_ADDR_ENV: &str = "LOKI_ASSISTANT_HTTP_ADDR";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:47321";
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServicePfile {
+    pub host: String,
+    pub port: u16,
+    pub pid: u32,
+    pub version: String,
+}
+
+impl ServicePfile {
+    pub fn path() -> Result<PathBuf, RuntimeConfigError> {
+        let home = env::var_os("HOME").ok_or(RuntimeConfigError::HomeUnavailable)?;
+        Ok(PathBuf::from(home).join(".assistant/service"))
+    }
+
+    pub fn for_listener(address: SocketAddr) -> Self {
+        Self {
+            host: address.ip().to_string(),
+            port: address.port(),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    pub fn write(&self) -> Result<PathBuf, RuntimeConfigError> {
+        let path = Self::path()?;
+        let parent = path.parent().ok_or(RuntimeConfigError::PfilePathInvalid)?;
+        fs::create_dir_all(parent).map_err(|source| RuntimeConfigError::Io {
+            operation: "创建 services 信息目录",
+            source,
+        })?;
+        let temporary = path.with_extension(format!("tmp.{}", self.pid));
+        let data = serde_json::to_vec_pretty(self).map_err(|source| RuntimeConfigError::Json {
+            operation: "生成 services 信息",
+            source,
+        })?;
+        fs::write(&temporary, data).map_err(|source| RuntimeConfigError::Io {
+            operation: "写入 services 信息",
+            source,
+        })?;
+        fs::rename(&temporary, &path).map_err(|source| RuntimeConfigError::Io {
+            operation: "更新 services 信息",
+            source,
+        })?;
+        Ok(path)
+    }
+
+    pub fn remove_if_owner(&self) -> Result<(), RuntimeConfigError> {
+        let path = Self::path()?;
+        let Ok(data) = fs::read(&path) else { return Ok(()) };
+        let Ok(current) = serde_json::from_slice::<ServicePfile>(&data) else { return Ok(()) };
+        if current.pid == self.pid {
+            fs::remove_file(path).map_err(|source| RuntimeConfigError::Io {
+                operation: "删除 services 信息",
+                source,
+            })?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeConfigError {
     #[error("环境变量 {name} 不是有效的 socket 地址：{value}")]
     InvalidAddress { name: &'static str, value: String },
+    #[error("无法确定用户主目录")]
+    HomeUnavailable,
+    #[error("services 信息路径无效")]
+    PfilePathInvalid,
+    #[error("{operation}失败：{source}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{operation}失败：{source}")]
+    Json {
+        operation: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// 服务进程启动所需的最低配置，不代表配置中心的业务配置。

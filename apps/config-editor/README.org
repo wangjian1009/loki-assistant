@@ -1,0 +1,28 @@
+#+TITLE: Loki Assistant 配置编辑器
+
+* 作用
+
+配置编辑器是独立的 macOS App。启动后请求 services 的配置元数据，左侧显示配置模块，右侧按配置项类型显示编辑控件；保存时向 services 提交完整配置值。
+
+当前支持字符串、文件路径、整数、数字、布尔值以及 JSON 字典/列表的通用编辑。配置模型为空时显示明确提示。
+
+* 构建与运行
+
+在仓库根目录执行：
+
+#+begin_src sh
+make build-config-editor
+make run-config-editor
+#+end_src
+
+应用启动后读取 ~~/.assistant/service~ 获取 services 端口，再请求配置接口。需要先启动 services：
+
+#+begin_src sh
+make start-service
+#+end_src
+
+* 测试
+
+#+begin_src sh
+make test-config-editor
+#+end_src

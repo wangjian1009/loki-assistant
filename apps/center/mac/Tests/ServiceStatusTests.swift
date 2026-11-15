@@ -11,7 +11,12 @@ final class ServiceStatusTests: XCTestCase {
         XCTAssertEqual(response.uptimeSeconds, 42)
     }
 
-    func testHealthURLUsesLoopbackServicesEndpoint() {
-        XCTAssertEqual(ServiceStatusModel.healthURL.absoluteString, "http://127.0.0.1:47321/healthz")
+    func testDecodesServiceEndpoint() throws {
+        let data = Data(#"{"host":"127.0.0.1","port":47321,"pid":42,"version":"0.1.0"}"#.utf8)
+        let endpoint = try JSONDecoder().decode(ServiceEndpoint.self, from: data)
+
+        XCTAssertEqual(endpoint.host, "127.0.0.1")
+        XCTAssertEqual(endpoint.port, 47321)
+        XCTAssertEqual(endpoint.version, "0.1.0")
     }
 }
