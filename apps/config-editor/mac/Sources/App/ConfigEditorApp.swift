@@ -7,9 +7,6 @@ struct ConfigEditorApp: App {
     var body: some Scene {
         WindowGroup("配置编辑器") {
             ConfigEditorView(model: model)
-                .task {
-                    await model.load()
-                }
         }
     }
 }

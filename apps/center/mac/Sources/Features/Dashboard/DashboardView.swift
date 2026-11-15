@@ -9,6 +9,13 @@ struct DashboardView: View {
             statusButton
             Divider()
             Button {
+                openConfigEditor()
+            } label: {
+                Label("设置", systemImage: "slider.horizontal.3")
+            }
+            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
                 NSApplication.shared.terminate(nil)
             } label: {
                 Label("退出", systemImage: "power")
@@ -18,6 +25,17 @@ struct DashboardView: View {
         }
         .padding(8)
         .frame(width: 130, alignment: .leading)
+    }
+
+    private func openConfigEditor() {
+        let appURL = Bundle.main.bundleURL
+            .deletingLastPathComponent() // Debug
+            .deletingLastPathComponent() // .build
+            .deletingLastPathComponent() // mac
+            .deletingLastPathComponent() // center
+            .deletingLastPathComponent() // apps
+            .appendingPathComponent("config-editor/mac/.build/Debug/LokiConfigEditor.app")
+        _ = NSWorkspace.shared.open(appURL)
     }
 
     @ViewBuilder

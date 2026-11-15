@@ -24,7 +24,10 @@ make services-run
 #+begin_src sh
 make build
 make run
+make restart-center
 #+end_src
+
+修改菜单栏 App 代码后使用 ~make restart-center~，该命令会退出旧进程并强制启动新构建的 App；只执行 ~make run~ 可能会复用旧实例。
 
 构建并运行通用配置编辑器：
 

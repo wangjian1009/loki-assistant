@@ -142,13 +142,15 @@ final class ConfigEditorModel {
     private(set) var values: [String: JSONValue] = [:]
     private(set) var message: String?
     private(set) var loading = false
+    private(set) var serviceAvailable: Bool?
 
     func load() async {
         loading = true
         defer { loading = false }
         do {
             let response: MetaResponse = try await request(path: "/meta")
-            modules = response.modules
+            serviceAvailable = true
+            modules = response.modules.filter { !$0.items.isEmpty }
             if selectedModuleID == nil || !modules.contains(where: { $0.id == selectedModuleID }) {
                 selectedModuleID = modules.first?.id
             }
@@ -157,7 +159,8 @@ final class ConfigEditorModel {
             }
             message = nil
         } catch {
-            message = error.localizedDescription
+            serviceAvailable = false
+            message = nil
         }
     }
 
@@ -165,9 +168,11 @@ final class ConfigEditorModel {
         selectedModuleID = moduleID
         do {
             try await loadData(for: moduleID)
+            serviceAvailable = true
             message = nil
         } catch {
-            message = error.localizedDescription
+            serviceAvailable = false
+            message = nil
         }
     }
 

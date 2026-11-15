@@ -4,6 +4,23 @@ struct ConfigEditorView: View {
     let model: ConfigEditorModel
 
     var body: some View {
+        Group {
+            if model.serviceAvailable == false {
+                ContentUnavailableView("服务没有运行", systemImage: "power")
+            } else if model.serviceAvailable == nil {
+                ProgressView("检查服务状态…")
+            } else if model.modules.isEmpty {
+                ContentUnavailableView("没有可编辑的配置", systemImage: "slider.horizontal.3")
+            } else {
+                editor
+            }
+        }
+        .task {
+            await model.load()
+        }
+    }
+
+    private var editor: some View {
         NavigationSplitView {
             List(model.modules, selection: Binding(
                 get: { model.selectedModuleID },

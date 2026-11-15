@@ -10,13 +10,14 @@ CTEST ?= ctest
 CARGO ?= cargo
 OPEN ?= open
 
-.PHONY: help configure build test test-mac config-editor-configure build-config-editor test-config-editor run-config-editor xcode-config-editor services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run xcode release clean
+.PHONY: help configure build test test-mac config-editor-configure build-config-editor test-config-editor run-config-editor xcode-config-editor services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release clean
 
 help:
 	@printf '%s\n' \
 	  'make configure       生成 Mac 菜单栏应用 Xcode 工程' \
 	  'make build           构建 Mac 菜单栏应用（默认 Debug）' \
 	  'make run             构建并启动 Mac 菜单栏应用' \
+	  'make restart-center  重建并重启 Mac 菜单栏应用' \
 	  'make xcode           生成并打开 Xcode 工程' \
 	  'make test            执行 Mac XCTest 和 services Rust 测试' \
 	  'make test-mac        构建并执行 Mac XCTest' \
@@ -92,6 +93,13 @@ service-status:
 
 run: build
 	"$(OPEN)" "$(BUILD_DIR)/$(CONFIG)/LokiAssistant.app"
+
+restart-center: build
+	@for center_pid in $$(pgrep -x LokiAssistant 2>/dev/null || true); do \
+	  kill "$$center_pid" 2>/dev/null || true; \
+	done
+	@sleep 1
+	"$(OPEN)" -n "$(BUILD_DIR)/$(CONFIG)/LokiAssistant.app"
 
 xcode: configure
 	"$(OPEN)" "$(BUILD_DIR)/LokiAssistant.xcodeproj"
