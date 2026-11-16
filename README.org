@@ -8,7 +8,7 @@ Loki Assistant 是个人使用的助理程序。当前重新设计的第一步�
 
 services 提供本机 loopback HTTP 服务、服务发现、配置数据和 macOS LaunchAgent 管理。Mac 菜单栏应用只展示 services 的健康状态、版本和运行时间，作为后续功能的入口。
 
-Emacs 插件和旧版会话控制实现已清理，后续能力重新设计后再建立。
+~emacs/~ 中已初始化 ~loki-assistant~ Emacs Lisp 包，目前提供包入口和配置组，后续集成能力尚未实现。
 
 * 快速开始
 
@@ -47,6 +47,14 @@ make stop-service
 
 * 开发操作
 
+加载 Emacs 包前，需有正在运行且已启动 ~server-start~ 的 Emacs。从仓库根目录执行：
+
+#+begin_src sh
+make emacs-load
+#+end_src
+
+该命令通过 ~emacsclient --eval~ 将 ~emacs/~ 加入 ~load-path~，卸载已加载的包后执行 ~(require 'loki-assistant)~ ，用于首次加载和修改后的重新加载。
+
 | 命令 | 操作 |
 |------+------|
 | make configure | 生成 Mac 菜单栏应用 Xcode 工程 |
@@ -66,6 +74,7 @@ make stop-service
 | make stop-service | 停止 services LaunchAgent |
 | make restart-service | 重启 services LaunchAgent |
 | make service-status | 查询 services LaunchAgent 状态 |
+| make emacs-load | 通过 emacsclient 重新加载 Emacs 包 |
 | make clean | 清理构建产物 |
 
 * 文档入口

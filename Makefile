@@ -9,6 +9,9 @@ CMAKE ?= cmake
 CTEST ?= ctest
 CARGO ?= cargo
 OPEN ?= open
+EMACSCLIENT ?= emacsclient
+
+.PHONY: emacs-load
 
 .PHONY: help configure build test test-mac config-editor-configure build-config-editor test-config-editor run-config-editor xcode-config-editor services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release clean
 
@@ -33,10 +36,18 @@ help:
 	  'make stop-service    停止 services 用户级 LaunchAgent' \
 	  'make restart-service 重启 services 用户级 LaunchAgent' \
 	  'make service-status  查询 services 用户级 LaunchAgent 状态' \
+	  'make emacs-load      通过 emacsclient 重新加载 Emacs 包' \
 	  'make release         构建 Release Mac 菜单栏应用' \
 	  'make clean           清理构建产物' \
 	  '' \
-	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR CMAKE CTEST CARGO OPEN'
+	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR CMAKE CTEST CARGO OPEN EMACSCLIENT'
+
+emacs-load:
+	"$(EMACSCLIENT)" --eval "(progn \
+	  (add-to-list 'load-path \"$(PROJECT_ROOT)/emacs\") \
+	  (when (featurep 'loki-assistant) \
+	    (unload-feature 'loki-assistant t)) \
+	  (require 'loki-assistant))"
 
 configure:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON
