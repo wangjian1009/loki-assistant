@@ -113,3 +113,23 @@ HTTP 失败保留状态、原始正文和可解析的 JSON，优先使用 servic
 #+end_src
 
 ~submitted~ 表示已提交系统通知中心； ~failed~ 包含明确原因； ~unconfirmed~ 表示尚未确认。查询只返回当时状态，需要后续结果时由调用者择时再查询。图标格式、点击跳转、回执保留期限等服务端约定见 [[file:control-center-services.org::*系统通知模块][系统通知模块]]。
+
+* agent-shell 集成
+
+在 macOS 上，~loki-assistant~ 会等待 ~agent-shell~ 加载完成，再自动加载
+~loki-assistant-agent-shell~ 并加入 ~agent-shell-mode-hook~；不需要在用户配置中单独
+加载扩展。~loki-assistant-agent-shell-enabled~ 默认为 ~t~，设置为 ~nil~ 可关闭自动加载。
+
+扩展提供 Finder 文件复制后的 ~C-y~ 文件上下文、文件拖放和项目外文件复制策略；图片显示
+预览，其他文件显示为可点击链接。文件复制策略由
+~loki-assistant-agent-shell-file-copy-policy~ 控制，可选 ~auto~、~always-copy~ 和
+~always-original~。系统临时目录中的文件始终复制到当前项目的
+~.agent-shell/.loki-assistant/~ 数据目录。
+
+Agent 的 ~permission-request~ 和 ~turn-complete~ 事件通过
+~loki-assistant-notify~ 发送，因此统一使用 services 和菜单栏应用的通知链路。通知由
+~loki-assistant-agent-shell-notifications~ 控制；默认在 Emacs 未聚焦或当前显示其他缓冲区时
+发送，~loki-assistant-agent-shell-notify-current-buffer~ 可设为 ~t~ 以便当前会话也发送。
+
+远程输入接收尚未实现；后续交互命令暂定命名为
+~loki-assistant-agent-shell-receive-input~，以便与通知和文件输入能力保持同一命名空间。

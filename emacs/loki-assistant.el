@@ -236,5 +236,27 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
                       (or (and (listp result) (alist-get 'status result)) "成功"))
            (loki-assistant--report-response response)))))))
 
+(defcustom loki-assistant-agent-shell-enabled t
+  "非 nil 时，在 macOS 上自动加载 `loki-assistant-agent-shell'。
+扩展只会在 `agent-shell' 已加载后安装 mode hook。"
+  :type 'boolean
+  :group 'loki-assistant)
+
+(defun loki-assistant--setup-agent-shell ()
+  "在 `agent-shell' 已加载后安装 Loki Assistant 扩展。"
+  (when (and loki-assistant-agent-shell-enabled
+             (eq system-type 'darwin)
+             (featurep 'agent-shell))
+    (require 'loki-assistant-agent-shell)
+    ;; 如果用户配置中还挂着上游 macext 包，避免新旧通知同时发送。
+    (when (fboundp 'agent-shell-macext-setup)
+      (remove-hook 'agent-shell-mode-hook #'agent-shell-macext-setup))
+    (add-hook 'agent-shell-mode-hook #'loki-assistant-agent-shell-setup)))
+
+(if (featurep 'agent-shell)
+    (loki-assistant--setup-agent-shell)
+  (with-eval-after-load 'agent-shell
+    (loki-assistant--setup-agent-shell)))
+
 (provide 'loki-assistant)
 ;;; loki-assistant.el ends here

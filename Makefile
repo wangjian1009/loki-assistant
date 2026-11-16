@@ -53,11 +53,19 @@ emacs-load:
 emacs-test: emacs-load
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
-	  (let ((stats (ert-run-tests-batch \"^loki-assistant-test-\"))) \
-	    (if (zerop (ert-stats-completed-unexpected stats)) \
-	        (format \"通过 %d 项 Emacs 测试\" (ert-stats-total stats)) \
-	      (error \"Emacs 测试失败：%d 项\" \
-	             (ert-stats-completed-unexpected stats)))))"
+	  (let ((stats (ert-run-tests-batch \"^loki-assistant-test-\")) \
+	        (agent-shell-stats \
+	         (when (require 'agent-shell nil t) \
+	           (load \"$(PROJECT_ROOT)/emacs/loki-assistant-agent-shell-tests.el\" nil t) \
+	           (ert-run-tests-batch \"^loki-assistant-agent-shell-\")))) \
+	    (if (zerop (+ (ert-stats-completed-unexpected stats) \
+	                  (if agent-shell-stats \
+                      (ert-stats-completed-unexpected agent-shell-stats) 0))) \
+	        (format \"通过 %d 项 Emacs 测试%s\" \
+	                (+ (ert-stats-total stats) \
+	                   (if agent-shell-stats (ert-stats-total agent-shell-stats) 0)) \
+	                (if agent-shell-stats \"（含 agent-shell 扩展）\" \"\")) \
+	      (error \"Emacs 测试失败\"))))"
 
 configure:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON
