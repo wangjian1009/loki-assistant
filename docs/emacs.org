@@ -1,0 +1,115 @@
+#+TITLE: Emacs 包使用说明
+
+* 已实现能力
+
+~loki-assistant~ 支持异步访问 services HTTP API，并向指定通知处理器发送目标 buffer、标题、可选正文和图标。依赖 Emacs 27.1 或更新版本以及内置的 ~url~ 、 ~json~ 、 ~cl-lib~ 。
+
+先按 [[file:../README.org::*快速开始][快速开始]] 启动 services；默认处理器的系统通知还需要菜单栏应用。加载与测试入口见 [[file:../README.org::*开发操作][开发操作]]。持久配置可将仓库的 ~emacs/~ 绝对路径加入 ~load-path~ ，再加载包：
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/loki-assistant/emacs")
+(require 'loki-assistant)
+#+end_src
+
+每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
+
+* 通用 HTTP 请求
+
+#+begin_src emacs-lisp
+(loki-assistant-request
+ 'get "/emacs/buffers"
+ :callback
+ (lambda (response)
+   (if (plist-get response :ok)
+       (message "buffer 列表：%S" (plist-get response :data))
+     (message "请求失败：HTTP %S [%s] %s"
+              (plist-get response :status)
+              (plist-get response :error-code)
+              (plist-get response :error-message)))))
+
+;; 查询参数按数据编码，允许中文、空格、引号等字符。
+(loki-assistant-request
+ 'post "/emacs/activate"
+ :params `((buffer . ,(buffer-name))))
+
+;; BODY 接受原始 JSON 字符串或可编码为 JSON 的 Lisp 值。
+(loki-assistant-request
+ 'post "/config/validate"
+ :body '((module_id . "emacs")
+         (key . "socket_name")
+         (value . "server"))
+ :timeout 5)
+#+end_src
+
+签名为 ~(loki-assistant-request method path &key params body headers callback timeout)~ ：
+
+| 参数 | 约定 |
+|------+------|
+| ~method~ | 字符串或符号，例如 ~"GET"~ 、 ~'post~ ，自动转为大写 |
+| ~path~ | 以 ~/~ 开头的本机路径，可带已编码的查询串；不接受主机 URL、fragment 或空白 |
+| ~params~ | 查询参数 alist，键值分别 URL 编码；支持重复键；nil 值编码为空字符串 |
+| ~body~ | nil 表示无正文；字符串原样发送；其他 Lisp 值编码为 UTF-8 JSON |
+| ~headers~ | 额外请求头 alist；默认 ~Content-Type~ 为 ~application/json; charset=utf-8~ |
+| ~callback~ | 接收单个响应 plist；省略时在 echo area 和 ~*Messages*~ 显示结果 |
+| ~timeout~ | 等待回调的最长秒数，必须是正数 |
+
+JSON 对象使用 alist 或 hash table，数组可用 vector， ~:null~ 和 ~:false~ 分别表示 JSON null 和 false， ~t~ 表示 true。传入 JSON string 标量时应自行提供带双引号的 JSON 字符串。
+
+接口立即返回请求 buffer；无法开始请求时返回 nil。结果通过回调交付，每个请求至多回调一次，响应 buffer 和计时器自动清理。发现失败时回调可能在函数返回前执行。不要依赖回调执行时的当前 buffer；需要修改目标时，应自行捕获并检查目标 buffer。
+
+| 响应字段 | 含义 |
+|----------+------|
+| ~:ok~ | HTTP 2xx 且正文为空或可解析为 JSON 时为 t |
+| ~:status~ | HTTP 状态码；未收到 HTTP 响应时为 nil |
+| ~:headers~ | URL 库处理后的响应头字符串，含 HTTP 状态行 |
+| ~:body~ | UTF-8 解码后的正文字符串；无响应时为 nil |
+| ~:data~ | 解析后的 JSON；对象为 symbol 键 alist，数组为 vector，null/false 为 ~:null~/~:false~ |
+| ~:error-code~ | services 错误码或本地错误码；成功时为 nil |
+| ~:error-message~ | services 中文错误说明或本地失败原因；成功时为 nil |
+
+HTTP 失败保留状态、原始正文和可解析的 JSON，优先使用 services 返回的 ~code~ 、 ~message~ ；非 JSON 错误页使用 ~http-error~ 。HTTP 2xx 的非空正文不能解析为 JSON 时使用 ~invalid-response~ 。本地错误还有 ~service-discovery-failed~ 、 ~transport-error~ 和 ~timeout~ 。非法调用参数直接报错。
+
+请求异步执行，不阻塞 services 回调 Emacs；不使用代理、Cookie、自动缓存或重定向，不自动重试。超时或连接中断不保证服务端操作已取消，尤其不要直接重发有副作用的请求。 ~:ok~ 表示 HTTP 层成功，业务校验结果如 ~valid~ 仍需从 ~:data~ 判断。
+
+* 通知发送
+
+#+begin_src emacs-lisp
+(loki-assistant-notify (current-buffer) "任务完成"
+                       :body "处理结果已就绪" :icon "✓")
+
+;; 不指定 buffer 时，默认通知点击后仅显示 Emacs。
+(loki-assistant-notify nil "提醒")
+
+;; tasks 仅为示例，必须先在 services 注册对应处理器。
+(loki-assistant-notify "*scratch*" "任务完成"
+                       :module-id "tasks"
+                       :payload '((task_id . "task-1"))
+                       :callback
+                       (lambda (response)
+                         (message "处理器响应：%S" response)))
+#+end_src
+
+签名为 ~(loki-assistant-notify buffer title &key body icon module-id payload callback timeout)~ 。 ~buffer~ 接受存活 buffer 对象、非空 buffer 名称或 nil；对象会在发送时转换为名称，不切换当前 buffer。名称按数据传递，函数不创建目标 buffer，也不保证其在通知点击时仍然存活。
+
+~title~ 必须非空； ~body~ 、 ~icon~ 接受字符串或 nil。省略字段时使用服务端默认值。 ~module-id~ 默认 ~"emacs"~ ，通过 ~POST /emacs/receiver/notification~ 中的 ~module_id~ 精确分发；未知处理器返回 HTTP 404 ~notification-handler-not-found~ 。 ~payload~ 为附加 JSON 数据。 ~callback~ 和 ~timeout~ 与通用请求接口相同。
+
+没有 ~callback~ 时显示处理器响应状态或明确错误；有回调时调用者自行处理反馈。默认处理器可能返回 ~forwarded~ ，它只说明通知已转交，不能据此判断系统已展示通知。若响应已经包含 ~failed~ 回执，通知函数会将 ~:ok~ 设为 nil 并提取其错误码与说明，同时保留 HTTP 状态和响应内容。
+
+成功响应中的 ~notification_id~ 位于 ~:data~ 的 ~result~ 内，可以查询最终提交状态：
+
+#+begin_src emacs-lisp
+(loki-assistant-notify
+ (current-buffer) "任务完成"
+ :callback
+ (lambda (response)
+   (if (plist-get response :ok)
+       (let* ((result (alist-get 'result (plist-get response :data)))
+              (id (alist-get 'notification_id result)))
+         (when id
+           (loki-assistant-request 'get (concat "/notification/" id))))
+     (message "通知失败 [%s]：%s"
+              (plist-get response :error-code)
+              (plist-get response :error-message)))))
+#+end_src
+
+~submitted~ 表示已提交系统通知中心； ~failed~ 包含明确原因； ~unconfirmed~ 表示尚未确认。查询只返回当时状态，需要后续结果时由调用者择时再查询。图标格式、点击跳转、回执保留期限等服务端约定见 [[file:control-center-services.org::*系统通知模块][系统通知模块]]。

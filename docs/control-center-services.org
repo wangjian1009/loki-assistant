@@ -45,7 +45,7 @@ services/
 apps/
 ├── apps/center/mac/        SwiftUI 菜单栏状态入口
 └── apps/config-editor/mac/ 通用配置编辑器
-emacs/                      预留空目录
+emacs/                      services HTTP 客户端与通知发送
 #+end_src
 
 * HTTP 接口
@@ -257,33 +257,13 @@ services.emacs.service().register_notification_handler(
 ).await?;
 #+end_src
 
-Emacs 代码可读取 services pfile，再异步发送通知；将 ~module_id~ 改为已注册模块即可定向投递：
+Emacs 包提供异步通知函数，内部读取 services pfile 并复用通用 HTTP 请求接口；通过 ~:module-id~ 选择已注册处理器。完整客户端用法和错误反馈见 [[file:emacs.org][Emacs 包使用说明]]：
 
 #+begin_src emacs-lisp
-(require 'json)
-(require 'url)
-(let* ((target (buffer-name))
-       (service (with-temp-buffer
-                  (insert-file-contents (expand-file-name "~/.assistant/service"))
-                  (json-parse-buffer :object-type 'alist)))
-       (host (alist-get 'host service))
-       (url-request-method "POST")
-       (url-request-extra-headers '(("Content-Type" . "application/json")))
-       (url-request-data
-        (encode-coding-string
-         (json-encode `((module_id . "emacs")
-                        (title . "任务完成")
-                        (icon . "✓")
-                        (buffer . ,target)))
-         'utf-8)))
-  (url-retrieve
-   (format "http://%s:%s/emacs/receiver/notification"
-           (if (string-match-p ":" host) (concat "[" host "]") host)
-           (alist-get 'port service))
-   (lambda (_status)
-     (unwind-protect
-         (message "通知 HTTP 状态：%s" url-http-response-status)
-       (kill-buffer (current-buffer))))))
+(require 'loki-assistant)
+(loki-assistant-notify (current-buffer) "任务完成"
+                       :body "处理结果已就绪" :icon "✓"
+                       :module-id "emacs")
 #+end_src
 
 ** 错误

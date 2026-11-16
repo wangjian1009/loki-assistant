@@ -1,7 +1,9 @@
 ## 目录职责
 
 - 本目录维护 `loki-assistant` Emacs Lisp 包。
-- `loki-assistant.el` 是包入口，提供 `loki-assistant` feature 和同名配置组；当前仅初始化包骨架。
+- `loki-assistant.el` 是包入口，提供 `loki-assistant` feature、同名配置组、异步 HTTP 请求和通知发送。
+- 每次 HTTP 请求从 services pfile 发现 loopback 地址；不硬编码端口。通知通过通用请求接口发送，使用 `module_id` 选择服务端处理器。
+- `loki-assistant-tests.el` 使用临时 pfile 和真实 loopback listener 验证协议与错误反馈，不发送真实系统通知、不改动用户配置。
 - 新增变量、函数和 feature 统一使用 `loki-assistant-` 前缀，文件启用 `lexical-binding`。
 - 注释、docstring 和面向用户的文本使用中文；按实际功能需要拆分文件。
 
@@ -12,3 +14,4 @@
 - 所有 Emacs 操作均使用 `emacsclient`，不得使用 `emacs` 或 `emacs --batch`；`--eval` 中的 Lisp 按多行缩进书写。
 - 加载失败时修复错误并重新验证；若 Emacs server 不可连接，应明确报告未完成加载验证。
 - 仅运行与改动相关的检查，不运行无关的 Mac 或 services 测试。
+- HTTP 或通知实现变更后执行 `make emacs-test`，通过现有 Emacs server 运行 ERT，不退出用户 Emacs。

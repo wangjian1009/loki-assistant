@@ -11,7 +11,7 @@ CARGO ?= cargo
 OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
-.PHONY: emacs-load
+.PHONY: emacs-load emacs-test
 
 .PHONY: help configure build test test-mac config-editor-configure build-config-editor test-config-editor run-config-editor xcode-config-editor services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release clean
 
@@ -37,6 +37,7 @@ help:
 	  'make restart-service 重启 services 用户级 LaunchAgent' \
 	  'make service-status  查询 services 用户级 LaunchAgent 状态' \
 	  'make emacs-load      通过 emacsclient 重新加载 Emacs 包' \
+	  'make emacs-test      通过 emacsclient 执行 Emacs ERT 测试' \
 	  'make release         构建 Release Mac 菜单栏应用' \
 	  'make clean           清理构建产物' \
 	  '' \
@@ -48,6 +49,15 @@ emacs-load:
 	  (when (featurep 'loki-assistant) \
 	    (unload-feature 'loki-assistant t)) \
 	  (require 'loki-assistant))"
+
+emacs-test: emacs-load
+	"$(EMACSCLIENT)" --eval "(progn \
+	  (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
+	  (let ((stats (ert-run-tests-batch \"^loki-assistant-test-\"))) \
+	    (if (zerop (ert-stats-completed-unexpected stats)) \
+	        (format \"通过 %d 项 Emacs 测试\" (ert-stats-total stats)) \
+	      (error \"Emacs 测试失败：%d 项\" \
+	             (ert-stats-completed-unexpected stats)))))"
 
 configure:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON

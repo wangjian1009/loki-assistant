@@ -18,7 +18,7 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 - `apps/`：可独立运行的客户端应用，包括菜单栏入口和配置编辑器。
 - `center/`：预留的应用编排与唤起层。
 - `services/`：控制中心核心服务及 macOS LaunchAgent 管理。
-- `emacs/`：`loki-assistant` Emacs Lisp 包，当前已初始化包入口。
+- `emacs/`：`loki-assistant` Emacs Lisp 包，提供 services HTTP 请求和通知发送。
 - `docs/`：需求、架构决策与跨模块协议。
 
 各目录的内部结构和开发约定由该目录的 `AGENTS.md` 定义；根文档不维护完整递归目录树。

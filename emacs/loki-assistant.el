@@ -1,18 +1,240 @@
 ;;; loki-assistant.el --- Loki Assistant 的 Emacs 入口 -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: convenience
 
 ;;; Commentary:
 
-;; Loki Assistant 的 Emacs 包入口，当前提供基础配置组和 feature。
+;; 通过 services pfile 发现本机服务，异步访问 HTTP API 并发送通知。
 
 ;;; Code:
+
+(require 'cl-lib)
+(require 'json)
+(require 'subr-x)
+(require 'url)
+(require 'url-http)
+
+(defvar url-http-response-status)
+(defvar url-http-end-of-headers)
 
 (defgroup loki-assistant nil
   "Loki Assistant 的 Emacs 集成。"
   :group 'applications
   :prefix "loki-assistant-")
+
+(defcustom loki-assistant-service-file "~/.assistant/service"
+  "services 地址信息文件；每次请求重新读取。"
+  :type 'file
+  :group 'loki-assistant)
+
+(defcustom loki-assistant-request-timeout 10
+  "HTTP 请求等待回调的最长秒数。超时不会自动重试。"
+  :type 'number
+  :group 'loki-assistant)
+
+(defun loki-assistant--service-url ()
+  "读取 pfile，返回经过 loopback 校验的 HTTP 地址。"
+  (let* ((service (with-temp-buffer
+                    (insert-file-contents
+                     (expand-file-name loki-assistant-service-file))
+                    (json-parse-buffer :object-type 'alist)))
+         (host (alist-get 'host service))
+         (port (alist-get 'port service)))
+    (unless (and (stringp host)
+                 (or (member host '("::1" "0:0:0:0:0:0:0:1"))
+                     (and (string-match-p
+                           "\\`127\\(?:\\.[0-9]\\{1,3\\}\\)\\{3\\}\\'" host)
+                          (cl-every (lambda (part) (<= (string-to-number part) 255))
+                                    (split-string host "\\."))))
+                 (integerp port) (<= 1 port 65535))
+      (error "services pfile 必须包含有效的 loopback host 和 port"))
+    (format "http://%s:%d"
+            (if (string-match-p ":" host) (concat "[" host "]") host)
+            port)))
+
+(defun loki-assistant--query-string (params)
+  "将 PARAMS alist 编码为查询字符串，保留重复键。"
+  (mapconcat
+   (lambda (pair)
+     (concat (url-hexify-string (format "%s" (car pair))) "="
+             (url-hexify-string (if (null (cdr pair)) ""
+                                 (format "%s" (cdr pair))))))
+   params "&"))
+
+(defun loki-assistant--failure (code message)
+  "构造带 CODE 和 MESSAGE 的本地错误响应。"
+  (list :ok nil :status nil :headers nil :body nil :data nil
+        :error-code code :error-message message))
+
+(defun loki-assistant--response (status)
+  "从当前 URL buffer 解析响应和回调 STATUS。"
+  (let* ((http-status url-http-response-status)
+         ;; URL 的 marker 指向分隔空行的最后一个换行符。
+         (end (and url-http-end-of-headers (1+ url-http-end-of-headers)))
+         (headers (and end (buffer-substring-no-properties (point-min) end)))
+         (body (and end (decode-coding-string
+                         (buffer-substring-no-properties end (point-max)) 'utf-8)))
+         (success (and http-status (<= 200 http-status) (< http-status 300)))
+         data parse-error)
+    (when (and body (not (string-empty-p (string-trim body))))
+      (condition-case err
+          (setq data (json-parse-string body :object-type 'alist
+                                        :array-type 'array
+                                        :null-object :null :false-object :false))
+        (error (setq parse-error (error-message-string err)))))
+    (let* ((object (and (listp data) data))
+           (code (alist-get 'code object))
+           (message (alist-get 'message object)))
+      (list :ok (and success (not parse-error))
+            :status http-status :headers headers :body body :data data
+            :error-code (cond ((not http-status) "transport-error")
+                              ((not success) (or code "http-error"))
+                              (parse-error "invalid-response"))
+            :error-message
+            (cond ((not http-status)
+                   (format "无法连接 services：%s" (plist-get status :error)))
+                  ((not success) (or message (format "services 返回 HTTP %s" http-status)))
+                  (parse-error (concat "services 响应不是有效 JSON：" parse-error)))))))
+
+(defun loki-assistant--report-response (response)
+  "显示 RESPONSE 的成功状态或明确的失败原因。"
+  (if (plist-get response :ok)
+      (message "services 请求成功（HTTP %s）" (plist-get response :status))
+    (message "services 请求失败 [%s]（HTTP %s）：%s"
+             (plist-get response :error-code)
+             (or (plist-get response :status) "无响应")
+             (plist-get response :error-message))))
+
+(cl-defun loki-assistant-request
+    (method path &key params body headers callback
+            (timeout loki-assistant-request-timeout))
+  "异步访问 services，使用 HTTP METHOD 和绝对 PATH。
+METHOD 接受字符串或符号；PATH 可含查询参数，但不能包含主机或 fragment。
+PARAMS 为查询参数 alist，键和值会进行 URL 编码，支持重复键。
+BODY 为 nil 时不发送正文；字符串按原样发送，其他值编码为 JSON。
+JSON null 和 false 分别用 :null、:false 表示。HEADERS 为额外请求头 alist。
+CALLBACK 接收一个 plist，包含 :ok、:status、:headers、:body、:data、
+:error-code 和 :error-message。JSON 对象为 symbol 键 alist，数组为 vector。
+非空响应正文应为 JSON；原始正文和响应头始终保留。
+发现、连接、HTTP 和解析失败通过同一回调反馈；无 CALLBACK 时显示结果。
+TIMEOUT 是正数秒，超时结果未知，不会自动重试。回调至多执行一次。
+返回请求 buffer；无法开始请求时返回 nil。buffer 由本函数负责清理。
+参数无效会直接报错；发现失败的回调可能在本函数返回前执行。"
+  (setq method (upcase (if (symbolp method) (symbol-name method) method)))
+  (unless (string-match-p "\\`[A-Z]+\\'" method)
+    (user-error "HTTP method 必须是非空字母串"))
+  (unless (and (stringp path) (string-prefix-p "/" path)
+               (not (string-prefix-p "//" path))
+               (not (string-match-p "[[:space:]#]" path)))
+    (user-error "HTTP path 必须是无空白和 fragment 的本机绝对路径"))
+  (unless (and (numberp timeout) (> timeout 0))
+    (user-error "HTTP timeout 必须是正数"))
+  (let* ((callback (or callback #'loki-assistant--report-response))
+         (query (loki-assistant--query-string params))
+         (url-request-method method)
+         (url-request-extra-headers
+          (append headers
+                  (unless (assoc-string "Content-Type" headers t)
+                    '(("Content-Type" . "application/json; charset=utf-8")))))
+         (json-null :null)
+         (json-false :false)
+         (url-request-data
+          (and body (encode-coding-string
+                     (if (stringp body) body (json-encode body)) 'utf-8)))
+         ;; 本机调用不使用代理、Cookie、缓存或重定向。
+         (url-proxy-services nil)
+         (url-using-proxy nil)
+         (url-automatic-caching nil)
+         (url-max-redirections 0)
+         response-buffer timer done base-url)
+    (cl-labels
+        ((finish (response)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (when (buffer-live-p response-buffer)
+               (when (equal (plist-get response :error-code) "timeout")
+                 (let ((process (get-buffer-process response-buffer)))
+                   (when process (delete-process process))))
+               (kill-buffer response-buffer))
+             (funcall callback response))))
+      (condition-case err
+          (setq base-url (loki-assistant--service-url))
+        (error (finish (loki-assistant--failure
+                        "service-discovery-failed" (error-message-string err)))))
+      (unless done
+        (condition-case err
+            (progn
+              (setq response-buffer
+                    (url-retrieve
+                     (concat base-url path
+                             (unless (string-empty-p query)
+                               (concat (if (string-match-p "?" path) "&" "?") query)))
+                     (lambda (status)
+                       (unless done
+                         (setq response-buffer (current-buffer))
+                         (finish (loki-assistant--response status))))
+                     nil t t))
+              (unless done
+                (if (not (buffer-live-p response-buffer))
+                    (finish (loki-assistant--failure
+                             "transport-error" "无法创建 services HTTP 请求"))
+                  (setq timer
+                        (run-at-time
+                         timeout nil
+                         (lambda ()
+                           (finish (loki-assistant--failure
+                                    "timeout" "services 请求超时，处理结果未知"))))))))
+          (error
+           (if done (signal (car err) (cdr err))
+             (finish (loki-assistant--failure
+                      "transport-error" (error-message-string err)))))))
+      (and (buffer-live-p response-buffer) response-buffer))))
+
+(cl-defun loki-assistant-notify
+    (buffer title &key body icon (module-id "emacs") payload callback
+            (timeout loki-assistant-request-timeout))
+  "向 services 的 MODULE-ID 处理器发送 BUFFER、TITLE、可选 BODY 和 ICON。
+BUFFER 接受存活 buffer 对象或非空名称；nil 表示不指定目标 buffer。
+省略 ICON 时由默认处理器选择 Emacs 图标；PAYLOAD 为附加 JSON 数据。
+CALLBACK 和 TIMEOUT 与 `loki-assistant-request' 相同。
+HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notification_id 查询。
+已返回的 failed 通知回执也按失败反馈；无 CALLBACK 时显示成功或失败原因。"
+  (when (bufferp buffer)
+    (unless (buffer-live-p buffer) (user-error "通知目标 buffer 已关闭"))
+    (setq buffer (buffer-name buffer)))
+  (dolist (field `(("title" . ,title) ("module-id" . ,module-id)
+                   ,@(when buffer `(("buffer" . ,buffer)))))
+    (unless (and (stringp (cdr field)) (not (string-empty-p (string-trim (cdr field)))))
+      (user-error "通知 %s 必须是非空字符串" (car field))))
+  (dolist (value (list body icon))
+    (unless (or (null value) (stringp value))
+      (user-error "通知正文和图标必须为字符串或 nil")))
+  (loki-assistant-request
+   "POST" "/emacs/receiver/notification"
+   :body `((module_id . ,module-id) (title . ,title)
+           ,@(when buffer `((buffer . ,buffer)))
+           ,@(when body `((body . ,body)))
+           ,@(when icon `((icon . ,icon)))
+           ,@(when payload `((payload . ,payload))))
+   :timeout timeout
+   :callback
+   (lambda (response)
+     (let* ((data (plist-get response :data))
+            (result (and (listp data) (alist-get 'result data))))
+       (when (and (plist-get response :ok) (listp result)
+                  (equal (alist-get 'status result) "failed"))
+         (setq response (plist-put response :ok nil)
+               response (plist-put response :error-code (alist-get 'code result))
+               response (plist-put response :error-message (alist-get 'message result))))
+       (if callback (funcall callback response)
+         (if (plist-get response :ok)
+             (message "通知处理器 %s 已响应：%s（%s）"
+                      module-id title
+                      (or (and (listp result) (alist-get 'status result)) "成功"))
+           (loki-assistant--report-response response)))))))
 
 (provide 'loki-assistant)
 ;;; loki-assistant.el ends here
