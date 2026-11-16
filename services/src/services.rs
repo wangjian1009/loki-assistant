@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::{
-    modules::{config, discover, emacs, health},
+    modules::{config, discover, emacs, health, notification::NotificationService},
     runtime::RuntimeState,
 };
 
@@ -13,6 +13,7 @@ pub struct Services {
     pub health: health::Module,
     pub discover: discover::Module,
     pub config: config::Module,
+    pub notification: Arc<NotificationService>,
     pub emacs: emacs::Module,
 }
 
@@ -31,12 +32,14 @@ impl Services {
     fn with_config(config: config::Module) -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
-        let emacs = emacs::Module::new(config.service());
+        let notification = Arc::new(NotificationService::new());
+        let emacs = emacs::Module::new(config.service(), Arc::clone(&notification));
 
         Self {
             health,
             discover,
             config,
+            notification,
             emacs,
         }
     }
@@ -46,6 +49,7 @@ impl Services {
             .merge(self.health.router(runtime))
             .merge(self.discover.router())
             .merge(self.config.router())
+            .merge(self.notification.router())
             .merge(self.emacs.router())
     }
 }

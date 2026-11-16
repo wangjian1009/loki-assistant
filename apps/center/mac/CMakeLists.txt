@@ -14,6 +14,7 @@ set(LOKI_APP_SOURCES
     Sources/App/LokiAssistantApp.swift
     Sources/App/ServiceStatusModel.swift
     Sources/App/SystemNotificationController.swift
+    Sources/App/NotificationReceiptClient.swift
     Sources/Features/Dashboard/DashboardView.swift
 )
 list(TRANSFORM LOKI_APP_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
@@ -45,6 +46,7 @@ if(BUILD_TESTING)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
         Tests/ServiceStatusTests.swift
         Tests/SystemNotificationTests.swift
+        Tests/NotificationReceiptTests.swift
     )
     set_target_properties(LokiAssistantTests PROPERTIES
         XCODE_GENERATE_SCHEME YES

@@ -35,7 +35,8 @@ pub struct Notification {
     pub module_id: String,
     pub title: String,
     pub icon: Option<String>,
-    pub buffer: String,
+    pub body: Option<String>,
+    pub buffer: Option<String>,
     #[serde(default)]
     pub payload: Value,
 }
@@ -49,6 +50,20 @@ pub struct NotificationResponse {
     pub api_version: String,
     pub module_id: String,
     pub result: Value,
+}
+
+pub use crate::modules::notification::protocol::{NotificationReceipt, NotificationStatusResponse};
+
+#[derive(Debug, Deserialize)]
+pub struct ActivationRequest {
+    pub buffer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivationResponse {
+    pub api_version: String,
+    pub activation: String,
+    pub buffer: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

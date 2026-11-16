@@ -6,7 +6,7 @@ Loki Assistant 是个人使用的助理程序。当前重新设计的第一步�
 
 * 当前阶段
 
-services 提供本机 loopback HTTP 服务、服务发现、配置数据和 macOS LaunchAgent 管理。Mac 菜单栏应用只展示 services 的健康状态、版本和运行时间，作为后续功能的入口。
+services 提供本机 loopback HTTP 服务、服务发现、配置数据、系统通知、Emacs gateway 和 macOS LaunchAgent 管理。Mac 菜单栏应用展示 services 状态并承接系统通知，点击后回调 services 执行对应业务跳转。
 
 ~emacs/~ 中已初始化 ~loki-assistant~ Emacs Lisp 包，目前提供包入口和配置组，后续集成能力尚未实现。
 

@@ -2,7 +2,7 @@
 
 * 范围
 
-本文规划电脑端控制中心服务层及其最小 macOS 菜单栏入口。当前交付由 Rust services、macOS LaunchAgent 管理和只读状态菜单组成。
+本文规划电脑端控制中心服务层及其最小 macOS 菜单栏入口。当前交付由 Rust services、macOS LaunchAgent 管理和菜单栏应用组成，支持状态展示与系统通知。
 
 旧版 Mac 会话界面、Emacs 插件和 agent-shell 控制协议已经清理。后续重新设计相关能力时，再建立新的模块和协议。
 
@@ -15,7 +15,8 @@
 | ~http~ | loopback HTTP server | 已实现 |
 | ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
 | ~modules/config~ | 配置模型、数据读写和变化订阅 | 已实现基础能力 |
-| ~modules/emacs~ | emacsclient gateway、buffer 列表和通知分发 | 已实现 |
+| ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
+| ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | LaunchAgent plist 和 launchctl 服务管理 | 已实现基础能力 |
 | ~apps/center~ | 菜单栏显示 services 状态 | 已实现最小入口 |
@@ -35,7 +36,8 @@ services/
     ├── modules/
     │   ├── config/         配置模型、路由、存储和订阅
     │   ├── discover/       模块/API 静态描述和发现路由
-    │   ├── emacs/          Lisp 求值、buffer 查询和通知处理器
+    │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
+│   ├── notification/   系统通知发送、跳转封装和回执状态
     │   └── health/         健康状态路由
     ├── platform/macos/     LaunchAgent 管理
     ├── runtime.rs          启动配置和运行状态
@@ -61,8 +63,13 @@ emacs/                      预留空目录
 | PUT | ~/data/{module_id}/{key}~ | 替换完整配置值 |
 | POST | ~/data/{module_id}/{key}~ | 合并字典或追加列表 |
 | POST | ~/config/validate~ | 预检配置值，不修改配置 |
+| GET | ~/notification/{id}~ | 查询系统通知处理状态 |
+| POST | ~/notification/{id}/receipt~ | 接收菜单栏应用处理回执 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
+| POST | ~/emacs/activate~ | 显示 Emacs 或通过 buffer 查询参数定位目标 |
 | POST | ~/emacs/receiver/notification~ | 接收 Emacs 通知上报，默认展示 macOS 系统通知 |
+| GET | ~/emacs/receiver/notification/{id}~ | 系统通知状态查询的兼容入口 |
+| POST | ~/emacs/receiver/notification/{id}/receipt~ | 系统通知回执的兼容入口 |
 | GET | ~/emacs/buffers~ | 查询当前 Emacs buffer 列表 |
 
 * 配置中心
@@ -193,23 +200,29 @@ Emacs 模块的协议版本为 ~1~，成功和错误响应均包含 ~api_version
 
 ** 通知和处理器
 
-~POST /emacs/receiver/notification~ 是 Emacs 向 services 上报通知的入口。~title~ 和 ~buffer~ 为必填非空字符串；~icon~ 为可选字符串，~module_id~ 默认为 ~emacs~，~payload~ 为可选的任意 JSON 值，默认为 ~null~ 。
+~POST /emacs/receiver/notification~ 是 Emacs 向 services 上报通知的入口。~title~ 为必填非空字符串；~buffer~、~icon~ 和 ~body~ 可省略或为 ~null~ ，提供 ~buffer~ 时必须为非空字符串。~module_id~ 默认为 ~emacs~ ，~payload~ 为可选的任意 JSON 值，默认为 ~null~ 。
 
 #+begin_src json
-{"module_id":"emacs","title":"任务完成","icon":"✓","buffer":"*scratch*","payload":{"task_id":"task-1"}}
+{"module_id":"emacs","title":"任务完成","buffer":"*scratch*","payload":{"task_id":"task-1"}}
 #+end_src
 
-默认处理器通过 ~NotificationLauncher~ 将上报转交给 Loki Assistant 菜单栏应用，由 ~UNUserNotificationCenter~ 展示 macOS 系统通知。点击通知只激活 Emacs 应用；如果 Emacs 没有运行，尝试通过其 Bundle ID ~org.gnu.Emacs~ 打开。~buffer~ 当前仅保留为通知元数据，不检查是否存在，也不执行 buffer 切换或 Lisp 求值。
+~Services~ 创建并持有 ~Arc<notification::NotificationService>~ ，再通过 ~emacs::Module::new(config.service(), Arc::clone(&notification))~ 注入 Emacs 模块。~EmacsService~ 保存该共享引用，发送、查询状态和接收回执都调用同一个实例，不会自行创建通知服务、状态表或平台发送器。
 
-~icon~ 支持文本或本地图片的绝对路径 / ~file:~ URL：文本置于标题前，图片作为通知附件展示，系统应用图标仍由 macOS 决定。图片读取失败时省略附件并记录日志。图片先复制到临时目录，避免系统附件处理影响原文件。
+默认处理器将 ~buffer~ 转换为 ~/emacs/activate?buffer=...~ 回调路径，省略时使用 ~/emacs/activate~ 。未提供图标或图标为空时，Emacs 模块补上 ~app-icon://org.gnu.Emacs~ 图标引用；App 使用 ~NSWorkspace~ 读取该应用的原生图标并转换为 PNG 附件。显式 ~icon~ 保持原值。~body~ 未提供时默认显示“点击显示 Emacs”。业务通知通过 ~NotificationService::send~ 发送，发送阶段不连接 Emacs 或执行 Lisp，避免同步上报期间回调 Emacs。
 
 #+begin_src json
-{"api_version":"1","module_id":"emacs","result":{"display":"macos","status":"forwarded","activation":"emacs"}}
+{"api_version":"1","module_id":"emacs","result":{"display":"macos","status":"forwarded","activation":"emacs","notification_id":"550e8400-e29b-41d4-a716-446655440000"}}
 #+end_src
 
-使用前需启动新版菜单栏应用以注册 ~loki-assistant~ URL scheme；可执行 ~make restart-center~ 加载当前构建。首次上报由菜单栏应用请求系统通知权限，拒绝后需要在系统设置中开启。~forwarded~ 仅表示 LaunchServices 已接受转交，不保证系统已展示；通知权限、勿扰模式或客户端处理失败可能影响展示，客户端错误写入系统日志。
+发送响应保持原有包装，ID 位于 ~result.notification_id~ ；如应用提前回执，~status~ 可以直接反映已收到的结果。通知回执、保留期限和通用代码接口见下文“系统通知模块”。旧的 ~GET /emacs/receiver/notification/{id}~ 和 ~POST /emacs/receiver/notification/{id}/receipt~ 继续代理同一个通知模块，客户端应优先使用 ~/notification/{id}~ 及其回执接口。
 
-services 使用独立参数调用 ~/usr/bin/open -g~ ，将百分号编码的 JSON 放入 ~loki-assistant://emacs/notification?payload=...~ URL，后台唤起菜单栏应用。菜单栏应用通过 AppKit delegate 接收 URL，并持有系统通知 delegate 处理点击；不直接调用 emacsclient。找不到菜单栏应用或转交进程失败返回 ~notification-failed~ 。指定 Emacs buffer 的定位留待后续实现。
+** 显示 Emacs 与 buffer
+
+~POST /emacs/activate~ 接受可选的 ~buffer~ 查询参数。省略时，services 通过 ~/usr/bin/open -b org.gnu.Emacs~ 显示或启动 Emacs；提供时，通过 gateway 连接现有 Emacs server，查找存活 buffer，选择图形 frame、显示目标并聚焦。没有图形 frame 时按需创建。此调用不自动启动新 daemon，不创建同名空 buffer，名称中的中文、引号、空格和换行按数据编码传递。
+
+成功返回 ~{"api_version":"1","activation":"emacs","buffer":"*scratch*"}~ ，无目标 buffer 时该字段为 ~null~ 。目标已关闭返回 HTTP 404 ~buffer-not-found~ ；连接失败、求值失败和超时使用 Emacs 模块现有错误响应。通知点击在 App 重新发现服务后调用本接口，跳转逻辑由 services 执行。
+
+*** 自定义处理器
 
 其他业务模块通过 ~EmacsService::register_notification_handler~ 注册异步处理器，按 ~module_id~ 精确分发，返回值作为响应的 ~result~。注册表不会在处理器执行期间持锁。重复注册返回错误，可先使用 ~unregister_notification_handler~ 取消；注册 ~emacs~ 可覆盖默认处理器，取消后恢复默认行为。未知模块返回 404，不静默丢弃通知。处理器须使用异步操作，避免阻塞运行时。
 
@@ -267,15 +280,84 @@ Emacs 代码可读取 services pfile，再异步发送通知；将 ~module_id~ �
 | HTTP 状态 | code | 含义 |
 |-----------+------+------|
 | 400 | ~invalid-request~ | JSON 结构、字段类型或必填内容无效 |
+| 404 | ~buffer-not-found~ | 激活目标 buffer 已关闭 |
 | 404 | ~notification-handler-not-found~ | 目标模块没有处理器 |
+| 404 | ~notification-not-found~ | 通知 ID 未知、过期或 services 已重启 |
 | 409 | ~notification-handler-exists~ | Rust 接口重复注册处理器 |
+| 409 | ~notification-receipt-conflict~ | 通知已有不同的明确处理结果 |
 | 422 | ~lisp-error~ | Lisp 读取或求值失败 |
 | 500 | ~invalid-config~ | 无法读取有效的 Emacs 配置 |
 | 502 | ~emacsclient-failed~ | 子进程失败，说明包含退出码与 stderr 或 stdout |
 | 502 | ~invalid-emacs-response~ | 子进程成功退出但响应无法解析 |
-| 502 | ~notification-failed~ | 自定义处理器报告通知失败 |
+| 502 | ~notification-failed~ | 系统通知转交失败或自定义处理器报告失败 |
 | 503 | ~emacs-unavailable~ | 无法执行 emacsclient |
+| 503 | ~notification-capacity-exceeded~ | 内存通知记录已满，稍后重试 |
 | 504 | ~emacs-timeout~ | 外部进程或通知处理器等待超时 |
+| 504 | ~notification-timeout~ | 通知模块的平台转交等待超时 |
+
+* 系统通知模块
+
+~modules/notification~ 提供通用的 Rust 代码接口、平台转交、应用内跳转封装及回执状态。业务模块负责选择默认图标、生成本机服务回调路径并执行具体业务；通知模块不解释 buffer 或调用 Emacs。发送由代码接口触发，当前没有独立的通知发送 HTTP 接口。
+
+** 代码接口与依赖注入
+
+通知模块直接导出 ~NotificationService~ 实例，提供 ~send~、~status~、~receive_receipt~ 和 ~router~ 方法。~Services~ 保存 ~Arc<NotificationService>~ ，业务模块在创建时接收并保存该共享引用，通过实例上的 ~send(NotificationRequest)~ 发送。~NotificationRequest~ 包含 ~title~、可选 ~body~、~icon~ 和 ~callback_url~ 。回调只允许本机服务的绝对路径及查询参数，不接受外部主机 URL；没有回调时点击不执行额外操作。
+
+#+begin_src rust
+use loki_services::modules::notification::protocol::NotificationRequest;
+
+let result = services.notification.send(NotificationRequest {
+    title: "任务完成".to_owned(),
+    body: Some("处理结果已就绪".to_owned()),
+    icon: None,
+    callback_url: None,
+}).await?;
+#+end_src
+
+成功返回 ~NotificationStatusResponse~ ，包含 ~api_version~、~notification_id~ 和当前 ~status~ 。发送器通过 ~NotificationLauncher~ 注入，单元测试不调用真实系统通知。
+
+** 平台转交与点击跳转
+
+services 通过独立参数调用 ~/usr/bin/open -g~ ，将通知 JSON 编码到 ~loki-assistant://notification/show?payload=...~ 并后台唤起菜单栏应用。~callback_url~ 在通知模块中包装为 ~loki-assistant://notification/activate?callback=...~ ，嵌套查询参数分别编码，应用保存此导航 URL 到系统通知 ~userInfo~ 。
+
+点击后，App 只解包通用导航 URL，检查服务文件锁、读取 pfile 并请求健康接口，然后向当前 services 地址的回调路径发送一次 ~POST~ 。Emacs 模块生成的回调由 ~/emacs/activate~ 执行。点击调用不自动重试，失败写入系统日志；成功日志包含通知 ID。导航 URL 不依赖内存回执记录，services 或 App 重启、回执记录过期后仍可发起跳转，实际目标是否有效由业务模块判断。
+
+~icon~ 支持文本、图片绝对路径、~file:~ URL 和 ~app-icon://<bundle-id>~ 应用图标引用。文本置于标题前；本地图片与应用图标转换为临时 PNG 附件，读取失败时继续发送文字通知。通知来源名称与系统应用图标属于 Loki Assistant，不可逐条更改为业务模块的名称或图标。
+
+使用前通过已有的 ~make restart-service~ 和 ~make restart-center~ 加载新版服务与 App。首次由 App 请求系统通知权限；拒绝后需要在系统设置中开启。旧版 ~loki-assistant://emacs/notification~ URL 及已发出通知的 Emacs 元数据仍可识别，点击统一回到 services，不在 App 中执行 Emacs 激活。
+
+** 通知回执与状态查询
+
+通知模块在转交前生成随机 UUID ~notification_id~ 并登记到内存，再将 ID 连同展示内容和通用跳转 URL 交给菜单栏应用。状态不依赖 Emacs 模块。即使应用在发送返回前完成回执，结果也不会丢失或被覆盖。
+
+~GET /notification/{id}~ 返回带协议版本的当前状态：
+
+#+begin_src json
+{"api_version":"1","notification_id":"550e8400-e29b-41d4-a716-446655440000","status":"submitted"}
+#+end_src
+
+| status | 含义 |
+|--------+------|
+| ~forwarded~ | 已登记并开始转交，尚未收到应用回执；发送接口成功返回表示 LaunchServices 已接受转交 |
+| ~submitted~ | 应用调用 ~UNUserNotificationCenter.add~ 成功，已提交给系统通知中心，不保证横幅展示或用户已经看到 |
+| ~failed~ | 应用明确报告授权、解析或提交失败，同时返回 ~code~ 和 ~message~ |
+| ~unconfirmed~ | 自登记起 30 秒内未收到回执，处理结果未知；等待用户授权也可能出现此状态 |
+
+菜单栏应用通过 ~POST /notification/{id}/receipt~ 回报结果。成功请求体为 ~{"status":"submitted"}~ ，失败示例如下：
+
+#+begin_src json
+{"status":"failed","code":"permission-denied","message":"请在 macOS 系统设置中允许 Loki Assistant 发送通知"}
+#+end_src
+
+允许回报的状态仅为 ~submitted~ 和 ~failed~ ；失败时 ~code~、~message~ 必须为非空字符串。应用使用 ~invalid-payload~、~permission-denied~ 和 ~notification-submit-failed~ 区分数据、权限和系统提交错误。成功接收回执返回 HTTP 200，响应结构与状态查询相同。相同内容的重复回执幂等；已经有明确结果后，冲突回执返回 HTTP 409 ~notification-receipt-conflict~ ，不覆盖原结果。
+
+记录自登记起保留 15 分钟，不因查询或重复回执续期；访问时清理过期记录，最多保留 1024 条，满额时新的系统通知返回 HTTP 503 ~notification-capacity-exceeded~ 。~unconfirmed~ 在过期前仍可接收迟到回执。未知、过期或 services 重启前的 ID 返回 HTTP 404 ~notification-not-found~ 。转交进程明确失败或超时后移除该记录；不会自动重发通知。
+
+应用每次发送回执都先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ ，校验 loopback 地址并请求 ~/healthz~ 。回执不使用硬编码端口，回执接收地址也不由通知数据指定。网络错误或服务端暂时失败时，最多尝试 3 次，重试前分别等待 1 秒、2 秒；每次重新发现服务，每个 HTTP 请求最多等待 5 秒。回执接口返回 HTTP 4xx 时立即停止重试。只重试回执，不重新提交通知；重试耗尽后记录系统日志。响应丢失时客户端无法确定回执是否送达，服务端保留已接收的结果；没有回执才按未知处理。
+
+应用启动早期安装通知 delegate。旧版不含 ~notification_id~ 的通知 URL 仍可展示，但不发送回执。数据格式错误且仍可读取有效 ID 时回报失败；无法读取 ID 时只记录日志。首次授权等待期间不会阻塞原 HTTP 请求，超过 30 秒仍可继续等待用户决定。
+
+点击跳转与通知提交结果分别处理，当前回执不追踪业务激活或用户阅读状态。
 
 * macOS 服务管理
 
@@ -289,19 +371,3 @@ make uninstall-service
 #+end_src
 
 ~make restart-service~ 会重新编译 services 并重启同一路径的 Debug binary。LaunchAgent 管理器使用用户级 domain，不在服务启动时自动修改用户配置。
-
-* 分阶段计划
-
-** INPROGRESS 第一阶段：基础入口
-
-- Rust services 提供 loopback HTTP 服务。
-- 服务发现和配置基础能力可用。
-- macOS 菜单栏入口展示 services 状态。
-- LaunchAgent 可显式安装、启动、停止和刷新。
-
-** TODO 第二阶段：状态和业务能力
-
-- 菜单栏入口展示更完整的运行状态和错误信息。
-- 重新设计业务模块及其 HTTP 协议。
-- Emacs 已接入 Lisp 求值、buffer 查询和通知上报；macOS 系统通知点击目前只激活 Emacs，后续补充 buffer 定位。
-- 根据新需求再建立语音和其他平台能力。

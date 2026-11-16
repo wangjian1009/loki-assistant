@@ -9,11 +9,11 @@ use tokio::{
 };
 
 use crate::modules::config::service::ConfigService;
-use crate::platform::macos::notification::{
-    MacNotificationLauncher, NotificationContent, NotificationLauncher,
+use crate::modules::notification::{
+    NotificationError, NotificationService, protocol::NotificationRequest,
 };
 
-use super::protocol::{Buffer, Notification};
+use super::protocol::{Buffer, Notification, NotificationReceipt, NotificationStatusResponse};
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
 
@@ -92,12 +92,16 @@ pub enum EmacsError {
     HandlerAlreadyRegistered(String),
     #[error("通知处理失败：{0}")]
     Notification(String),
+    #[error(transparent)]
+    SystemNotification(#[from] NotificationError),
+    #[error("目标 buffer 已不存在")]
+    BufferNotFound,
 }
 
 pub struct EmacsService {
     config: Arc<ConfigService>,
     runner: Arc<dyn CommandRunner>,
-    notification_launcher: Arc<dyn NotificationLauncher>,
+    notifications: Arc<NotificationService>,
     timeout: Duration,
     evaluation: Mutex<()>,
     handlers: RwLock<HashMap<String, Arc<dyn NotificationHandler>>>,
@@ -114,9 +118,10 @@ impl Debug for EmacsService {
 }
 
 impl EmacsService {
-    pub fn new(config: Arc<ConfigService>) -> Self {
+    pub fn new(config: Arc<ConfigService>, notifications: Arc<NotificationService>) -> Self {
         Self::with_runner(
             config,
+            notifications,
             Arc::new(ProcessCommandRunner),
             Duration::from_secs(30),
         )
@@ -124,25 +129,29 @@ impl EmacsService {
 
     pub fn with_runner(
         config: Arc<ConfigService>,
+        notifications: Arc<NotificationService>,
         runner: Arc<dyn CommandRunner>,
         timeout: Duration,
     ) -> Self {
         Self {
             config,
             runner,
-            notification_launcher: Arc::new(MacNotificationLauncher),
+            notifications,
             timeout,
             evaluation: Mutex::new(()),
             handlers: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn with_notification_launcher(mut self, launcher: Arc<dyn NotificationLauncher>) -> Self {
-        self.notification_launcher = launcher;
-        self
+    pub async fn eval(&self, script: &str) -> Result<String, EmacsError> {
+        self.eval_with_startup(script, true).await
     }
 
-    pub async fn eval(&self, script: &str) -> Result<String, EmacsError> {
+    async fn eval_with_startup(
+        &self,
+        script: &str,
+        auto_start: bool,
+    ) -> Result<String, EmacsError> {
         if script.trim().is_empty() {
             return Err(EmacsError::InvalidRequest("script 不能为空".to_owned()));
         }
@@ -158,7 +167,12 @@ impl EmacsService {
             Err(error) => return Err(EmacsError::Config(error.to_string())),
         };
         let args = vec![
-            "--alternate-editor=".to_owned(),
+            if auto_start {
+                "--alternate-editor="
+            } else {
+                "--alternate-editor=/usr/bin/false"
+            }
+            .to_owned(),
             "--eval".to_owned(),
             eval_expression(script),
         ];
@@ -209,10 +223,13 @@ impl EmacsService {
     pub async fn notify(&self, notification: Notification) -> Result<Value, EmacsError> {
         if notification.module_id.trim().is_empty()
             || notification.title.trim().is_empty()
-            || notification.buffer.trim().is_empty()
+            || notification
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| buffer.trim().is_empty())
         {
             return Err(EmacsError::InvalidRequest(
-                "module_id、title 和 buffer 不能为空".to_owned(),
+                "module_id、title 不能为空；提供 buffer 时必须为非空字符串".to_owned(),
             ));
         }
         let handler = self
@@ -227,23 +244,92 @@ impl EmacsService {
                 .await
                 .map_err(|_| EmacsError::Timeout)?
         } else if notification.module_id == "emacs" {
-            timeout(
-                self.timeout,
-                self.notification_launcher.launch(NotificationContent {
+            let callback_url = match &notification.buffer {
+                Some(buffer) => format!(
+                    "/emacs/activate?buffer={}",
+                    percent_encoding::utf8_percent_encode(
+                        buffer,
+                        percent_encoding::NON_ALPHANUMERIC
+                    )
+                ),
+                None => "/emacs/activate".to_owned(),
+            };
+            let result = self
+                .notifications
+                .send(NotificationRequest {
                     title: notification.title,
-                    icon: notification.icon,
-                    buffer: notification.buffer,
-                }),
-            )
-            .await
-            .map_err(|_| EmacsError::Timeout)?
-            .map_err(EmacsError::Notification)?;
+                    body: notification
+                        .body
+                        .or_else(|| Some("点击显示 Emacs".to_owned())),
+                    icon: Some(
+                        notification
+                            .icon
+                            .filter(|icon| !icon.trim().is_empty())
+                            .unwrap_or_else(|| "app-icon://org.gnu.Emacs".to_owned()),
+                    ),
+                    callback_url: Some(callback_url),
+                })
+                .await?;
             Ok(
-                serde_json::json!({"display": "macos", "status": "forwarded", "activation": "emacs"}),
+                serde_json::json!({"display":"macos", "status":result.status, "activation":"emacs", "notification_id":result.notification_id}),
             )
         } else {
             Err(EmacsError::HandlerNotFound(notification.module_id))
         }
+    }
+
+    pub async fn activate(&self, buffer: Option<&str>) -> Result<(), EmacsError> {
+        if let Some(buffer) = buffer {
+            if buffer.trim().is_empty() {
+                return Err(EmacsError::InvalidRequest("buffer 不能为空".to_owned()));
+            }
+            let buffer_name = serde_json::to_string(buffer).expect("字符串可以序列化");
+            let script = format!(
+                r#"(progn
+  (require 'seq)
+  (let ((target (get-buffer {buffer_name})))
+    (when target
+      (let ((frame (or (seq-find (lambda (candidate) (display-graphic-p candidate)) (frame-list))
+                       (make-frame '((window-system . ns))))))
+        (select-frame-set-input-focus frame)
+        (switch-to-buffer target)
+        (raise-frame frame)
+        t))))"#
+            );
+            if self.eval_with_startup(&script, false).await? == "nil" {
+                return Err(EmacsError::BufferNotFound);
+            }
+        } else {
+            let args = vec!["-b".to_owned(), "org.gnu.Emacs".to_owned()];
+            let output = timeout(self.timeout, self.runner.run("/usr/bin/open", &args))
+                .await
+                .map_err(|_| EmacsError::Timeout)??;
+            if !output.success {
+                return Err(EmacsError::CommandFailed {
+                    status: output.status,
+                    message: output.stderr,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn notification_status(
+        &self,
+        id: &str,
+    ) -> Result<NotificationStatusResponse, EmacsError> {
+        self.notifications.status(id).await.map_err(Into::into)
+    }
+
+    pub async fn receive_notification_receipt(
+        &self,
+        id: &str,
+        receipt: NotificationReceipt,
+    ) -> Result<NotificationStatusResponse, EmacsError> {
+        self.notifications
+            .receive_receipt(id, receipt)
+            .await
+            .map_err(Into::into)
     }
 }
 

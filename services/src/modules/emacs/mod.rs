@@ -16,6 +16,7 @@ use crate::modules::{
         service::ConfigService,
     },
     discover::registry::ModuleRegistration,
+    notification::NotificationService,
 };
 
 use self::service::EmacsService;
@@ -47,9 +48,9 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new(config: Arc<ConfigService>) -> Self {
+    pub fn new(config: Arc<ConfigService>, notification: Arc<NotificationService>) -> Self {
         Self {
-            service: Arc::new(EmacsService::new(config)),
+            service: Arc::new(EmacsService::new(config, notification)),
         }
     }
 

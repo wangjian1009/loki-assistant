@@ -3,12 +3,14 @@ use std::{fmt::Debug, future::Future, pin::Pin};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
 
-/// 菜单栏应用承接的系统通知数据；buffer 暂时仅作为元数据保留。
+/// 菜单栏应用承接的通用通知数据，不解释业务回调路径。
 #[derive(Clone, Debug, Serialize)]
 pub struct NotificationContent {
+    pub notification_id: String,
     pub title: String,
     pub icon: Option<String>,
-    pub buffer: String,
+    pub body: Option<String>,
+    pub navigation_url: Option<String>,
 }
 
 pub type NotificationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -53,7 +55,7 @@ impl NotificationLauncher for MacNotificationLauncher {
 fn notification_url(content: &NotificationContent) -> Result<String, String> {
     let json = serde_json::to_string(content).map_err(|error| error.to_string())?;
     Ok(format!(
-        "loki-assistant://emacs/notification?payload={}",
+        "loki-assistant://notification/show?payload={}",
         utf8_percent_encode(&json, NON_ALPHANUMERIC)
     ))
 }
@@ -65,13 +67,17 @@ mod tests {
     #[test]
     fn encodes_notification_as_a_single_url_argument() {
         let content = NotificationContent {
+            notification_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
             title: "中文 & \"通知\"\n$(test)".to_owned(),
             icon: Some("/tmp/图标 #1.png".to_owned()),
-            buffer: "*scratch*".to_owned(),
+            body: Some("完成".to_owned()),
+            navigation_url: Some(
+                "loki-assistant://notification/activate?callback=%2Femacs%2Factivate".to_owned(),
+            ),
         };
         let url = notification_url(&content).unwrap();
         let encoded = url
-            .strip_prefix("loki-assistant://emacs/notification?payload=")
+            .strip_prefix("loki-assistant://notification/show?payload=")
             .unwrap();
         let decoded = percent_encoding::percent_decode_str(encoded)
             .decode_utf8()

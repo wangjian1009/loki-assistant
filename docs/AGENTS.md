@@ -4,7 +4,7 @@
 
 ## 文档划分
 
-- `control-center-services.org`：控制中心服务层的范围、模块边界与分阶段实现。
+- `control-center-services.org`：控制中心服务层的范围、模块边界与跨模块协议。
 - 后续独立主题出现时再增加文档；各代码目录的内部结构由其自身的 `AGENTS.md` 定义。
 
 ## 写作约定

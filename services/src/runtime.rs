@@ -1,6 +1,7 @@
 use std::{
     env, fs, io,
     net::SocketAddr,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::PathBuf,
     str::FromStr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -12,6 +13,46 @@ use crate::services::Services;
 
 const HTTP_ADDR_ENV: &str = "LOKI_ASSISTANT_HTTP_ADDR";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:47321";
+
+/// 随服务进程持有文件锁；进程退出或崩溃时由操作系统释放。
+pub struct ServiceInstanceLock {
+    _file: fs::File,
+}
+
+impl ServiceInstanceLock {
+    pub fn acquire() -> Result<Self, RuntimeConfigError> {
+        Self::acquire_at(&ServicePfile::path()?.with_extension("lock"))
+    }
+
+    fn acquire_at(path: &std::path::Path) -> Result<Self, RuntimeConfigError> {
+        let lock_file = || -> io::Result<fs::File> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(file)
+        };
+        match lock_file() {
+            Ok(file) => Ok(Self { _file: file }),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(RuntimeConfigError::AlreadyRunning)
+            }
+            Err(source) => Err(RuntimeConfigError::Io {
+                operation: "获取 services 文件锁",
+                source,
+            }),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ServicePfile {
@@ -84,6 +125,8 @@ impl ServicePfile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeConfigError {
+    #[error("services 已运行，无法获取独占文件锁")]
+    AlreadyRunning,
     #[error("环境变量 {name} 不是有效的 socket 地址：{value}")]
     InvalidAddress { name: &'static str, value: String },
     #[error("无法确定用户主目录")]
@@ -178,6 +221,21 @@ impl Default for RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_lock_is_exclusive_and_released_on_drop() {
+        let directory = env::temp_dir().join(format!("loki-service-lock-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("service.lock");
+        let first = ServiceInstanceLock::acquire_at(&path).unwrap();
+        assert!(matches!(
+            ServiceInstanceLock::acquire_at(&path),
+            Err(RuntimeConfigError::AlreadyRunning)
+        ));
+        drop(first);
+        let second = ServiceInstanceLock::acquire_at(&path).unwrap();
+        drop(second);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn defaults_to_loopback() {

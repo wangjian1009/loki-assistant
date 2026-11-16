@@ -12,10 +12,12 @@
 Sources/
 ├── App/LokiAssistantApp.swift       菜单栏应用入口
 ├── App/ServiceStatusModel.swift     services 状态请求和模型
-├── App/SystemNotificationController.swift  通知 URL 解码、系统通知与 Emacs 应用激活
+├── App/SystemNotificationController.swift  通用通知解码、系统展示与点击回调
+├── App/NotificationReceiptClient.swift     通知回执、点击导航、服务发现及有限重试
 └── Features/Dashboard/DashboardView.swift  菜单内容
 Tests/ServiceStatusTests.swift       健康响应和状态模型测试
 Tests/SystemNotificationTests.swift  通知数据与展示内容测试
+Tests/NotificationReceiptTests.swift 回执、重试、导航及服务发现测试
 ```
 
 增加 Swift 源文件时同步修改 `CMakeLists.txt`，不要直接修改生成的 Xcode 工程。

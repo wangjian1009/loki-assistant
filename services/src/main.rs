@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, sync::Arc};
 use loki_services::{
     Services, http,
     platform::macos::{LaunchdManager, LaunchdServiceSpec},
-    runtime::{RuntimeConfig, RuntimeState, ServicePfile},
+    runtime::{RuntimeConfig, RuntimeState, ServiceInstanceLock, ServicePfile},
 };
 
 #[tokio::main]
@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_config = RuntimeConfig::from_env()?;
+    let _instance_lock = ServiceInstanceLock::acquire()?;
     let listener = tokio::net::TcpListener::bind(runtime_config.http_addr).await?;
     let service_pfile = ServicePfile::for_listener(listener.local_addr()?);
     let services = Arc::new(Services::load()?);
