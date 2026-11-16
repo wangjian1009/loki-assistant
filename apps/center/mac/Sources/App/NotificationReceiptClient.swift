@@ -33,6 +33,21 @@ enum NotificationReceiptError: Error, LocalizedError {
     }
 }
 
+enum NotificationActivationError: Error, LocalizedError {
+    case rejected(status: Int, message: String?)
+
+    var errorDescription: String? {
+        switch self {
+        case let .rejected(status, message):
+            message ?? "通知跳转失败（HTTP \(status)）"
+        }
+    }
+}
+
+private struct ActivationErrorResponse: Decodable {
+    let message: String
+}
+
 struct NotificationReceiptClient: Sendable {
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private let discover: @Sendable () throws -> ServiceEndpoint
@@ -106,9 +121,12 @@ struct NotificationReceiptClient: Sendable {
         }
         var request = URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.httpMethod = "POST"
-        let (_, response) = try await transport(request)
+        let (data, response) = try await transport(request)
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        guard response.statusCode == 200 else { throw NotificationReceiptError.rejected(response.statusCode) }
+        guard response.statusCode == 200 else {
+            let message = (try? JSONDecoder().decode(ActivationErrorResponse.self, from: data))?.message
+            throw NotificationActivationError.rejected(status: response.statusCode, message: message?.isEmpty == false ? message : nil)
+        }
     }
 
     static func discoverEndpoint(

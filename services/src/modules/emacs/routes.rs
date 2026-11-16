@@ -183,7 +183,9 @@ fn error_response(error: EmacsError) -> Response {
     let (status, code) = match &error {
         EmacsError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid-request"),
         EmacsError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "invalid-config"),
-        EmacsError::Process(_) => (StatusCode::SERVICE_UNAVAILABLE, "emacs-unavailable"),
+        EmacsError::Process(_) | EmacsError::ConnectionFailed(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "emacs-unavailable")
+        }
         EmacsError::CommandFailed { .. } => (StatusCode::BAD_GATEWAY, "emacsclient-failed"),
         EmacsError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "emacs-timeout"),
         EmacsError::Lisp(_) => (StatusCode::UNPROCESSABLE_ENTITY, "lisp-error"),

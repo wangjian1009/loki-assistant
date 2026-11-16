@@ -65,7 +65,7 @@ control-center:
 
 * Emacs
 
-Emacs 的 Rust 配置入口为 ~modules/emacs/config.rs~ 中的 ~EmacsConfig~ ，构造时注入 ~Arc<ConfigService>~ 。每个配置项有独立读取方法；~emacsclient_path()~ 在每次使用时读取生效值及来源，不缓存程序路径。配置元数据通过静态方法和 ~#[loki_config]~ 注册，与 API 元数据使用相同的编译期发现方式。
+Emacs 的 Rust 配置入口为 ~modules/emacs/config.rs~ 中的 ~EmacsConfig~ ，构造时注入 ~Arc<ConfigService>~ 。每个配置项有独立读取方法；~emacsclient_path()~ 和 ~socket_name()~ 在每次使用时读取生效值及来源，不缓存连接配置。配置元数据通过静态方法和 ~#[loki_config]~ 注册，与 API 元数据使用相同的编译期发现方式。
 
 ~emacsclient_path~ 的类型为 ~Executable~，默认程序名为 ~emacsclient~。配置模块先按 services 进程的 ~PATH~ 搜索，再检查模块声明的 Homebrew 和 Emacs App 目录；找到的绝对路径作为默认值返回。也可在配置编辑器中使用“选择可执行文件…”按钮，或通过接口指定路径：
 
@@ -85,7 +85,9 @@ curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
   -d '{"title":"任务完成","icon":"✓","buffer":"*scratch*"}'
 #+end_src
 
-路径修改从下次调用开始生效，并保存到 ~~/.assistant/config.yml~。不展开路径中的 ~ 和环境变量。server 不可用时，~emacsclient --alternate-editor=~ 自动启动 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置仍须在 services 运行环境中可用。
+配置修改从下次调用开始生效，并保存到 ~~/.assistant/config.yml~ 。不展开路径中的 ~ 和环境变量。~socket_name~ 默认为 ~server~ ，可在配置编辑器中改为目标 Emacs 的 socket 名称或绝对路径。gateway 显式传入该 socket，不依赖 ~EMACS_SOCKET_NAME~ 或 ~EMACS_SERVER_FILE~ ，也不在连接失败后回退到 TCP server 或其他实例。
+
+Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclient --alternate-editor=~ 自动启动目标 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置须在 services 运行环境中可用。services 以用户级 LaunchAgent 的用户身份运行。
 
 通知上报接口为 ~POST /emacs/receiver/notification~ 。Emacs 模块调用创建时注入的系统通知模块，转交菜单栏应用展示 macOS 通知。~buffer~ 可省略，点击时由 services 显示 Emacs；提供时定位对应的存活 buffer。~icon~ 省略时使用 Emacs 原生图标附件，显式值支持文本或本地图片。传入 ~module_id~ 可将上报交给已注册的 Rust 模块处理器；默认值为 ~emacs~ 。
 
@@ -101,7 +103,7 @@ curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
 
 ~services.notification~ 直接持有 ~Arc<NotificationService>~ ，通过 ~services.notification.send(NotificationRequest)~ 发送标题、正文、图标与本机服务回调路径。业务模块保存创建时注入的共享引用并调用其实例方法。通知模块负责 URL scheme 转交、App 内跳转封装和提交回执；具体跳转操作由 services 中的业务模块执行。Emacs 模块的创建方式为 ~emacs::Module::new(config.service(), Arc::clone(&notification))~ 。通用接口、图标格式及跳转协议见 [[file:../docs/control-center-services.org::*系统通知模块][系统通知模块协议]]。
 
-原 Emacs 状态和回执 URL 保留为兼容入口，与通用接口共享同一份记录。~POST /emacs/activate~ 可显示 Emacs，或通过 ~buffer~ 查询参数激活指定 buffer；后者仅连接已有 server，不创建同名空 buffer。
+原 Emacs 状态和回执 URL 保留为兼容入口，与通用接口共享同一份记录。~POST /emacs/activate~ 可显示 Emacs，或通过 ~buffer~ 查询参数激活指定 buffer。指定 buffer 时仅连接目标 socket 的已有 server，优先聚焦已经显示该 buffer 的 GUI 窗口，并恢复最小化或隐藏的窗口；没有 GUI frame 时创建窗口。中文、引号、反斜杠和换行保持完整。目标已关闭时返回 ~buffer-not-found~ ，不创建同名空 buffer；连接失败返回 ~emacs-unavailable~ ，点击旧通知也不会启动新 daemon。点击失败时菜单栏应用显示具体原因。
 
 * macOS 服务管理
 

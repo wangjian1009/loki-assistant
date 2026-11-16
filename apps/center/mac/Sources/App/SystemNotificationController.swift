@@ -52,6 +52,8 @@ struct SystemNotification: Codable, Equatable, Sendable {
         var callback = URLComponents()
         callback.path = "/emacs/activate"
         if let buffer { callback.queryItems = [URLQueryItem(name: "buffer", value: buffer)] }
+        // services 的查询解析将 + 视为空格，名称中的字面 + 必须单独编码。
+        callback.percentEncodedQuery = callback.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         var navigation = URLComponents()
         navigation.scheme = "loki-assistant"
         navigation.host = "notification"
@@ -107,8 +109,7 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             Task {
                 do {
                     if url.host == "notification", url.path == "/activate" {
-                        try await receiptClient.activate(url)
-                        logger.notice("应用内通知跳转已回调 services")
+                        await followNotificationNavigation(url, notificationID: "URL")
                         return
                     }
                     let delivery = NotificationDelivery(
@@ -190,6 +191,13 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             logger.notice("通知点击已回调 services：\(notificationID, privacy: .public)")
         } catch {
             logger.error("通知点击跳转失败：\(error.localizedDescription, privacy: .public)")
+            let alert = NSAlert()
+            alert.messageText = "无法完成通知跳转"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "好")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
     }
 }

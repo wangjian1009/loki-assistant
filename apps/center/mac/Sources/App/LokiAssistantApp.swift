@@ -31,6 +31,14 @@ struct LokiAssistantApp: App {
     @State private var status: ServiceStatusModel
 
     init() {
+        // XCTest 的宿主进程不参与日常实例锁，也不轮询真实 services。
+        let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+        if isTesting {
+            instanceLock = nil
+            _status = State(initialValue: ServiceStatusModel())
+            return
+        }
         let instanceLock = CenterInstanceLock()
         self.instanceLock = instanceLock
         let model = ServiceStatusModel()

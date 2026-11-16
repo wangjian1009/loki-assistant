@@ -141,6 +141,10 @@ async fn eval_uses_argument_boundary_auto_start_and_latest_config() {
         .replace("emacs", "emacsclient_path", json!(executable))
         .await
         .unwrap();
+    config
+        .replace("emacs", "socket_name", json!("目标 socket"))
+        .await
+        .unwrap();
     let updated = module_config.emacsclient_path().await.unwrap();
     assert_eq!(updated.value, json!(executable));
     assert_eq!(updated.source, ConfigValueSource::User);
@@ -149,10 +153,17 @@ async fn eval_uses_argument_boundary_auto_start_and_latest_config() {
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls[0].0, "/default/emacsclient");
     assert_eq!(calls[1].0, executable.to_str().unwrap());
-    assert_eq!(&calls[1].1[..2], ["--alternate-editor=", "--eval"]);
-    assert_eq!(calls[1].1.len(), 3);
+    assert_eq!(
+        &calls[0].1[..3],
+        ["--alternate-editor=", "--socket-name=server", "--eval"]
+    );
+    assert_eq!(
+        &calls[1].1[..3],
+        ["--alternate-editor=", "--socket-name=目标 socket", "--eval"]
+    );
+    assert_eq!(calls[1].1.len(), 4);
     assert!(
-        calls[1].1[2].contains(&serde_json::to_string(&format!("(progn\n{script}\n)")).unwrap())
+        calls[1].1[3].contains(&serde_json::to_string(&format!("(progn\n{script}\n)")).unwrap())
     );
     std::fs::remove_dir_all(directory.parent().unwrap()).unwrap();
 }
@@ -292,6 +303,9 @@ async fn rejects_invalid_input_before_executing_anything() {
             .await
             .is_err()
     );
+    for value in [json!(""), json!(" \n"), json!("bad\u{0}socket"), json!(42)] {
+        assert!(config.replace("emacs", "socket_name", value).await.is_err());
+    }
     assert!(runner.calls.lock().unwrap().is_empty());
 }
 
@@ -642,7 +656,205 @@ async fn activation_preserves_buffer_name_and_reports_missing_target() {
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(
-        &calls[0].1[..2],
-        ["--alternate-editor=/usr/bin/false", "--eval"]
+        &calls[0].1[..3],
+        [
+            "--alternate-editor=/usr/bin/false",
+            "--socket-name=server",
+            "--eval"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn activation_reports_connection_failure_without_retry_or_opening_another_instance() {
+    let (service, runner, config) = service(vec![
+        Ok(CommandOutput {
+            success: false,
+            status: Some(1),
+            stdout: String::new(),
+            stderr: "can't connect to socket".to_owned(),
+        }),
+        Err(EmacsError::Process("找不到 emacsclient".to_owned())),
+        Ok(wire(json!({"result":"unexpected"}))),
+    ]);
+    config
+        .replace("emacs", "socket_name", json!("/tmp/不存在的 Emacs socket"))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let (status, body) = request(
+            service.clone(),
+            "POST",
+            "/emacs/activate?buffer=old",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "emacs-unavailable");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("无法连接目标 Emacs")
+        );
+    }
+    let (status, body) = request(service, "POST", "/emacs/activate?buffer=old", Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["code"], "invalid-emacs-response");
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    for (program, args) in calls.iter() {
+        assert_eq!(program, "/default/emacsclient");
+        assert_eq!(
+            &args[..3],
+            [
+                "--alternate-editor=/usr/bin/false",
+                "--socket-name=/tmp/不存在的 Emacs socket",
+                "--eval"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_timeout_has_a_clear_error_and_does_not_retry() {
+    let service = Arc::new(EmacsService::with_runner(
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
+        default_notifications(),
+        Arc::new(StallingRunner),
+        Duration::from_millis(1),
+    ));
+    let (status, body) = request(service, "POST", "/emacs/activate?buffer=old", Value::Null).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["code"], "emacs-timeout");
+}
+
+#[tokio::test]
+#[ignore = "需要通过 LOKI_TEST_EMACS_SOCKET 指定独立、无 GUI frame 的测试 daemon"]
+async fn activation_in_live_emacs_without_gui() {
+    let socket = std::env::var("LOKI_TEST_EMACS_SOCKET").expect("必须指定独立测试 socket");
+    assert!(
+        socket.contains("loki-activation-test-"),
+        "禁止使用日常 Emacs 实例"
+    );
+    let config = Arc::new(ConfigService::new(EmacsConfig::metadata()));
+    config
+        .replace("emacs", "socket_name", json!(socket))
+        .await
+        .unwrap();
+    let service = EmacsService::new(EmacsConfig::new(config.clone()), default_notifications());
+    assert_eq!(
+        service
+            .eval("(and (daemonp) (not (seq-some #'display-graphic-p (frame-list))))")
+            .await
+            .unwrap(),
+        "t"
+    );
+    let pid = service.eval("(emacs-pid)").await.unwrap();
+    let buffer = "中文 & # + % \"引号\" \\ \n\t😀";
+    let name = serde_json::to_string(buffer).unwrap();
+    service
+        .eval(&format!(
+            r#"(with-current-buffer (get-buffer-create {name})
+  (insert "验收内容：中文和引号完整"))"#
+        ))
+        .await
+        .unwrap();
+
+    // 从纯 daemon 创建真实 GUI frame，并核对名称与内容。
+    service.activate(Some(buffer)).await.unwrap();
+    assert_eq!(
+        service
+            .eval(&format!(
+                r#"(progn
+  (setq loki-assistant-test-frame (selected-frame)
+        loki-assistant-test-window (get-buffer-window {name} t))
+  (and (display-graphic-p loki-assistant-test-frame)
+       loki-assistant-test-window
+       (eq (window-buffer loki-assistant-test-window) (get-buffer {name}))
+       (equal (with-current-buffer {name} (buffer-string)) "验收内容：中文和引号完整")))"#
+            ))
+            .await
+            .unwrap(),
+        "t"
+    );
+
+    // 另一个 GUI frame 成为当前窗口后，仍回到已经显示目标的窗口。
+    service
+        .eval(
+            r#"(progn
+  (select-frame (make-frame '((window-system . ns) (name . "其他测试窗口"))))
+  (switch-to-buffer "*scratch*")
+  (setq loki-assistant-test-frame-count (length (frame-list))))"#,
+        )
+        .await
+        .unwrap();
+    service.activate(Some(buffer)).await.unwrap();
+    assert_eq!(
+        service
+            .eval(
+                r#"(and (eq (selected-frame) loki-assistant-test-frame)
+     (eq (selected-window) loki-assistant-test-window)
+     (= (length (frame-list)) loki-assistant-test-frame-count))"#
+            )
+            .await
+            .unwrap(),
+        "t"
+    );
+    service
+        .eval("(iconify-frame loki-assistant-test-frame)")
+        .await
+        .unwrap();
+    service.activate(Some(buffer)).await.unwrap();
+    assert_eq!(
+        service
+            .eval("(eq t (frame-visible-p loki-assistant-test-frame))")
+            .await
+            .unwrap(),
+        "t"
+    );
+    service
+        .eval("(make-frame-invisible loki-assistant-test-frame t)")
+        .await
+        .unwrap();
+    service.activate(Some(buffer)).await.unwrap();
+    assert_eq!(
+        service
+            .eval("(eq t (frame-visible-p loki-assistant-test-frame))")
+            .await
+            .unwrap(),
+        "t"
+    );
+
+    service
+        .eval(&format!("(kill-buffer {name})"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.activate(Some(buffer)).await,
+        Err(EmacsError::BufferNotFound)
+    ));
+    assert_eq!(service.eval(&format!("(and (not (get-buffer {name})) (= (length (frame-list)) loki-assistant-test-frame-count))")).await.unwrap(), "t");
+
+    // 默认实例仍运行；不存在的显式 socket 必须失败，不能启动新会话。
+    config
+        .replace("emacs", "socket_name", json!(format!("{socket}-missing")))
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.activate(Some("*scratch*")).await,
+        Err(EmacsError::ConnectionFailed(_))
+    ));
+    config
+        .replace("emacs", "socket_name", json!(socket))
+        .await
+        .unwrap();
+    assert_eq!(service.eval("(emacs-pid)").await.unwrap(), pid);
+    assert_eq!(
+        service
+            .eval("(= (length (frame-list)) loki-assistant-test-frame-count)")
+            .await
+            .unwrap(),
+        "t"
     );
 }

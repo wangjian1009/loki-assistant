@@ -77,6 +77,8 @@ pub enum EmacsError {
     Config(String),
     #[error("执行 emacsclient 失败：{0}")]
     Process(String),
+    #[error("无法连接目标 Emacs，请确认该实例的 server 已启动及 socket 配置正确：{0}")]
+    ConnectionFailed(String),
     #[error("emacsclient 退出码 {status:?}：{message}")]
     CommandFailed {
         status: Option<i32>,
@@ -168,6 +170,18 @@ impl EmacsService {
                 .to_owned(),
             Err(error) => return Err(EmacsError::Config(error.to_string())),
         };
+        let socket = self
+            .config
+            .socket_name()
+            .await
+            .map_err(|error| EmacsError::Config(error.to_string()))?;
+        let socket = socket
+            .value
+            .as_str()
+            .filter(|name| !name.trim().is_empty() && !name.contains('\0'))
+            .ok_or_else(|| {
+                EmacsError::Config("socket_name 必须是非空 socket 名称或路径".to_owned())
+            })?;
         let args = vec![
             if auto_start {
                 "--alternate-editor="
@@ -175,6 +189,8 @@ impl EmacsService {
                 "--alternate-editor=/usr/bin/false"
             }
             .to_owned(),
+            // 显式指定 socket，禁止 emacsclient 在连接失败后尝试 TCP server 文件。
+            format!("--socket-name={socket}"),
             "--eval".to_owned(),
             eval_expression(script),
         ];
@@ -285,21 +301,23 @@ impl EmacsService {
             if buffer.trim().is_empty() {
                 return Err(EmacsError::InvalidRequest("buffer 不能为空".to_owned()));
             }
-            let buffer_name = serde_json::to_string(buffer).expect("字符串可以序列化");
-            let script = format!(
-                r#"(progn
-  (require 'seq)
-  (let ((target (get-buffer {buffer_name})))
-    (when target
-      (let ((frame (or (seq-find (lambda (candidate) (display-graphic-p candidate)) (frame-list))
-                       (make-frame '((window-system . ns))))))
-        (select-frame-set-input-focus frame)
-        (switch-to-buffer target)
-        (raise-frame frame)
-        t))))"#
-            );
-            if self.eval_with_startup(&script, false).await? == "nil" {
-                return Err(EmacsError::BufferNotFound);
+            let result = self
+                .eval_with_startup(&activation_script(buffer), false)
+                .await
+                .map_err(|error| match error {
+                    EmacsError::Process(_) | EmacsError::CommandFailed { .. } => {
+                        EmacsError::ConnectionFailed(error.to_string())
+                    }
+                    error => error,
+                })?;
+            match result.as_str() {
+                "t" => {}
+                "nil" => return Err(EmacsError::BufferNotFound),
+                _ => {
+                    return Err(EmacsError::InvalidResponse(
+                        "buffer 激活未返回 t 或 nil".to_owned(),
+                    ));
+                }
             }
         } else {
             let args = vec!["-b".to_owned(), "org.gnu.Emacs".to_owned()];
@@ -333,6 +351,29 @@ impl EmacsService {
             .await
             .map_err(Into::into)
     }
+}
+
+fn activation_script(buffer: &str) -> String {
+    let buffer_name = serde_json::to_string(buffer).expect("字符串可以序列化");
+    format!(
+        r#"(progn
+  (require 'seq)
+  (let ((target (get-buffer {buffer_name})))
+    (when (buffer-live-p target)
+      (let* ((window (seq-find (lambda (candidate)
+                                (display-graphic-p (window-frame candidate)))
+                              (get-buffer-window-list target nil t)))
+             (frame (or (and window (window-frame window))
+                        (and (display-graphic-p (selected-frame)) (selected-frame))
+                        (seq-find (lambda (candidate) (display-graphic-p candidate)) (frame-list))
+                        (make-frame '((window-system . ns))))))
+        (select-frame frame)
+        (when window (select-window window))
+        (switch-to-buffer target)
+        (make-frame-visible frame)
+        (select-frame-set-input-focus frame)
+        t))))"#
+    )
 }
 
 #[derive(Deserialize)]

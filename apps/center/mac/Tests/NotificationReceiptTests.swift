@@ -113,7 +113,7 @@ final class NotificationReceiptTests: XCTestCase {
     }
 
     func testClickCallsServicesWithEncodedBufferWithoutRetry() async throws {
-        let buffer = "中文 & \"buffer\"\n"
+        let buffer = "中文 & + % # \\ \"buffer\"\n😀"
         let navigation = SystemNotification.legacyNavigationURL(buffer: buffer)
         let stub = ReceiptStub(statuses: [200])
         let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) }, retryDelay: { _ in XCTFail("点击操作不自动重试") })
@@ -123,6 +123,7 @@ final class NotificationReceiptTests: XCTestCase {
         XCTAssertEqual(request.url?.path, "/emacs/activate")
         let query = try XCTUnwrap(URLComponents(url: XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
         XCTAssertEqual(query.queryItems?.first?.value, buffer)
+        XCTAssertFalse(query.percentEncodedQuery?.contains("+") ?? true)
         XCTAssertEqual(stub.requests.count, 2)
     }
 
@@ -132,13 +133,40 @@ final class NotificationReceiptTests: XCTestCase {
         do {
             try await client.activate(SystemNotification.legacyNavigationURL(buffer: "已关闭"))
             XCTFail("应报告目标失效")
-        } catch NotificationReceiptError.rejected(let status) { XCTAssertEqual(status, 404) }
+        } catch NotificationActivationError.rejected(let status, let message) {
+            XCTAssertEqual(status, 404)
+            XCTAssertNil(message)
+        }
         XCTAssertEqual(stub.requests.count, 2)
         for callback in ["https://example.com/activate", "//example.com/activate", "/\\example.com", "/%2Fexample.com"] {
             var components = URLComponents(string: "loki-assistant://notification/activate")!
             components.queryItems = [URLQueryItem(name: "callback", value: callback)]
             XCTAssertThrowsError(try NotificationReceiptClient.callbackPath(XCTUnwrap(components.url)))
         }
+    }
+
+    func testClickPreservesServicesFailureMessageWithoutRetry() async throws {
+        for (status, message) in [(404, "目标 buffer 已不存在"), (503, "无法连接目标 Emacs，请确认 server 已启动"), (504, "Emacs 调用超时")] {
+            let stub = ReceiptStub(statuses: [status], errorBody: try JSONSerialization.data(withJSONObject: ["api_version": "1", "code": "test-error", "message": message]))
+            let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) }, retryDelay: { _ in XCTFail("点击操作不自动重试") })
+            do {
+                try await client.activate(SystemNotification.legacyNavigationURL(buffer: "旧通知"))
+                XCTFail("应显示 services 返回的失败原因")
+            } catch let error as NotificationActivationError {
+                XCTAssertEqual(error.localizedDescription, message)
+            }
+            XCTAssertEqual(stub.requests.count, 2)
+        }
+    }
+
+    func testClickDoesNotRetryOrPostWhenServicesIsUnavailable() async throws {
+        let stub = ReceiptStub(statuses: [], healthBody: "{}")
+        let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) }, retryDelay: { _ in XCTFail("点击操作不自动重试") })
+        do {
+            try await client.activate(SystemNotification.legacyNavigationURL(buffer: "旧通知"))
+            XCTFail("services 不可用时应提示失败")
+        } catch NotificationReceiptError.serviceUnavailable {}
+        XCTAssertEqual(stub.requests.count, 1)
     }
 
     private func notificationURL(_ payload: String) throws -> URL {
@@ -157,10 +185,12 @@ private final class ReceiptStub: @unchecked Sendable {
     private var recorded: [URLRequest] = []
     private var discoveries = 0
     private let healthBody: String
+    private let errorBody: Data?
 
-    init(statuses: [Int], healthBody: String = #"{"service":"loki-services","status":"ok","version":"test","uptime_seconds":0}"#) {
+    init(statuses: [Int], healthBody: String = #"{"service":"loki-services","status":"ok","version":"test","uptime_seconds":0}"#, errorBody: Data? = nil) {
         self.statuses = statuses
         self.healthBody = healthBody
+        self.errorBody = errorBody
     }
     var requests: [URLRequest] { lock.withLock { recorded } }
 
@@ -176,7 +206,7 @@ private final class ReceiptStub: @unchecked Sendable {
             recorded.append(request)
             let status = request.url!.path == "/healthz" ? 200 : statuses.removeFirst()
             if status == -1 { throw URLError(.networkConnectionLost) }
-            let data = Data(healthBody.utf8)
+            let data = request.url!.path == "/healthz" ? Data(healthBody.utf8) : errorBody ?? Data(healthBody.utf8)
             return (data, HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
         }
     }
