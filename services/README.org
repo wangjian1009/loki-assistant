@@ -65,6 +65,8 @@ control-center:
 
 * Emacs
 
+Emacs 的 Rust 配置入口为 ~modules/emacs/config.rs~ 中的 ~EmacsConfig~ ，构造时注入 ~Arc<ConfigService>~ 。每个配置项有独立读取方法；~emacsclient_path()~ 在每次使用时读取生效值及来源，不缓存程序路径。配置元数据通过静态方法和 ~#[loki_config]~ 注册，与 API 元数据使用相同的编译期发现方式。
+
 ~emacsclient_path~ 的类型为 ~Executable~，默认程序名为 ~emacsclient~。配置模块先按 services 进程的 ~PATH~ 搜索，再检查模块声明的 Homebrew 和 Emacs App 目录；找到的绝对路径作为默认值返回。也可在配置编辑器中使用“选择可执行文件…”按钮，或通过接口指定路径：
 
 #+begin_src sh

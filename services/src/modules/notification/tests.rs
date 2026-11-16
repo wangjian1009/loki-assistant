@@ -93,7 +93,7 @@ async fn emacs_uses_injected_module_and_both_routes_share_receipts() {
         Duration::from_secs(1),
     ));
     let emacs = emacs::Module::new(
-        Arc::new(ConfigService::new(emacs::Module::config_metadata())),
+        Arc::new(ConfigService::new(emacs::config::EmacsConfig::metadata())),
         notification.clone(),
     );
     let app = Router::new()

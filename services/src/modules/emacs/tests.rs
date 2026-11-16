@@ -19,7 +19,7 @@ use crate::{modules::config::service::ConfigService, runtime::RuntimeState};
 use crate::modules::notification::{self, NotificationError, NotificationService};
 
 use super::{
-    Module,
+    config::EmacsConfig,
     protocol::Notification,
     routes,
     service::{CommandOutput, CommandRunner, EmacsError, EmacsService, ServiceFuture},
@@ -90,7 +90,7 @@ fn service(
     });
     (
         Arc::new(EmacsService::with_runner(
-            config.clone(),
+            EmacsConfig::new(config.clone()),
             default_notifications(),
             runner.clone(),
             Duration::from_millis(100),
@@ -101,7 +101,7 @@ fn service(
 }
 
 fn test_metadata() -> crate::modules::config::model::ConfigModuleMetadata {
-    let mut metadata = Module::config_metadata();
+    let mut metadata = EmacsConfig::metadata();
     metadata.items[0].default = Some(json!("/default/emacsclient"));
     metadata
 }
@@ -119,6 +119,7 @@ fn notification(module_id: &str) -> Notification {
 
 #[tokio::test]
 async fn eval_uses_argument_boundary_auto_start_and_latest_config() {
+    use crate::modules::config::model::ConfigValueSource;
     use std::os::unix::fs::PermissionsExt;
     let directory = std::env::temp_dir()
         .join(format!("loki-emacs-program-{}", std::process::id()))
@@ -131,11 +132,18 @@ async fn eval_uses_argument_boundary_auto_start_and_latest_config() {
     startup_output.stdout = format!("Starting Emacs daemon.\n{}\n", startup_output.stdout);
     let (service, runner, config) =
         service(vec![Ok(startup_output), Ok(wire(json!({"result":"nil"})))]);
+    let module_config = EmacsConfig::new(Arc::clone(&config));
+    let default = module_config.emacsclient_path().await.unwrap();
+    assert_eq!(default.value, json!("/default/emacsclient"));
+    assert_eq!(default.source, ConfigValueSource::Default);
     assert_eq!(service.eval("(+ 1 2)").await.unwrap(), "3");
     config
         .replace("emacs", "emacsclient_path", json!(executable))
         .await
         .unwrap();
+    let updated = module_config.emacsclient_path().await.unwrap();
+    assert_eq!(updated.value, json!(executable));
+    assert_eq!(updated.source, ConfigValueSource::User);
     let script = "(message \"中文\")\n(list \"\\\"\" \"$(touch /tmp/nope)\")";
     assert_eq!(service.eval(script).await.unwrap(), "nil");
     let calls = runner.calls.lock().unwrap();
@@ -197,7 +205,7 @@ impl CommandRunner for StallingRunner {
 #[tokio::test]
 async fn times_out_and_releases_evaluation_lock() {
     let service = EmacsService::with_runner(
-        Arc::new(ConfigService::new(test_metadata())),
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         default_notifications(),
         Arc::new(StallingRunner),
         Duration::from_millis(1),
@@ -432,7 +440,7 @@ async fn notification_forwards_content_without_running_emacs_lisp() {
     let runner = Arc::new(FakeRunner::default());
     let launcher = Arc::new(FakeNotificationLauncher::default());
     let service = EmacsService::with_runner(
-        config,
+        EmacsConfig::new(config),
         notifications(launcher.clone()),
         runner.clone(),
         Duration::from_millis(100),
@@ -455,7 +463,7 @@ async fn notification_forwards_content_without_running_emacs_lisp() {
 async fn notification_reports_launch_failure_as_json_error() {
     let config = Arc::new(ConfigService::new(test_metadata()));
     let service = Arc::new(EmacsService::with_runner(
-        config,
+        EmacsConfig::new(config),
         notifications(Arc::new(FakeNotificationLauncher {
             error: Some("菜单栏应用不可用".to_owned()),
             ..Default::default()
@@ -552,7 +560,7 @@ async fn failed_receipt_preserves_details_and_rejects_unknown_or_invalid_results
         assert_eq!(body["code"], "notification-not-found");
     }
     let restarted = EmacsService::new(
-        Arc::new(ConfigService::new(test_metadata())),
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         default_notifications(),
     );
     assert!(matches!(
@@ -586,7 +594,7 @@ impl NotificationLauncher for EarlyReceiptLauncher {
 async fn registers_before_forwarding_and_preserves_early_receipt() {
     let launcher = Arc::new(EarlyReceiptLauncher::default());
     let service = Arc::new(EmacsService::new(
-        Arc::new(ConfigService::new(test_metadata())),
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         notifications(launcher.clone()),
     ));
     *launcher.service.lock().unwrap() = Arc::downgrade(&service);

@@ -8,12 +8,14 @@ use tokio::{
     time::timeout,
 };
 
-use crate::modules::config::service::ConfigService;
 use crate::modules::notification::{
     NotificationError, NotificationService, protocol::NotificationRequest,
 };
 
-use super::protocol::{Buffer, Notification, NotificationReceipt, NotificationStatusResponse};
+use super::{
+    config::EmacsConfig,
+    protocol::{Buffer, Notification, NotificationReceipt, NotificationStatusResponse},
+};
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
 
@@ -99,7 +101,7 @@ pub enum EmacsError {
 }
 
 pub struct EmacsService {
-    config: Arc<ConfigService>,
+    config: EmacsConfig,
     runner: Arc<dyn CommandRunner>,
     notifications: Arc<NotificationService>,
     timeout: Duration,
@@ -118,7 +120,7 @@ impl Debug for EmacsService {
 }
 
 impl EmacsService {
-    pub fn new(config: Arc<ConfigService>, notifications: Arc<NotificationService>) -> Self {
+    pub fn new(config: EmacsConfig, notifications: Arc<NotificationService>) -> Self {
         Self::with_runner(
             config,
             notifications,
@@ -128,7 +130,7 @@ impl EmacsService {
     }
 
     pub fn with_runner(
-        config: Arc<ConfigService>,
+        config: EmacsConfig,
         notifications: Arc<NotificationService>,
         runner: Arc<dyn CommandRunner>,
         timeout: Duration,
@@ -157,7 +159,7 @@ impl EmacsService {
         }
         // 同一 gateway 串行连接，避免多个请求同时触发 daemon 启动。
         let _guard = self.evaluation.lock().await;
-        let program = match self.config.value("emacs", "emacsclient_path").await {
+        let program = match self.config.emacsclient_path().await {
             Ok(value) => value
                 .value
                 .as_str()

@@ -81,7 +81,7 @@ emacs/                      预留空目录
 #+begin_src rust
 #[loki_services_macros::loki_config]
 fn emacs_config_metadata() -> ConfigModuleMetadata {
-    Module::config_metadata()
+    EmacsConfig::metadata()
 }
 #+end_src
 
@@ -167,6 +167,8 @@ Emacs 模块的协议版本为 ~1~，成功和错误响应均包含 ~api_version
 ** 配置和连接
 
 配置元数据通过 ~GET /meta/emacs~ 获取，~emacsclient_path~ 使用配置中心的通用读写接口。其类型为 ~Executable~，默认程序名为 ~emacsclient~，由配置模块按规则发现实际路径；也可指定包含空格的完整可执行文件路径。不展开 ~ 和环境变量，也不接受附加命令行参数。
+
+Rust 侧由 ~modules/emacs/config.rs~ 的 ~EmacsConfig~ 定义配置项、默认程序和搜索目录，构造时传入 ~Arc<ConfigService>~ 。每个属性通过独立方法读取，例如 ~emacsclient_path().await~ 每次调用配置中心，返回包含 ~value~ 和 ~source~ 的 ~ConfigValue~ 。~EmacsService~ 持有此配置对象，通过属性方法获取最新值。元数据由静态函数 ~EmacsConfig::metadata()~ 提供，经 ~#[loki_config]~ 进入编译期目录，不需要创建配置对象或运行 Emacs。
 
 每次求值读取最新生效配置，不需要重启服务或启动配置订阅任务。用户值保存在 ~~/.assistant/config.yml~ ，重启后继续生效；未配置且无法找到默认程序时返回配置错误。
 

@@ -401,7 +401,7 @@ mod tests {
         let service = Arc::new(
             ConfigService::load_with_metadata(
                 &path,
-                vec![crate::modules::emacs::Module::config_metadata()],
+                vec![crate::modules::emacs::config::EmacsConfig::metadata()],
             )
             .unwrap()
             .with_executable_search_path(vec![directory.clone()]),
