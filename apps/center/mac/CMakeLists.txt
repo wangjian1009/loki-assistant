@@ -14,6 +14,7 @@ set(LOKI_APP_SOURCES
     Sources/App/LokiAssistantApp.swift
     Sources/App/ServiceStatusModel.swift
     Sources/App/ServiceSettingsClient.swift
+    Sources/App/EmacsReportedStatus.swift
     Sources/App/SystemNotificationController.swift
     Sources/App/NotificationReceiptClient.swift
     Sources/Features/Dashboard/DashboardView.swift
@@ -64,6 +65,7 @@ if(BUILD_TESTING)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
         Tests/ServiceStatusTests.swift
         Tests/ServiceSettingsTests.swift
+        Tests/EmacsReportedStatusTests.swift
         Tests/SystemNotificationTests.swift
         Tests/NotificationReceiptTests.swift
     )

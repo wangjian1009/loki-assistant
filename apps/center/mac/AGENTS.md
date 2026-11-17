@@ -16,6 +16,7 @@
 Sources/
 ├── App/LokiAssistantApp.swift       菜单栏应用入口
 ├── App/ServiceSettingsClient.swift  通过 services 打开 Emacs 配置界面
+├── App/EmacsReportedStatus.swift    托盘菜单读取 Emacs 上报 buffer 状态
 ├── App/ServiceStatusModel.swift     services 状态请求和模型
 ├── App/SystemNotificationController.swift  通用通知解码、系统展示与点击回调
 ├── App/NotificationReceiptClient.swift     通知回执、点击导航、服务发现及有限重试

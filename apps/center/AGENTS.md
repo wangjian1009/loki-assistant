@@ -8,6 +8,7 @@
 - 菜单栏应用通过 services 的 `/healthz` 查询状态，不直接调用 emacsclient；系统通知点击只回调 services。
 - `loki-assistant://notification/show` 接收通用通知，`loki-assistant://notification/activate` 包装本机服务回调路径，由 `UNUserNotificationCenter` 展示并处理点击，不提供额外 HTTP listener。旧 Emacs URL 和元数据保留兼容。
 - 带 `notification_id` 的通知通过 `/notification/{id}/receipt` 回报提交结果；每次回执尝试先检查服务文件锁、读取 pfile 并请求健康接口。回执最多尝试 3 次，4xx 停止重试，不因回执失败重发系统通知。旧版不带 ID 的 URL 仍可展示。
+- 菜单打开时从 services 的 `/emacs/status/emacs/buffer` 读取最近上报快照；菜单关闭取消请求，不后台轮询。点击使用 `buffer_id` 请求 `/emacs/activate`，不直接接触 Emacs。
 - “设置”只请求 services 的 `POST /emacs/apps/open?app=config`；应用加载、固定 Lisp 和图形 frame 聚焦均属于服务端，不在 Swift 中维护 Emacs 脚本。应用不存在时展示服务端 `app-not-found` 的中文说明。请求前检查服务文件锁和健康状态；失败显示服务端原因，不自动重试。
 - 应用启动后不创建 Dock 主窗口；菜单栏菜单显示连接状态和版本，后台自动监控 services；停止时提供灰色启动按钮。
 

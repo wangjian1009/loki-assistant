@@ -66,6 +66,9 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 | POST | ~/notification/{id}/receipt~ | 接收菜单栏应用处理回执 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
 | POST | ~/emacs/apps/open~ | 按 app 查询参数打开 Emacs 应用 |
+| GET | ~/emacs/status~ | 读取 Emacs 主动上报的状态快照 |
+| POST | ~/emacs/status~ | 接收 Emacs 按 app/数据项上报的状态 |
+| GET | ~/emacs/status/{app}/{key}~ | 读取指定状态数据项 |
 | POST | ~/emacs/activate~ | 显示 Emacs 或通过 buffer 查询参数定位目标 |
 | POST | ~/emacs/receiver/notification~ | 接收 Emacs 通知上报，默认展示 macOS 系统通知 |
 | GET | ~/emacs/receiver/notification/{id}~ | 系统通知状态查询的兼容入口 |
@@ -177,6 +180,30 @@ Rust 侧由 ~modules/emacs/config.rs~ 的 ~EmacsConfig~ 定义配置项、默认
 Lisp 求值与 buffer 列表查询传入 ~--alternate-editor=~ 和 ~--eval~ 。server 不可用时，由 emacsclient 启动目标 Emacs daemon 并连接；不会因为普通 Lisp 错误重复求值。已打开但未运行 server 的 Emacs 与新 daemon 可能是两个进程。Emacs daemon 的启动依赖服务运行环境中的 Emacs 可执行程序和用户配置。指定 buffer 的激活使用下述禁止启动的连接策略。
 
 同一 gateway 内的求值串行执行。每次外部进程调用和自定义通知处理器执行最多等待 30 秒，排队时间不计入此限制。超时或请求取消会终止 emacsclient 子进程，但不会保证中止已经在 Emacs 中开始的 Lisp，也不会终止自动启动的 daemon。
+
+** Emacs 主动状态上报
+
+Emacs 模块主动向 services 上报状态，services 只保存内存中的最后快照，不为查询反向连接或启动 Emacs。状态请求按 app 和数据项组织，请求体是两层 JSON object：
+
+#+begin_src json
+{"emacs":{"runtime":{"pid":20349,"version":"31.1"},"buffer":[{"id":"instance:1","name":"Codex Agent @ loki-assistant","mode":"agent-shell-mode","directory":"/Users/example/project/","file":null,"modified":false}]}}
+#+end_src
+
+~POST /emacs/status~ 对已存在 app 只替换本次请求包含的数据项，未包含的数据项保留；每次成功请求更新全局 ~updated_at~ Unix 秒。空 app、空数据项、名称包含 ~/~ 或 ~.~、~~..~~ 返回 400 ~invalid-request~ 。状态只保留到 services 重启，不写入用户配置文件。
+
+~GET /emacs/status~ 返回 ~api_version~、完整 ~status~ object 和全局 ~updated_at~；没有任何上报时返回空 object 和 ~updated_at: null~。~GET /emacs/status/{app}/{key}~ 返回单项的 ~app~、~key~、~value~ 和 ~updated_at~ ；未收到该项返回 404 ~status-not-found~ 。服务只返回缓存，不检查 Emacs 是否仍然运行。
+
+#+begin_src json
+{"api_version":"1","app":"emacs","key":"buffer","value":[],"updated_at":1794890558}
+#+end_src
+
+** 统一 buffer 关注
+
+Emacs 包提供 ~loki-assistant-monitor-mode~，加载 ~loki-assistant~ 时默认启用。~loki-assistant-monitor-buffer~ 默认值为 ~(agent-shell-mode)~，表示关注该 mode 及其派生 mode；可在 Emacs 配置中改为其他 mode 符号列表。对应 mode hook 注册 buffer，~kill-buffer-hook~ 和 ~change-major-mode-hook~ 注销，注册集合不扫描或复制所有 buffer 状态。
+
+关注集合按固定数据项 ~emacs/buffer~ 上报。每个条目包含进程内唯一 ~id~ 、buffer 名称、mode、工作目录、文件和 modified 状态；Emacs 实例启动时生成 id 前缀，关闭或重启后不会复用旧 ID。注册、注销和数据变化合并触发同步，默认每 5 秒发送一次 ~POST /emacs/status~ ；请求失败保留本地状态，下一次周期继续尝试，不立即循环重试。
+
+状态上报开关为 ~loki-assistant-monitor-mode~；关闭后移除 mode hook 和定时器，services 保留最后一次成功上报的数据。托盘读取缓存时不要求 Emacs 在线，点击 buffer 时通过 ~POST /emacs/activate?buffer_id=...~ 让 services 回到同一个 Emacs 实例中解析 ID，并在一次 Emacs 求值内校验 buffer 仍被关注后再聚焦；失效 ID 返回 404 ~buffer-not-found~。~buffer_id~ 与旧的 ~buffer~ 查询参数互斥，旧 buffer 激活接口保持兼容。
 
 ** 打开 Emacs 应用
 

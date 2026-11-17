@@ -13,6 +13,45 @@
 
 每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
 
+* Emacs 状态主动上报
+
+加载 ~loki-assistant~ 后，~loki-assistant-monitor-mode~ 默认开启。它按 mode hook 维护关注 buffer，并定时将状态按 app/数据项发送到 services 的 ~POST /emacs/status~ ；不会为状态查询反向启动 Emacs。默认配置为：
+
+#+begin_src emacs-lisp
+(setq loki-assistant-monitor-buffer '(agent-shell-mode))
+#+end_src
+
+~loki-assistant-monitor-buffer~ 是 mode 符号列表，匹配派生 mode。关注 buffer 通过统一结构维护，buffer 创建、mode 切换和关闭会触发注册或注销；上报数据项为 ~emacs/buffer~ ，包含稳定的进程内 ~id~ 、名称、mode、目录、文件和 modified 状态。Emacs 运行信息上报为 ~emacs/runtime~ ，包括 pid、Emacs version、启动时间和最近上报时间。默认每 5 秒同步一次，短时间内多次变化会合并；请求失败保留本地数据并在下个周期重试。
+
+可以主动触发一次同步：
+
+#+begin_src emacs-lisp
+(loki-assistant-status-sync)
+#+end_src
+
+状态数据统一由结构化状态仓库维护。使用 ~loki-assistant-status-set-value~ 写入 app/数据项，并由 ~loki-assistant-status-trigger-sync~ 延迟 1 秒合并触发同步：
+
+#+begin_src emacs-lisp
+;; symbol 名称和值会按 JSON 规则编码；value1 发送为字符串。
+(loki-assistant-status-set-value 'emacs 'key1 'value1)
+
+;; list 和 vector 都作为 JSON array 发送；nil 删除数据项。
+(loki-assistant-status-set-value 'emacs 'items '(one two))
+(loki-assistant-status-set-value 'emacs 'items [one two])
+(loki-assistant-status-set-value 'emacs 'items nil)
+
+;; 用更新函数追加或修改 list/vector；返回 nil 时删除数据项。
+(loki-assistant-status-update-value
+ 'emacs 'items (lambda (items) (vconcat (or items []) [next])))
+
+;; 多次调用在短延迟内合并为一次最终同步。
+(loki-assistant-status-trigger-sync)
+#+end_src
+
+~loki-assistant-status-sync~ 仍可用于立即发起一次异步同步；普通数据变更应使用 ~loki-assistant-status-set-value~，不要直接修改内部 hash table。~loki-assistant-status-trigger-sync~ 会重新计时，网络请求在途时把变化合并到请求完成后的下一次同步。
+
+关闭 ~loki-assistant-monitor-mode~ 会移除 hooks 和定时器；services 保留最后一次成功数据直到重启。状态接口的完整响应和托盘读取约定见 [[file:control-center-services.org::*Emacs 主动状态上报][Emacs 主动状态上报]]。
+
 * 服务配置管理
 
 加载包后执行 ~M-x loki-assistant-config~ ，或从仓库根目录执行 ~make emacs-config~ 。菜单栏“设置”调用 services 的 ~POST /emacs/apps/open?app=config~ ，由服务打开该界面并聚焦图形 frame；目标 Emacs 需要已将本包加入 ~load-path~ 。首次连接尚未运行的 server 时，启动行为沿用 [[file:control-center-services.org::*配置和连接][Emacs gateway 的连接约定]]。原来的 ~apps/config-editor~ 原生 App 已由此界面替代。

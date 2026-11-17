@@ -13,7 +13,8 @@ use super::{
     protocol::{
         API_VERSION, ActivationRequest, ActivationResponse, BuffersResponse, ErrorResponse,
         EvalRequest, EvalResponse, Notification, NotificationReceipt, NotificationResponse,
-        NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
+        NotificationStatusResponse, OpenAppRequest, OpenAppResponse, StatusResponse,
+        StatusValueResponse, StatusValues,
     },
     service::{EmacsError, EmacsService},
 };
@@ -33,6 +34,11 @@ pub fn router(service: Arc<EmacsService>) -> Router {
             post(notification_receipt),
         )
         .route("/emacs/buffers", get(buffers))
+        .route(
+            "/emacs/status",
+            get(reported_status).post(set_reported_status),
+        )
+        .route("/emacs/status/{app}/{key}", get(reported_status_value))
         .with_state(service)
 }
 
@@ -167,14 +173,27 @@ async fn activate(
 ) -> Result<Json<ActivationResponse>, Response> {
     let Query(request) =
         request.map_err(|error| error_response(EmacsError::InvalidRequest(error.body_text())))?;
-    service
-        .activate(request.buffer.as_deref())
-        .await
-        .map_err(error_response)?;
+    if request.buffer.is_some() && request.buffer_id.is_some() {
+        return Err(error_response(EmacsError::InvalidRequest(
+            "buffer 与 buffer_id 不能同时提供".to_owned(),
+        )));
+    }
+    if let Some(id) = &request.buffer_id {
+        service
+            .activate_monitored_buffer(id)
+            .await
+            .map_err(error_response)?;
+    } else {
+        service
+            .activate(request.buffer.as_deref())
+            .await
+            .map_err(error_response)?;
+    }
     Ok(Json(ActivationResponse {
         api_version: API_VERSION.to_owned(),
         activation: "emacs".to_owned(),
         buffer: request.buffer,
+        buffer_id: request.buffer_id,
     }))
 }
 
@@ -205,6 +224,57 @@ fn json_error(error: JsonRejection) -> Response {
     error_response(EmacsError::InvalidRequest(error.body_text()))
 }
 
+#[loki_api(
+    module = "emacs",
+    id = "reported-status",
+    method = "GET",
+    path = "/emacs/status",
+    summary = "读取 Emacs 上报状态",
+    description = "只读内存快照，按 app/数据项组织；不连接或启动 Emacs。"
+)]
+async fn reported_status(State(service): State<Arc<EmacsService>>) -> Json<StatusResponse> {
+    Json(service.reported_status().await)
+}
+
+#[loki_api(
+    module = "emacs",
+    id = "set-reported-status",
+    method = "POST",
+    path = "/emacs/status",
+    summary = "接收 Emacs 主动上报",
+    description = "请求体为 app 到数据项对象的映射；按数据项完整替换，保留未提交项。状态只保存在内存。"
+)]
+async fn set_reported_status(
+    State(service): State<Arc<EmacsService>>,
+    request: Result<Json<StatusValues>, JsonRejection>,
+) -> Result<Json<StatusResponse>, Response> {
+    let Json(values) = request.map_err(json_error)?;
+    service
+        .set_reported_status(values)
+        .await
+        .map(Json)
+        .map_err(error_response)
+}
+
+#[loki_api(
+    module = "emacs",
+    id = "reported-status-value",
+    method = "GET",
+    path = "/emacs/status/{app}/{key}",
+    summary = "读取指定上报数据项",
+    description = "返回指定 app/数据项的最后上报值；未收到时返回 404 status-not-found。不连接 Emacs。"
+)]
+async fn reported_status_value(
+    State(service): State<Arc<EmacsService>>,
+    Path((app, key)): Path<(String, String)>,
+) -> Result<Json<StatusValueResponse>, Response> {
+    service
+        .reported_status_value(&app, &key)
+        .await
+        .map(Json)
+        .map_err(error_response)
+}
+
 fn error_response(error: EmacsError) -> Response {
     let (status, code) = match &error {
         EmacsError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid-request"),
@@ -226,6 +296,7 @@ fn error_response(error: EmacsError) -> Response {
         }
         EmacsError::BufferNotFound => (StatusCode::NOT_FOUND, "buffer-not-found"),
         EmacsError::AppNotFound(_) => (StatusCode::NOT_FOUND, "app-not-found"),
+        EmacsError::StatusNotFound(_, _) => (StatusCode::NOT_FOUND, "status-not-found"),
     };
     (
         status,

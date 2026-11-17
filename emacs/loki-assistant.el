@@ -261,5 +261,8 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
   (with-eval-after-load 'agent-shell
     (loki-assistant--setup-agent-shell)))
 
+(require 'loki-assistant-monitor)
+(loki-assistant-monitor-mode 1)
+
 (provide 'loki-assistant)
 ;;; loki-assistant.el ends here

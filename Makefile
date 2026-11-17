@@ -44,7 +44,7 @@ help:
 emacs-load:
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (add-to-list 'load-path \"$(PROJECT_ROOT)/emacs\") \
-	  (dolist (feature '(loki-assistant-config-tests loki-assistant-config loki-assistant)) \
+	  (dolist (feature '(loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config))"
@@ -55,22 +55,24 @@ emacs-config: emacs-load
 	  t)"
 
 emacs-test: emacs-load
-	"$(EMACSCLIENT)" --eval "(progn \
-	  (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
-	  (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
-	  (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\"))) \
-	        (agent-shell-stats \
-	         (when (require 'agent-shell nil t) \
-	           (load \"$(PROJECT_ROOT)/emacs/loki-assistant-agent-shell-tests.el\" nil t) \
-	           (ert-run-tests-batch \"^loki-assistant-agent-shell-\")))) \
-	    (if (zerop (+ (ert-stats-completed-unexpected stats) \
-	                  (if agent-shell-stats \
-                      (ert-stats-completed-unexpected agent-shell-stats) 0))) \
-	        (format \"通过 %d 项 Emacs 测试%s\" \
-	                (+ (ert-stats-total stats) \
-	                   (if agent-shell-stats (ert-stats-total agent-shell-stats) 0)) \
-	                (if agent-shell-stats \"（含 agent-shell 扩展）\" \"\")) \
-	      (error \"Emacs 测试失败\"))))"
+	"$(EMACSCLIENT)" --eval "(let ((monitor-enabled loki-assistant-monitor-mode)) \
+	  (unwind-protect \
+	      (progn \
+	        (loki-assistant-monitor-mode -1) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-monitor-tests.el\" nil t) \
+	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-monitor-test-\"))) \
+	              (agent-shell-stats \
+	               (when (require 'agent-shell nil t) \
+	                 (load \"$(PROJECT_ROOT)/emacs/loki-assistant-agent-shell-tests.el\" nil t) \
+	                 (ert-run-tests-batch \"^loki-assistant-agent-shell-\")))) \
+	          (if (zerop (+ (ert-stats-completed-unexpected stats) \
+	                        (if agent-shell-stats (ert-stats-completed-unexpected agent-shell-stats) 0))) \
+	              (format \"通过 %d 项 Emacs 测试\" \
+	                      (+ (ert-stats-total stats) (if agent-shell-stats (ert-stats-total agent-shell-stats) 0))) \
+	            (error \"Emacs 测试失败\")))) \
+	    (when monitor-enabled (loki-assistant-monitor-mode 1))))"
 
 export-icons:
 	python3 "$(PROJECT_ROOT)/apps/center/mac/scripts/export-icons.py"

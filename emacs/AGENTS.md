@@ -6,6 +6,8 @@
 - `loki-assistant-tests.el` 使用临时 pfile 和真实 loopback listener 验证协议与错误反馈，不发送真实系统通知、不改动用户配置。
 - `loki-assistant-config.el` 提供 Customize 风格的 services 配置管理；通过 widget 展示动态元数据，完整加载模块实例后统一展示，预检与保存走现有 HTTP API，不复制服务端业务校验。保存时捕获模块、键和值，旧响应不覆盖新的输入；失败保留输入并显示服务端错误。
 - `control-center.center_auto_start` 保存成功后同步托盘用户级 LaunchAgent；同步失败须区分配置保存与系统操作结果。登录启动测试只写临时目录并注入 launchctl 替身。
+- `loki-assistant-monitor.el` 提供主动状态上报和统一 buffer 关注；默认 `loki-assistant-monitor-buffer` 为 `(agent-shell-mode)`，通过 mode hook 注册并通过 `POST /emacs/status` 同步。关闭 `loki-assistant-monitor-mode` 时移除 hook 和定时器，保留 services 最后状态。
+- `loki-assistant-monitor-tests.el` 覆盖关注生命周期、状态分组、请求合并、过期响应和失败保留，纳入 `make emacs-test`。
 - `loki-assistant-config-tests.el` 覆盖配置界面和 HTTP 流程，纳入 `make emacs-test`。
 - 新增变量、函数和 feature 统一使用 `loki-assistant-` 前缀，文件启用 `lexical-binding`。
 - 注释、docstring 和面向用户的文本使用中文；按实际功能需要拆分文件。

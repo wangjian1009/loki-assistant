@@ -405,7 +405,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 7);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 10);
             let open_app = body["apis"]
                 .as_array()
                 .unwrap()
@@ -970,4 +970,143 @@ async fn open_app_reports_timeout() {
     let (status, body) = request(service, "POST", "/emacs/apps/open?app=config", Value::Null).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(body["code"], "emacs-timeout");
+}
+
+#[tokio::test]
+async fn reported_status_is_a_passive_cache_and_preserves_json_values() {
+    let (service, runner, _) = service(vec![]);
+    let (status, empty) = request(service.clone(), "GET", "/emacs/status", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        empty,
+        json!({"api_version":"1","status":{},"updated_at":null})
+    );
+    let values = json!({"emacs":{"buffer":[{"id":"id-1","name":"中文 buffer"}],"runtime":{"pid":123}},
+                        "tools":{"enabled":false,"count":0,"empty":null,"list":[]}});
+    let (status, posted) = request(service.clone(), "POST", "/emacs/status", values.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(posted["status"], values);
+    assert!(posted["updated_at"].as_u64().unwrap() > 0);
+    let (_, value) = request(
+        service.clone(),
+        "GET",
+        "/emacs/status/tools/empty",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(value["value"], Value::Null);
+    assert_eq!(value["app"], "tools");
+    let (_, value) = request(
+        service.clone(),
+        "GET",
+        "/emacs/status/tools/enabled",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(value["value"], false);
+    let (_, read) = request(service, "GET", "/emacs/status", Value::Null).await;
+    assert_eq!(read, posted);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reported_status_replaces_items_without_erasing_other_apps() {
+    let (service, _, _) = service(vec![]);
+    request(
+        service.clone(),
+        "POST",
+        "/emacs/status",
+        json!({"emacs":{"buffer":[1],"runtime":{"pid":123}},"tasks":{"count":2}}),
+    )
+    .await;
+    let (status, result) = request(
+        service.clone(),
+        "POST",
+        "/emacs/status",
+        json!({"emacs":{"buffer":[]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["status"],
+        json!({"emacs":{"buffer":[],"runtime":{"pid":123}},"tasks":{"count":2}})
+    );
+    let (status, result) =
+        request(service, "GET", "/emacs/status/emacs/missing", Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(result["code"], "status-not-found");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("emacs/missing")
+    );
+}
+
+#[tokio::test]
+async fn reported_status_rejects_invalid_updates_atomically() {
+    let (service, runner, _) = service(vec![]);
+    request(
+        service.clone(),
+        "POST",
+        "/emacs/status",
+        json!({"valid":{"value":1}}),
+    )
+    .await;
+    for input in [
+        json!([]),
+        json!(null),
+        json!({}),
+        json!({"emacs":[]}),
+        json!({"emacs":{"":1}}),
+        json!({"bad/app":{"value":1}}),
+        json!({"valid":{"value":2}," ":{"value":3}}),
+    ] {
+        let (status, result) = request(service.clone(), "POST", "/emacs/status", input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(result["code"], "invalid-request");
+    }
+    let (_, result) = request(service, "GET", "/emacs/status/valid/value", Value::Null).await;
+    assert_eq!(result["value"], 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn monitored_buffer_activation_resolves_id_in_emacs_without_starting_a_daemon() {
+    let (service, runner, _) = service(vec![
+        Ok(wire(json!({"result":"t"}))),
+        Ok(wire(json!({"result":"nil"}))),
+    ]);
+    let (status, body) = request(
+        service.clone(),
+        "POST",
+        "/emacs/activate?buffer_id=opaque%22id",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["buffer_id"], "opaque\"id");
+    let (status, body) = request(
+        service.clone(),
+        "POST",
+        "/emacs/activate?buffer_id=gone",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "buffer-not-found");
+    for path in [
+        "/emacs/activate?buffer_id=",
+        "/emacs/activate?buffer=x&buffer_id=y",
+    ] {
+        assert_eq!(
+            request(service.clone(), "POST", path, Value::Null).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1[0], "--alternate-editor=/usr/bin/false");
+    assert!(calls[0].1[3].contains("loki-assistant-monitor-buffer-by-id"));
+    assert!(calls[0].1[3].contains("select-frame-set-input-focus"));
 }

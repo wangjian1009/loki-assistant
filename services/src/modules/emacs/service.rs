@@ -1,4 +1,11 @@
-use std::{collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -14,7 +21,10 @@ use crate::modules::notification::{
 
 use super::{
     config::EmacsConfig,
-    protocol::{Buffer, Notification, NotificationReceipt, NotificationStatusResponse},
+    protocol::{
+        API_VERSION, Buffer, Notification, NotificationReceipt, NotificationStatusResponse,
+        StatusResponse, StatusValueResponse, StatusValues,
+    },
 };
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
@@ -102,6 +112,8 @@ pub enum EmacsError {
     BufferNotFound,
     #[error("Emacs 应用不存在或未安装：{0}")]
     AppNotFound(String),
+    #[error("尚未收到状态信息：{0}/{1}")]
+    StatusNotFound(String, String),
 }
 
 pub struct EmacsService {
@@ -111,6 +123,7 @@ pub struct EmacsService {
     timeout: Duration,
     evaluation: Mutex<()>,
     handlers: RwLock<HashMap<String, Arc<dyn NotificationHandler>>>,
+    status: RwLock<StatusResponse>,
 }
 
 impl Debug for EmacsService {
@@ -146,11 +159,95 @@ impl EmacsService {
             timeout,
             evaluation: Mutex::new(()),
             handlers: RwLock::new(HashMap::new()),
+            status: RwLock::new(StatusResponse {
+                api_version: API_VERSION.to_owned(),
+                status: StatusValues::new(),
+                updated_at: None,
+            }),
         }
     }
 
     pub async fn eval(&self, script: &str) -> Result<String, EmacsError> {
         self.eval_with_startup(script, true).await
+    }
+
+    pub async fn reported_status(&self) -> StatusResponse {
+        self.status.read().await.clone()
+    }
+
+    pub async fn set_reported_status(
+        &self,
+        values: StatusValues,
+    ) -> Result<StatusResponse, EmacsError> {
+        let valid_name = |name: &str| {
+            !name.trim().is_empty() && !name.contains('/') && name != "." && name != ".."
+        };
+        if values.is_empty()
+            || values.iter().any(|(app, items)| {
+                !valid_name(app) || items.is_empty() || items.keys().any(|key| !valid_name(key))
+            })
+        {
+            return Err(EmacsError::InvalidRequest(
+                "状态必须按非空 app/数据项组织，名称不能包含 /".to_owned(),
+            ));
+        }
+        let mut snapshot = self.status.write().await;
+        for (app, items) in values {
+            snapshot.status.entry(app).or_default().extend(items);
+        }
+        snapshot.updated_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        Ok(snapshot.clone())
+    }
+
+    pub async fn reported_status_value(
+        &self,
+        app: &str,
+        key: &str,
+    ) -> Result<StatusValueResponse, EmacsError> {
+        let snapshot = self.status.read().await;
+        let value = snapshot
+            .status
+            .get(app)
+            .and_then(|items| items.get(key))
+            .ok_or_else(|| EmacsError::StatusNotFound(app.to_owned(), key.to_owned()))?;
+        Ok(StatusValueResponse {
+            api_version: API_VERSION.to_owned(),
+            app: app.to_owned(),
+            key: key.to_owned(),
+            value: value.clone(),
+            updated_at: snapshot.updated_at,
+        })
+    }
+
+    pub async fn activate_monitored_buffer(&self, id: &str) -> Result<(), EmacsError> {
+        if id.trim().is_empty() {
+            return Err(EmacsError::InvalidRequest("buffer_id 不能为空".to_owned()));
+        }
+        let id = serde_json::to_string(id).expect("字符串可以序列化");
+        let script = activation_script_for_target(&format!(
+            "(and (fboundp 'loki-assistant-monitor-buffer-by-id) (loki-assistant-monitor-buffer-by-id {id}))"
+        ));
+        let result = self
+            .eval_with_startup(&script, false)
+            .await
+            .map_err(|error| match error {
+                EmacsError::Process(_) | EmacsError::CommandFailed { .. } => {
+                    EmacsError::ConnectionFailed(error.to_string())
+                }
+                error => error,
+            })?;
+        match result.as_str() {
+            "t" => Ok(()),
+            "nil" => Err(EmacsError::BufferNotFound),
+            _ => Err(EmacsError::InvalidResponse(
+                "buffer 激活未返回 t 或 nil".to_owned(),
+            )),
+        }
     }
 
     async fn eval_with_startup(
@@ -379,10 +476,14 @@ impl EmacsService {
 
 fn activation_script(buffer: &str) -> String {
     let buffer_name = serde_json::to_string(buffer).expect("字符串可以序列化");
+    activation_script_for_target(&format!("(get-buffer {buffer_name})"))
+}
+
+fn activation_script_for_target(target: &str) -> String {
     format!(
         r#"(progn
   (require 'seq)
-  (let ((target (get-buffer {buffer_name})))
+  (let ((target {target}))
     (when (buffer-live-p target)
       (let* ((window (seq-find (lambda (candidate)
                                 (display-graphic-p (window-frame candidate)))
