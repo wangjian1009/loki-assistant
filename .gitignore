@@ -9,6 +9,7 @@ xcuserdata/
 
 # HarmonyOS build outputs
 apps/harmony/.hvigor/
+apps/harmony/.signing/
 apps/harmony/build/
 apps/harmony/entry/build/
 apps/harmony/oh_modules/

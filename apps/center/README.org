@@ -20,7 +20,7 @@
 
 * 应用图标
 
-应用显示名称为“Loki的助理”，采用已确认的“对话中的 L”图标：深绿底板、薄荷色字母 L 与回应气泡。应用图标、完整 PNG iconset、1024 像素 PNG 及菜单栏 20/40 像素透明图标位于 ~mac/Resources/AppIcon/~ 。菜单栏使用单色 template 图标，自动适配浅色与深色外观；设计说明与导出文件见 [[file:../../docs/icon-design.org][图标设计]]。
+应用显示名称为“Loki的助理”，采用已确认的“对话中的 L”图标：深绿底板、薄荷色字母 L 与回应气泡。SVG 母版与设计预览统一放在仓库根目录 ~resources/icons/~ ，由根目录 ~scripts/export-icons.py~ 同时生成 macOS 与 HarmonyOS 图标。Mac 应用的完整 PNG iconset、ICNS、1024 像素 PNG 及菜单栏 20/40 像素透明图标位于 ~mac/Resources/AppIcon/~ 。菜单栏使用单色 template 图标，自动适配浅色与深色外观；设计说明与导出文件见 [[file:../../docs/icon-design.org][图标设计]]。
 
 修改 SVG 母版后，在仓库根目录执行：
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
   <title>Loki Assistant 图标：对话中的 L</title>
-  <desc>深绿圆角底上的薄荷色 L 与回应气泡，用于 macOS 应用图标。</desc>
+  <desc>深绿圆角底上的薄荷色 L 与回应气泡，用于各平台应用图标。</desc>
   <defs>
     <linearGradient id="base" x1="200" y1="70" x2="810" y2="960" gradientUnits="userSpaceOnUse">
       <stop stop-color="#183F3B"/>

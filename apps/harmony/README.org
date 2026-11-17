@@ -4,9 +4,11 @@
 
 这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS。当前仅完成应用入口初始化，主页面保持空白，为后续接入辅助能力预留运行容器。
 
+应用、Ability 和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。根目录 ~make export-icons~ 将图标导出为 ~AppScope/resources/base/media/app_icon.png~ 的 1024 × 1024 PNG；构建直接使用仓库中的导出资源。设计与导出说明见 [[file:../../docs/icon-design.org][图标设计]]。
+
 * 构建与运行
 
-工程依赖 DevEco Studio 提供的 Hvigor 和 HarmonyOS SDK。默认工具路径为：
+工程依赖 DevEco Studio 提供的 Node.js、OHPM、Hvigor 和 HarmonyOS SDK。默认工具路径为：
 
 - ~/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw~
 - ~/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc~
@@ -14,11 +16,28 @@
 在本目录执行：
 
 #+begin_src sh
-make build       # 构建未签名 Debug HAP
+make check-sdk   # 检查 SDK 安装
+make deps        # 检查 SDK 并安装工程依赖
+make build       # 构建 Debug HAP，使用 OrgTasksDebug 调试签名
 make devices     # 查看 hdc 设备
 make install     # 安装到已连接设备
 make run         # 启动手机应用
-make deploy      # 构建、安装并启动
+make deploy      # 检查真机，构建、安装并启动
 #+end_src
 
-未配置发布签名时，~make build~ 会生成未签名 HAP，适合在 DevEco Studio 中继续配置签名或进行工程检查。安装到真机需要可用的开发者签名和已授权的 ~hdc~ 设备。
+~make build~ 自动检查 SDK 目录及 ~sdk-pkg.json~ ，执行工程和 entry 模块的 OHPM 依赖安装，再通过 Hvigor 的 ~default@PackingCheck~ 和 ~default@CollectDebugSymbol~ 打包。构建显式指定 ~module=entry@default~ 、 ~product=default~ 、 ~buildMode=debug~ 和 ~debuggable=true~ ，随后由 ~scripts/sign-hap.cjs~ 使用 ~signing/config.json~ 指定的材料独立签名，生成 ~entry/build/default/outputs/default/entry-default-signed.hap~ 。安装入口只使用已签名产物，真机还需已授权的 ~hdc~ 连接。
+
+~make install~ 和 ~make run~ 同样通过设备选择脚本自动选择唯一真机；也可用 ~HDC_TARGET=<设备 ID>~ 显式选择已连接的模拟器。根目录提供 ~make harmony-deps~ 和 ~make harmony-check-sdk~ 对应依赖安装与 SDK 检查。
+
+~make deploy~ 在构建前检查真机，自动选中唯一已连接的真机；多台真机时通过 ~HDC_TARGET=<设备 ID>~ 指定。模拟器、离线或未授权设备不能作为部署目标。确认设备后依次完成构建签名、安装和启动，任一步失败即停止；并行执行 make 时也保持此顺序。根目录的 ~make deploy~ 和 ~make harmony-deploy~ 均调用此入口。
+
+* 调试签名
+
+项目复用 ~OrgTasksDebug~ 调试证书，配套的 ~LokiAssistantDebug~ Profile 绑定包名 ~cc.loki.assistant.mobile~ 和后台登记的手机，有效期至 2027-10-11。此配置用于调试构建。
+
+- ~signing/OrgTasksDebug.cer~ ：公共证书链，纳入版本管理。
+- ~signing/LokiAssistantDebug.p7b~ ：Loki 专用调试 Profile，纳入版本管理；增加调试设备时需在华为后台更新并重新下载。
+- ~signing/config.json~ ：证书、Profile、私钥路径、keyAlias 和 Keychain 条目名称，纳入版本管理。
+- ~.signing/org-tasks.p12~ ：与证书配套的本地私钥库，由 Git 忽略；新开发环境需要恢复此文件。
+
+签名脚本从 macOS Keychain 的 ~org-tasks-signing~ / ~development~ 条目读取密码，通过 stdin 交给 JVM 内的签名工具；密码不写入工程配置或命令行。签名前校验签名材料的有效期、Profile 包名以及证书与私钥是否配套。

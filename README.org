@@ -33,8 +33,12 @@ make restart-center
 
 #+begin_src sh
 make harmony-build
-make harmony-deploy HDC_TARGET=<设备 ID>
+make deploy
 #+end_src
+
+~make deploy~ 先检查真机，再构建、签名、安装并启动应用；多台真机时使用 ~HDC_TARGET=<设备 ID>~ 指定目标。模拟器、离线或未授权设备会被排除。
+
+HarmonyOS 构建会自动检查 SDK 并安装 OHPM 依赖，显式使用可调试的 Debug 模式打包后独立签名。~make harmony-install~ 和 ~make harmony-run~ 默认选择唯一真机，也可通过 ~HDC_TARGET=<设备 ID>~ 显式选择模拟器。
 
 修改菜单栏 App 代码后使用 ~make restart-center~，该命令会退出旧进程并强制启动新构建的 App；只执行 ~make run~ 可能会复用旧实例。
 
@@ -57,6 +61,8 @@ make stop-service
 
 * 开发操作
 
+跨应用图标的 SVG 母版与设计预览集中在 ~resources/icons/~ ，通过根目录 ~make export-icons~ 同步生成 macOS 的 iconset、ICNS、asset catalog、菜单栏图标，以及 HarmonyOS 的应用 PNG。各应用构建直接使用已导出的资源，详见 [[file:docs/icon-design.org][图标设计]]。
+
 加载 Emacs 包前，需有正在运行且已启动 ~server-start~ 的 Emacs。从仓库根目录执行：
 
 #+begin_src sh
@@ -76,7 +82,7 @@ make emacs-test
 | make test | 执行 Mac XCTest 和 services Rust 测试 |
 | make test-mac | 执行 Mac XCTest |
 | make emacs-config | 打开 Emacs 服务配置管理界面 |
-| make export-icons | 从 SVG 母版导出应用和菜单栏图标 |
+| make export-icons | 从公共 SVG 母版导出 macOS 和 HarmonyOS 图标 |
 | make services-test | 执行 services workspace 测试 |
 | make services-fmt | 检查 services Rust 格式 |
 | make services-run | 运行 services |
@@ -88,10 +94,13 @@ make emacs-test
 | make service-status | 查询 services LaunchAgent 状态 |
 | make emacs-load | 通过 emacsclient 重新加载 Emacs 包 |
 | make emacs-test | 通过 emacsclient 执行 Emacs ERT 测试 |
-| make harmony-build | 构建 HarmonyOS 手机应用 Debug HAP |
+| make harmony-deps | 检查 SDK 并安装 HarmonyOS 工程依赖 |
+| make harmony-check-sdk | 检查 HarmonyOS SDK 安装 |
+| make harmony-build | 检查 SDK、安装依赖，构建并使用 OrgTasksDebug 签名 |
 | make harmony-install | 构建并安装 HarmonyOS 手机应用 |
 | make harmony-run | 启动 HarmonyOS 手机应用 |
-| make harmony-deploy | 构建、安装并启动 HarmonyOS 手机应用 |
+| make deploy | 检查 HarmonyOS 真机，构建、安装并启动 |
+| make harmony-deploy | 同 make deploy |
 | make harmony-devices | 查看 HarmonyOS ~hdc~ 设备 |
 | make harmony-clean | 清理 HarmonyOS 构建产物 |
 | make clean | 清理构建产物 |

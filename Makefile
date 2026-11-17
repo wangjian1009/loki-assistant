@@ -12,7 +12,7 @@ EMACSCLIENT ?= emacsclient
 
 .PHONY: emacs-load emacs-test emacs-config export-icons
 
-.PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release harmony-help harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
+.PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
 
 help:
 	@printf '%s\n' \
@@ -24,7 +24,7 @@ help:
 	  'make test            执行 Mac XCTest 和 services Rust 测试' \
 	  'make test-mac        构建并执行 Mac XCTest' \
 	  'make emacs-config    打开 Emacs 服务配置管理界面' \
-	  'make export-icons    从 SVG 母版导出应用和菜单栏图标' \
+	  'make export-icons    从公共 SVG 母版导出 macOS 和 HarmonyOS 图标' \
 	  'make services-test   执行 services Rust 测试' \
 	  'make services-fmt    检查 services Rust 格式' \
 	  'make services-run    运行 services 本地服务' \
@@ -37,10 +37,13 @@ help:
 	  'make emacs-load      通过 emacsclient 重新加载 Emacs 包' \
 	  'make emacs-test      通过 emacsclient 执行 Emacs ERT 测试' \
 	  'make release         构建 Release Mac 菜单栏应用' \
-	  'make harmony-build   构建 HarmonyOS 手机应用 Debug HAP' \
+	  'make deploy          检查 HarmonyOS 真机，构建、安装并启动' \
+	  'make harmony-deps    检查 SDK 并安装 HarmonyOS 工程依赖' \
+	  'make harmony-check-sdk 检查 HarmonyOS SDK 安装' \
+	  'make harmony-build   构建 HarmonyOS 手机应用并使用 OrgTasksDebug 签名' \
 	  'make harmony-install 构建并安装 HarmonyOS 手机应用' \
 	  'make harmony-run     启动 HarmonyOS 手机应用' \
-	  'make harmony-deploy  构建、安装并启动 HarmonyOS 手机应用' \
+	  'make harmony-deploy  同 make deploy，检查真机后构建、安装并启动' \
 	  'make harmony-devices 查看 HarmonyOS hdc 设备' \
 	  'make harmony-clean   清理 HarmonyOS 构建产物' \
 	  'make clean           清理构建产物' \
@@ -81,7 +84,7 @@ emacs-test: emacs-load
 	    (when monitor-enabled (loki-assistant-monitor-mode 1))))"
 
 export-icons:
-	python3 "$(PROJECT_ROOT)/apps/center/mac/scripts/export-icons.py"
+	python3 "$(PROJECT_ROOT)/scripts/export-icons.py"
 
 configure:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON
@@ -141,6 +144,12 @@ release:
 harmony-help:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" help
 
+harmony-deps:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" deps
+
+harmony-check-sdk:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" check-sdk
+
 harmony-build:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" build
 
@@ -149,6 +158,8 @@ harmony-install:
 
 harmony-run:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" run
+
+deploy: harmony-deploy
 
 harmony-deploy:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" deploy

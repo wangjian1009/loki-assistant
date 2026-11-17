@@ -1,29 +1,53 @@
 # Loki Assistant HarmonyOS 手机应用编译安装入口
+.DEFAULT_GOAL := build
 
 DEVECO_HOME ?= /Applications/DevEco-Studio.app/Contents
 DEVECO_SDK_HOME ?= $(DEVECO_HOME)/sdk
-export DEVECO_SDK_HOME
+NODE_HOME := $(DEVECO_HOME)/tools/node
+export DEVECO_SDK_HOME NODE_HOME
+export PATH := $(NODE_HOME)/bin:$(PATH)
 HVIGORW := $(DEVECO_HOME)/tools/hvigor/bin/hvigorw
+OHPM := $(DEVECO_HOME)/tools/ohpm/bin/ohpm
 HDC := $(DEVECO_HOME)/sdk/default/openharmony/toolchains/hdc
+NODE := $(NODE_HOME)/bin/node
 HDC_TARGET ?=
-HDC_ARGS = $(if $(HDC_TARGET),-t $(HDC_TARGET),)
+HDC_DEVICE = device_target="$$(sh scripts/select-hdc-target.sh "$(HDC)" "$(HDC_TARGET)")" && "$(HDC)" -t "$$device_target"
 BUNDLE_NAME := cc.loki.assistant.mobile
 ABILITY_NAME := EntryAbility
-HAP_FILE := entry/build/default/outputs/default/entry-default-unsigned.hap
+HAP_FILE := entry/build/default/outputs/default/entry-default-signed.hap
 
-.PHONY: build install run deploy devices clean help
+.PHONY: build deps check-sdk install run deploy devices clean help
 
-build:
-	"$(HVIGORW)" assembleHap --no-daemon
+check-sdk:
+	@test -d "$(DEVECO_SDK_HOME)" || { echo "未找到 HarmonyOS SDK：$(DEVECO_SDK_HOME)" >&2; exit 1; }
+	@find "$(DEVECO_SDK_HOME)" -maxdepth 2 -name sdk-pkg.json -print -quit | grep -q . || { \
+	  echo "HarmonyOS SDK 安装不完整，请在 DevEco Studio 的 SDK Manager 中安装 HarmonyOS 6.1.1（API 24）组件。" >&2; \
+	  exit 1; \
+	}
+
+deps: check-sdk
+	"$(OHPM)" install --all
+	cd entry && "$(OHPM)" install
+
+build: deps
+	rm -f "$(HAP_FILE)"
+	"$(HVIGORW)" default@PackingCheck default@CollectDebugSymbol --mode module \
+	  -p module=entry@default -p product=default -p buildMode=debug -p debuggable=true --no-daemon
+	"$(NODE)" scripts/sign-hap.cjs "$(DEVECO_HOME)"
 
 install: build
-	@test -f "$(HAP_FILE)" || { echo "未找到 HAP: $(HAP_FILE)" >&2; exit 1; }
-	"$(HDC)" $(HDC_ARGS) install -r "$(HAP_FILE)"
+	@test -f "$(HAP_FILE)" || { echo "未找到已签名 HAP，请检查 signing/config.json 和本地私钥" >&2; exit 1; }
+	$(HDC_DEVICE) install -r "$(HAP_FILE)"
 
 run:
-	"$(HDC)" $(HDC_ARGS) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME)
+	$(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME)
 
-deploy: install run
+# 固定同一台真机，按顺序完成安装和启动，支持并行 make。
+deploy:
+	@device_target="$$(sh scripts/select-hdc-target.sh "$(HDC)" "$(HDC_TARGET)" --physical)" || exit $$?; \
+	  echo ">>> 部署到真机：$$device_target"; \
+	  $(MAKE) install HDC_TARGET="$$device_target" && \
+	  $(MAKE) run HDC_TARGET="$$device_target"
 
 devices:
 	"$(HDC)" list targets
@@ -34,10 +58,12 @@ clean:
 
 help:
 	@printf '%s\n' \
-	  'make build    构建未签名 Debug HAP' \
+	  'make deps     检查 SDK 并安装 HarmonyOS 工程依赖' \
+	  'make check-sdk 检查 HarmonyOS SDK 安装' \
+	  'make build    构建 Debug HAP，使用 OrgTasksDebug 调试签名' \
 	  'make install  安装到已连接的 HarmonyOS 设备' \
 	  'make run      启动手机应用' \
-	  'make deploy   构建、安装并启动' \
+	  'make deploy   检查真机，构建、安装并启动' \
 	  'make devices  查看 hdc 设备' \
 	  'make clean    清理构建产物' \
-	  'HDC_TARGET=<设备 ID> 可指定目标设备'
+	  'HDC_TARGET=<设备 ID> 可指定目标设备；install/run 可显式选择模拟器，deploy 仅接受真机'
