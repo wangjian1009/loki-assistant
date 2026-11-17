@@ -11,17 +11,32 @@ struct MonitoredEmacsBuffer: Decodable, Equatable, Identifiable, Sendable {
 }
 
 struct EmacsBufferStatus: Decodable, Sendable {
+    struct AppStatus: Decodable, Sendable {
+        let buffer: [MonitoredEmacsBuffer]?
+    }
+
     let apiVersion: String
-    let app: String
-    let key: String
-    let value: [MonitoredEmacsBuffer]
+    let status: [String: AppStatus]
     let updatedAt: UInt64?
+
+    var bufferGroups: [EmacsBufferGroup] {
+        status.keys.sorted().compactMap { app in
+            guard let buffers = status[app]?.buffer, !buffers.isEmpty else { return nil }
+            return EmacsBufferGroup(app: app, buffers: buffers)
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case apiVersion = "api_version"
-        case app, key, value
+        case status
         case updatedAt = "updated_at"
     }
+}
+
+struct EmacsBufferGroup: Equatable, Identifiable, Sendable {
+    let app: String
+    let buffers: [MonitoredEmacsBuffer]
+    var id: String { app }
 }
 
 private struct EmacsStatusAPIError: Decodable { let message: String }
@@ -70,12 +85,15 @@ struct EmacsReportedStatusClient: Sendable {
 
     func fetchBuffers() async throws -> EmacsBufferStatus {
         let endpoint = try await endpoint()
-        let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/status/emacs/buffer"),
+        let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/status"),
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         let result = try JSONDecoder().decode(EmacsBufferStatus.self, from: await send(request))
-        guard result.apiVersion == "1", result.app == "emacs", result.key == "buffer",
-              Set(result.value.map(\.id)).count == result.value.count,
-              result.value.allSatisfy({ !$0.id.isEmpty && !$0.name.isEmpty }) else {
+        guard result.apiVersion == "1",
+              result.bufferGroups.allSatisfy({ group in
+                  !group.app.isEmpty
+                      && Set(group.buffers.map(\.id)).count == group.buffers.count
+                      && group.buffers.allSatisfy { !$0.id.isEmpty && !$0.name.isEmpty }
+              }) else {
             throw EmacsReportedStatusError.failed("Emacs buffer 状态响应无效")
         }
         return result
@@ -105,7 +123,7 @@ private enum EmacsReportedStatusError: LocalizedError {
 @MainActor
 @Observable
 final class EmacsReportedStatusModel {
-    private(set) var buffers: [MonitoredEmacsBuffer] = []
+    private(set) var bufferGroups: [EmacsBufferGroup] = []
     private(set) var updatedAt: UInt64?
     private(set) var hasSnapshot = false
     private(set) var loading = false
@@ -146,7 +164,7 @@ final class EmacsReportedStatusModel {
                 let snapshot = try await client.fetchBuffers()
                 try Task.checkCancellation()
                 guard let self, self.menuOpen, self.generation == current else { return }
-                self.buffers = snapshot.value
+                self.bufferGroups = snapshot.bufferGroups
                 self.updatedAt = snapshot.updatedAt
                 self.hasSnapshot = true
                 self.refreshError = nil

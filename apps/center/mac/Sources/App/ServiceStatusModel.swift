@@ -52,21 +52,15 @@ final class ServiceStatusModel {
 
     private(set) var status: ServiceStatus = .unknown
     private(set) var lastUpdated: Date?
-    private(set) var uptimeSeconds: Int?
+    private(set) var startedAt: Date?
     @ObservationIgnored private var monitoringTask: Task<Void, Never>?
 
     func startMonitoring() {
         guard monitoringTask == nil else { return }
         monitoringTask = Task { @MainActor [weak self] in
-            var tick = 0
             while !Task.isCancelled {
-                if tick % 5 == 0 {
-                    await self?.refresh()
-                } else {
-                    self?.advanceUptime()
-                }
-                tick += 1
-                try? await Task.sleep(for: .seconds(1))
+                await self?.refresh()
+                try? await Task.sleep(for: .seconds(5))
             }
         }
     }
@@ -76,28 +70,20 @@ final class ServiceStatusModel {
             let printResult = try await runLaunchctl(["print", serviceTarget])
             guard printResult.status == 0 else {
                 status = .stopped
+                startedAt = nil
                 lastUpdated = Date()
                 return
             }
             let endpoint = try readEndpoint()
             let health = try await fetchHealth(endpoint: endpoint)
             status = .healthy(health)
-            uptimeSeconds = currentUptime(startedAt: endpoint.startedAt)
+            startedAt = Date(timeIntervalSince1970: TimeInterval(endpoint.startedAt))
             lastUpdated = Date()
         } catch {
             status = .unavailable(error.localizedDescription)
-            uptimeSeconds = nil
+            startedAt = nil
             lastUpdated = Date()
         }
-    }
-
-    private func advanceUptime() {
-        guard case .healthy = status, let endpoint = try? readEndpoint() else { return }
-        uptimeSeconds = currentUptime(startedAt: endpoint.startedAt)
-    }
-
-    private func currentUptime(startedAt: UInt64) -> Int {
-        max(0, Int(Date().timeIntervalSince1970) - Int(startedAt))
     }
 
     func start() async {

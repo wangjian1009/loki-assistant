@@ -62,26 +62,28 @@ struct DashboardView: View {
 
     @ViewBuilder
     private var monitoredBuffers: some View {
-        Text("关注的 buffer（\(reportedStatus.buffers.count)）")
-            .font(.caption).foregroundStyle(.secondary)
         if let error = reportedStatus.refreshError {
             Text(error).font(.caption).foregroundStyle(.secondary)
         } else if reportedStatus.loading {
             Text("正在读取状态…").foregroundStyle(.secondary)
-        } else if reportedStatus.hasSnapshot && reportedStatus.buffers.isEmpty {
+        } else if reportedStatus.hasSnapshot && reportedStatus.bufferGroups.isEmpty {
             Text("没有关注的 buffer").foregroundStyle(.secondary)
         } else if !reportedStatus.hasSnapshot {
             Text("打开菜单后读取 Emacs 上报状态").foregroundStyle(.secondary)
         }
-        ForEach(reportedStatus.buffers) { buffer in
-            Button { reportedStatus.activate(buffer) } label: {
-                Label(buffer.name, systemImage: "terminal")
-                    .lineLimit(1)
+        ForEach(reportedStatus.bufferGroups) { group in
+            Section(group.app) {
+                ForEach(group.buffers) { buffer in
+                    Button { reportedStatus.activate(buffer) } label: {
+                        Label(buffer.name, systemImage: "terminal")
+                            .lineLimit(1)
+                    }
+                    .help("\(buffer.mode)\n\(buffer.directory)")
+                    .disabled(reportedStatus.activatingID != nil)
+                    .buttonStyle(.borderless)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .help("\(buffer.mode)\n\(buffer.directory)")
-            .disabled(reportedStatus.activatingID != nil)
-            .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -92,15 +94,19 @@ struct DashboardView: View {
             Button {
             } label: {
                 Label {
-                    Text("\(health.version) · \(formatUptime(status.uptimeSeconds ?? health.uptimeSeconds))")
-                        .monospacedDigit()
+                    if let startedAt = status.startedAt {
+                        Text("\(health.version) · 启动于 \(startedAt.formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))")
+                            .monospacedDigit()
+                    } else {
+                        Text(health.version)
+                    }
                 } icon: {
                     statusDot
                 }
             }
             .disabled(true)
             .buttonStyle(.borderless)
-            .frame(width: 170, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
         case .stopped:
             Button {
                 Task { await status.start() }
@@ -154,13 +160,6 @@ struct DashboardView: View {
         case .unavailable:
             .gray
         }
-    }
-
-    private func formatUptime(_ seconds: Int) -> String {
-        let hours = seconds / 3600
-        let minutes = (seconds % 3600) / 60
-        let remainder = seconds % 60
-        return String(format: "%02d:%02d:%02d", hours, minutes, remainder)
     }
 
 }
