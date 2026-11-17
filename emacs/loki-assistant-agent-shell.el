@@ -94,10 +94,18 @@ if (names.isNil()) { '' } else { \
   (agent-shell--dot-subdir ".loki-assistant"))
 
 (defun loki-assistant-agent-shell--copy-to-data-dir (file-path)
-  "将 FILE-PATH 复制到扩展数据目录并返回新路径。"
+  "将 FILE-PATH 复制到扩展数据目录并返回新路径，重名时附加数字序号。"
   (let* ((dest-dir (loki-assistant-agent-shell--data-dir))
-         (dest (expand-file-name (file-name-nondirectory file-path) dest-dir)))
-    (copy-file file-path dest t)
+         (filename (file-name-nondirectory file-path))
+         (dest (expand-file-name filename dest-dir))
+         (number 0))
+    (while (or (file-exists-p dest) (file-symlink-p dest))
+      (setq number (1+ number)
+            dest (expand-file-name
+                  (format "%s-%d%s" (file-name-sans-extension filename)
+                          number (or (file-name-extension filename t) ""))
+                  dest-dir)))
+    (copy-file file-path dest nil)
     dest))
 
 (defun loki-assistant-agent-shell--outside-project-p (file-path)
