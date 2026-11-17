@@ -190,6 +190,24 @@ HTTP 失败保留状态、原始正文和可解析的 JSON，优先使用 servic
 ~always-original~ 。系统临时目录中的文件始终复制到当前项目的
 ~.agent-shell/.loki-assistant/~ 数据目录。
 
+截图后可直接将 macOS 浮动缩略图拖入 agent-shell 会话或 viewport，显示图片预览。
+截图会先复制到会话所属项目的数据目录，使用 ~截图 - YYYY-MM-DD HH-MM-SS.png~
+形式命名并保留原扩展名；同一秒内重名时依次追加 ~-1~、~-2~ 等序号，不覆盖已有文件。
+截图识别依据 macOS 截图临时目录或常见中英文截图文件名，始终缓存，不受
+~always-original~ 策略影响。
+
+~loki-assistant-agent-shell-yank-image~ 将剪贴板中的图片保存到当前会话缓存并插入预览，
+沿用截图时间戳命名和重名避让规则，不自动发送给 Agent。该命令直接读取 Emacs 的图片
+剪贴板数据，无需 ~pngpaste~ ；没有图片时提示错误。建议在会话及 viewport 中绑定 ~C-c y~ ：
+
+#+begin_src emacs-lisp
+(with-eval-after-load 'loki-assistant-agent-shell
+  (dolist (map (list agent-shell-mode-map
+                     agent-shell-viewport-edit-mode-map
+                     agent-shell-viewport-view-mode-map))
+    (keymap-set map "C-c y" #'loki-assistant-agent-shell-yank-image)))
+#+end_src
+
 Agent 的 ~permission-request~ 和 ~turn-complete~ 事件通过
 ~loki-assistant-notify~ 发送，因此统一使用 services 和菜单栏应用的通知链路。通知由
 ~loki-assistant-agent-shell-notifications~ 控制；默认在 Emacs 未聚焦或当前显示其他缓冲区时

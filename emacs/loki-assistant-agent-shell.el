@@ -29,6 +29,7 @@
 ;;; Code:
 
 (require 'agent-shell)
+(require 'image)
 
 (declare-function agent-shell--get-files-context "agent-shell")
 (declare-function agent-shell-insert "agent-shell")
@@ -60,7 +61,8 @@
 
 `always-original' 从不复制，始终将原路径交给 Agent。
 
-系统临时目录中的文件始终复制，以避免文件在 Agent 使用前被系统删除。"
+系统临时目录中的文件和截图始终复制，以避免文件在 Agent 使用前被系统删除。
+截图使用“截图 - 时间戳”的文件名，重名时附加数字序号。"
   :type '(choice (const :tag "自动（仅复制项目外文件）" auto)
                  (const :tag "始终复制" always-copy)
                  (const :tag "始终使用原路径" always-original))
@@ -93,10 +95,9 @@ if (names.isNil()) { '' } else { \
   "返回扩展数据目录；目录不存在时创建，并遵循 `agent-shell-dot-subdir-function'。"
   (agent-shell--dot-subdir ".loki-assistant"))
 
-(defun loki-assistant-agent-shell--copy-to-data-dir (file-path)
-  "将 FILE-PATH 复制到扩展数据目录并返回新路径，重名时附加数字序号。"
+(defun loki-assistant-agent-shell--available-cache-path (filename)
+  "返回扩展数据目录中 FILENAME 的可用路径，重名时附加数字序号。"
   (let* ((dest-dir (loki-assistant-agent-shell--data-dir))
-         (filename (file-name-nondirectory file-path))
          (dest (expand-file-name filename dest-dir))
          (number 0))
     (while (or (file-exists-p dest) (file-symlink-p dest))
@@ -105,6 +106,13 @@ if (names.isNil()) { '' } else { \
                   (format "%s-%d%s" (file-name-sans-extension filename)
                           number (or (file-name-extension filename t) ""))
                   dest-dir)))
+    dest))
+
+(defun loki-assistant-agent-shell--copy-to-data-dir (file-path &optional filename)
+  "将 FILE-PATH 复制到扩展数据目录并返回新路径，重名时附加数字序号。
+FILENAME 非 nil 时作为目标文件名。"
+  (let ((dest (loki-assistant-agent-shell--available-cache-path
+               (or filename (file-name-nondirectory file-path)))))
     (copy-file file-path dest nil)
     dest))
 
@@ -127,17 +135,33 @@ if (names.isNil()) { '' } else { \
         (string-prefix-p "/tmp/" real)
         (string-prefix-p "/private/tmp/" real))))
 
+(defun loki-assistant-agent-shell--screenshot-file-p (file-path)
+  "如果 FILE-PATH 是 macOS 截图则返回非 nil。
+识别截图浮动缩略图的临时目录，以及常见中英文截图文件名。"
+  (let ((case-fold-search t))
+    (and (image-supported-file-p file-path)
+         (or (string-match-p "/NSIRD_screencaptureui_[^/]+/" file-path)
+             (string-match-p
+              "\\`\\(?:截图\\|截屏\\|屏幕快照\\|螢幕截圖\\|Screen ?Shot\\)"
+              (file-name-nondirectory file-path))))))
+
 (defun loki-assistant-agent-shell--resolve-file-path (file-path)
-  "根据 `loki-assistant-agent-shell-file-copy-policy' 返回 FILE-PATH 的使用路径。"
-  (if (loki-assistant-agent-shell--temp-path-p file-path)
-      (loki-assistant-agent-shell--copy-to-data-dir file-path)
+  "根据复制策略返回 FILE-PATH 的使用路径；截图始终以时间戳命名后缓存。"
+  (cond
+   ((loki-assistant-agent-shell--screenshot-file-p file-path)
+    (loki-assistant-agent-shell--copy-to-data-dir
+     file-path (concat (format-time-string "截图 - %Y-%m-%d %H-%M-%S")
+                       (file-name-extension file-path t))))
+   ((loki-assistant-agent-shell--temp-path-p file-path)
+    (loki-assistant-agent-shell--copy-to-data-dir file-path))
+   (t
     (pcase loki-assistant-agent-shell-file-copy-policy
       ('always-copy     (loki-assistant-agent-shell--copy-to-data-dir file-path))
       ('always-original file-path)
       ('auto            (if (or (loki-assistant-agent-shell--permission-allow-all-p)
                                 (not (loki-assistant-agent-shell--outside-project-p file-path)))
                             file-path
-                          (loki-assistant-agent-shell--copy-to-data-dir file-path))))))
+                          (loki-assistant-agent-shell--copy-to-data-dir file-path)))))))
 
 ;; 继承 yank 的 `delete-selection' 属性，使粘贴替换活动区域。
 (put 'loki-assistant-agent-shell-yank 'delete-selection 'yank)
@@ -161,12 +185,48 @@ Finder 文件、表示现有文件的文本路径会作为文件上下文插入�
      (t
       (agent-shell-yank-dwim arg)))))
 
+(defun loki-assistant-agent-shell--clipboard-image ()
+  "返回剪贴板图片的 (扩展名 . 二进制数据)，没有图片时返回 nil。"
+  (seq-some
+   (lambda (type)
+     (let ((data (ignore-errors (gui-get-selection 'CLIPBOARD (car type)))))
+       (when (and (stringp data) (not (string-empty-p data))
+                  (eq (image-type-from-data data) (cadr type)))
+         (cons (caddr type) data))))
+   '((image/png png ".png") (image/tiff tiff ".tiff") (image/jpeg jpeg ".jpg")
+     (image/gif gif ".gif") (image/webp webp ".webp") (image/svg+xml svg ".svg"))))
+
+;;;###autoload
+(defun loki-assistant-agent-shell-yank-image ()
+  "将剪贴板图片保存到当前会话的缓存目录并插入预览。
+适用于 `agent-shell-mode' 和 viewport，建议绑定到 `C-c y'。
+文件采用“截图 - 时间戳”的名称，重名时附加数字序号。
+剪贴板没有图片时提示错误，不粘贴文本；不自动发送给 Agent。"
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode
+                          'agent-shell-viewport-edit-mode
+                          'agent-shell-viewport-view-mode)
+    (user-error "请在 agent-shell 会话或 viewport 中粘贴图片"))
+  (let* ((image (or (loki-assistant-agent-shell--clipboard-image)
+                    (user-error "剪贴板中没有可用的图片")))
+         (shell-buffer (agent-shell--shell-buffer))
+         (path (with-current-buffer shell-buffer
+                 (loki-assistant-agent-shell--available-cache-path
+                  (concat (format-time-string "截图 - %Y-%m-%d %H-%M-%S")
+                          (car image)))))
+         (coding-system-for-write 'no-conversion))
+    (write-region (cdr image) nil path nil 'silent nil 'excl)
+    (agent-shell-insert
+     :text (agent-shell--get-files-context :files (list path))
+     :shell-buffer shell-buffer)))
+
 ;;; Drag and drop
 
 (defun loki-assistant-agent-shell--insert-files (file-paths)
   "将 FILE-PATHS 按粘贴规则插入当前 `agent-shell' 缓冲区。"
-  (let* ((resolved (mapcar #'loki-assistant-agent-shell--resolve-file-path file-paths))
-         (shell-buffer (agent-shell--shell-buffer)))
+  (let* ((shell-buffer (agent-shell--shell-buffer))
+         (resolved (with-current-buffer shell-buffer
+                     (mapcar #'loki-assistant-agent-shell--resolve-file-path file-paths))))
     (when resolved
       (agent-shell-insert
        :text (agent-shell--get-files-context :files resolved)
@@ -194,11 +254,12 @@ Finder 文件、表示现有文件的文本路径会作为文件上下文插入�
   (let ((handler (if (>= emacs-major-version 30)
                      #'loki-assistant-agent-shell--dnd-multi-handler
                    #'loki-assistant-agent-shell--dnd-handler)))
-    (setq-local dnd-protocol-alist
-                (append (list (cons "^file:///" handler)
-                              (cons "^file:/[^/]" handler)
-                              (cons "^file:[^/]" handler))
-                        dnd-protocol-alist))))
+    (unless (rassq handler dnd-protocol-alist)
+      (setq-local dnd-protocol-alist
+                  (append (list (cons "^file:///" handler)
+                                (cons "^file:/[^/]" handler)
+                                (cons "^file:[^/]" handler))
+                          dnd-protocol-alist)))))
 
 ;;; Notifications
 
