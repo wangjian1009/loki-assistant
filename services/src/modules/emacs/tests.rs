@@ -893,6 +893,21 @@ async fn open_config_app_uses_gateway_and_latest_socket() {
 }
 
 #[tokio::test]
+async fn open_logs_app_opens_org_log_through_gateway() {
+    let (service, runner, _) = service(vec![Ok(wire(json!({"result":"t"})))]);
+    let (status, body) = request(service, "POST", "/emacs/apps/open?app=logs", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({"api_version":"1", "app":"logs", "opened":true})
+    );
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].1[3].contains("loki-assistant.log.org"));
+    assert!(calls[0].1[3].contains("find-file"));
+}
+
+#[tokio::test]
 async fn open_app_rejects_invalid_and_unknown_identifiers_without_execution() {
     let (service, runner, _) = service(vec![]);
     for (path, expected, code) in [
@@ -981,7 +996,7 @@ async fn reported_status_is_a_passive_cache_and_preserves_json_values() {
         empty,
         json!({"api_version":"1","status":{},"updated_at":null})
     );
-    let values = json!({"emacs":{"buffer":[{"id":"id-1","name":"中文 buffer"}],"runtime":{"pid":123}},
+    let values = json!({"emacs":{"buffer":[{"name":"中文 buffer"}],"runtime":{"pid":123}},
                         "tools":{"enabled":false,"count":0,"empty":null,"list":[]}});
     let (status, posted) = request(service.clone(), "POST", "/emacs/status", values.clone()).await;
     assert_eq!(status, StatusCode::OK);
@@ -1072,7 +1087,7 @@ async fn reported_status_rejects_invalid_updates_atomically() {
 }
 
 #[tokio::test]
-async fn monitored_buffer_activation_resolves_id_in_emacs_without_starting_a_daemon() {
+async fn buffer_activation_resolves_name_in_emacs_without_starting_a_daemon() {
     let (service, runner, _) = service(vec![
         Ok(wire(json!({"result":"t"}))),
         Ok(wire(json!({"result":"nil"}))),
@@ -1080,25 +1095,22 @@ async fn monitored_buffer_activation_resolves_id_in_emacs_without_starting_a_dae
     let (status, body) = request(
         service.clone(),
         "POST",
-        "/emacs/activate?buffer_id=opaque%22id",
+        "/emacs/activate?buffer=opaque%22name",
         Value::Null,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["buffer_id"], "opaque\"id");
+    assert_eq!(body["buffer"], "opaque\"name");
     let (status, body) = request(
         service.clone(),
         "POST",
-        "/emacs/activate?buffer_id=gone",
+        "/emacs/activate?buffer=gone",
         Value::Null,
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "buffer-not-found");
-    for path in [
-        "/emacs/activate?buffer_id=",
-        "/emacs/activate?buffer=x&buffer_id=y",
-    ] {
+    for path in ["/emacs/activate?buffer="] {
         assert_eq!(
             request(service.clone(), "POST", path, Value::Null).await.0,
             StatusCode::BAD_REQUEST
@@ -1107,6 +1119,6 @@ async fn monitored_buffer_activation_resolves_id_in_emacs_without_starting_a_dae
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].1[0], "--alternate-editor=/usr/bin/false");
-    assert!(calls[0].1[3].contains("loki-assistant-monitor-buffer-by-id"));
+    assert!(calls[0].1[3].contains("get-buffer"));
     assert!(calls[0].1[3].contains("select-frame-set-input-focus"));
 }

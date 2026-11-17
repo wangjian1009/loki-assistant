@@ -31,39 +31,38 @@
      (unwind-protect (progn ,@body)
        (loki-assistant-monitor-mode -1))))
 
-(ert-deftest loki-assistant-monitor-test-hooks-id-and-buffer-lifecycle ()
+(ert-deftest loki-assistant-monitor-test-hooks-and-buffer-lifecycle ()
   (loki-assistant-monitor-test--isolated
     (with-temp-buffer
       ;; 启用时补注册已存在的 buffer，之后由 mode hook 维护。
       (loki-assistant-monitor-test-mode)
       (loki-assistant-monitor-mode 1)
       (should (= (hash-table-count loki-assistant-monitor--buffers) 1))
-      (let ((id (gethash (current-buffer) loki-assistant-monitor--buffers)))
+      (let ((buffer (current-buffer)))
         (rename-buffer " *关注测试：改名*" t)
-        (should (eq (loki-assistant-monitor-buffer-by-id id) (current-buffer)))
+        (should (eq (gethash buffer loki-assistant-monitor--buffers) buffer))
         (let ((snapshot (loki-assistant-monitor--snapshot-buffers)))
           (should (= (length snapshot) 1))
           (should (equal (alist-get 'name (aref snapshot 0)) (buffer-name))))
         (fundamental-mode)
-        (should-not (loki-assistant-monitor-buffer-by-id id))
         (should (zerop (hash-table-count loki-assistant-monitor--buffers))))
       (loki-assistant-monitor-test-mode)
       (should (= (hash-table-count loki-assistant-monitor--buffers) 1)))
     (should (zerop (length (loki-assistant-monitor--snapshot-buffers))))))
 
-(ert-deftest loki-assistant-monitor-test-closed-name-reuse-does-not-reuse-id ()
+(ert-deftest loki-assistant-monitor-test-closed-name-reuse-registers-buffer ()
   (loki-assistant-monitor-test--isolated
     (loki-assistant-monitor-mode 1)
-    (let ((buffer (generate-new-buffer " *关注测试复用*")) name old-id)
+    (let ((buffer (generate-new-buffer " *关注测试复用*")) name)
       (with-current-buffer buffer
         (loki-assistant-monitor-test-mode)
-        (setq name (buffer-name) old-id (gethash buffer loki-assistant-monitor--buffers)))
+        (setq name (buffer-name)))
       (kill-buffer buffer)
       (with-temp-buffer
         (rename-buffer name)
         (loki-assistant-monitor-test-mode)
-        (should-not (loki-assistant-monitor-buffer-by-id old-id))
-        (should-not (equal old-id (gethash (current-buffer) loki-assistant-monitor--buffers)))))))
+        (should (eq (gethash (current-buffer) loki-assistant-monitor--buffers)
+                    (current-buffer)))))))
 
 (ert-deftest loki-assistant-monitor-test-real-http-post-groups-apps-and-items ()
   (let (received headers)

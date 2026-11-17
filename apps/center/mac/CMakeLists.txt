@@ -12,6 +12,7 @@ project(LokiAssistant VERSION 0.1.0 LANGUAGES Swift)
 
 set(LOKI_APP_SOURCES
     Sources/App/LokiAssistantApp.swift
+    Sources/App/CenterLog.swift
     Sources/App/ServiceStatusModel.swift
     Sources/App/ServiceSettingsClient.swift
     Sources/App/EmacsReportedStatus.swift
@@ -66,6 +67,7 @@ if(BUILD_TESTING)
         Tests/ServiceStatusTests.swift
         Tests/ServiceSettingsTests.swift
         Tests/EmacsReportedStatusTests.swift
+        Tests/CenterLogTests.swift
         Tests/SystemNotificationTests.swift
         Tests/NotificationReceiptTests.swift
     )

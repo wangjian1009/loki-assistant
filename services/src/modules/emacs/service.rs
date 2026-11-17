@@ -224,32 +224,6 @@ impl EmacsService {
         })
     }
 
-    pub async fn activate_monitored_buffer(&self, id: &str) -> Result<(), EmacsError> {
-        if id.trim().is_empty() {
-            return Err(EmacsError::InvalidRequest("buffer_id 不能为空".to_owned()));
-        }
-        let id = serde_json::to_string(id).expect("字符串可以序列化");
-        let script = activation_script_for_target(&format!(
-            "(and (fboundp 'loki-assistant-monitor-buffer-by-id) (loki-assistant-monitor-buffer-by-id {id}))"
-        ));
-        let result = self
-            .eval_with_startup(&script, false)
-            .await
-            .map_err(|error| match error {
-                EmacsError::Process(_) | EmacsError::CommandFailed { .. } => {
-                    EmacsError::ConnectionFailed(error.to_string())
-                }
-                error => error,
-            })?;
-        match result.as_str() {
-            "t" => Ok(()),
-            "nil" => Err(EmacsError::BufferNotFound),
-            _ => Err(EmacsError::InvalidResponse(
-                "buffer 激活未返回 t 或 nil".to_owned(),
-            )),
-        }
-    }
-
     async fn eval_with_startup(
         &self,
         script: &str,
@@ -322,6 +296,7 @@ impl EmacsService {
         }
         let script = match app {
             "config" => OPEN_CONFIG_APP_SCRIPT,
+            "logs" => OPEN_LOG_APP_SCRIPT,
             _ => return Err(EmacsError::AppNotFound(app.to_owned())),
         };
         // 应用标识只选择固定入口，不作为 Lisp 符号或脚本执行。
@@ -558,6 +533,19 @@ const OPEN_CONFIG_APP_SCRIPT: &str = r#"(progn
       (make-frame-visible frame)
       (select-frame-set-input-focus frame)
       t)))"#;
+
+const OPEN_LOG_APP_SCRIPT: &str = r#"(progn
+  (require 'seq)
+  (let* ((path (expand-file-name "~/.assistant/loki-assistant.log.org"))
+         (frame (or (and (display-graphic-p (selected-frame)) (selected-frame))
+                    (seq-find #'display-graphic-p (frame-list))
+                    (make-frame '((window-system . ns)))))
+         (buffer (find-file path)))
+    (select-frame frame)
+    (switch-to-buffer buffer)
+    (make-frame-visible frame)
+    (select-frame-set-input-focus frame)
+    t))"#;
 
 const BUFFERS_SCRIPT: &str = r#"(let ((json-encoding-pretty-print nil)
       (json-null nil)

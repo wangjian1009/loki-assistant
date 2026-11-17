@@ -32,12 +32,12 @@ private actor StatusTestTransport {
             } else if let statusBody {
                 body = statusBody
             } else {
-                body = #"{"api_version":"1","updated_at":123,"status":{"emacs":{"buffer":[{"id":"token:1","name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","file":null,"modified":false}]}}}"#
+                body = #"{"api_version":"1","updated_at":123,"status":{"emacs":{"buffer":[{"name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","file":null,"modified":false}]}}}"#
             }
         case "/emacs/activate":
             XCTAssertEqual(request.httpMethod, "POST")
             query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value
-            body = #"{"api_version":"1","activation":"emacs","buffer":null,"buffer_id":"token:1"}"#
+            body = #"{"api_version":"1","activation":"emacs","buffer":"中文会话"}"#
         default:
             XCTFail("不应请求 \(url.path)")
             body = "{}"
@@ -71,7 +71,7 @@ final class EmacsReportedStatusTests: XCTestCase {
         let paths = await transport.paths
         let query = await transport.query
         XCTAssertEqual(paths, ["/healthz", "/emacs/status", "/healthz", "/emacs/activate"])
-        XCTAssertEqual(query, "token:1")
+        XCTAssertEqual(query, "中文会话")
     }
 
     func testPreservesMissingReportError() async {
@@ -88,8 +88,8 @@ final class EmacsReportedStatusTests: XCTestCase {
         let transport = StatusTestTransport()
         await transport.setStatusBody(#"""
         {"api_version":"1","updated_at":123,"status":{
-          "tools":{"buffer":[{"id":"token:1","name":"工具","mode":"fundamental-mode","directory":"/tmp/","file":null,"modified":false}]},
-          "emacs":{"runtime":{"pid":42},"buffer":[{"id":"token:1","name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","file":null,"modified":false}]},
+          "tools":{"buffer":[{"name":"工具","mode":"fundamental-mode","directory":"/tmp/","modified":false}]},
+          "emacs":{"runtime":{"pid":42},"buffer":[{"name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","modified":false}]},
           "empty":{"buffer":[]},"runtime-only":{"runtime":{"pid":42}}
         }}
         """#)
@@ -109,20 +109,16 @@ final class EmacsReportedStatusTests: XCTestCase {
         XCTAssertNil(snapshot.updatedAt)
     }
 
-    func testRejectsDuplicateBufferIDsWithinApp() async throws {
+    func testAllowsDuplicateBufferNamesWithinApp() async throws {
         let transport = StatusTestTransport()
         await transport.setStatusBody(#"""
         {"api_version":"1","status":{"emacs":{"buffer":[
-          {"id":"same","name":"一","mode":"fundamental-mode","directory":"/tmp/","modified":false},
-          {"id":"same","name":"二","mode":"fundamental-mode","directory":"/tmp/","modified":false}
+          {"name":"一","mode":"fundamental-mode","directory":"/tmp/","modified":false},
+          {"name":"二","mode":"fundamental-mode","directory":"/tmp/","modified":false}
         ]}},"updated_at":123}
         """#)
-        do {
-            _ = try await Self.client(transport).fetchBuffers()
-            XCTFail("同一 app 内重复的 buffer ID 应被拒绝")
-        } catch {
-            XCTAssertEqual(error.localizedDescription, "Emacs buffer 状态响应无效")
-        }
+        let snapshot = try await Self.client(transport).fetchBuffers()
+        XCTAssertEqual(snapshot.bufferGroups.first?.buffers.count, 2)
     }
 
     @MainActor

@@ -6,3 +6,10 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 *.elc
+
+# HarmonyOS build outputs
+apps/harmony/.hvigor/
+apps/harmony/build/
+apps/harmony/entry/build/
+apps/harmony/oh_modules/
+apps/harmony/entry/oh_modules/

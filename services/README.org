@@ -107,7 +107,7 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 ~services.notification~ 直接持有 ~Arc<NotificationService>~ ，通过 ~services.notification.send(NotificationRequest)~ 发送标题、正文、应用标识与本机服务回调路径。业务模块保存创建时注入的共享引用并调用其实例方法。通知模块负责 URL scheme 转交、App 内跳转封装和提交回执；具体跳转操作由 services 中的业务模块执行。Emacs 模块的创建方式为 ~emacs::Module::new(config.service(), Arc::clone(&notification))~ 。通用接口、应用图标命名规则及跳转协议见 [[file:../docs/control-center-services.org::*系统通知模块][系统通知模块协议]]。
 
-原 Emacs 状态和回执 URL 保留为兼容入口，与通用接口共享同一份记录。~POST /emacs/activate~ 可显示 Emacs，或通过 ~buffer~ 查询参数激活指定 buffer。指定 buffer 时仅连接目标 socket 的已有 server，优先聚焦已经显示该 buffer 的 GUI 窗口，并恢复最小化或隐藏的窗口；没有 GUI frame 时创建窗口。中文、引号、反斜杠和换行保持完整。目标已关闭时返回 ~buffer-not-found~ ，不创建同名空 buffer；连接失败返回 ~emacs-unavailable~ ，点击旧通知也不会启动新 daemon。点击失败时菜单栏应用显示具体原因。
+原 Emacs 状态和回执 URL 保留为兼容入口，与通用接口共享同一份记录。~POST /emacs/activate~ 可显示 Emacs，或通过 ~buffer~ 查询参数按名称激活第一个匹配的 buffer。指定 buffer 时仅连接目标 socket 的已有 server，优先聚焦已经显示该 buffer 的 GUI 窗口，并恢复最小化或隐藏的窗口；没有 GUI frame 时创建窗口。中文、引号、反斜杠和换行保持完整。目标已关闭时返回 ~buffer-not-found~ ，不创建同名空 buffer；连接失败返回 ~emacs-unavailable~ ，点击旧通知也不会启动新 daemon。点击失败时菜单栏应用显示具体原因。
 
 * macOS 服务管理
 

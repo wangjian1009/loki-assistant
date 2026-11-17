@@ -5,7 +5,9 @@ struct DashboardView: View {
     let status: ServiceStatusModel
     let reportedStatus: EmacsReportedStatusModel
     @State private var openingSettings = false
-    @State private var settingsError: String?
+    @State private var openingLog = false
+    @State private var appOpenError: String?
+    @State private var appOpenErrorTitle = "无法打开 Emacs"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -17,16 +19,40 @@ struct DashboardView: View {
                 openingSettings = true
                 Task { @MainActor in
                     defer { openingSettings = false }
+                    let operation = CenterLog.shared.start("打开设置")
                     do {
-                        try await ServiceSettingsClient().open()
+                        try await ServiceSettingsClient().open(app: "config", operation: operation)
+                        CenterLog.shared.finish(operation, result: "success")
                     } catch {
-                        settingsError = error.localizedDescription
+                        CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
+                        appOpenErrorTitle = "无法打开设置"
+                        appOpenError = error.localizedDescription
                     }
                 }
             } label: {
                 Label(openingSettings ? "打开设置…" : "设置", systemImage: "slider.horizontal.3")
             }
             .disabled(openingSettings)
+            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                openingLog = true
+                Task { @MainActor in
+                    defer { openingLog = false }
+                    let operation = CenterLog.shared.start("打开日志")
+                    do {
+                        try await ServiceSettingsClient().open(app: "logs", operation: operation)
+                        CenterLog.shared.finish(operation, result: "success")
+                    } catch {
+                        CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
+                        appOpenErrorTitle = "无法打开日志"
+                        appOpenError = error.localizedDescription
+                    }
+                }
+            } label: {
+                Label(openingLog ? "打开日志…" : "日志", systemImage: "doc.text.magnifyingglass")
+            }
+            .disabled(openingLog)
             .buttonStyle(.borderless)
             .frame(maxWidth: .infinity, alignment: .leading)
             Button {
@@ -42,21 +68,13 @@ struct DashboardView: View {
         .labelStyle(.titleAndIcon)
         .onAppear { reportedStatus.menuDidOpen() }
         .onDisappear { reportedStatus.menuDidClose() }
-        .alert("无法打开配置", isPresented: Binding(
-            get: { settingsError != nil },
-            set: { if !$0 { settingsError = nil } }
+        .alert(appOpenErrorTitle, isPresented: Binding(
+            get: { appOpenError != nil },
+            set: { if !$0 { appOpenError = nil } }
         )) {
-            Button("好") { settingsError = nil }
+            Button("好") { appOpenError = nil }
         } message: {
-            Text(settingsError ?? "")
-        }
-        .alert("无法激活 buffer", isPresented: Binding(
-            get: { reportedStatus.activationError != nil },
-            set: { if !$0 { reportedStatus.activationError = nil } }
-        )) {
-            Button("好") { reportedStatus.activationError = nil }
-        } message: {
-            Text(reportedStatus.activationError ?? "")
+            Text(appOpenError ?? "")
         }
     }
 
@@ -73,13 +91,13 @@ struct DashboardView: View {
         }
         ForEach(reportedStatus.bufferGroups) { group in
             Section(group.app) {
-                ForEach(group.buffers) { buffer in
+                ForEach(Array(group.buffers.enumerated()), id: \.offset) { _, buffer in
                     Button { reportedStatus.activate(buffer) } label: {
                         Label(buffer.name, systemImage: "terminal")
                             .lineLimit(1)
                     }
                     .help("\(buffer.mode)\n\(buffer.directory)")
-                    .disabled(reportedStatus.activatingID != nil)
+                    .disabled(reportedStatus.activating)
                     .buttonStyle(.borderless)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }

@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Loki的助理手机执行中心"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Loki的助理手机执行中心"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Loki的助理"
+    }
+  ]
+}

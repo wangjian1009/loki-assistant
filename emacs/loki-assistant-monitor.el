@@ -35,10 +35,6 @@
 (defvar loki-assistant-monitor--dirty nil)
 (defvar loki-assistant-monitor--epoch nil)
 (defvar loki-assistant-monitor--last-error nil)
-(defvar loki-assistant-monitor--instance
-  (secure-hash 'sha256 (format "%s:%s:%s" (emacs-pid) (current-time) (random))))
-(defvar loki-assistant-monitor--counter 0)
-(defvar-local loki-assistant-monitor--buffer-id nil)
 
 (defun loki-assistant-monitor--set-buffers (symbol value)
   "设置 SYMBOL 为 mode 列表 VALUE，并更新已经安装的 hook。"
@@ -81,11 +77,7 @@
   (when (and loki-assistant-monitor-mode
              (loki-assistant-monitor--matches-p buffer))
     (with-current-buffer buffer
-      (unless loki-assistant-monitor--buffer-id
-        (setq loki-assistant-monitor--buffer-id
-              (format "%s:%d" loki-assistant-monitor--instance
-                      (cl-incf loki-assistant-monitor--counter))))
-      (puthash buffer loki-assistant-monitor--buffer-id loki-assistant-monitor--buffers)
+      (puthash buffer buffer loki-assistant-monitor--buffers)
       (add-hook 'kill-buffer-hook #'loki-assistant-monitor-unregister-buffer nil t)
       (add-hook 'change-major-mode-hook #'loki-assistant-monitor-unregister-buffer nil t))
     (loki-assistant-monitor--queue)))
@@ -101,18 +93,6 @@
         (remove-hook 'change-major-mode-hook #'loki-assistant-monitor-unregister-buffer t)))
     (loki-assistant-monitor--queue)))
 
-(defun loki-assistant-monitor-buffer-by-id (id)
-  "返回仍受关注的 ID 对应 buffer，失效时返回 nil。
-重命名保持 ID；关闭后新建的同名 buffer 不会匹配旧 ID。"
-  (when loki-assistant-monitor-mode
-    (let (found)
-      (maphash (lambda (buffer token)
-                 (when (and (equal token id)
-                            (loki-assistant-monitor--matches-p buffer))
-                   (setq found buffer)))
-               loki-assistant-monitor--buffers)
-      found)))
-
 (defun loki-assistant-monitor--configure ()
   "按配置安装 mode hook，兼容加载前已存在的 buffer。"
   (dolist (hook loki-assistant-monitor--hooks)
@@ -123,7 +103,7 @@
   (dolist (hook loki-assistant-monitor--hooks)
     (add-hook hook #'loki-assistant-monitor-register-buffer))
   (let (removed)
-    (maphash (lambda (buffer _id)
+    (maphash (lambda (buffer _buffer)
                (unless (loki-assistant-monitor--matches-p buffer) (push buffer removed)))
              loki-assistant-monitor--buffers)
     (mapc #'loki-assistant-monitor-unregister-buffer removed))
@@ -137,10 +117,10 @@
   "返回关注 buffer 的 JSON 数组快照，并清理失效项。"
   (let (entries removed)
     (maphash
-     (lambda (buffer id)
+     (lambda (buffer _buffer)
        (if (not (loki-assistant-monitor--matches-p buffer)) (push buffer removed)
          (with-current-buffer buffer
-           (push `((id . ,id) (name . ,(buffer-name))
+           (push `((name . ,(buffer-name))
                    (mode . ,(symbol-name major-mode))
                    (directory . ,default-directory)
                    (file . ,(or buffer-file-name :null))
@@ -148,7 +128,7 @@
                  entries))))
      loki-assistant-monitor--buffers)
     (dolist (buffer removed) (remhash buffer loki-assistant-monitor--buffers))
-    (vconcat (sort entries (lambda (a b) (string< (alist-get 'id a) (alist-get 'id b)))))))
+    (vconcat (sort entries (lambda (a b) (string< (alist-get 'name a) (alist-get 'name b)))))))
 
 (defun loki-assistant-status--name (value label)
   "将 VALUE 转为 app 或数据项名称；LABEL 用于错误说明。"
@@ -300,7 +280,7 @@ FUNCTION 的第一个参数是当前值，后续参数为 ARGS；可用于 list/
     (dolist (hook loki-assistant-monitor--hooks)
       (remove-hook hook #'loki-assistant-monitor-register-buffer))
     (let (buffers)
-      (maphash (lambda (buffer _id) (push buffer buffers)) loki-assistant-monitor--buffers)
+      (maphash (lambda (buffer _buffer) (push buffer buffers)) loki-assistant-monitor--buffers)
       (mapc #'loki-assistant-monitor-unregister-buffer buffers))
     (setq loki-assistant-monitor--hooks nil)))
 

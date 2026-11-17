@@ -12,7 +12,7 @@ EMACSCLIENT ?= emacsclient
 
 .PHONY: emacs-load emacs-test emacs-config export-icons
 
-.PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release clean
+.PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release harmony-help harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
 
 help:
 	@printf '%s\n' \
@@ -37,9 +37,15 @@ help:
 	  'make emacs-load      通过 emacsclient 重新加载 Emacs 包' \
 	  'make emacs-test      通过 emacsclient 执行 Emacs ERT 测试' \
 	  'make release         构建 Release Mac 菜单栏应用' \
+	  'make harmony-build   构建 HarmonyOS 手机应用 Debug HAP' \
+	  'make harmony-install 构建并安装 HarmonyOS 手机应用' \
+	  'make harmony-run     启动 HarmonyOS 手机应用' \
+	  'make harmony-deploy  构建、安装并启动 HarmonyOS 手机应用' \
+	  'make harmony-devices 查看 HarmonyOS hdc 设备' \
+	  'make harmony-clean   清理 HarmonyOS 构建产物' \
 	  'make clean           清理构建产物' \
 	  '' \
-	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR CMAKE CTEST CARGO OPEN EMACSCLIENT'
+	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR CMAKE CTEST CARGO OPEN EMACSCLIENT DEVECO_HOME HDC_TARGET'
 
 emacs-load:
 	"$(EMACSCLIENT)" --eval "(progn \
@@ -131,6 +137,27 @@ xcode: configure
 release:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(RELEASE_BUILD_DIR)" -G Xcode -DBUILD_TESTING=OFF
 	"$(CMAKE)" --build "$(RELEASE_BUILD_DIR)" --config Release
+
+harmony-help:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" help
+
+harmony-build:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" build
+
+harmony-install:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" install
+
+harmony-run:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" run
+
+harmony-deploy:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" deploy
+
+harmony-devices:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" devices
+
+harmony-clean:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" clean
 
 clean:
 	@if [ -f "$(BUILD_DIR)/CMakeCache.txt" ]; then \

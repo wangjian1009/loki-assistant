@@ -1,8 +1,8 @@
+import AppKit
 import Foundation
 import Observation
 
-struct MonitoredEmacsBuffer: Decodable, Equatable, Identifiable, Sendable {
-    let id: String
+struct MonitoredEmacsBuffer: Decodable, Equatable, Sendable {
     let name: String
     let mode: String
     let directory: String
@@ -43,7 +43,6 @@ private struct EmacsStatusAPIError: Decodable { let message: String }
 private struct EmacsBufferActivation: Decodable {
     let api_version: String
     let activation: String
-    let buffer_id: String?
 }
 
 struct EmacsReportedStatusClient: Sendable {
@@ -59,11 +58,19 @@ struct EmacsReportedStatusClient: Sendable {
         self.transport = transport
     }
 
-    private func endpoint() async throws -> ServiceEndpoint {
+    private func endpoint(operation: CenterLogOperation? = nil) async throws -> ServiceEndpoint {
         let endpoint = try discover()
         let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/healthz"),
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
-        let (data, response) = try await transport(request)
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await transport(request)
+        } catch {
+            operation?.call("GET /healthz", result: "failure", details: ["error": error.localizedDescription])
+            throw error
+        }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        operation?.call("GET /healthz", result: statusCode == 200 ? "success" : "failure", details: ["http_status": "\(statusCode)"])
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let health = try? JSONDecoder().decode(HealthResponse.self, from: data),
               health.service == "loki-services", health.status == "ok" else {
@@ -73,9 +80,17 @@ struct EmacsReportedStatusClient: Sendable {
         return endpoint
     }
 
-    private func send(_ request: URLRequest) async throws -> Data {
-        let (data, response) = try await transport(request)
+    private func send(_ request: URLRequest, operation: CenterLogOperation? = nil) async throws -> Data {
+        let action = "\(request.httpMethod ?? "GET") \(request.url?.path ?? "")"
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await transport(request)
+        } catch {
+            operation?.call(action, result: "failure", details: ["error": error.localizedDescription])
+            throw error
+        }
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        operation?.call(action, result: response.statusCode == 200 ? "success" : "failure", details: ["http_status": "\(response.statusCode)"])
         guard response.statusCode == 200 else {
             let message = (try? JSONDecoder().decode(EmacsStatusAPIError.self, from: data))?.message
             throw EmacsReportedStatusError.failed(message ?? "Emacs 状态接口返回 HTTP \(response.statusCode)")
@@ -83,31 +98,30 @@ struct EmacsReportedStatusClient: Sendable {
         return data
     }
 
-    func fetchBuffers() async throws -> EmacsBufferStatus {
-        let endpoint = try await endpoint()
+    func fetchBuffers(operation: CenterLogOperation? = nil) async throws -> EmacsBufferStatus {
+        let endpoint = try await endpoint(operation: operation)
         let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/status"),
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
-        let result = try JSONDecoder().decode(EmacsBufferStatus.self, from: await send(request))
+        let result = try JSONDecoder().decode(EmacsBufferStatus.self, from: await send(request, operation: operation))
         guard result.apiVersion == "1",
               result.bufferGroups.allSatisfy({ group in
                   !group.app.isEmpty
-                      && Set(group.buffers.map(\.id)).count == group.buffers.count
-                      && group.buffers.allSatisfy { !$0.id.isEmpty && !$0.name.isEmpty }
+                      && group.buffers.allSatisfy { !$0.name.isEmpty }
               }) else {
             throw EmacsReportedStatusError.failed("Emacs buffer 状态响应无效")
         }
         return result
     }
 
-    func activate(_ buffer: MonitoredEmacsBuffer) async throws {
-        let endpoint = try await endpoint()
+    func activate(_ buffer: MonitoredEmacsBuffer, operation: CenterLogOperation? = nil) async throws {
+        let endpoint = try await endpoint(operation: operation)
         let base = try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/activate")
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "buffer_id", value: buffer.id)]
+        components.queryItems = [URLQueryItem(name: "buffer", value: buffer.name)]
         var request = URLRequest(url: components.url!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 35)
         request.httpMethod = "POST"
-        let result = try JSONDecoder().decode(EmacsBufferActivation.self, from: await send(request))
-        guard result.api_version == "1", result.activation == "emacs", result.buffer_id == buffer.id else {
+        let result = try JSONDecoder().decode(EmacsBufferActivation.self, from: await send(request, operation: operation))
+        guard result.api_version == "1", result.activation == "emacs" else {
             throw EmacsReportedStatusError.failed("Emacs 未确认目标 buffer 已激活")
         }
     }
@@ -116,7 +130,9 @@ struct EmacsReportedStatusClient: Sendable {
 private enum EmacsReportedStatusError: LocalizedError {
     case failed(String)
     var errorDescription: String? {
-        switch self { case let .failed(message): message }
+        switch self {
+        case let .failed(message): message
+        }
     }
 }
 
@@ -128,22 +144,30 @@ final class EmacsReportedStatusModel {
     private(set) var hasSnapshot = false
     private(set) var loading = false
     private(set) var refreshError: String?
-    private(set) var activatingID: String?
+    private(set) var activating = false
     var activationError: String?
     @ObservationIgnored private let client: EmacsReportedStatusClient
+    @ObservationIgnored private let logger: CenterLog?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var menuOpen = false
 
-    init(client: EmacsReportedStatusClient = .init()) {
+    init(client: EmacsReportedStatusClient = .init(), logger: CenterLog? = nil) {
         self.client = client
+        self.logger = logger
     }
 
     func menuDidOpen() {
         // 原生菜单的 tracking 事件触发一次读取，不安装轮询定时器。
         guard !menuOpen else { return }
         menuOpen = true
-        refresh()
+        refresh(operation: logger?.start("打开托盘菜单"))
+    }
+
+    func menuTrackingDidBegin() {
+        menuOpen = true
+        guard !loading else { return }
+        refresh(operation: logger?.start("打开托盘菜单"))
     }
 
     func menuDidClose() {
@@ -155,22 +179,37 @@ final class EmacsReportedStatusModel {
     }
 
     func refresh() {
+        refresh(operation: nil)
+    }
+
+    private func refresh(operation: CenterLogOperation?) {
         guard menuOpen, !loading else { return }
         generation += 1
         let current = generation
         loading = true
-        refreshTask = Task { [weak self, client] in
+        refreshTask = Task { [weak self, client, logger] in
             do {
-                let snapshot = try await client.fetchBuffers()
+                let snapshot = try await client.fetchBuffers(operation: operation)
                 try Task.checkCancellation()
-                guard let self, self.menuOpen, self.generation == current else { return }
+                guard let self else {
+                    if let operation { logger?.finish(operation, result: "cancelled") }
+                    return
+                }
+                guard self.menuOpen, self.generation == current else {
+                    if let operation { self.logger?.finish(operation, result: "cancelled") }
+                    return
+                }
                 self.bufferGroups = snapshot.bufferGroups
                 self.updatedAt = snapshot.updatedAt
                 self.hasSnapshot = true
                 self.refreshError = nil
                 self.loading = false
                 self.refreshTask = nil
+                if let operation {
+                    self.logger?.finish(operation, result: "success", details: ["buffer_count": "\(snapshot.bufferGroups.reduce(0) { $0 + $1.buffers.count })"])
+                }
             } catch {
+                if let operation { self?.logger?.finish(operation, result: error is CancellationError ? "cancelled" : "failure", details: ["error": error.localizedDescription]) }
                 guard let self, self.menuOpen, self.generation == current else { return }
                 self.loading = false
                 self.refreshTask = nil
@@ -180,12 +219,35 @@ final class EmacsReportedStatusModel {
     }
 
     func activate(_ buffer: MonitoredEmacsBuffer) {
-        guard activatingID == nil else { return }
-        activatingID = buffer.id
+        guard !activating else { return }
+        activating = true
+        let operation = logger?.start("切换 agent-shell 窗口", details: ["buffer": buffer.name])
         Task {
-            defer { activatingID = nil }
-            do { try await client.activate(buffer) }
-            catch { activationError = error.localizedDescription }
+            defer { activating = false }
+            do {
+                try await client.activate(buffer, operation: operation)
+                if let operation { logger?.finish(operation, result: "success") }
+            }
+            catch {
+                let message = error.localizedDescription
+                if let operation { logger?.finish(operation, result: "failure", details: ["error": message]) }
+                activationError = message
+                presentActivationError(message)
+            }
+        }
+    }
+
+    private func presentActivationError(_ message: String) {
+        // 菜单点击后会立即关闭，挂在菜单内容上的 SwiftUI alert 无法稳定显示。
+        // 使用独立的 AppKit modal alert，确保请求失败时用户能看到原因。
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "无法切换 agent-shell 窗口"
+            alert.informativeText = message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "好")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
     }
 }

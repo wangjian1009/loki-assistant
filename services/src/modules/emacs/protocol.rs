@@ -76,7 +76,6 @@ pub use crate::modules::notification::protocol::{NotificationReceipt, Notificati
 #[derive(Debug, Deserialize)]
 pub struct ActivationRequest {
     pub buffer: Option<String>,
-    pub buffer_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,8 +83,6 @@ pub struct ActivationResponse {
     pub api_version: String,
     pub activation: String,
     pub buffer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub buffer_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

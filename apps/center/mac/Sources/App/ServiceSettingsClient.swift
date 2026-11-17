@@ -1,6 +1,6 @@
 import Foundation
 
-/// 通过 services 的应用接口打开配置界面，Emacs 操作由服务端负责。
+/// 通过 services 的应用接口打开 Emacs 应用，Emacs 操作由服务端负责。
 struct ServiceSettingsClient: Sendable {
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private let discover: @Sendable () throws -> ServiceEndpoint
@@ -15,11 +15,23 @@ struct ServiceSettingsClient: Sendable {
     }
 
     func open() async throws {
+        try await open(app: "config")
+    }
+
+    func open(app: String, operation: CenterLogOperation? = nil) async throws {
         let endpoint = try discover()
         let healthRequest = URLRequest(
             url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/healthz"),
             cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
-        let (healthData, healthResponse) = try await transport(healthRequest)
+        let (healthData, healthResponse): (Data, URLResponse)
+        do {
+            (healthData, healthResponse) = try await transport(healthRequest)
+        } catch {
+            operation?.call("GET /healthz", result: "failure", details: ["error": error.localizedDescription])
+            throw error
+        }
+        let healthCode = (healthResponse as? HTTPURLResponse)?.statusCode ?? 0
+        operation?.call("GET /healthz", result: healthCode == 200 ? "success" : "failure", details: ["http_status": "\(healthCode)"])
         guard (healthResponse as? HTTPURLResponse)?.statusCode == 200,
               let health = try? JSONDecoder().decode(HealthResponse.self, from: healthData),
               health.service == "loki-services", health.status == "ok" else {
@@ -27,20 +39,28 @@ struct ServiceSettingsClient: Sendable {
         }
         let openURL = try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/apps/open")
         var components = URLComponents(url: openURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "app", value: "config")]
+        components.queryItems = [URLQueryItem(name: "app", value: app)]
         var request = URLRequest(
             url: components.url!,
             cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 35)
         request.httpMethod = "POST"
-        let (data, response) = try await transport(request)
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await transport(request)
+        } catch {
+            operation?.call("POST /emacs/apps/open", result: "failure", details: ["app": app, "error": error.localizedDescription])
+            throw error
+        }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        operation?.call("POST /emacs/apps/open", result: statusCode == 200 ? "success" : "failure", details: ["app": app, "http_status": "\(statusCode)"])
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard response.statusCode == 200 else {
             let error = try? JSONDecoder().decode(SettingsErrorResponse.self, from: data)
-            throw ServiceSettingsError.failed(error?.message ?? "打开 Emacs 配置失败（HTTP \(response.statusCode)）")
+            throw ServiceSettingsError.failed(error?.message ?? "打开 Emacs 应用失败（HTTP \(response.statusCode)）")
         }
         let result = try JSONDecoder().decode(SettingsOpenResponse.self, from: data)
-        guard result.apiVersion == "1", result.app == "config", result.opened else {
-            throw ServiceSettingsError.failed("Emacs 未确认配置界面已打开")
+        guard result.apiVersion == "1", result.app == app, result.opened else {
+            throw ServiceSettingsError.failed("Emacs 未确认应用已打开")
         }
     }
 }

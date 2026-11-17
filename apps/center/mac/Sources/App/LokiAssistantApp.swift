@@ -24,10 +24,39 @@ private final class CenterInstanceLock {
     }
 }
 
+@MainActor
+private final class MenuTrackingObserver {
+    private var tokens: [NSObjectProtocol] = []
+
+    init(status: EmacsReportedStatusModel) {
+        let center = NotificationCenter.default
+        tokens.append(center.addObserver(
+            forName: NSMenu.didBeginTrackingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak status] _ in
+            Task { @MainActor in status?.menuTrackingDidBegin() }
+        })
+        tokens.append(center.addObserver(
+            forName: NSMenu.didEndTrackingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak status] _ in
+            Task { @MainActor in status?.menuDidClose() }
+        })
+    }
+
+    isolated deinit {
+        let center = NotificationCenter.default
+        tokens.forEach(center.removeObserver)
+    }
+}
+
 @main
 struct LokiAssistantApp: App {
     @NSApplicationDelegateAdaptor(CenterAppDelegate.self) private var appDelegate
     private let instanceLock: CenterInstanceLock?
+    private let menuTrackingObserver: MenuTrackingObserver
     @State private var status: ServiceStatusModel
     @State private var reportedStatus: EmacsReportedStatusModel
 
@@ -42,8 +71,9 @@ struct LokiAssistantApp: App {
     }()
 
     init() {
-        let reportedStatus = EmacsReportedStatusModel()
+        let reportedStatus = EmacsReportedStatusModel(logger: .shared)
         _reportedStatus = State(initialValue: reportedStatus)
+        menuTrackingObserver = MenuTrackingObserver(status: reportedStatus)
         // XCTest 的宿主进程不参与日常实例锁，也不轮询真实 services。
         let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
             || NSClassFromString("XCTestCase") != nil

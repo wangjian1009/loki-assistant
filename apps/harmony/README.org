@@ -1,0 +1,24 @@
+#+TITLE: Loki Assistant HarmonyOS 手机应用
+
+* 项目说明
+
+这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS。当前仅完成应用入口初始化，主页面保持空白，为后续接入辅助能力预留运行容器。
+
+* 构建与运行
+
+工程依赖 DevEco Studio 提供的 Hvigor 和 HarmonyOS SDK。默认工具路径为：
+
+- ~/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw~
+- ~/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc~
+
+在本目录执行：
+
+#+begin_src sh
+make build       # 构建未签名 Debug HAP
+make devices     # 查看 hdc 设备
+make install     # 安装到已连接设备
+make run         # 启动手机应用
+make deploy      # 构建、安装并启动
+#+end_src
+
+未配置发布签名时，~make build~ 会生成未签名 HAP，适合在 DevEco Studio 中继续配置签名或进行工程检查。安装到真机需要可用的开发者签名和已授权的 ~hdc~ 设备。

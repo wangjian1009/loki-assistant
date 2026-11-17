@@ -2,11 +2,13 @@
 
 * 项目简介
 
-Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的助理”。当前重新设计的第一步由 Rust services 和一个最小 macOS 菜单栏入口组成。
+Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的助理”。当前重新设计由 Rust services、macOS 菜单栏入口和 HarmonyOS 手机执行中心初始化工程组成。
 
 * 当前阶段
 
 services 提供本机 loopback HTTP 服务、服务发现、配置数据、系统通知、Emacs gateway 和 macOS LaunchAgent 管理。Mac 菜单栏应用展示 services 状态并承接系统通知，点击后回调 services 执行对应业务跳转。
+
+~apps/harmony/~ 已完成 HarmonyOS Stage 模式应用初始化，使用 ArkTS 提供手机执行中心入口。当前主页面保持空白，后续辅助能力按 services HTTP 协议接入。
 
 ~emacs/~ 中的 ~loki-assistant~ Emacs Lisp 包提供服务配置管理、异步 services HTTP 请求与通知发送，支持目标 buffer、标题、正文、应用标识和处理器选择；失败时返回明确错误。
 
@@ -25,6 +27,13 @@ make services-run
 make build
 make run
 make restart-center
+#+end_src
+
+构建并运行 HarmonyOS 手机应用（需要 DevEco Studio 的 SDK，以及已授权的 ~hdc~ 设备）：
+
+#+begin_src sh
+make harmony-build
+make harmony-deploy HDC_TARGET=<设备 ID>
 #+end_src
 
 修改菜单栏 App 代码后使用 ~make restart-center~，该命令会退出旧进程并强制启动新构建的 App；只执行 ~make run~ 可能会复用旧实例。
@@ -79,11 +88,18 @@ make emacs-test
 | make service-status | 查询 services LaunchAgent 状态 |
 | make emacs-load | 通过 emacsclient 重新加载 Emacs 包 |
 | make emacs-test | 通过 emacsclient 执行 Emacs ERT 测试 |
+| make harmony-build | 构建 HarmonyOS 手机应用 Debug HAP |
+| make harmony-install | 构建并安装 HarmonyOS 手机应用 |
+| make harmony-run | 启动 HarmonyOS 手机应用 |
+| make harmony-deploy | 构建、安装并启动 HarmonyOS 手机应用 |
+| make harmony-devices | 查看 HarmonyOS ~hdc~ 设备 |
+| make harmony-clean | 清理 HarmonyOS 构建产物 |
 | make clean | 清理构建产物 |
 
 * 文档入口
 
 - [[file:apps/center/README.org][Mac 菜单栏入口]]
+- [[file:apps/harmony/README.org][HarmonyOS 手机执行中心]]
 - [[file:docs/icon-design.org][应用图标设计与导出资源]]
 - [[file:services/README.org][控制中心服务层]]
 - [[file:docs/emacs.org][Emacs 包使用说明]]

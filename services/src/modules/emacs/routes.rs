@@ -73,7 +73,7 @@ async fn eval(
     method = "POST",
     path = "/emacs/apps/open",
     summary = "打开 Emacs 应用",
-    description = "协议版本 1：必填 app 查询参数，当前支持 config；由服务打开并聚焦 Emacs 配置界面。应用未注册或未安装返回 404 app-not-found。"
+    description = "协议版本 1：必填 app 查询参数，当前支持 config 和 logs；由服务打开并聚焦 Emacs 应用。应用未注册或未安装返回 404 app-not-found。"
 )]
 async fn open_app(
     State(service): State<Arc<EmacsService>>,
@@ -173,27 +173,14 @@ async fn activate(
 ) -> Result<Json<ActivationResponse>, Response> {
     let Query(request) =
         request.map_err(|error| error_response(EmacsError::InvalidRequest(error.body_text())))?;
-    if request.buffer.is_some() && request.buffer_id.is_some() {
-        return Err(error_response(EmacsError::InvalidRequest(
-            "buffer 与 buffer_id 不能同时提供".to_owned(),
-        )));
-    }
-    if let Some(id) = &request.buffer_id {
-        service
-            .activate_monitored_buffer(id)
-            .await
-            .map_err(error_response)?;
-    } else {
-        service
-            .activate(request.buffer.as_deref())
-            .await
-            .map_err(error_response)?;
-    }
+    service
+        .activate(request.buffer.as_deref())
+        .await
+        .map_err(error_response)?;
     Ok(Json(ActivationResponse {
         api_version: API_VERSION.to_owned(),
         activation: "emacs".to_owned(),
         buffer: request.buffer,
-        buffer_id: request.buffer_id,
     }))
 }
 
