@@ -1,0 +1,126 @@
+#+TITLE: 手机与 services 的身份组网方式调研
+
+* 调研范围与结论
+
+目标是让 HarmonyOS 手机应用和 Rust services 进入同一个逻辑网络，节点使用稳定身份互相发送消息；节点可能位于不同 NAT 后面，必要时由一台中继服务器转发；应用层不把 IP 地址当作节点定位依据。本文记录截至 2026-11-18 的公开源码和 GitHub 页面核对结果。Star 数是该日期抓取页面显示的近似值，会随时间变化。
+
+首选方案是 [[https://github.com/n0-computer/iroh][iroh]] + 自建 [[https://github.com/n0-computer/iroh/tree/main/iroh-relay][iroh-relay]]。它的核心 API 就是按公钥派生的 Endpoint ID 拨号，先尝试直连和 NAT 打洞，失败后回落到 relay；relay、客户端和协议均可从源码构建。Rust services 可以直接使用 Rust crate，手机端可复用官方 [[https://github.com/n0-computer/iroh-ffi][iroh-ffi]] 的 FFI 设计，再为 ArkTS/NAPI 补一层很小的适配。iroh-ffi 当前依赖 iroh 1.0 API，并已提供 Swift、Kotlin、Node.js、Python 绑定，适合把跨语言边界控制在少量方法上。
+
+如果产品只需要可靠的“手机 ↔ 中心服务”消息转发，不需要节点之间尝试直连，[[https://github.com/nats-io/nats-server][NATS]] + [[https://github.com/nats-io/nats.rs][async-nats]] 是实现成本最低的替代方案。NATS server 是成熟的中心消息总线；节点用 NKey/JWT 完成认证，在 subject 中使用自己的 node ID 做寻址。它不提供 iroh/libp2p 那种按公钥建立任意节点连接的覆盖网络，因此应把它描述为消息中继层，而不是通用 P2P 组网层。
+
+* 需求映射
+
+| 需求 | 方案中的对应机制 |
+|------+------------------|
+| 不使用 IP 定位节点 | iroh 的 Endpoint ID 或 libp2p 的 PeerId 由节点密钥派生；NATS 则使用 NKey 身份配合应用层 node ID。IP 只作为连接引导或 relay 地址，不进入业务寻址。 |
+| 中继服务器 | iroh-relay 的 relay protocol；libp2p circuit relay v2；NATS server 的 broker 转发。 |
+| NAT 后互通 | iroh 自动尝试 hole punching，失败回落 relay；libp2p 使用 AutoNAT、DCUtR 和 relay；NATS 默认始终连接 broker。 |
+| 手机端 | iroh-ffi 有 Swift/Kotlin/Node.js 等绑定，但没有现成 ArkTS 包；libp2p 没有同等官方移动 FFI；NATS 可使用手机 WebSocket/原生客户端。 |
+| 源码级接入 | 三个候选都允许自建或修改源码；iroh-relay、libp2p relay 和 NATS server 均有公开实现。 |
+
+* 候选项目与成熟度
+
+Star 数按抓取时 GitHub 公开仓库页面记录；NATS 同时列出服务端和 Rust 客户端，iroh 同时列出核心库和绑定仓库。
+
+| 项目 | GitHub Star（约） | 主要语言 | 身份与转发模型 | 对本项目的判断 |
+|------+------------------+----------+----------------+------------------|
+| [[https://github.com/n0-computer/iroh][n0-computer/iroh]] | 13k | Rust | Endpoint ID；QUIC；直连/打洞/relay | 与需求最贴合。核心 API 已进入 1.0，但项目仍较年轻，需锁定版本并自建 relay。 |
+| [[https://github.com/n0-computer/iroh-ffi][n0-computer/iroh-ffi]] | 174 | Rust/FFI | 覆盖 endpoints、connections、paths、tickets、relays、services | 绑定仓库 Star 较少，但它是配套接入层；不能用该数字替代 iroh 核心成熟度判断。ArkTS 仍需自建 NAPI 封装。 |
+| [[https://github.com/libp2p/rust-libp2p][libp2p/rust-libp2p]] | 5.6k | Rust | PeerId；Noise/QUIC；circuit relay v2；DCUtR；可自定义协议 | 协议和生态成熟，扩展性最好；Rust API 和移动端桥接工作量高于 iroh。 |
+| [[https://github.com/nats-io/nats-server][nats-io/nats-server]] + [[https://github.com/nats-io/nats.rs][nats-io/nats.rs]] | 21.1k + 1.6k | Go + Rust | broker；NKey/JWT 认证；subject/request-reply | 运营成熟、实现最简单；适合中心转发，不提供按公钥拨号的 P2P 覆盖网。 |
+| [[https://github.com/yggdrasil-network/yggdrasil-go][yggdrasil-network/yggdrasil-go]] | 5.6k | Go | 加密 IPv6 overlay；mesh 路由 | 需要 TUN/TAP 和虚拟 IPv6，身份与地址耦合；不适合把 ArkTS 应用直接嵌入。 |
+| [[https://github.com/slackhq/nebula][slackhq/nebula]] | 18.5k | Go | 证书、lighthouse、UDP 打洞；主机证书包含虚拟 IP | 源码和平台支持成熟，但设计就是虚拟 IP 网络；与“不使用 IP 定位”冲突，且移动端需 VPN/TUN 能力。 |
+| [[https://github.com/markqvist/Reticulum][markqvist/Reticulum]] | 7.7k | Python | Identity/destination hash；多种接口和转发节点 | 身份和消息模型很接近，但主要实现是 Python，项目自述仍属相对年轻的软件；不适合作为 Rust services 的主依赖。 |
+
+* 方案一：iroh（建议优先验证）
+
+** 适配关系
+
+iroh README 将模型描述为“dial by public key”：应用保存本端密钥，Endpoint ID 由该身份派生；连接地址不是固定 IP，而是由 relay、地址发现和直连路径组成的集合。连接先尝试最快的直连，必要时做 NAT hole punching，失败时使用公开或自建 relay。QUIC 提供加密、多路复用和双向 stream；应用协议用 ALPN 区分。
+
+iroh-relay 仓库同时包含 relay protocol、客户端和可执行的 relay server，可使用 Cargo 从源码构建。relay 支持按 Endpoint ID allowlist/denylist、共享 token 或 HTTP 鉴权回调，适合 services 控制加入网络的节点集合。relay 只需暴露稳定的公网 HTTPS/QUIC 入口，业务节点不需要公网 IP。
+
+** 源码级接入
+
+services 侧可直接依赖 iroh 1.0 API，并把网络层封装为 Loki 自己的模块；建议只向上暴露以下操作：
+
+#+begin_src rust
+pub struct IdentityNetwork { /* endpoint, router, identity */ }
+
+impl IdentityNetwork {
+    pub async fn start(config: NetworkConfig) -> Result<Self>;
+    pub fn endpoint_id(&self) -> EndpointId;
+    pub async fn send(&self, peer: EndpointId, body: Bytes) -> Result<()>;
+    pub async fn recv(&self) -> Result<InboundMessage>;
+}
+#+end_src
+
+实现时为 Loki 定义一个版本化 ALPN，例如 ~loki-assistant/msg/1~, 消息头携带 request ID、发送方 Endpoint ID、过期时间和幂等键；不要把 relay URL 或观察到的 IP 写入业务持久化数据。节点私钥只在首次注册时生成，之后放入平台安全存储；Endpoint ID 可以公开，私钥不能通过 HTTP 配置接口导出。
+
+手机侧不应直接把完整 iroh API 暴露给 ArkTS。iroh-ffi 已将 Rust 库构建为 ~staticlib~ / ~cdylib~, 并通过 UniFFI 提供 Swift、Kotlin、Node.js、Python 包；HarmonyOS 当前没有官方 ArkTS 包，因此需要验证下列最小路径：
+
+1. 为目标 ABI 编译 iroh-ffi 的 Rust 动态库。
+2. 用 HarmonyOS NDK/NAPI 写一个 C/C++ 桥，把 ~start~、~endpoint_id~、~connect/send~、~close~ 映射为 Promise/事件。
+3. ArkTS 只处理字符串形式的 Endpoint ID、JSON/ArrayBuffer 消息和生命周期回调。
+4. 在手机的安全存储中持久化身份密钥；应用重装、清除数据和密钥轮换策略需要产品明确决定。
+
+这部分是集成风险点：iroh-ffi 的 Swift/Kotlin/Node.js 构建已经有源码和 CI 参考，但 HarmonyOS NAPI、后台存活、网络权限和 ABI 兼容性仍需在真机上验证，不能把官方绑定现状写成“现成支持 HarmonyOS”。
+
+** 部署形态
+
+#+begin_src text
+HarmonyOS App ──(直连或 hole punch)──┐
+                                     ├─ iroh endpoint ↔ endpoint
+services (Rust) ──(直连或 hole punch)─┘
+       \____________ 失败时经过自建 iroh-relay ____________/
+#+end_src
+
+relay 可独立部署在 VPS；services 也可以同机运行一个受控 relay，但建议生产环境把 relay 与业务服务分开，便于限制带宽、观察连接数并轮换访问 token。relay 只负责传输，业务消息仍由端点之间的 QUIC 加密通道保护。
+
+* 方案二：libp2p（需要更强协议扩展时选用）
+
+rust-libp2p 的身份层生成 PeerId，multiaddr 只是连接路径。Rust 仓库提供 QUIC、Noise、Identify、Kademlia、circuit relay v2、AutoNAT、DCUtR、request-response 和 gossipsub 等模块；relay 规范明确包含 Circuit Switching 和 Direct Connection Upgrade through Relay。可以为 Loki 定义 request-response 协议，或使用 gossipsub 做多节点广播。
+
+它的优势是协议选择和生态最丰富，适合未来形成多个 services、群组订阅或离线发现；代价是需要自己组合 Transport/Swarm/NetworkBehaviour，处理连接状态和版本兼容。rust-libp2p 当前 workspace 版本已包含 ~libp2p-relay 0.23~、~libp2p-quic 0.15~ 和 ~libp2p 0.58~, 建议锁定这些版本并隔离在独立 crate。
+
+libp2p 没有像 iroh-ffi 那样面向 Swift/Kotlin/Node.js 的官方绑定。HarmonyOS 接入要自行编译 Rust ~cdylib~ 并实现 NAPI/FFI；如果手机只是 ArkTS WebSocket 客户端，则必须另加一个网关，失去端到端 PeerId 网络的直接性。因此它应作为第二阶段或协议复杂度确实超过 iroh 时的备选。
+
+* 方案三：NATS（以中心转发为主的低成本路径）
+
+NATS server 是 CNCF 生态中成熟的 Go 消息服务器，支持 Core NATS、JetStream、request/reply、TLS、认证和多种客户端。Rust 的 async-nats 当前 README 列出 Core NATS、JetStream、Service API、TLS、重连和订阅能力；手机端可以使用 WebSocket 或一个很薄的 ArkTS 原生客户端，不需要在手机中运行 Rust 网络栈。
+
+建议将 NATS 身份和 Loki node ID 分开：NKey/JWT 用于 broker 认证，成功认证后由服务端登记一个不可变的 ~node_id~；消息使用 ~loki.node.<node_id>.in~ 或 request/reply inbox。客户端连接时只需知道 broker 的 bootstrap URL，业务寻址只使用 node ID。服务端可用 account/export/import 或 ACL 限制节点只能订阅自己的 inbox 和允许的服务 subject。
+
+这个模型的限制是所有消息都经过 broker，broker 掉线时没有端点间直连能力；节点 ID 也需要 Loki 自己维护，不能直接从 NATS subject 推导出像 Endpoint ID/PeerId 那样的网络身份。如果当前功能只是手机调用 services、通知和状态同步，NATS 的整体工作量和移动端风险最低；如果以后需要手机与电脑直连、端到端 stream 或不经过中心转发，则应从一开始选 iroh。
+
+* 不作为首选的项目
+
+** Yggdrasil
+
+Yggdrasil 是加密 IPv6 mesh，节点需要 TUN/TAP，应用通过虚拟 IPv6 访问。它的确能跨 IPv4 建立 overlay，但本项目要求应用层不要使用 IP 定位，而且 HarmonyOS 应用无法假定可以创建系统级 TUN，因此不建议嵌入。
+
+** Nebula
+
+Nebula 使用 lighthouse 发现和 UDP 打洞，主机证书明确包含虚拟 IP、名字和组；它更适合给整台主机建立 VPN。仓库虽有 iOS/Android 源码目录，但手机集成依赖 VPN/TUN 和证书生命周期，仍然不满足“以身份而非 IP 寻址”的核心要求。
+
+** Reticulum
+
+Reticulum 的 identity、destination hash 和传播节点概念很有吸引力，且源代码完整；但主仓库约 99.9% 为 Python，README 自述软件相对年轻，移动端需要另外维护运行时和封装。它适合作为离线/低带宽消息网络的专题评估，不适合作为当前 Rust services 的基础层。
+
+* 推荐的落地顺序
+
+1. 先用 iroh-relay 的本地或测试实例验证 services 与一台开发设备的身份生成、relay 连接、重启后身份保持和消息重放防护。
+2. 为 services 增加独立的 network crate，先实现单播 request/reply 和健康状态，不把 iroh 类型泄漏到现有 HTTP 模块。
+3. 以 iroh-ffi 为参考实现一个最小 HarmonyOS NAPI 模块，只暴露身份、连接、发送、接收和关闭；在真机验证后台网络、进程重启、断网重连与 ABI。
+4. 验证通过后再增加服务发现、ACL、密钥轮换和消息持久化；relay 访问控制先使用 shared token，接入账号系统后改 HTTP callout。
+5. 如果测试证明产品只需要中心消息转发，保留 NATS 作为简化路径：手机使用 WebSocket，services 使用 async-nats，node ID 和 ACL 放在 Loki 服务层。
+
+* 来源
+
+- [[https://github.com/n0-computer/iroh][iroh README 与源码]]：按公钥拨号、QUIC、hole punching、relay、iroh-relay workspace。
+- [[https://github.com/n0-computer/iroh/blob/main/iroh-relay/README.md][iroh-relay README]]：自建 relay、访问控制、HTTP 鉴权和测试方式。
+- [[https://github.com/n0-computer/iroh-ffi][iroh-ffi README 与 Cargo.toml]]：Swift/Kotlin/Node.js/Python 绑定、iroh 1.0 API、Android 构建和 cdylib。
+- [[https://github.com/libp2p/rust-libp2p][rust-libp2p README 与 Cargo.toml]]：Rust 组件、版本和可扩展协议。
+- [[https://github.com/libp2p/specs/tree/master/relay][libp2p relay specification]]：circuit relay v2 与 DCUtR。
+- [[https://github.com/nats-io/nats-server][NATS server README]] 与 [[https://github.com/nats-io/nats.rs][nats.rs README]]：服务器成熟度、客户端能力和 Rust API。
+- [[https://github.com/yggdrasil-network/yggdrasil-go][Yggdrasil README]]、[[https://github.com/slackhq/nebula][Nebula README]]、[[https://github.com/markqvist/Reticulum][Reticulum README]]：排除项的网络模型、平台和实现语言。
