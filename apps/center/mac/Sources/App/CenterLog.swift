@@ -9,7 +9,7 @@ final class CenterLog: @unchecked Sendable {
 
     private let fileURL: URL
     private let lock = NSLock()
-    private let retention: TimeInterval = 3 * 24 * 60 * 60
+    private let maximumEntries = 500
 
     init(fileURL: URL = CenterLog.defaultFileURL) {
         self.fileURL = fileURL
@@ -28,9 +28,8 @@ final class CenterLog: @unchecked Sendable {
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let existing = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? Self.header
-            let cutoff = date.addingTimeInterval(-retention)
-            let retained = Self.entries(in: existing).filter { $0.timestamp >= cutoff }
-            let content = Self.render(header: existing, entries: retained + [entry])
+            let retained = Array((Self.entries(in: existing) + [entry]).suffix(maximumEntries))
+            let content = Self.render(header: existing, entries: retained)
             try content.write(to: fileURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
@@ -46,7 +45,6 @@ final class CenterLog: @unchecked Sendable {
 """
 
     fileprivate struct Entry {
-        let timestamp: Date
         let text: String
     }
 
@@ -66,13 +64,10 @@ final class CenterLog: @unchecked Sendable {
     }
 
     private static func entry(from lines: [String]) -> Entry? {
-        guard !lines.isEmpty,
-              let timestampLine = lines.first(where: { $0.hasPrefix(":TIMESTAMP:") }),
-              let value = timestampLine.split(separator: ":", maxSplits: 2).last,
-              let timestamp = isoDate(from: value.trimmingCharacters(in: .whitespaces)) else {
+        guard !lines.isEmpty else {
             return nil
         }
-        return Entry(timestamp: timestamp, text: lines.joined(separator: "\n"))
+        return Entry(text: lines.joined(separator: "\n"))
     }
 
     private static func render(header existing: String, entries: [Entry]) -> String {
@@ -87,12 +82,6 @@ final class CenterLog: @unchecked Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withColonSeparatorInTime]
         return formatter.string(from: date)
-    }
-
-    fileprivate static func isoDate(from value: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withColonSeparatorInTime]
-        return formatter.date(from: value)
     }
 
     fileprivate static func headingString(_ date: Date) -> String {
@@ -150,7 +139,7 @@ final class CenterLogOperation: @unchecked Sendable {
         lines.append(contentsOf: properties(allDetails))
         lines.append(":END:")
         lines.append(contentsOf: calls.map(renderCall))
-        return CenterLog.Entry(timestamp: endedAt, text: lines.joined(separator: "\n"))
+        return CenterLog.Entry(text: lines.joined(separator: "\n"))
     }
 
     private func properties(_ values: [String: String]) -> [String] {

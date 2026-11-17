@@ -16,7 +16,7 @@
 
 托盘菜单每次打开时通过 ~GET /emacs/status~ 读取 services 缓存的最新状态，按 ~app~ 分组展示各应用的 ~buffer~ 列表，不显示总数标题或空分组；菜单关闭后取消本次请求，不进行后台轮询。点击 buffer 使用名称请求 services 激活对应 Emacs buffer；名称重复时由服务端使用第一个匹配项。
 
-“设置”请求 services 的 ~POST /emacs/apps/open?app=config~ ；“日志”请求 ~POST /emacs/apps/open?app=logs~ ，打开 ~~/.assistant/loki-assistant.log.org~ 。托盘菜单打开、设置、日志和 agent-shell 切换均写入 Org 日志；一级标题是用户操作，二级标题是本次操作的 services 调用，写入时清理三天前的条目。应用不存在、服务不可用或 Emacs 出错时，弹窗显示服务返回的具体原因。界面用法见 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]。
+“设置”请求 services 的 ~POST /emacs/apps/open?app=config~ ；“日志”请求 ~POST /emacs/apps/open?app=logs~ ，打开 ~~/.assistant/loki-assistant.log.org~ 。托盘菜单打开、设置、日志和 agent-shell 切换均写入 Org 日志；一级标题是用户操作，二级标题是本次操作的 services 调用，文件最多保留 500 条一级操作。应用不存在、服务不可用或 Emacs 出错时，弹窗显示服务返回的具体原因。界面用法见 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]。
 
 * 应用图标
 
@@ -57,4 +57,4 @@ make restart-center
 make test-mac
 #+end_src
 
-测试覆盖 services 健康响应、状态模型、设置和日志入口的 gateway 调用与错误反馈、托盘日志的 Org 层级和三天保留、通知 URL 解码和展示内容、回执分类、服务发现及回执重试，不要求 services 正在运行，也不发送真实系统通知。
+测试覆盖 services 健康响应、状态模型、设置和日志入口的 gateway 调用与错误反馈、托盘日志的 Org 层级和 500 条上限、通知 URL 解码和展示内容、回执分类、服务发现及回执重试，不要求 services 正在运行，也不发送真实系统通知。
