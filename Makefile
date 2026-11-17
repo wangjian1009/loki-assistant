@@ -2,7 +2,6 @@
 
 PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR ?= $(PROJECT_ROOT)/apps/center/mac/.build
-CONFIG_EDITOR_BUILD_DIR ?= $(PROJECT_ROOT)/apps/config-editor/mac/.build
 RELEASE_BUILD_DIR ?= $(BUILD_DIR)/release
 CONFIG ?= Debug
 CMAKE ?= cmake
@@ -11,9 +10,9 @@ CARGO ?= cargo
 OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
-.PHONY: emacs-load emacs-test
+.PHONY: emacs-load emacs-test emacs-config export-icons
 
-.PHONY: help configure build test test-mac config-editor-configure build-config-editor test-config-editor run-config-editor xcode-config-editor services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release clean
+.PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release clean
 
 help:
 	@printf '%s\n' \
@@ -24,9 +23,8 @@ help:
 	  'make xcode           生成并打开 Xcode 工程' \
 	  'make test            执行 Mac XCTest 和 services Rust 测试' \
 	  'make test-mac        构建并执行 Mac XCTest' \
-	  'make build-config-editor 构建通用配置编辑器' \
-	  'make test-config-editor 执行配置编辑器 XCTest' \
-	  'make run-config-editor 启动通用配置编辑器' \
+	  'make emacs-config    打开 Emacs 服务配置管理界面' \
+	  'make export-icons    从 SVG 母版导出应用和菜单栏图标' \
 	  'make services-test   执行 services Rust 测试' \
 	  'make services-fmt    检查 services Rust 格式' \
 	  'make services-run    运行 services 本地服务' \
@@ -46,14 +44,21 @@ help:
 emacs-load:
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (add-to-list 'load-path \"$(PROJECT_ROOT)/emacs\") \
-	  (when (featurep 'loki-assistant) \
-	    (unload-feature 'loki-assistant t)) \
-	  (require 'loki-assistant))"
+	  (dolist (feature '(loki-assistant-config-tests loki-assistant-config loki-assistant)) \
+	    (when (featurep feature) (unload-feature feature t))) \
+	  (require 'loki-assistant) \
+	  (require 'loki-assistant-config))"
+
+emacs-config: emacs-load
+	"$(EMACSCLIENT)" --eval "(progn \
+	  (loki-assistant-config) \
+	  t)"
 
 emacs-test: emacs-load
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
-	  (let ((stats (ert-run-tests-batch \"^loki-assistant-test-\")) \
+	  (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
+	  (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\"))) \
 	        (agent-shell-stats \
 	         (when (require 'agent-shell nil t) \
 	           (load \"$(PROJECT_ROOT)/emacs/loki-assistant-agent-shell-tests.el\" nil t) \
@@ -67,31 +72,19 @@ emacs-test: emacs-load
 	                (if agent-shell-stats \"（含 agent-shell 扩展）\" \"\")) \
 	      (error \"Emacs 测试失败\"))))"
 
+export-icons:
+	python3 "$(PROJECT_ROOT)/apps/center/mac/scripts/export-icons.py"
+
 configure:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON
 
 build: configure
 	"$(CMAKE)" --build "$(BUILD_DIR)" --config "$(CONFIG)"
 
-test: test-mac test-config-editor services-test
+test: test-mac services-test
 
 test-mac: build
 	"$(CTEST)" --test-dir "$(BUILD_DIR)" -C "$(CONFIG)" --output-on-failure
-
-config-editor-configure:
-	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/config-editor/mac" -B "$(CONFIG_EDITOR_BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON
-
-build-config-editor: config-editor-configure
-	"$(CMAKE)" --build "$(CONFIG_EDITOR_BUILD_DIR)" --config "$(CONFIG)"
-
-test-config-editor: build-config-editor
-	"$(CTEST)" --test-dir "$(CONFIG_EDITOR_BUILD_DIR)" -C "$(CONFIG)" --output-on-failure
-
-run-config-editor: build-config-editor
-	"$(OPEN)" "$(CONFIG_EDITOR_BUILD_DIR)/$(CONFIG)/LokiConfigEditor.app"
-
-xcode-config-editor: config-editor-configure
-	"$(OPEN)" "$(CONFIG_EDITOR_BUILD_DIR)/LokiConfigEditor.xcodeproj"
 
 services-test:
 	"$(CARGO)" test --workspace --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml"
@@ -143,7 +136,4 @@ clean:
 	fi
 	@if [ -f "$(RELEASE_BUILD_DIR)/CMakeCache.txt" ]; then \
 	  "$(CMAKE)" --build "$(RELEASE_BUILD_DIR)" --config Release --target clean; \
-	fi
-	@if [ -f "$(CONFIG_EDITOR_BUILD_DIR)/CMakeCache.txt" ]; then \
-	  "$(CMAKE)" --build "$(CONFIG_EDITOR_BUILD_DIR)" --config "$(CONFIG)" --target clean; \
 	fi

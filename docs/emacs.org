@@ -2,7 +2,7 @@
 
 * 已实现能力
 
-~loki-assistant~ 支持异步访问 services HTTP API，并向指定通知处理器发送目标 buffer、标题、可选正文和图标。依赖 Emacs 27.1 或更新版本以及内置的 ~url~ 、 ~json~ 、 ~cl-lib~ 。
+~loki-assistant~ 提供 Customize 风格的服务配置管理界面，支持异步访问 services HTTP API，并向指定通知处理器发送目标 buffer、标题、可选正文和应用标识。依赖 Emacs 27.1 或更新版本以及内置的 ~url~ 、 ~json~ 、 ~cl-lib~ 。
 
 先按 [[file:../README.org::*快速开始][快速开始]] 启动 services；默认处理器的系统通知还需要菜单栏应用。加载与测试入口见 [[file:../README.org::*开发操作][开发操作]]。持久配置可将仓库的 ~emacs/~ 绝对路径加入 ~load-path~ ，再加载包：
 
@@ -12,6 +12,31 @@
 #+end_src
 
 每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
+
+* 服务配置管理
+
+加载包后执行 ~M-x loki-assistant-config~ ，或从仓库根目录执行 ~make emacs-config~ 。菜单栏“设置”调用 services 的 ~POST /emacs/apps/open?app=config~ ，由服务打开该界面并聚焦图形 frame；目标 Emacs 需要已将本包加入 ~load-path~ 。首次连接尚未运行的 server 时，启动行为沿用 [[file:control-center-services.org::*配置和连接][Emacs gateway 的连接约定]]。原来的 ~apps/config-editor~ 原生 App 已由此界面替代。
+
+界面使用 Emacs 内置 widget，与 Customize 采用相同的字段、复选框和按钮交互。所有可编辑模块按名称分组展示，配置名称、说明和类型从 ~GET /meta~ 动态读取，再并行请求各模块的 ~GET /data/{module_id}~ ；完整读取成功后一起展示。默认值、用户设置和未设置有明确标记，编辑后显示“已修改，尚未保存”。加载失败显示实际原因，可用“刷新 / 重试”重新获取。
+
+字符串、文件路径、可执行文件使用文本字段；布尔值使用复选框；整数、数字、字典和列表以 JSON 文本编辑。字典和列表分别输入 JSON object 和 array；空对象、空数组、false 和 null 保留原始 JSON 语义。文件和可执行文件提供“选择文件…”按钮，可通过 minibuffer 补全进入 ~.app~ 包，也可直接输入程序名；初始目录参考当前路径或服务元数据的建议搜索目录。
+
+| 操作 | 行为 |
+|------+------|
+| TAB / S-TAB | 在字段与按钮之间移动 |
+| RET | 激活按钮 |
+| 校验 | 请求 ~POST /config/validate~ ，只预检，不保存 |
+| 保存 | 先预检，再用 ~PUT /data/{module_id}/{key}~ 提交该项原始 JSON 值 |
+| 撤销编辑 | 回到该项最近读取或保存成功的值 |
+| C-c C-c / 保存所有修改 | 按顺序校验并保存已修改项，失败时停止；此前成功项已经保存 |
+| g / 刷新 | 重新读取全部元数据和实例；有未保存输入时先确认丢弃 |
+| q | 退出当前配置窗口，buffer 中的输入保留 |
+
+配置由 services 保存到 ~~/.assistant/config.yml~ ，不写入 Emacs ~custom-file~ 。保存成功后使用服务端响应更新值和来源；错误在对应项旁标红并保留输入。程序查找、类型和业务校验以 services 为准；提交时再次校验，不把预检成功当作保存成功。保存期间继续输入的内容会保留，不被旧响应覆盖。接口协议见 [[file:control-center-services.org::*配置中心][配置中心]]。
+
+“控制中心”的“登录时自动启动”保存成功后，由 Emacs 同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent；开启时生成 plist，已注册则 ~kickstart~ ，否则 ~bootstrap~ ，关闭时卸载并删除 plist。默认使用仓库 Debug 菜单栏程序；使用其他构建目录时，调整 ~loki-assistant-config-center-executable~ 。日志位于 ~~/Library/Logs/LokiAssistant/center.log~ 和 ~~/Library/Logs/LokiAssistant/center.error.log~ 。同步失败会明确提示“配置已保存，登录启动同步失败”，可检查构建路径或系统错误后再次点击该项“保存”重试。
+
+配置界面的 ERT 测试包含在 ~make emacs-test~ 中，覆盖真实 loopback HTTP 加载和校验保存、失败保留输入、完整快照、过期回调、保存期间继续编辑，以及使用临时目录和 launchctl 替身的登录启动管理；不修改真实用户配置或 LaunchAgent。
 
 * 通用 HTTP 请求
 
@@ -75,7 +100,7 @@ HTTP 失败保留状态、原始正文和可解析的 JSON，优先使用 servic
 
 #+begin_src emacs-lisp
 (loki-assistant-notify (current-buffer) "任务完成"
-                       :body "处理结果已就绪" :icon "✓")
+                       :body "处理结果已就绪" :app "emacs")
 
 ;; 不指定 buffer 时，默认通知点击后仅显示 Emacs。
 (loki-assistant-notify nil "提醒")
@@ -89,9 +114,9 @@ HTTP 失败保留状态、原始正文和可解析的 JSON，优先使用 servic
                          (message "处理器响应：%S" response)))
 #+end_src
 
-签名为 ~(loki-assistant-notify buffer title &key body icon module-id payload callback timeout)~ 。 ~buffer~ 接受存活 buffer 对象、非空 buffer 名称或 nil；对象会在发送时转换为名称，不切换当前 buffer。名称按数据传递，函数不创建目标 buffer，也不保证其在通知点击时仍然存活。
+签名为 ~(loki-assistant-notify buffer title &key body app module-id payload callback timeout)~ 。 ~buffer~ 接受存活 buffer 对象、非空 buffer 名称或 nil；对象会在发送时转换为名称，不切换当前 buffer。名称按数据传递，函数不创建目标 buffer，也不保证其在通知点击时仍然存活。
 
-~title~ 必须非空； ~body~ 、 ~icon~ 接受字符串或 nil。省略字段时使用服务端默认值。 ~module-id~ 默认 ~"emacs"~ ，通过 ~POST /emacs/receiver/notification~ 中的 ~module_id~ 精确分发；未知处理器返回 HTTP 404 ~notification-handler-not-found~ 。 ~payload~ 为附加 JSON 数据。 ~callback~ 和 ~timeout~ 与通用请求接口相同。
+~title~ 必须非空； ~body~ 接受字符串或 nil；~app~ 接受应用标识或 nil，仅含小写字母、数字、~-~ 或 ~_~ 。省略 ~app~ 时，services 的 Emacs 默认处理器补为 ~emacs~ ，center 使用随程序打包的 Emacs 图标。接口不提供自定义图标参数。 ~module-id~ 默认 ~"emacs"~ ，通过 ~POST /emacs/receiver/notification~ 中的 ~module_id~ 精确分发；未知处理器返回 HTTP 404 ~notification-handler-not-found~ 。 ~payload~ 为附加 JSON 数据。 ~callback~ 和 ~timeout~ 与通用请求接口相同。
 
 没有 ~callback~ 时显示处理器响应状态或明确错误；有回调时调用者自行处理反馈。默认处理器可能返回 ~forwarded~ ，它只说明通知已转交，不能据此判断系统已展示通知。若响应已经包含 ~failed~ 回执，通知函数会将 ~:ok~ 设为 nil 并提取其错误码与说明，同时保留 HTTP 状态和响应内容。
 
@@ -112,18 +137,18 @@ HTTP 失败保留状态、原始正文和可解析的 JSON，优先使用 servic
               (plist-get response :error-message)))))
 #+end_src
 
-~submitted~ 表示已提交系统通知中心； ~failed~ 包含明确原因； ~unconfirmed~ 表示尚未确认。查询只返回当时状态，需要后续结果时由调用者择时再查询。图标格式、点击跳转、回执保留期限等服务端约定见 [[file:control-center-services.org::*系统通知模块][系统通知模块]]。
+~submitted~ 表示已提交系统通知中心； ~failed~ 包含明确原因； ~unconfirmed~ 表示尚未确认。查询只返回当时状态，需要后续结果时由调用者择时再查询。应用图标命名规则、点击跳转、回执保留期限等服务端约定见 [[file:control-center-services.org::*系统通知模块][系统通知模块]]。
 
 * agent-shell 集成
 
 在 macOS 上，~loki-assistant~ 会等待 ~agent-shell~ 加载完成，再自动加载
-~loki-assistant-agent-shell~ 并加入 ~agent-shell-mode-hook~；不需要在用户配置中单独
+~loki-assistant-agent-shell~ 并加入 ~agent-shell-mode-hook~ ；不需要在用户配置中单独
 加载扩展。~loki-assistant-agent-shell-enabled~ 默认为 ~t~，设置为 ~nil~ 可关闭自动加载。
 
 扩展提供 Finder 文件复制后的 ~C-y~ 文件上下文、文件拖放和项目外文件复制策略；图片显示
 预览，其他文件显示为可点击链接。文件复制策略由
 ~loki-assistant-agent-shell-file-copy-policy~ 控制，可选 ~auto~、~always-copy~ 和
-~always-original~。系统临时目录中的文件始终复制到当前项目的
+~always-original~ 。系统临时目录中的文件始终复制到当前项目的
 ~.agent-shell/.loki-assistant/~ 数据目录。
 
 Agent 的 ~permission-request~ 和 ~turn-complete~ 事件通过
@@ -132,4 +157,4 @@ Agent 的 ~permission-request~ 和 ~turn-complete~ 事件通过
 发送，~loki-assistant-agent-shell-notify-current-buffer~ 可设为 ~t~ 以便当前会话也发送。
 
 远程输入接收尚未实现；后续交互命令暂定命名为
-~loki-assistant-agent-shell-receive-input~，以便与通知和文件输入能力保持同一命名空间。
+~loki-assistant-agent-shell-receive-input~ ，以便与通知和文件输入能力保持同一命名空间。

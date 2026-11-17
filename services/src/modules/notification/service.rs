@@ -5,7 +5,9 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::time::timeout;
 
 use super::{
-    protocol::{NotificationReceipt, NotificationRequest, NotificationStatusResponse},
+    protocol::{
+        NotificationReceipt, NotificationRequest, NotificationStatusResponse, is_valid_app,
+    },
     tracker::NotificationTracker,
 };
 use crate::platform::macos::notification::{
@@ -63,6 +65,11 @@ impl NotificationService {
                 "title 不能为空".to_owned(),
             ));
         }
+        if request.app.as_deref().is_some_and(|app| !is_valid_app(app)) {
+            return Err(NotificationError::InvalidRequest(
+                "app 必须是仅含小写字母、数字、- 或 _ 的非空应用标识".to_owned(),
+            ));
+        }
         let navigation_url = request
             .callback_url
             .as_deref()
@@ -73,7 +80,7 @@ impl NotificationService {
             notification_id: notification_id.clone(),
             title: request.title,
             body: request.body,
-            icon: request.icon,
+            app: request.app,
             navigation_url,
         };
         let result = timeout(self.timeout, self.launcher.launch(content))

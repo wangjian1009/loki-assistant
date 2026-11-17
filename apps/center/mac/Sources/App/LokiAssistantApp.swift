@@ -30,6 +30,16 @@ struct LokiAssistantApp: App {
     private let instanceLock: CenterInstanceLock?
     @State private var status: ServiceStatusModel
 
+    private static let menuBarIcon: NSImage = {
+        // Xcode 将独立 PNG 的两种倍率合并为 TIFF，须通过 Bundle 加载。
+        let image = Bundle.main.image(forResource: NSImage.Name("loki-assistant-menu-v1"))
+            ?? NSImage(systemSymbolName: "server.rack", accessibilityDescription: "Loki的助理")
+            ?? NSImage(size: NSSize(width: 20, height: 20))
+        image.isTemplate = true
+        image.size = NSSize(width: 20, height: 20)
+        return image
+    }()
+
     init() {
         // XCTest 的宿主进程不参与日常实例锁，也不轮询真实 services。
         let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
@@ -57,13 +67,17 @@ struct LokiAssistantApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra("Loki Assistant", systemImage: "server.rack") {
+        MenuBarExtra {
             DashboardView(status: status)
                 .onAppear {
                     Task {
                         await status.refresh()
                     }
                 }
+        } label: {
+            Image(nsImage: Self.menuBarIcon)
+                .accessibilityLabel("Loki的助理")
+                .help("Loki的助理")
         }
         .menuBarExtraStyle(.menu)
     }

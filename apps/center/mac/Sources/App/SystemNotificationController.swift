@@ -7,7 +7,7 @@ struct SystemNotification: Codable, Equatable, Sendable {
     let notificationID: String?
     let title: String
     let body: String?
-    let icon: String?
+    let app: String?
     let navigationURL: String?
     // 兼容已发出的旧版 Emacs 通知；新通知只携带通用跳转 URL。
     let buffer: String?
@@ -15,14 +15,15 @@ struct SystemNotification: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case notificationID = "notification_id"
         case navigationURL = "navigation_url"
-        case title, body, icon, buffer
+        case title, body, app, buffer
     }
 
     init(url: URL) throws {
         self = try JSONDecoder().decode(Self.self, from: Self.payload(url: url))
         _ = try Self.receiptID(url: url)
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              buffer.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? true else {
+              buffer.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? true,
+              app.map(Self.isValidApp) ?? true else {
             throw SystemNotificationError.invalidPayload
         }
         if let navigationURL {
@@ -74,12 +75,18 @@ struct SystemNotification: Codable, Equatable, Sendable {
             content.userInfo["buffer"] = buffer
         }
         if let notificationID { content.userInfo["notification_id"] = notificationID }
-        if let icon, !icon.isEmpty, !Self.isImage(icon) { content.title = "\(icon) \(title)" }
         return content
     }
 
-    static func isImage(_ icon: String) -> Bool {
-        icon.hasPrefix("/") || icon.hasPrefix("file:") || icon.hasPrefix("app-icon://")
+    private static func isValidApp(_ app: String) -> Bool {
+        !app.isEmpty && app.utf8.allSatisfy {
+            (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95
+        }
+    }
+
+    func appIconURL(in bundle: Bundle = .main) -> URL? {
+        guard let app, Self.isValidApp(app) else { return nil }
+        return bundle.url(forResource: app, withExtension: "png", subdirectory: "NotificationAppIcons")
     }
 }
 
@@ -90,7 +97,7 @@ enum SystemNotificationError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidPayload: "系统通知数据无效"
-        case .permissionDenied: "请在 macOS 系统设置中允许 Loki Assistant 发送通知"
+        case .permissionDenied: "请在 macOS 系统设置中允许 Loki的助理 发送通知"
         }
     }
 }
@@ -132,29 +139,14 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "LokiAssistantNotifications/\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
-        if let icon = notification.icon, SystemNotification.isImage(icon) {
+        if let source = notification.appIconURL() {
             do {
-                let image: NSImage?
-                if icon.hasPrefix("app-icon://") {
-                    let bundleID = String(icon.dropFirst("app-icon://".count))
-                    image = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
-                        .map { NSWorkspace.shared.icon(forFile: $0.path) }
-                } else {
-                    let source = icon.hasPrefix("file:") ? URL(string: icon) : URL(fileURLWithPath: icon)
-                    guard let source, source.isFileURL else { throw SystemNotificationError.invalidPayload }
-                    image = NSImage(contentsOf: source)
-                }
-                guard let data = image?.tiffRepresentation,
-                      let bitmap = NSBitmapImageRep(data: data),
-                      let png = bitmap.representation(using: .png, properties: [:]) else {
-                    throw SystemNotificationError.invalidPayload
-                }
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let copy = directory.appending(path: "icon.png")
-                try png.write(to: copy)
-                content.attachments = [try UNNotificationAttachment(identifier: "icon", url: copy)]
+                let copy = directory.appending(path: "app.png")
+                try FileManager.default.copyItem(at: source, to: copy)
+                content.attachments = [try UNNotificationAttachment(identifier: "app", url: copy)]
             } catch {
-                logger.error("通知图标无法显示：\(error.localizedDescription, privacy: .public)")
+                logger.error("应用图标无法显示：\(error.localizedDescription, privacy: .public)")
             }
         }
         try await center.add(UNNotificationRequest(identifier: notification.notificationID ?? UUID().uuidString, content: content, trigger: nil))

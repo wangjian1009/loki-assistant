@@ -3,16 +3,27 @@ import SwiftUI
 
 struct DashboardView: View {
     let status: ServiceStatusModel
+    @State private var openingSettings = false
+    @State private var settingsError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             statusButton
             Divider()
             Button {
-                openConfigEditor()
+                openingSettings = true
+                Task { @MainActor in
+                    defer { openingSettings = false }
+                    do {
+                        try await ServiceSettingsClient().open()
+                    } catch {
+                        settingsError = error.localizedDescription
+                    }
+                }
             } label: {
-                Label("设置", systemImage: "slider.horizontal.3")
+                Label(openingSettings ? "打开设置…" : "设置", systemImage: "slider.horizontal.3")
             }
+            .disabled(openingSettings)
             .buttonStyle(.borderless)
             .frame(maxWidth: .infinity, alignment: .leading)
             Button {
@@ -26,17 +37,14 @@ struct DashboardView: View {
         .padding(8)
         .frame(width: 130, alignment: .leading)
         .labelStyle(.titleAndIcon)
-    }
-
-    private func openConfigEditor() {
-        let appURL = Bundle.main.bundleURL
-            .deletingLastPathComponent() // Debug
-            .deletingLastPathComponent() // .build
-            .deletingLastPathComponent() // mac
-            .deletingLastPathComponent() // center
-            .deletingLastPathComponent() // apps
-            .appendingPathComponent("config-editor/mac/.build/Debug/LokiConfigEditor.app")
-        _ = NSWorkspace.shared.open(appURL)
+        .alert("无法打开配置", isPresented: Binding(
+            get: { settingsError != nil },
+            set: { if !$0 { settingsError = nil } }
+        )) {
+            Button("好") { settingsError = nil }
+        } message: {
+            Text(settingsError ?? "")
+        }
     }
 
     @ViewBuilder

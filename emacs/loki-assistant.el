@@ -24,6 +24,9 @@
   :group 'applications
   :prefix "loki-assistant-")
 
+(autoload 'loki-assistant-config "loki-assistant-config"
+  "打开 services 配置管理界面。" t)
+
 (defcustom loki-assistant-service-file "~/.assistant/service"
   "services 地址信息文件；每次请求重新读取。"
   :type 'file
@@ -194,11 +197,11 @@ TIMEOUT 是正数秒，超时结果未知，不会自动重试。回调至多执
       (and (buffer-live-p response-buffer) response-buffer))))
 
 (cl-defun loki-assistant-notify
-    (buffer title &key body icon (module-id "emacs") payload callback
+    (buffer title &key body app (module-id "emacs") payload callback
             (timeout loki-assistant-request-timeout))
-  "向 services 的 MODULE-ID 处理器发送 BUFFER、TITLE、可选 BODY 和 ICON。
+  "向 services 的 MODULE-ID 处理器发送 BUFFER、TITLE、可选 BODY 和 APP。
 BUFFER 接受存活 buffer 对象或非空名称；nil 表示不指定目标 buffer。
-省略 ICON 时由默认处理器选择 Emacs 图标；PAYLOAD 为附加 JSON 数据。
+APP 为应用标识，省略时由默认处理器使用 emacs；图标由 center 提供；PAYLOAD 为附加 JSON 数据。
 CALLBACK 和 TIMEOUT 与 `loki-assistant-request' 相同。
 HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notification_id 查询。
 已返回的 failed 通知回执也按失败反馈；无 CALLBACK 时显示成功或失败原因。"
@@ -209,15 +212,15 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
                    ,@(when buffer `(("buffer" . ,buffer)))))
     (unless (and (stringp (cdr field)) (not (string-empty-p (string-trim (cdr field)))))
       (user-error "通知 %s 必须是非空字符串" (car field))))
-  (dolist (value (list body icon))
+  (dolist (value (list body app))
     (unless (or (null value) (stringp value))
-      (user-error "通知正文和图标必须为字符串或 nil")))
+      (user-error "通知正文和应用标识必须为字符串或 nil")))
   (loki-assistant-request
    "POST" "/emacs/receiver/notification"
    :body `((module_id . ,module-id) (title . ,title)
            ,@(when buffer `((buffer . ,buffer)))
            ,@(when body `((body . ,body)))
-           ,@(when icon `((icon . ,icon)))
+           ,@(when app `((app . ,app)))
            ,@(when payload `((payload . ,payload))))
    :timeout timeout
    :callback

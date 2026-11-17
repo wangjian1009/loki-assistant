@@ -8,6 +8,7 @@
 - 菜单栏应用通过 services 的 `/healthz` 查询状态，不直接调用 emacsclient；系统通知点击只回调 services。
 - `loki-assistant://notification/show` 接收通用通知，`loki-assistant://notification/activate` 包装本机服务回调路径，由 `UNUserNotificationCenter` 展示并处理点击，不提供额外 HTTP listener。旧 Emacs URL 和元数据保留兼容。
 - 带 `notification_id` 的通知通过 `/notification/{id}/receipt` 回报提交结果；每次回执尝试先检查服务文件锁、读取 pfile 并请求健康接口。回执最多尝试 3 次，4xx 停止重试，不因回执失败重发系统通知。旧版不带 ID 的 URL 仍可展示。
+- “设置”只请求 services 的 `POST /emacs/apps/open?app=config`；应用加载、固定 Lisp 和图形 frame 聚焦均属于服务端，不在 Swift 中维护 Emacs 脚本。应用不存在时展示服务端 `app-not-found` 的中文说明。请求前检查服务文件锁和健康状态；失败显示服务端原因，不自动重试。
 - 应用启动后不创建 Dock 主窗口；菜单栏菜单显示连接状态和版本，后台自动监控 services；停止时提供灰色启动按钮。
 
-- 点击时重新发现 services 并向解包后的本机回调路径发送一次 POST，不自动重试、不在 App 中实现 Emacs buffer 操作。`app-icon://<bundle-id>` 通过 `NSWorkspace` 读取原生应用图标并转换为 PNG 附件。
+- 点击时重新发现 services 并向解包后的本机回调路径发送一次 POST，不自动重试、不在 App 中实现 Emacs buffer 操作。通知接口仅接收 `app` 应用标识，不支持指定图标。图标按 `mac/Resources/NotificationAppIcons/<app>.png` 命名并随 App 打包，以 PNG 附件展示；已提供 `emacs`。标识仅允许小写字母、数字、`-` 和 `_`；缺省或资源不存在时展示文字通知。

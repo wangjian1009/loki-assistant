@@ -13,7 +13,7 @@ use super::{
     protocol::{
         API_VERSION, ActivationRequest, ActivationResponse, BuffersResponse, ErrorResponse,
         EvalRequest, EvalResponse, Notification, NotificationReceipt, NotificationResponse,
-        NotificationStatusResponse,
+        NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
     },
     service::{EmacsError, EmacsService},
 };
@@ -22,6 +22,7 @@ pub fn router(service: Arc<EmacsService>) -> Router {
     Router::new()
         .route("/emacs/eval", post(eval))
         .route("/emacs/activate", post(activate))
+        .route("/emacs/apps/open", post(open_app))
         .route("/emacs/receiver/notification", post(notification))
         .route(
             "/emacs/receiver/notification/{id}",
@@ -62,11 +63,36 @@ async fn eval(
 
 #[loki_api(
     module = "emacs",
+    id = "open-app",
+    method = "POST",
+    path = "/emacs/apps/open",
+    summary = "打开 Emacs 应用",
+    description = "协议版本 1：必填 app 查询参数，当前支持 config；由服务打开并聚焦 Emacs 配置界面。应用未注册或未安装返回 404 app-not-found。"
+)]
+async fn open_app(
+    State(service): State<Arc<EmacsService>>,
+    request: Result<Query<OpenAppRequest>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<OpenAppResponse>, Response> {
+    let Query(request) =
+        request.map_err(|error| error_response(EmacsError::InvalidRequest(error.body_text())))?;
+    service
+        .open_app(&request.app)
+        .await
+        .map_err(error_response)?;
+    Ok(Json(OpenAppResponse {
+        api_version: API_VERSION.to_owned(),
+        app: request.app,
+        opened: true,
+    }))
+}
+
+#[loki_api(
+    module = "emacs",
     id = "notification",
     method = "POST",
     path = "/emacs/receiver/notification",
     summary = "接收 Emacs 通知上报",
-    description = "协议版本 1：接收 title、icon、buffer 和可选 module_id、payload；默认转交菜单栏应用并返回 result.notification_id，可查询异步回执；点击仅激活 Emacs。"
+    description = "协议版本 1：接收 title 和可选 app、body、buffer、module_id、payload；app 默认为 emacs，图标由 center 内置资源提供；默认转交菜单栏应用并返回 result.notification_id，可查询异步回执；点击仅激活 Emacs。"
 )]
 async fn notification(
     State(service): State<Arc<EmacsService>>,
@@ -199,6 +225,7 @@ fn error_response(error: EmacsError) -> Response {
             return crate::modules::notification::routes::error_response(error.clone());
         }
         EmacsError::BufferNotFound => (StatusCode::NOT_FOUND, "buffer-not-found"),
+        EmacsError::AppNotFound(_) => (StatusCode::NOT_FOUND, "app-not-found"),
     };
     (
         status,

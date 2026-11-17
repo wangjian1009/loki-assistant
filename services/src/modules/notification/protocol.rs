@@ -7,8 +7,16 @@ pub const API_VERSION: &str = "1";
 pub struct NotificationRequest {
     pub title: String,
     pub body: Option<String>,
-    pub icon: Option<String>,
+    pub app: Option<String>,
     pub callback_url: Option<String>,
+}
+
+/// 应用标识对应 center 内置资源名称，不接受路径或 URL。
+pub(crate) fn is_valid_app(app: &str) -> bool {
+    !app.is_empty()
+        && app.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

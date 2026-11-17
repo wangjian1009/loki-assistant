@@ -189,7 +189,7 @@
            (plist-get
             (loki-assistant-test--await
              (lambda (callback)
-               (loki-assistant-notify target "任务完成" :body "正文" :icon "✓"
+               (loki-assistant-notify target "任务完成" :body "正文" :app "emacs"
                                       :module-id "tasks" :payload '((task_id . "1"))
                                       :callback callback))) :ok))
           (should (buffer-live-p target))
@@ -198,7 +198,7 @@
           (should (equal (alist-get 'module_id (cadr received)) "tasks"))
           (should (equal (alist-get 'title (cadr received)) "任务完成"))
           (should (equal (alist-get 'body (cadr received)) "正文"))
-          (should (equal (alist-get 'icon (cadr received)) "✓"))
+          (should (equal (alist-get 'app (cadr received)) "emacs"))
           (should (equal (alist-get 'task_id (alist-get 'payload (cadr received))) "1")))))))
 
 (ert-deftest loki-assistant-test-notify-defaults-and-failed-receipt ()
@@ -211,7 +211,7 @@
                        (lambda (callback)
                          (loki-assistant-notify nil "完成" :callback callback)))))
         (should (equal (alist-get 'module_id received) "emacs"))
-        (dolist (key '(buffer body icon payload)) (should-not (assq key received)))
+        (dolist (key '(buffer body app icon payload)) (should-not (assq key received)))
         (should-not (plist-get response :ok))
         (should (= (plist-get response :status) 200))
         (should (equal (plist-get response :error-code) "permission-denied"))

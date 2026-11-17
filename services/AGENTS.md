@@ -4,7 +4,7 @@
 
 ## 范围
 
-当前实现控制中心服务框架、配置中心、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 目前仍是预留空目录。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
+当前实现控制中心服务框架、配置中心、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
@@ -110,13 +110,15 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 `platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。
 
-`Services` 创建并持有 `Arc<notification::NotificationService>`，创建 `emacs::Module` 时通过 `Arc::clone` 注入。通知模块直接导出 `NotificationService`，发送、状态查询、回执和路由均通过该实例调用，不另设 `Module` 包装或 `service()` 取用入口。`EmacsService` 保存该 `Arc<NotificationService>` 引用，不得自行创建通知服务或平台发送器。Emacs 通知上报入口保留 `POST /emacs/receiver/notification`：本模块负责把可选 buffer 转成 `/emacs/activate` 回调路径，缺省图标补为 `app-icon://org.gnu.Emacs`，再调用通知服务发送；不在发送期间连接 Emacs。
+`Services` 创建并持有 `Arc<notification::NotificationService>`，创建 `emacs::Module` 时通过 `Arc::clone` 注入。通知模块直接导出 `NotificationService`，发送、状态查询、回执和路由均通过该实例调用，不另设 `Module` 包装或 `service()` 取用入口。`EmacsService` 保存该 `Arc<NotificationService>` 引用，不得自行创建通知服务或平台发送器。Emacs 通知上报入口保留 `POST /emacs/receiver/notification`：本模块负责把可选 buffer 转成 `/emacs/activate` 回调路径，未收到 `app` 或收到 `null` 时补为 `emacs`（图标由 center 按应用标识从内置资源读取），再调用通知服务发送；不在发送期间连接 Emacs。
 
 `modules/notification` 拥有通用 `NotificationRequest`、代码发送接口、应用内跳转封装、回执与状态。它通过可注入的 `NotificationLauncher` 调用 `/usr/bin/open -g`，使用 `loki-assistant://notification/show` 转交 App；将业务提供的本机服务路径包装成 `loki-assistant://notification/activate` 导航 URL，不解释 buffer。通用路由为 `GET /notification/{id}` 和 `POST /notification/{id}/receipt`；旧 Emacs 路由只代理同一份状态。单元测试注入 fake，不发送真实通知。
 
 系统通知先登记随机 `notification_id` 再转交；相同回执幂等，冲突不覆盖，超时只表示未知，记录按访问清理。不得为状态维护另启线程，测试通过 Tokio 虚拟时间验证期限。自定义 Emacs 模块通知处理器不自动纳入系统通知状态。
 
 `POST /emacs/activate` 执行点击后的业务跳转：无 buffer 时通过独立参数打开 Emacs；有 buffer 时通过现有 gateway 定位存活目标并聚焦图形 frame，不自动启动新 daemon，不创建同名空 buffer。App 只解包通用导航 URL 并回调 services，不直接执行 Emacs 激活。
+
+`POST /emacs/apps/open` 以必填查询参数 `app` 选择固定应用入口，当前支持 `config`。应用标识不作为 Lisp 执行；由 `EmacsService` 通过现有 gateway 完成应用加载、图形 frame 选择和聚焦，Mac 客户端只发送业务请求。未知应用或目标 Emacs 缺少对应 feature 时返回 404 `app-not-found`，客户端展示服务端说明。
 
 服务入口在写入 pfile 前获取 `ServiceInstanceLock`，运行期间持有 `~/.assistant/service.lock`，进程退出时释放。文件锁测试使用临时目录，不操作真实用户的服务锁。
 

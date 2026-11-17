@@ -8,7 +8,7 @@ use serde::Serialize;
 pub struct NotificationContent {
     pub notification_id: String,
     pub title: String,
-    pub icon: Option<String>,
+    pub app: Option<String>,
     pub body: Option<String>,
     pub navigation_url: Option<String>,
 }
@@ -69,7 +69,7 @@ mod tests {
         let content = NotificationContent {
             notification_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
             title: "中文 & \"通知\"\n$(test)".to_owned(),
-            icon: Some("/tmp/图标 #1.png".to_owned()),
+            app: Some("emacs".to_owned()),
             body: Some("完成".to_owned()),
             navigation_url: Some(
                 "loki-assistant://notification/activate?callback=%2Femacs%2Factivate".to_owned(),

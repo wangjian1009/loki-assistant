@@ -2,13 +2,13 @@
 
 * 项目简介
 
-Loki Assistant 是个人使用的助理程序。当前重新设计的第一步由 Rust services 和一个最小 macOS 菜单栏入口组成。
+Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的助理”。当前重新设计的第一步由 Rust services 和一个最小 macOS 菜单栏入口组成。
 
 * 当前阶段
 
 services 提供本机 loopback HTTP 服务、服务发现、配置数据、系统通知、Emacs gateway 和 macOS LaunchAgent 管理。Mac 菜单栏应用展示 services 状态并承接系统通知，点击后回调 services 执行对应业务跳转。
 
-~emacs/~ 中的 ~loki-assistant~ Emacs Lisp 包提供异步 services HTTP 请求与通知发送，支持目标 buffer、标题、正文、图标和处理器选择；失败时返回明确错误。
+~emacs/~ 中的 ~loki-assistant~ Emacs Lisp 包提供服务配置管理、异步 services HTTP 请求与通知发送，支持目标 buffer、标题、正文、应用标识和处理器选择；失败时返回明确错误。
 
 * 快速开始
 
@@ -29,12 +29,13 @@ make restart-center
 
 修改菜单栏 App 代码后使用 ~make restart-center~，该命令会退出旧进程并强制启动新构建的 App；只执行 ~make run~ 可能会复用旧实例。
 
-构建并运行通用配置编辑器：
+在已启动 server 的 Emacs 中打开服务配置管理界面：
 
 #+begin_src sh
-make build-config-editor
-make run-config-editor
+make emacs-config
 #+end_src
+
+也可在加载包后执行 ~M-x loki-assistant-config~ ，或通过菜单栏“设置”打开。界面按模块显示配置，提供校验、保存、撤销编辑和文件选择；详见 [[file:docs/emacs.org::*服务配置管理][服务配置管理]]。
 
 注册、启动和停止 services 用户级 LaunchAgent：
 
@@ -54,9 +55,9 @@ make emacs-load
 make emacs-test
 #+end_src
 
-该命令通过 ~emacsclient --eval~ 将 ~emacs/~ 加入 ~load-path~，卸载已加载的包后执行 ~(require 'loki-assistant)~ ，用于首次加载和修改后的重新加载。
+该命令通过 ~emacsclient --eval~ 将 ~emacs/~ 加入 ~load-path~，卸载已加载的包后执行 ~(require 'loki-assistant)~ 和 ~(require 'loki-assistant-config)~ ，用于首次加载和修改后的重新加载。
 
-~make emacs-test~ 重新加载包并运行 ERT，使用临时 HTTP listener 验证请求与通知，不改动用户配置或发送系统通知。测试失败时命令返回非零退出码；不会退出 Emacs。~make test~ 仍按下表执行 Mac 与 services 检查，Emacs 测试通过独立入口运行。
+~make emacs-test~ 重新加载包并运行 ERT，使用临时 HTTP listener 验证请求、通知与配置界面，不改动用户配置或发送系统通知。测试失败时命令返回非零退出码；不会退出 Emacs。~make test~ 仍按下表执行 Mac 与 services 检查，Emacs 测试通过独立入口运行。
 
 | 命令 | 操作 |
 |------+------|
@@ -65,9 +66,8 @@ make emacs-test
 | make run | 启动 Mac 菜单栏应用 |
 | make test | 执行 Mac XCTest 和 services Rust 测试 |
 | make test-mac | 执行 Mac XCTest |
-| make build-config-editor | 构建通用配置编辑器 |
-| make test-config-editor | 执行配置编辑器 XCTest |
-| make run-config-editor | 启动通用配置编辑器 |
+| make emacs-config | 打开 Emacs 服务配置管理界面 |
+| make export-icons | 从 SVG 母版导出应用和菜单栏图标 |
 | make services-test | 执行 services workspace 测试 |
 | make services-fmt | 检查 services Rust 格式 |
 | make services-run | 运行 services |
@@ -84,7 +84,7 @@ make emacs-test
 * 文档入口
 
 - [[file:apps/center/README.org][Mac 菜单栏入口]]
-- [[file:apps/config-editor/README.org][通用配置编辑器]]
+- [[file:docs/icon-design.org][应用图标设计与导出资源]]
 - [[file:services/README.org][控制中心服务层]]
 - [[file:docs/emacs.org][Emacs 包使用说明]]
 - [[file:docs/control-center-services.org][控制中心 services 模块规划]]

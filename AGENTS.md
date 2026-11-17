@@ -15,10 +15,10 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 
 ## 顶层目录职责
 
-- `apps/`：可独立运行的客户端应用，包括菜单栏入口和配置编辑器。
+- `apps/`：可独立运行的客户端应用，目前为 macOS 菜单栏入口。
 - `center/`：预留的应用编排与唤起层。
 - `services/`：控制中心核心服务及 macOS LaunchAgent 管理。
-- `emacs/`：`loki-assistant` Emacs Lisp 包，提供 services HTTP 请求和通知发送。
+- `emacs/`：`loki-assistant` Emacs Lisp 包，提供 services HTTP 请求、通知发送和 Customize 风格的服务配置管理。
 - `docs/`：需求、架构决策与跨模块协议。
 
 各目录的内部结构和开发约定由该目录的 `AGENTS.md` 定义；根文档不维护完整递归目录树。
@@ -35,7 +35,7 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 - 修改前阅读适用的各级 `AGENTS.md`；子目录约定补充父目录约定。
 - `AGENTS.md` 面向开发协作，定义职责、目录结构及实现约束；`README.org` 面向使用者，说明功能、安装、构建与运行。
 - 目录随实现按需创建，不提前铺设空目录或未使用的抽象层。
-- 当前已实现 services 服务骨架、服务发现、配置模块、LaunchAgent 管理、Mac 菜单栏状态入口和通用配置编辑器。文档须区分计划能力与已实现能力，不提供尚不存在的构建或安装命令。
+- 当前已实现 services 服务骨架、服务发现、配置模块、LaunchAgent 管理、Mac 菜单栏状态入口和 Emacs 服务配置界面。文档须区分计划能力与已实现能力，不提供尚不存在的构建或安装命令。
 - services HTTP 接口以 `docs/control-center-services.org` 和各模块元数据为准。
 - 仅运行与改动有关的检查；不为纯文档变更添加实现测试。
 - 第一阶段不扩展到手机端、跨设备同步或独立后台服务。

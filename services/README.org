@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏应用提供 services 状态监控和启动入口，托盘登录启动由配置编辑器管理。
+当前已完成核心服务器骨架、服务发现模块、配置模块、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏应用提供 services 状态监控和启动入口，托盘登录启动由 Emacs 配置界面管理。
 
 服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
@@ -67,7 +67,7 @@ control-center:
 
 Emacs 的 Rust 配置入口为 ~modules/emacs/config.rs~ 中的 ~EmacsConfig~ ，构造时注入 ~Arc<ConfigService>~ 。每个配置项有独立读取方法；~emacsclient_path()~ 和 ~socket_name()~ 在每次使用时读取生效值及来源，不缓存连接配置。配置元数据通过静态方法和 ~#[loki_config]~ 注册，与 API 元数据使用相同的编译期发现方式。
 
-~emacsclient_path~ 的类型为 ~Executable~，默认程序名为 ~emacsclient~。配置模块先按 services 进程的 ~PATH~ 搜索，再检查模块声明的 Homebrew 和 Emacs App 目录；找到的绝对路径作为默认值返回。也可在配置编辑器中使用“选择可执行文件…”按钮，或通过接口指定路径：
+~emacsclient_path~ 的类型为 ~Executable~，默认程序名为 ~emacsclient~。配置模块先按 services 进程的 ~PATH~ 搜索，再检查模块声明的 Homebrew 和 Emacs App 目录；找到的绝对路径作为默认值返回。也可在 Emacs 配置界面中使用“选择文件…”按钮，或通过接口指定路径：
 
 #+begin_src sh
 curl -X PUT http://127.0.0.1:47321/data/emacs/emacsclient_path \
@@ -80,16 +80,20 @@ curl -X POST http://127.0.0.1:47321/emacs/eval \
 
 curl http://127.0.0.1:47321/emacs/buffers
 
+curl -X POST 'http://127.0.0.1:47321/emacs/apps/open?app=config'
+
 curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
   -H 'Content-Type: application/json' \
-  -d '{"title":"任务完成","icon":"✓","buffer":"*scratch*"}'
+  -d '{"title":"任务完成","app":"emacs","buffer":"*scratch*"}'
 #+end_src
 
-配置修改从下次调用开始生效，并保存到 ~~/.assistant/config.yml~ 。不展开路径中的 ~ 和环境变量。~socket_name~ 默认为 ~server~ ，可在配置编辑器中改为目标 Emacs 的 socket 名称或绝对路径。gateway 显式传入该 socket，不依赖 ~EMACS_SOCKET_NAME~ 或 ~EMACS_SERVER_FILE~ ，也不在连接失败后回退到 TCP server 或其他实例。
+配置修改从下次调用开始生效，并保存到 ~~/.assistant/config.yml~ 。不展开路径中的 ~ 和环境变量。~socket_name~ 默认为 ~server~ ，可在 Emacs 配置界面中改为目标 Emacs 的 socket 名称或绝对路径。gateway 显式传入该 socket，不依赖 ~EMACS_SOCKET_NAME~ 或 ~EMACS_SERVER_FILE~ ，也不在连接失败后回退到 TCP server 或其他实例。
 
 Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclient --alternate-editor=~ 自动启动目标 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置须在 services 运行环境中可用。services 以用户级 LaunchAgent 的用户身份运行。
 
-通知上报接口为 ~POST /emacs/receiver/notification~ 。Emacs 模块调用创建时注入的系统通知模块，转交菜单栏应用展示 macOS 通知。~buffer~ 可省略，点击时由 services 显示 Emacs；提供时定位对应的存活 buffer。~icon~ 省略时使用 Emacs 原生图标附件，显式值支持文本或本地图片。传入 ~module_id~ 可将上报交给已注册的 Rust 模块处理器；默认值为 ~emacs~ 。
+控制中心“设置”调用 ~POST /emacs/apps/open?app=config~ ，由 Emacs 模块负责应用加载和窗口聚焦，客户端无需传入 Lisp。未知应用或目标 Emacs 未安装对应应用时返回 HTTP 404 ~app-not-found~ 和中文 ~message~ ，控制中心在界面显示该说明。完整约定见 [[file:../docs/control-center-services.org::*打开 Emacs 应用][打开 Emacs 应用]]。
+
+通知上报接口为 ~POST /emacs/receiver/notification~ 。Emacs 模块调用创建时注入的系统通知模块，转交菜单栏应用展示 macOS 通知。~buffer~ 可省略，点击时由 services 显示 Emacs；提供时定位对应的存活 buffer。~app~ 省略或为 ~null~ 时由 Emacs 模块补为 ~emacs~ ，center 按应用标识读取随程序打包的图标，不接受自定义图标。传入 ~module_id~ 可将上报交给已注册的 Rust 模块处理器；默认值为 ~emacs~ 。
 
 使用前先执行 ~make restart-center~ 加载新版菜单栏应用并注册通知 URL scheme。首次上报时，macOS 会请求 Loki Assistant 的通知权限；未授权时需在系统设置中允许通知。HTTP 返回 ~status: "forwarded"~ 只表示已交给菜单栏应用，不表示系统已经展示。
 
@@ -101,7 +105,7 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 * 系统通知代码接口
 
-~services.notification~ 直接持有 ~Arc<NotificationService>~ ，通过 ~services.notification.send(NotificationRequest)~ 发送标题、正文、图标与本机服务回调路径。业务模块保存创建时注入的共享引用并调用其实例方法。通知模块负责 URL scheme 转交、App 内跳转封装和提交回执；具体跳转操作由 services 中的业务模块执行。Emacs 模块的创建方式为 ~emacs::Module::new(config.service(), Arc::clone(&notification))~ 。通用接口、图标格式及跳转协议见 [[file:../docs/control-center-services.org::*系统通知模块][系统通知模块协议]]。
+~services.notification~ 直接持有 ~Arc<NotificationService>~ ，通过 ~services.notification.send(NotificationRequest)~ 发送标题、正文、应用标识与本机服务回调路径。业务模块保存创建时注入的共享引用并调用其实例方法。通知模块负责 URL scheme 转交、App 内跳转封装和提交回执；具体跳转操作由 services 中的业务模块执行。Emacs 模块的创建方式为 ~emacs::Module::new(config.service(), Arc::clone(&notification))~ 。通用接口、应用图标命名规则及跳转协议见 [[file:../docs/control-center-services.org::*系统通知模块][系统通知模块协议]]。
 
 原 Emacs 状态和回执 URL 保留为兼容入口，与通用接口共享同一份记录。~POST /emacs/activate~ 可显示 Emacs，或通过 ~buffer~ 查询参数激活指定 buffer。指定 buffer 时仅连接目标 socket 的已有 server，优先聚焦已经显示该 buffer 的 GUI 窗口，并恢复最小化或隐藏的窗口；没有 GUI frame 时创建窗口。中文、引号、反斜杠和换行保持完整。目标已关闭时返回 ~buffer-not-found~ ，不创建同名空 buffer；连接失败返回 ~emacs-unavailable~ ，点击旧通知也不会启动新 daemon。点击失败时菜单栏应用显示具体原因。
 

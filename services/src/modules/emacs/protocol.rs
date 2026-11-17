@@ -34,7 +34,7 @@ pub struct Notification {
     #[serde(default = "default_notification_module")]
     pub module_id: String,
     pub title: String,
-    pub icon: Option<String>,
+    pub app: Option<String>,
     pub body: Option<String>,
     pub buffer: Option<String>,
     #[serde(default)]
@@ -64,6 +64,18 @@ pub struct ActivationResponse {
     pub api_version: String,
     pub activation: String,
     pub buffer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenAppRequest {
+    pub app: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenAppResponse {
+    pub api_version: String,
+    pub app: String,
+    pub opened: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

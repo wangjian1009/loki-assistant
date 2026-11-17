@@ -100,6 +100,8 @@ pub enum EmacsError {
     SystemNotification(#[from] NotificationError),
     #[error("目标 buffer 已不存在")]
     BufferNotFound,
+    #[error("Emacs 应用不存在或未安装：{0}")]
+    AppNotFound(String),
 }
 
 pub struct EmacsService {
@@ -217,6 +219,24 @@ impl EmacsService {
         serde_json::from_str(&json).map_err(|error| EmacsError::InvalidResponse(error.to_string()))
     }
 
+    pub async fn open_app(&self, app: &str) -> Result<(), EmacsError> {
+        if app.trim().is_empty() {
+            return Err(EmacsError::InvalidRequest("app 不能为空".to_owned()));
+        }
+        let script = match app {
+            "config" => OPEN_CONFIG_APP_SCRIPT,
+            _ => return Err(EmacsError::AppNotFound(app.to_owned())),
+        };
+        // 应用标识只选择固定入口，不作为 Lisp 符号或脚本执行。
+        match self.eval(script).await?.as_str() {
+            "t" => Ok(()),
+            "nil" => Err(EmacsError::AppNotFound(app.to_owned())),
+            _ => Err(EmacsError::InvalidResponse(
+                "打开 Emacs 应用未返回 t 或 nil".to_owned(),
+            )),
+        }
+    }
+
     pub async fn register_notification_handler(
         &self,
         module_id: impl Into<String>,
@@ -239,6 +259,15 @@ impl EmacsService {
     }
 
     pub async fn notify(&self, notification: Notification) -> Result<Value, EmacsError> {
+        if notification
+            .app
+            .as_deref()
+            .is_some_and(|app| !crate::modules::notification::protocol::is_valid_app(app))
+        {
+            return Err(EmacsError::InvalidRequest(
+                "app 必须是仅含小写字母、数字、- 或 _ 的非空应用标识".to_owned(),
+            ));
+        }
         if notification.module_id.trim().is_empty()
             || notification.title.trim().is_empty()
             || notification
@@ -279,12 +308,7 @@ impl EmacsService {
                     body: notification
                         .body
                         .or_else(|| Some("点击显示 Emacs".to_owned())),
-                    icon: Some(
-                        notification
-                            .icon
-                            .filter(|icon| !icon.trim().is_empty())
-                            .unwrap_or_else(|| "app-icon://org.gnu.Emacs".to_owned()),
-                    ),
+                    app: notification.app.or_else(|| Some("emacs".to_owned())),
                     callback_url: Some(callback_url),
                 })
                 .await?;
@@ -421,6 +445,18 @@ fn eval_expression(script: &str) -> String {
        (json-encode `((error . ,(error-message-string err))))))))"#
     )
 }
+
+const OPEN_CONFIG_APP_SCRIPT: &str = r#"(progn
+  (require 'seq)
+  (when (require 'loki-assistant-config nil t)
+    (let ((frame (or (and (display-graphic-p (selected-frame)) (selected-frame))
+                     (seq-find #'display-graphic-p (frame-list))
+                     (make-frame '((window-system . ns))))))
+      (select-frame frame)
+      (loki-assistant-config)
+      (make-frame-visible frame)
+      (select-frame-set-input-focus frame)
+      t)))"#;
 
 const BUFFERS_SCRIPT: &str = r#"(let ((json-encoding-pretty-print nil)
       (json-null nil)

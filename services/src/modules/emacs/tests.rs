@@ -110,7 +110,7 @@ fn notification(module_id: &str) -> Notification {
     Notification {
         module_id: module_id.to_owned(),
         title: "任务完成".to_owned(),
-        icon: Some("✓".to_owned()),
+        app: Some("emacs".to_owned()),
         body: None,
         buffer: Some("*scratch*".to_owned()),
         payload: json!({"task": 42}),
@@ -405,7 +405,16 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 6);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 7);
+            let open_app = body["apis"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|api| api["id"] == "open-app")
+                .unwrap();
+            assert_eq!(open_app["method"], "POST");
+            assert_eq!(open_app["path"], "/emacs/apps/open");
+            assert!(open_app["description"].as_str().unwrap().contains("app"));
             let notification = body["apis"]
                 .as_array()
                 .unwrap()
@@ -465,7 +474,7 @@ async fn notification_forwards_content_without_running_emacs_lisp() {
     let calls = launcher.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].title, "任务完成");
-    assert_eq!(calls[0].icon.as_deref(), Some("✓"));
+    assert_eq!(calls[0].app.as_deref(), Some("emacs"));
     let navigation =
         percent_encoding::percent_decode_str(calls[0].navigation_url.as_deref().unwrap())
             .decode_utf8()
@@ -857,4 +866,108 @@ async fn activation_in_live_emacs_without_gui() {
             .unwrap(),
         "t"
     );
+}
+
+#[tokio::test]
+async fn open_config_app_uses_gateway_and_latest_socket() {
+    let (service, runner, config) = service(vec![Ok(wire(json!({"result":"t"})))]);
+    config
+        .replace("emacs", "socket_name", json!("目标 socket"))
+        .await
+        .unwrap();
+    let (status, body) = request(service, "POST", "/emacs/apps/open?app=config", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({"api_version":"1", "app":"config", "opened":true})
+    );
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "/default/emacsclient");
+    assert_eq!(
+        &calls[0].1[..3],
+        ["--alternate-editor=", "--socket-name=目标 socket", "--eval"]
+    );
+    assert!(calls[0].1[3].contains("loki-assistant-config"));
+    assert!(calls[0].1[3].contains("select-frame-set-input-focus"));
+}
+
+#[tokio::test]
+async fn open_app_rejects_invalid_and_unknown_identifiers_without_execution() {
+    let (service, runner, _) = service(vec![]);
+    for (path, expected, code) in [
+        (
+            "/emacs/apps/open",
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+        ),
+        (
+            "/emacs/apps/open?app=",
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+        ),
+        (
+            "/emacs/apps/open?app=%20",
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+        ),
+        (
+            "/emacs/apps/open?app=missing",
+            StatusCode::NOT_FOUND,
+            "app-not-found",
+        ),
+        (
+            "/emacs/apps/open?app=%28kill-emacs%29",
+            StatusCode::NOT_FOUND,
+            "app-not-found",
+        ),
+    ] {
+        let (status, body) = request(service.clone(), "POST", path, Value::Null).await;
+        assert_eq!(status, expected);
+        assert_eq!(body["api_version"], "1");
+        assert_eq!(body["code"], code);
+        assert!(!body["message"].as_str().unwrap().is_empty());
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn open_app_preserves_missing_package_lisp_and_connection_failures() {
+    let (service, runner, _) = service(vec![
+        Ok(wire(json!({"result":"nil"}))),
+        Ok(wire(json!({"error":"配置界面加载失败"}))),
+        Err(EmacsError::Process("无法启动 emacsclient".to_owned())),
+        Ok(wire(json!({"result":"unexpected"}))),
+    ]);
+    for (expected, code) in [
+        (StatusCode::NOT_FOUND, "app-not-found"),
+        (StatusCode::UNPROCESSABLE_ENTITY, "lisp-error"),
+        (StatusCode::SERVICE_UNAVAILABLE, "emacs-unavailable"),
+        (StatusCode::BAD_GATEWAY, "invalid-emacs-response"),
+    ] {
+        let (status, body) = request(
+            service.clone(),
+            "POST",
+            "/emacs/apps/open?app=config",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, expected);
+        assert_eq!(body["code"], code);
+        assert!(!body["message"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(runner.calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn open_app_reports_timeout() {
+    let service = Arc::new(EmacsService::with_runner(
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
+        default_notifications(),
+        Arc::new(StallingRunner),
+        Duration::from_millis(1),
+    ));
+    let (status, body) = request(service, "POST", "/emacs/apps/open?app=config", Value::Null).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["code"], "emacs-timeout");
 }
