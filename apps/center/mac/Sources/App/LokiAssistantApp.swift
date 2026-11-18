@@ -71,6 +71,14 @@ struct LokiAssistantApp: App {
         return image
     }()
 
+    private static let menuBarSleepIcon: NSImage = {
+        let image = Bundle.main.image(forResource: NSImage.Name("loki-assistant-menu-sleep-v1"))
+            ?? Self.menuBarIcon
+        image.isTemplate = true
+        image.size = NSSize(width: 20, height: 20)
+        return image
+    }()
+
     init() {
         let reportedStatus = EmacsReportedStatusModel(logger: .shared)
         _reportedStatus = State(initialValue: reportedStatus)
@@ -110,30 +118,7 @@ struct LokiAssistantApp: App {
                     }
                 }
         } label: {
-            Group {
-                if idleSleep.isEnabled {
-                    ZStack(alignment: .bottomTrailing) {
-                        Image(nsImage: Self.menuBarIcon)
-                            .scaleEffect(0.86)
-                        ZStack {
-                            Circle()
-                                .fill(Color(nsColor: .windowBackgroundColor))
-                            Image(systemName: "moon.zzz.fill")
-                                .font(.system(size: 7, weight: .bold))
-                                .symbolRenderingMode(.monochrome)
-                                .foregroundStyle(.primary)
-                        }
-                        .frame(width: 11, height: 11)
-                        .overlay {
-                            Circle().stroke(.primary, lineWidth: 1)
-                        }
-                        .offset(x: 1, y: 1)
-                    }
-                    .frame(width: 20, height: 20)
-                } else {
-                    Image(nsImage: Self.menuBarIcon)
-                }
-            }
+            Image(nsImage: idleSleep.isEnabled ? Self.menuBarSleepIcon : Self.menuBarIcon)
             .accessibilityLabel(idleSleep.isEnabled ? "Loki的助理，已阻止空闲休眠" : "Loki的助理")
             .help(idleSleep.isEnabled ? "Loki的助理：已阻止空闲休眠" : "Loki的助理")
         }

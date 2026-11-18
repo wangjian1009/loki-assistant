@@ -16,7 +16,7 @@ def render(source: Path, output: Path, size: int) -> None:
     )
 
 
-def export_macos(app_source: Path, menu_source: Path, resources: Path) -> Path:
+def export_macos(app_source: Path, menu_source: Path, sleep_source: Path, resources: Path) -> Path:
     """生成 macOS iconset、ICNS、asset catalog 和菜单栏图标。"""
     assets = resources / "AppIcon"
     iconset = assets / "loki-assistant-v1.iconset"
@@ -30,6 +30,7 @@ def export_macos(app_source: Path, menu_source: Path, resources: Path) -> Path:
     for scale in (1, 2):
         suffix = "@2x" if scale == 2 else ""
         render(menu_source, assets / f"loki-assistant-menu-v1{suffix}.png", 20 * scale)
+        render(sleep_source, assets / f"loki-assistant-menu-sleep-v1{suffix}.png", 20 * scale)
     subprocess.run(
         ["iconutil", "-c", "icns", str(iconset), "-o", str(assets / "loki-assistant-v1.icns")],
         check=True,
@@ -73,7 +74,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="loki-icon-export-") as temporary:
         staging = Path(temporary)
         app_png = export_macos(sources / "loki-assistant-v1.svg",
-                               sources / "loki-assistant-menu-v1.svg", staging / mac_resources)
+                               sources / "loki-assistant-menu-v1.svg",
+                               sources / "loki-assistant-menu-sleep-v1.svg", staging / mac_resources)
         export_harmony(app_png, staging / harmony_media)
         for generated in staging.rglob("*"):
             if generated.is_file():

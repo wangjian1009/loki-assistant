@@ -36,6 +36,8 @@ set_source_files_properties(${LOKI_NOTIFICATION_APP_ICONS} PROPERTIES
 set(LOKI_APP_ICONS
     Resources/AppIcon/loki-assistant-menu-v1.png
     Resources/AppIcon/loki-assistant-menu-v1@2x.png
+    Resources/AppIcon/loki-assistant-menu-sleep-v1.png
+    Resources/AppIcon/loki-assistant-menu-sleep-v1@2x.png
     Resources/Assets.xcassets
 )
 list(TRANSFORM LOKI_APP_ICONS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")

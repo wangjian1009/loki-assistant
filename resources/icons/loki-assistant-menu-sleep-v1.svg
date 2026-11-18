@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="240 230 540 580" fill="none">
+  <title>Loki Assistant 菜单栏阻止休眠状态图标</title>
+  <defs>
+    <mask id="sleep-badge-cutout" maskUnits="userSpaceOnUse" x="240" y="230" width="540" height="580">
+      <rect x="240" y="230" width="540" height="580" fill="white"/>
+      <circle cx="630" cy="660" r="145" fill="black"/>
+    </mask>
+  </defs>
+  <g fill="#000000" mask="url(#sleep-badge-cutout)">
+    <path d="M356 280C326 280 302 304 302 334V590C302 660 358 716 428 716H548V754C548 770 568 778 580 768L708 669C729 653 718 620 692 620H444C431 620 420 609 420 596V334C420 304 396 280 366 280H356Z"/>
+    <path d="M579 280H666C697 280 722 305 722 336V365C722 396 697 421 666 421H636L589 460C578 469 563 461 563 447V419C539 412 522 390 522 365V336C522 305 547 280 579 280Z"/>
+  </g>
+  <circle cx="630" cy="660" r="129" stroke="#000000" stroke-width="32"/>
+  <g transform="translate(630 660) scale(0.85) translate(-650 -682)">
+    <path d="M672 606A79 79 0 1 0 726 704A75 75 0 0 1 672 606Z" fill="#000000"/>
+  </g>
+</svg>
