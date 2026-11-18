@@ -1,7 +1,9 @@
 mod config;
 mod identity;
+pub mod protocol;
 mod relay;
 mod service;
+mod status;
 
 pub use identity::IdentityStore;
 pub use relay::{IrohRelayRegistrar, RelayRegistrar, RelaySession};

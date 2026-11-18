@@ -1,26 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 pub const API_VERSION: &str = "1";
-
-pub type StatusValues = BTreeMap<String, BTreeMap<String, Value>>;
-
-#[derive(Clone, Debug, Serialize)]
-pub struct StatusResponse {
-    pub api_version: String,
-    pub status: StatusValues,
-    pub updated_at: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StatusValueResponse {
-    pub api_version: String,
-    pub app: String,
-    pub key: String,
-    pub value: Value,
-    pub updated_at: Option<u64>,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalRequest {

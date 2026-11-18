@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::modules::status::protocol::{StatusResponse, StatusValues};
 use axum::{
     Json, Router,
     extract::{Path, Query, State, rejection::JsonRejection},
@@ -13,8 +14,7 @@ use super::{
     protocol::{
         API_VERSION, ActivationRequest, ActivationResponse, BuffersResponse, ErrorResponse,
         EvalRequest, EvalResponse, Notification, NotificationReceipt, NotificationResponse,
-        NotificationStatusResponse, OpenAppRequest, OpenAppResponse, StatusResponse,
-        StatusValueResponse, StatusValues,
+        NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
     },
     service::{EmacsError, EmacsService},
 };
@@ -22,6 +22,7 @@ use super::{
 pub fn router(service: Arc<EmacsService>) -> Router {
     Router::new()
         .route("/emacs/eval", post(eval))
+        .route("/emacs/receiver/status", post(receive_status))
         .route("/emacs/activate", post(activate))
         .route("/emacs/apps/open", post(open_app))
         .route("/emacs/receiver/notification", post(notification))
@@ -34,11 +35,6 @@ pub fn router(service: Arc<EmacsService>) -> Router {
             post(notification_receipt),
         )
         .route("/emacs/buffers", get(buffers))
-        .route(
-            "/emacs/status",
-            get(reported_status).post(set_reported_status),
-        )
-        .route("/emacs/status/{app}/{key}", get(reported_status_value))
         .with_state(service)
 }
 
@@ -207,59 +203,31 @@ async fn buffers(
         .map_err(error_response)
 }
 
-fn json_error(error: JsonRejection) -> Response {
-    error_response(EmacsError::InvalidRequest(error.body_text()))
-}
-
 #[loki_api(
     module = "emacs",
-    id = "reported-status",
-    method = "GET",
-    path = "/emacs/status",
-    summary = "读取 Emacs 上报状态",
-    description = "只读内存快照，按 app/数据项组织；不连接或启动 Emacs。"
-)]
-async fn reported_status(State(service): State<Arc<EmacsService>>) -> Json<StatusResponse> {
-    Json(service.reported_status().await)
-}
-
-#[loki_api(
-    module = "emacs",
-    id = "set-reported-status",
+    id = "receive-status",
     method = "POST",
-    path = "/emacs/status",
-    summary = "接收 Emacs 主动上报",
-    description = "请求体为 app 到数据项对象的映射；按数据项完整替换，保留未提交项。状态只保存在内存。"
+    path = "/emacs/receiver/status",
+    summary = "接收 Emacs 状态上报",
+    description = "按状态元数据校验外部模块/数据项快照，整批通过后经共享 StatusService 发布；失败返回 400 与字段路径，不修改已有状态。"
 )]
-async fn set_reported_status(
+async fn receive_status(
     State(service): State<Arc<EmacsService>>,
     request: Result<Json<StatusValues>, JsonRejection>,
 ) -> Result<Json<StatusResponse>, Response> {
-    let Json(values) = request.map_err(json_error)?;
+    let Json(values) = request.map_err(|_| {
+        error_response(EmacsError::InvalidRequest(
+            "状态请求格式无效，必须是模块到数据项的 JSON object".to_owned(),
+        ))
+    })?;
     service
-        .set_reported_status(values)
-        .await
+        .receive_status(values)
         .map(Json)
         .map_err(error_response)
 }
 
-#[loki_api(
-    module = "emacs",
-    id = "reported-status-value",
-    method = "GET",
-    path = "/emacs/status/{app}/{key}",
-    summary = "读取指定上报数据项",
-    description = "返回指定 app/数据项的最后上报值；未收到时返回 404 status-not-found。不连接 Emacs。"
-)]
-async fn reported_status_value(
-    State(service): State<Arc<EmacsService>>,
-    Path((app, key)): Path<(String, String)>,
-) -> Result<Json<StatusValueResponse>, Response> {
-    service
-        .reported_status_value(&app, &key)
-        .await
-        .map(Json)
-        .map_err(error_response)
+fn json_error(error: JsonRejection) -> Response {
+    error_response(EmacsError::InvalidRequest(error.body_text()))
 }
 
 fn error_response(error: EmacsError) -> Response {
@@ -283,7 +251,6 @@ fn error_response(error: EmacsError) -> Response {
         }
         EmacsError::BufferNotFound => (StatusCode::NOT_FOUND, "buffer-not-found"),
         EmacsError::AppNotFound(_) => (StatusCode::NOT_FOUND, "app-not-found"),
-        EmacsError::StatusNotFound(_, _) => (StatusCode::NOT_FOUND, "status-not-found"),
     };
     (
         status,

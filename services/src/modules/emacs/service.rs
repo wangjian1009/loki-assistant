@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -15,16 +8,18 @@ use tokio::{
     time::timeout,
 };
 
+use crate::modules::status::{
+    StatusService,
+    protocol::{StatusResponse, StatusValues},
+};
+
 use crate::modules::notification::{
     NotificationError, NotificationService, protocol::NotificationRequest,
 };
 
 use super::{
     config::EmacsConfig,
-    protocol::{
-        API_VERSION, Buffer, Notification, NotificationReceipt, NotificationStatusResponse,
-        StatusResponse, StatusValueResponse, StatusValues,
-    },
+    protocol::{Buffer, Notification, NotificationReceipt, NotificationStatusResponse},
 };
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
@@ -112,18 +107,16 @@ pub enum EmacsError {
     BufferNotFound,
     #[error("Emacs 应用不存在或未安装：{0}")]
     AppNotFound(String),
-    #[error("尚未收到状态信息：{0}/{1}")]
-    StatusNotFound(String, String),
 }
 
 pub struct EmacsService {
     config: EmacsConfig,
     runner: Arc<dyn CommandRunner>,
     notifications: Arc<NotificationService>,
+    status: Arc<StatusService>,
     timeout: Duration,
     evaluation: Mutex<()>,
     handlers: RwLock<HashMap<String, Arc<dyn NotificationHandler>>>,
-    status: RwLock<StatusResponse>,
 }
 
 impl Debug for EmacsService {
@@ -137,10 +130,15 @@ impl Debug for EmacsService {
 }
 
 impl EmacsService {
-    pub fn new(config: EmacsConfig, notifications: Arc<NotificationService>) -> Self {
+    pub fn new(
+        config: EmacsConfig,
+        notifications: Arc<NotificationService>,
+        status: Arc<StatusService>,
+    ) -> Self {
         Self::with_runner(
             config,
             notifications,
+            status,
             Arc::new(ProcessCommandRunner),
             Duration::from_secs(30),
         )
@@ -149,6 +147,7 @@ impl EmacsService {
     pub fn with_runner(
         config: EmacsConfig,
         notifications: Arc<NotificationService>,
+        status: Arc<StatusService>,
         runner: Arc<dyn CommandRunner>,
         timeout: Duration,
     ) -> Self {
@@ -156,72 +155,22 @@ impl EmacsService {
             config,
             runner,
             notifications,
+            status,
             timeout,
             evaluation: Mutex::new(()),
             handlers: RwLock::new(HashMap::new()),
-            status: RwLock::new(StatusResponse {
-                api_version: API_VERSION.to_owned(),
-                status: StatusValues::new(),
-                updated_at: None,
-            }),
         }
+    }
+
+    /// Emacs 业务入口接收上报后，通过共享 Rust 接口发布，不另建状态缓存。
+    pub fn receive_status(&self, values: StatusValues) -> Result<StatusResponse, EmacsError> {
+        self.status
+            .publish_many_validated(values)
+            .map_err(|error| EmacsError::InvalidRequest(error.to_string()))
     }
 
     pub async fn eval(&self, script: &str) -> Result<String, EmacsError> {
         self.eval_with_startup(script, true).await
-    }
-
-    pub async fn reported_status(&self) -> StatusResponse {
-        self.status.read().await.clone()
-    }
-
-    pub async fn set_reported_status(
-        &self,
-        values: StatusValues,
-    ) -> Result<StatusResponse, EmacsError> {
-        let valid_name = |name: &str| {
-            !name.trim().is_empty() && !name.contains('/') && name != "." && name != ".."
-        };
-        if values.is_empty()
-            || values.iter().any(|(app, items)| {
-                !valid_name(app) || items.is_empty() || items.keys().any(|key| !valid_name(key))
-            })
-        {
-            return Err(EmacsError::InvalidRequest(
-                "状态必须按非空 app/数据项组织，名称不能包含 /".to_owned(),
-            ));
-        }
-        let mut snapshot = self.status.write().await;
-        for (app, items) in values {
-            snapshot.status.entry(app).or_default().extend(items);
-        }
-        snapshot.updated_at = Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        );
-        Ok(snapshot.clone())
-    }
-
-    pub async fn reported_status_value(
-        &self,
-        app: &str,
-        key: &str,
-    ) -> Result<StatusValueResponse, EmacsError> {
-        let snapshot = self.status.read().await;
-        let value = snapshot
-            .status
-            .get(app)
-            .and_then(|items| items.get(key))
-            .ok_or_else(|| EmacsError::StatusNotFound(app.to_owned(), key.to_owned()))?;
-        Ok(StatusValueResponse {
-            api_version: API_VERSION.to_owned(),
-            app: app.to_owned(),
-            key: key.to_owned(),
-            value: value.clone(),
-            updated_at: snapshot.updated_at,
-        })
     }
 
     async fn eval_with_startup(

@@ -12,7 +12,7 @@ struct MonitoredEmacsBuffer: Decodable, Equatable, Sendable {
 
 struct EmacsBufferStatus: Decodable, Sendable {
     struct AppStatus: Decodable, Sendable {
-        let buffer: [MonitoredEmacsBuffer]?
+        let buffers: [MonitoredEmacsBuffer]?
     }
 
     let apiVersion: String
@@ -21,7 +21,7 @@ struct EmacsBufferStatus: Decodable, Sendable {
 
     var bufferGroups: [EmacsBufferGroup] {
         status.keys.sorted().compactMap { app in
-            guard let buffers = status[app]?.buffer, !buffers.isEmpty else { return nil }
+            guard let buffers = status[app]?.buffers, !buffers.isEmpty else { return nil }
             return EmacsBufferGroup(app: app, buffers: buffers)
         }
     }
@@ -100,7 +100,7 @@ struct EmacsReportedStatusClient: Sendable {
 
     func fetchBuffers(operation: CenterLogOperation? = nil) async throws -> EmacsBufferStatus {
         let endpoint = try await endpoint(operation: operation)
-        let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/status"),
+        let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/status"),
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         let result = try JSONDecoder().decode(EmacsBufferStatus.self, from: await send(request, operation: operation))
         guard result.apiVersion == "1",

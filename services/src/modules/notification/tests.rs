@@ -116,6 +116,7 @@ async fn emacs_defaults_missing_app_and_forwards_explicit_app_without_icons() {
     let emacs = emacs::Module::new(
         Arc::new(ConfigService::new(emacs::config::EmacsConfig::metadata())),
         notification,
+        Arc::new(crate::modules::status::StatusService::new()),
     );
     for (body, expected) in [
         (json!({"title":"默认应用"}), "emacs"),
@@ -154,6 +155,7 @@ async fn emacs_uses_injected_module_and_both_routes_share_receipts() {
     let emacs = emacs::Module::new(
         Arc::new(ConfigService::new(emacs::config::EmacsConfig::metadata())),
         notification.clone(),
+        Arc::new(crate::modules::status::StatusService::new()),
     );
     let app = Router::new()
         .merge(emacs.router())

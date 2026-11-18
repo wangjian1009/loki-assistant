@@ -2,6 +2,7 @@ pub mod config;
 pub mod protocol;
 mod routes;
 pub mod service;
+mod status;
 
 #[cfg(test)]
 mod tests;
@@ -12,7 +13,7 @@ use axum::Router;
 
 use crate::modules::{
     config::service::ConfigService, discover::registry::ModuleRegistration,
-    notification::NotificationService,
+    notification::NotificationService, status::StatusService,
 };
 
 use self::{config::EmacsConfig, service::EmacsService};
@@ -31,9 +32,17 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new(config: Arc<ConfigService>, notification: Arc<NotificationService>) -> Self {
+    pub fn new(
+        config: Arc<ConfigService>,
+        notification: Arc<NotificationService>,
+        status: Arc<StatusService>,
+    ) -> Self {
         Self {
-            service: Arc::new(EmacsService::new(EmacsConfig::new(config), notification)),
+            service: Arc::new(EmacsService::new(
+                EmacsConfig::new(config),
+                notification,
+                status,
+            )),
         }
     }
 

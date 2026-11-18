@@ -14,7 +14,7 @@
 
 收到带 ~notification_id~ 的通知时，应用将提交成功或明确失败的结果回报 services；提交成功不保证系统已经展示横幅。回执通过文件锁、服务发现文件和健康检查获取当前本机 HTTP 地址，网络错误时最多尝试 3 次；只重试回执，不重复发送通知。未知或已过期的通知停止回报。旧版不含 ID 的 URL 仍可展示通知，但没有回执。状态通过 ~/notification/{id}~ 查询，回执发往 ~/notification/{id}/receipt~ ，保留期限见系统通知模块协议。点击跳转每次重新发现服务，调用一次业务回调；成功或失败写入系统日志，不覆盖提交回执。失败时弹窗显示 services 返回的具体原因，例如目标 buffer 已关闭、无法连接目标 Emacs 或调用超时；services 不可用时也会提示。旧通知沿用相同流程，不在 App 中启动 Emacs。
 
-托盘菜单每次打开时通过 ~GET /emacs/status~ 读取 services 缓存的最新状态，按 ~app~ 分组展示各应用的 ~buffer~ 列表，不显示总数标题或空分组；菜单关闭后取消本次请求，不进行后台轮询。点击 buffer 使用名称请求 services 激活对应 Emacs buffer；名称重复时由服务端使用第一个匹配项。
+托盘菜单每次打开时通过 ~GET /status~ 读取 services 缓存的最新状态，按 ~app~ 分组展示各应用的 ~buffers~ 列表，不显示总数标题或空分组；菜单关闭后取消本次请求，不进行后台轮询。点击 buffer 使用名称请求 services 激活对应 Emacs buffer；名称重复时由服务端使用第一个匹配项。
 
 “设置”请求 services 的 ~POST /emacs/apps/open?app=config~ ；“日志”请求 ~POST /emacs/apps/open?app=logs~ ，打开 ~~/.assistant/loki-assistant.log.org~ 。托盘菜单打开、设置、日志和 agent-shell 切换均写入 Org 日志；一级标题是用户操作，二级标题是本次操作的 services 调用，文件最多保留 500 条一级操作。应用不存在、服务不可用或 Emacs 出错时，弹窗显示服务返回的具体原因。界面用法见 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]。
 

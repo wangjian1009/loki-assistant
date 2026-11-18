@@ -31,6 +31,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(error) = network.start(config).await {
             eprintln!("网络初始化失败：{error}");
         }
+        network.monitor().await;
     });
 
     eprintln!(

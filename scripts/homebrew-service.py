@@ -17,7 +17,6 @@ NAME = "loki-assistant-services"
 FORMULA = f"{TAP}/{NAME}"
 LEGACY_LABEL = "cc.loki-assistant.services"
 MARKER = "# 由 scripts/homebrew-service.py 为当前本机构建生成。"
-ENV_KEYS = ("LOKI_ASSISTANT_HTTP_ADDR", "LOKI_ASSISTANT_CENTER_EXECUTABLE", "LOKI_ASSISTANT_RELAY_TOKEN")
 
 
 def run(command, *, capture=False, check=True):
@@ -28,36 +27,15 @@ def run(command, *, capture=False, check=True):
                           stderr=subprocess.PIPE if capture else None)
 
 
-def legacy_settings():
+def legacy_service_path():
     path = Path.home() / "Library/LaunchAgents" / f"{LEGACY_LABEL}.plist"
     if not path.exists():
-        return path, {}
+        return path
     with path.open("rb") as source:
         settings = plistlib.load(source)
     if settings.get("Label") != LEGACY_LABEL:
         raise RuntimeError("旧服务 plist 的 Label 不匹配，停止迁移")
-    return path, settings.get("EnvironmentVariables", {})
-
-
-def preserve_environment(settings):
-    values = {key: os.environ.get(key, settings.get(key)) for key in ENV_KEYS}
-    values = {key: value for key, value in values.items() if value is not None}
-    if not values:
-        return
-    for key, value in values.items():
-        if "\n" in value or "\r" in value:
-            raise RuntimeError(f"{key} 包含换行，无法迁移环境设置")
-    directory = Path(os.environ.get("HOMEBREW_USER_CONFIG_HOME", str(Path.home() / ".homebrew"))) / "services"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = directory / f"{NAME}.env"
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return  # 保留已有的 Homebrew 服务环境设置。
-    with os.fdopen(descriptor, "w") as target:
-        for key, value in values.items():
-            target.write(f"{key}={value}\n")
-    print("已将旧服务的环境设置保存到 Homebrew 用户配置，权限为 0600。", flush=True)
+    return path
 
 
 def remove_legacy(path):
@@ -72,7 +50,7 @@ def remove_legacy(path):
 
 
 def install(brew, cargo):
-    legacy_path, settings = legacy_settings()
+    legacy_path = legacy_service_path()
     manifest = ROOT / "services/Cargo.toml"
     run([cargo, "build", "--manifest-path", str(manifest)])
     metadata = json.loads(run([cargo, "metadata", "--no-deps", "--format-version", "1", "--manifest-path", str(manifest)], capture=True).stdout)
@@ -108,7 +86,6 @@ def install(brew, cargo):
     if version not in versions:
         run([brew, "reinstall" if versions else "install", "--formula", "--build-from-source", FORMULA])
     (Path.home() / "Library/Logs/LokiAssistant").mkdir(parents=True, exist_ok=True)
-    preserve_environment(settings)
     # 新 formula 安装完成后再卸载旧任务，避免安装失败影响正在运行的服务。
     remove_legacy(legacy_path)
     run([brew, "services", "restart", FORMULA])

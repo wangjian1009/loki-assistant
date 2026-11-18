@@ -8,7 +8,7 @@ Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的�
 
 services 提供本机 loopback HTTP 服务、服务发现、配置数据、系统通知、Emacs gateway 和 macOS LaunchAgent 管理。Mac 菜单栏应用展示 services 状态并承接系统通知，点击后回调 services 执行对应业务跳转。
 
-services 的网络模块自动生成并保存本地身份，按 ~network.relay_url~ 注册中转，并通过通知模块报告结果。~apps/harmony/~ 使用 HarmonyOS Stage 模式与 ArkTS，目前提供执行中心入口；手机辅助能力、设备配对与后台常驻尚未实现。
+services 的网络模块自动生成并保存本地身份，按 ~network.relay_url~ 和 ~network.relay_token~ 注册中转，并通过通知模块报告结果。状态中心统一提供各模块的 Rust 发布接口与 HTTP 只读查询。~apps/harmony/~ 使用 HarmonyOS Stage 模式与 ArkTS，目前提供执行中心入口；手机辅助能力、设备配对与后台常驻尚未实现。
 
 ~emacs/~ 中的 ~loki-assistant~ Emacs Lisp 包提供服务配置管理、异步 services HTTP 请求与通知发送，支持目标 buffer、标题、正文、应用标识和处理器选择；失败时返回明确错误。
 

@@ -15,19 +15,21 @@
 
 * Emacs 状态主动上报
 
-加载 ~loki-assistant~ 后，~loki-assistant-monitor-mode~ 默认开启。它按 mode hook 维护关注 buffer，并定时将状态按 app/数据项发送到 services 的 ~POST /emacs/status~ ；不会为状态查询反向启动 Emacs。默认配置为：
+加载 ~loki-assistant~ 后，~loki-assistant-monitor-mode~ 默认开启。它按 mode hook 维护关注 buffer，并定时将状态按 app/数据项发送到 services 的 ~POST /emacs/receiver/status~ ；不会为状态查询反向启动 Emacs。默认配置为：
 
 #+begin_src emacs-lisp
 (setq loki-assistant-monitor-buffer '(agent-shell-mode))
 #+end_src
 
-~loki-assistant-monitor-buffer~ 是 mode 符号列表，匹配派生 mode。关注 buffer 通过统一结构维护，buffer 创建、mode 切换和关闭会触发注册或注销；上报数据项为 ~emacs/buffer~ ，包含稳定的进程内 ~id~ 、名称、mode、目录、文件和 modified 状态。Emacs 运行信息上报为 ~emacs/runtime~ ，包括 pid、Emacs version、启动时间和最近上报时间。默认每 5 秒同步一次，短时间内多次变化会合并；请求失败保留本地数据并在下个周期重试。
+~loki-assistant-monitor-buffer~ 是 mode 符号列表，匹配派生 mode。关注 buffer 通过统一结构维护，buffer 创建、mode 切换和关闭会触发注册或注销；上报数据项为 ~emacs/buffers~ ，包含名称、mode、目录、文件和 modified 状态。Emacs 运行信息上报为 ~emacs/runtime~ ，包括 pid、Emacs version、启动时间和最近上报时间。默认每 5 秒同步一次，短时间内多次变化会合并；请求失败保留本地数据并在下个周期重试。
 
 可以主动触发一次同步：
 
 #+begin_src emacs-lisp
 (loki-assistant-status-sync)
 #+end_src
+
+外部上报必须符合 ~GET /stats/meta~ 的状态声明，失败时显示具体字段错误，服务端整批保留原值。自定义状态需先在 services 中通过 ~#[loki_status]~ 声明；以下 ~key1~ 、 ~items~ 示例演示本地仓库操作，这些键具备服务端声明后才能用于 HTTP 上报。
 
 状态数据统一由结构化状态仓库维护。使用 ~loki-assistant-status-set-value~ 写入 app/数据项，并由 ~loki-assistant-status-trigger-sync~ 延迟 1 秒合并触发同步：
 

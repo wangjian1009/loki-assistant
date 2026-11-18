@@ -17,6 +17,7 @@ use crate::platform::macos::notification::{
 use crate::{modules::config::service::ConfigService, runtime::RuntimeState};
 
 use crate::modules::notification::{self, NotificationError, NotificationService};
+use crate::modules::status::StatusService;
 
 use super::{
     config::EmacsConfig,
@@ -67,6 +68,10 @@ fn notifications(launcher: Arc<dyn NotificationLauncher>) -> Arc<NotificationSer
     ))
 }
 
+fn default_status() -> Arc<StatusService> {
+    Arc::new(StatusService::new())
+}
+
 fn default_notifications() -> Arc<NotificationService> {
     notifications(Arc::new(FakeNotificationLauncher::default()))
 }
@@ -92,6 +97,7 @@ fn service(
         Arc::new(EmacsService::with_runner(
             EmacsConfig::new(config.clone()),
             default_notifications(),
+            default_status(),
             runner.clone(),
             Duration::from_millis(100),
         )),
@@ -218,6 +224,7 @@ async fn times_out_and_releases_evaluation_lock() {
     let service = EmacsService::with_runner(
         EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         default_notifications(),
+        default_status(),
         Arc::new(StallingRunner),
         Duration::from_millis(1),
     );
@@ -405,7 +412,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 10);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 8);
             let open_app = body["apis"]
                 .as_array()
                 .unwrap()
@@ -465,6 +472,7 @@ async fn notification_forwards_content_without_running_emacs_lisp() {
     let service = EmacsService::with_runner(
         EmacsConfig::new(config),
         notifications(launcher.clone()),
+        default_status(),
         runner.clone(),
         Duration::from_millis(100),
     );
@@ -491,6 +499,7 @@ async fn notification_reports_launch_failure_as_json_error() {
             error: Some("菜单栏应用不可用".to_owned()),
             ..Default::default()
         })),
+        default_status(),
         Arc::new(FakeRunner::default()),
         Duration::from_millis(100),
     ));
@@ -585,6 +594,7 @@ async fn failed_receipt_preserves_details_and_rejects_unknown_or_invalid_results
     let restarted = EmacsService::new(
         EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         default_notifications(),
+        default_status(),
     );
     assert!(matches!(
         restarted.notification_status(id).await,
@@ -619,6 +629,7 @@ async fn registers_before_forwarding_and_preserves_early_receipt() {
     let service = Arc::new(EmacsService::new(
         EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         notifications(launcher.clone()),
+        default_status(),
     ));
     *launcher.service.lock().unwrap() = Arc::downgrade(&service);
     let result = service.notify(notification("emacs")).await.unwrap();
@@ -730,6 +741,7 @@ async fn activation_timeout_has_a_clear_error_and_does_not_retry() {
     let service = Arc::new(EmacsService::with_runner(
         EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         default_notifications(),
+        default_status(),
         Arc::new(StallingRunner),
         Duration::from_millis(1),
     ));
@@ -751,7 +763,11 @@ async fn activation_in_live_emacs_without_gui() {
         .replace("emacs", "socket_name", json!(socket))
         .await
         .unwrap();
-    let service = EmacsService::new(EmacsConfig::new(config.clone()), default_notifications());
+    let service = EmacsService::new(
+        EmacsConfig::new(config.clone()),
+        default_notifications(),
+        default_status(),
+    );
     assert_eq!(
         service
             .eval("(and (daemonp) (not (seq-some #'display-graphic-p (frame-list))))")
@@ -979,111 +995,13 @@ async fn open_app_reports_timeout() {
     let service = Arc::new(EmacsService::with_runner(
         EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
         default_notifications(),
+        default_status(),
         Arc::new(StallingRunner),
         Duration::from_millis(1),
     ));
     let (status, body) = request(service, "POST", "/emacs/apps/open?app=config", Value::Null).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(body["code"], "emacs-timeout");
-}
-
-#[tokio::test]
-async fn reported_status_is_a_passive_cache_and_preserves_json_values() {
-    let (service, runner, _) = service(vec![]);
-    let (status, empty) = request(service.clone(), "GET", "/emacs/status", Value::Null).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        empty,
-        json!({"api_version":"1","status":{},"updated_at":null})
-    );
-    let values = json!({"emacs":{"buffer":[{"name":"中文 buffer"}],"runtime":{"pid":123}},
-                        "tools":{"enabled":false,"count":0,"empty":null,"list":[]}});
-    let (status, posted) = request(service.clone(), "POST", "/emacs/status", values.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(posted["status"], values);
-    assert!(posted["updated_at"].as_u64().unwrap() > 0);
-    let (_, value) = request(
-        service.clone(),
-        "GET",
-        "/emacs/status/tools/empty",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(value["value"], Value::Null);
-    assert_eq!(value["app"], "tools");
-    let (_, value) = request(
-        service.clone(),
-        "GET",
-        "/emacs/status/tools/enabled",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(value["value"], false);
-    let (_, read) = request(service, "GET", "/emacs/status", Value::Null).await;
-    assert_eq!(read, posted);
-    assert!(runner.calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn reported_status_replaces_items_without_erasing_other_apps() {
-    let (service, _, _) = service(vec![]);
-    request(
-        service.clone(),
-        "POST",
-        "/emacs/status",
-        json!({"emacs":{"buffer":[1],"runtime":{"pid":123}},"tasks":{"count":2}}),
-    )
-    .await;
-    let (status, result) = request(
-        service.clone(),
-        "POST",
-        "/emacs/status",
-        json!({"emacs":{"buffer":[]}}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        result["status"],
-        json!({"emacs":{"buffer":[],"runtime":{"pid":123}},"tasks":{"count":2}})
-    );
-    let (status, result) =
-        request(service, "GET", "/emacs/status/emacs/missing", Value::Null).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(result["code"], "status-not-found");
-    assert!(
-        result["message"]
-            .as_str()
-            .unwrap()
-            .contains("emacs/missing")
-    );
-}
-
-#[tokio::test]
-async fn reported_status_rejects_invalid_updates_atomically() {
-    let (service, runner, _) = service(vec![]);
-    request(
-        service.clone(),
-        "POST",
-        "/emacs/status",
-        json!({"valid":{"value":1}}),
-    )
-    .await;
-    for input in [
-        json!([]),
-        json!(null),
-        json!({}),
-        json!({"emacs":[]}),
-        json!({"emacs":{"":1}}),
-        json!({"bad/app":{"value":1}}),
-        json!({"valid":{"value":2}," ":{"value":3}}),
-    ] {
-        let (status, result) = request(service.clone(), "POST", "/emacs/status", input).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(result["code"], "invalid-request");
-    }
-    let (_, result) = request(service, "GET", "/emacs/status/valid/value", Value::Null).await;
-    assert_eq!(result["value"], 1);
-    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1121,4 +1039,152 @@ async fn buffer_activation_resolves_name_in_emacs_without_starting_a_daemon() {
     assert_eq!(calls[0].1[0], "--alternate-editor=/usr/bin/false");
     assert!(calls[0].1[3].contains("get-buffer"));
     assert!(calls[0].1[3].contains("select-frame-set-input-focus"));
+}
+
+#[tokio::test]
+async fn receiver_status_publishes_through_the_injected_rust_status_service() {
+    let status = default_status();
+    status
+        .publish("network", "my", json!({"status":"disconnected"}))
+        .unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    let service = Arc::new(EmacsService::with_runner(
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
+        default_notifications(),
+        status.clone(),
+        runner.clone(),
+        Duration::from_secs(1),
+    ));
+    let values = json!({"emacs":{"buffers":[{"name":"会话","mode":"agent-shell-mode","directory":"/tmp/","file":null,"modified":false}],"runtime":{"pid":42,"version":"31.1","started_at":1,"reported_at":2}}});
+    let (response, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
+    assert_eq!(response, StatusCode::OK);
+    assert_eq!(body["status"]["network"]["my"]["status"], "disconnected");
+    assert_eq!(
+        status.value("emacs", "buffers").unwrap().value,
+        json!([{"name":"会话","mode":"agent-shell-mode","directory":"/tmp/","file":null,"modified":false}])
+    );
+    let before = serde_json::to_value(status.snapshot()).unwrap();
+    for values in [
+        json!([]),
+        json!(null),
+        json!({}),
+        json!({"emacs":[]}),
+        json!({"emacs":{"":1}}),
+        json!({"ok":{"value":2},"bad/module":{"value":1}}),
+    ] {
+        let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid-request");
+        assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snapshot() {
+    let status = default_status();
+    status
+        .publish("network", "my", json!({"status":"disconnected"}))
+        .unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    let service = Arc::new(EmacsService::with_runner(
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
+        default_notifications(),
+        status.clone(),
+        runner.clone(),
+        Duration::from_secs(1),
+    ));
+    let buffer = json!({"name":"会话","mode":"agent-shell-mode","directory":"/tmp/","file":null,"modified":false});
+    let runtime = json!({"pid":42,"version":"31.1","started_at":1,"reported_at":2});
+    let (code, _) = request(
+        service.clone(),
+        "POST",
+        "/emacs/receiver/status",
+        json!({"emacs":{"buffers":[buffer.clone()],"runtime":runtime.clone()}}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let before = serde_json::to_value(status.snapshot()).unwrap();
+    let mut wrong_boolean = buffer.clone();
+    wrong_boolean["modified"] = json!("DO_NOT_ECHO_VALUE");
+    let mut non_nullable_name = buffer.clone();
+    non_nullable_name["name"] = Value::Null;
+    let mut wrong_file = buffer.clone();
+    wrong_file["file"] = json!(123);
+    let mut extra_field = buffer.clone();
+    extra_field["unexpected"] = json!("DO_NOT_ECHO_VALUE");
+    let mut wrong_pid = runtime.clone();
+    wrong_pid["pid"] = json!(42.5);
+    let mut wrong_version = runtime;
+    wrong_version["version"] = json!(31);
+    for (values, expected) in [
+        (json!({"emacs":{"buffers":{}}}), "emacs/buffers"),
+        (json!({"emacs":{"buffers":[null]}}), "emacs/buffers[0]"),
+        (
+            json!({"emacs":{"buffers":[{"name":"缺少字段"}]}}),
+            "emacs/buffers[0].mode",
+        ),
+        (
+            json!({"emacs":{"buffers":[wrong_boolean]}}),
+            "emacs/buffers[0].modified",
+        ),
+        (
+            json!({"emacs":{"buffers":[non_nullable_name]}}),
+            "emacs/buffers[0].name",
+        ),
+        (
+            json!({"emacs":{"buffers":[wrong_file]}}),
+            "emacs/buffers[0].file",
+        ),
+        (
+            json!({"emacs":{"buffers":[extra_field]}}),
+            "emacs/buffers[0].unexpected",
+        ),
+        (json!({"emacs":{"runtime":wrong_pid}}), "emacs/runtime.pid"),
+        (
+            json!({"emacs":{"runtime":wrong_version}}),
+            "emacs/runtime.version",
+        ),
+        (
+            json!({"network":{"my":{"status":"DO_NOT_ECHO_VALUE"}}}),
+            "network/my.status",
+        ),
+        (json!({"unknown":{"value":1}}), "unknown/value"),
+        (json!({"emacs":{"unknown":[]}}), "emacs/unknown"),
+        (
+            json!({"emacs":{"buffers":[]},"network":{"my":{"status":"bad"}}}),
+            "network/my.status",
+        ),
+    ] {
+        let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["api_version"], "1");
+        assert_eq!(body["code"], "invalid-request");
+        assert!(
+            body["message"].as_str().unwrap().contains(expected),
+            "{body}"
+        );
+        assert!(!body.to_string().contains("DO_NOT_ECHO_VALUE"));
+        assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
+    }
+    for value in [
+        json!("DO_NOT_ECHO_VALUE"),
+        json!({"emacs":"DO_NOT_ECHO_VALUE"}),
+    ] {
+        let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", value).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains("DO_NOT_ECHO_VALUE"));
+        assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+    let (code, _) = request(
+        service,
+        "POST",
+        "/emacs/receiver/status",
+        json!({"emacs":{"buffers":[]}}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(status.value("emacs", "buffers").unwrap().value, json!([]));
+    assert_eq!(status.value("emacs", "runtime").unwrap().value["pid"], 42);
 }

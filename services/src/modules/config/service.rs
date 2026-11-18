@@ -32,6 +32,8 @@ pub struct ConfigChange {
     pub value: Value,
     pub operation: ConfigChangeOperation,
     pub previous_value: Option<Value>,
+    /// 本次提交后的模块生效值快照，供关联配置项一起判断；尚未写入内存或文件。
+    pub module_values: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,12 +436,31 @@ impl ConfigService {
             )
             .await?
             .map(|data| data.value);
+        values
+            .entry(module_id.to_owned())
+            .or_default()
+            .insert(key.to_owned(), value.clone());
+        let mut module_values = BTreeMap::new();
+        for item in self.module_metadata(module_id).await?.items {
+            if let Some(data) = self
+                .resolve_value(
+                    &item,
+                    values
+                        .get(module_id)
+                        .and_then(|entries| entries.get(&item.key)),
+                )
+                .await?
+            {
+                module_values.insert(item.key, data.value);
+            }
+        }
         let change = ConfigChange {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
             value: value.clone(),
             operation,
             previous_value,
+            module_values,
         };
         let handler = self.handlers.get(module_id);
         if let Some(handler) = handler {
@@ -451,10 +472,6 @@ impl ConfigService {
                 }
             })?;
         }
-        values
-            .entry(module_id.to_owned())
-            .or_default()
-            .insert(key.to_owned(), value.clone());
         if let Some(storage) = &self.storage {
             if let Err(error) = storage.write(values.clone()).await {
                 if let Some(handler) = handler {
@@ -679,6 +696,7 @@ mod tests {
                         .map(|data| data.value);
                     assert_eq!(previous, change.previous_value);
                 }
+                assert_eq!(change.module_values.get(&change.key), Some(&change.value));
                 self.seen.lock().unwrap().push(change);
                 tokio::task::yield_now().await;
                 if self.reject.load(Ordering::SeqCst) {

@@ -39,7 +39,7 @@ agent-shell 会话（3）
 | Emacs 适配 | ~emacs/loki-assistant-agent-shell.el~ | 枚举、筛选、生成快照和按 buffer 名称定位，处理 viewport 偏好 |
 | 图形窗口激活 | 复用现有激活实现的窗口选择与聚焦部分 | 优先复用已有窗口，恢复隐藏或最小化的 frame |
 
-服务只返回当前 Emacs 快照，不新增会话数据库或后台监听服务。状态快照由 Emacs 主动上报到 `/emacs/status`，托盘打开菜单时读取 `/emacs/status/emacs/buffer`；详见 [[file:control-center-services.org::*Emacs 主动状态上报][Emacs 主动状态上报]]。列表不通过 Swift 解析 ~/emacs/buffers~ 的 buffer 名称，也不依赖通知是否开启来决定会话状态。
+服务只返回当前 Emacs 快照，不新增会话数据库或后台监听服务。状态快照由 Emacs 主动发布到 ~POST /emacs/receiver/status~ ，托盘打开菜单时读取 ~GET /status~ 中的 ~buffers~ 数据项，单项路径为 ~/status/emacs/buffers~ ；详见 [[file:control-center-services.org::*Emacs 主动状态上报][Emacs 主动状态上报]]。列表不通过 Swift 解析 ~/emacs/buffers~ 的 buffer 名称，也不依赖通知是否开启来决定会话状态。
 
 * HTTP 接口建议
 

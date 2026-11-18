@@ -30,6 +30,34 @@ pub fn loki_config(attr: TokenStream, item: TokenStream) -> TokenStream {
     }.into()
 }
 
+/// 将无参数状态元数据函数注册到编译期状态目录。
+#[proc_macro_attribute]
+pub fn loki_status(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let function = parse_macro_input!(item as ItemFn);
+    if !attr.is_empty()
+        || !function.sig.inputs.is_empty()
+        || function.sig.asyncness.is_some()
+        || !function.sig.generics.params.is_empty()
+    {
+        return syn::Error::new_spanned(
+            &function.sig,
+            "loki_status 仅支持无参数、无泛型的同步元数据函数",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let name = &function.sig.ident;
+    let registration = format_ident!("__LOKI_STATUS_{}", name);
+    quote! {
+        #function
+
+        #[::linkme::distributed_slice(::loki_services::modules::status::registry::STATUS_MODULES)]
+        #[allow(non_upper_case_globals)]
+        static #registration: ::loki_services::modules::status::registry::StatusModuleRegistration =
+            ::loki_services::modules::status::registry::StatusModuleRegistration { metadata: #name };
+    }.into()
+}
+
 struct ApiArguments {
     module: LitStr,
     id: LitStr,

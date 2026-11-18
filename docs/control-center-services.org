@@ -17,6 +17,7 @@
 | ~modules/config~ | 配置模型、提交前处理、数据读写和变化订阅 | 已实现基础能力 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
+| ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/network~ | 本地身份持久化、中转注册和结果通知 | 已实现 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
@@ -40,7 +41,8 @@ services/
     │   ├── control_center/ 控制中心配置和登录启动处理器
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
-    │   ├── network/        本地身份、中转注册、配置处理与通知
+    │   ├── network/        本地身份、中转注册、配置处理与状态发布
+    │   ├── status/         状态结构元数据、编译期目录、Rust 发布与 HTTP 查询
 │   ├── notification/   系统通知发送、跳转封装和回执状态
     │   └── health/         健康状态路由
     ├── platform/macos/     LaunchAgent 管理
@@ -70,10 +72,11 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 | POST | ~/notification/{id}/receipt~ | 接收菜单栏应用处理回执 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
 | POST | ~/emacs/apps/open~ | 按 app 查询参数打开 Emacs 应用 |
-| GET | ~/emacs/status~ | 读取 Emacs 主动上报的状态快照 |
-| POST | ~/emacs/status~ | 接收 Emacs 按 app/数据项上报的状态 |
-| GET | ~/emacs/status/{app}/{key}~ | 读取指定状态数据项 |
+| GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
+| GET | ~/status~ | 读取全部模块发布的状态 |
+| GET | ~/status/{module_id}/{key}~ | 读取指定状态数据项 |
 | POST | ~/emacs/activate~ | 显示 Emacs 或通过 buffer 查询参数定位目标 |
+| POST | ~/emacs/receiver/status~ | 接收 Emacs 业务状态并通过 Rust 接口发布 |
 | POST | ~/emacs/receiver/notification~ | 接收 Emacs 通知上报，默认展示 macOS 系统通知 |
 | GET | ~/emacs/receiver/notification/{id}~ | 系统通知状态查询的兼容入口 |
 | POST | ~/emacs/receiver/notification/{id}/receipt~ | 系统通知回执的兼容入口 |
@@ -154,7 +157,7 @@ Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明�
 
 ** 提交前变化处理
 
-模块在组装阶段通过 ~ConfigService::with_change_handler(module_id, handler)~ 注入一个 ~ConfigChangeHandler~ 。~handle~ 接收 ~ConfigChange~ ，包含 ~module_id~ 、 ~key~ 、规范化后的候选 ~value~ 、 ~operation~ 和提交前生效的 ~previous_value~ ，返回异步处理结果；未设置且无默认值时旧值为 ~None~ 。字典和列表处理器接收合并或追加后的完整值。未注册处理器的模块直接进入存储阶段。
+模块在组装阶段通过 ~ConfigService::with_change_handler(module_id, handler)~ 注入一个 ~ConfigChangeHandler~ 。~handle~ 接收 ~ConfigChange~ ，包含 ~module_id~ 、 ~key~ 、规范化后的候选 ~value~ 、 ~operation~ 和提交前生效的 ~previous_value~ ，以及包含本次候选值的模块生效快照 ~module_values~ ，返回异步处理结果；未设置且无默认值时旧值为 ~None~ 。字典和列表处理器接收合并或追加后的完整值。未注册处理器的模块直接进入存储阶段。
 
 提交顺序为：校验、串行取得最新值、等待模块处理器成功、原子写入 YAML、更新内存、广播变化。处理器可读取提交前配置，不得递归提交配置。相同值的重复提交也会执行处理器，便于修复外部状态后重试。~POST /config/validate~ 只预检，不调用处理器，不保证系统操作成功。
 
@@ -195,25 +198,72 @@ control-center:
 
 * 网络模块
 
-~network~ 通过编译期描述加入服务发现，不提供独立业务 HTTP API。~GET /meta/network~ 返回 ~relay_url~ 配置，显示名称为“中转地址”，类型为 ~string~ ，默认空字符串。读取和提交仍使用 ~GET /data/network/relay_url~ 与 ~PUT /data/network/relay_url~ 。
+~network~ 的 ~relay_url~ （中转地址）和 ~relay_token~ （中转令牌）均为非必填字符串，默认空字符串。两项都通过通用配置接口读取和保存，由 Emacs 配置界面的“网络”分组编辑，保存于权限为 ~0600~ 的 ~~/.assistant/config.yml~ 。令牌使用服务器已有的共享访问令牌；客户端不生成 relay 访问令牌，也不再从环境变量或 Homebrew 服务环境文件读取令牌。
 
 ** 本地身份
 
 服务启动及接收网络配置提交时检查 ~~/.assistant/identity.json~ 。文件不存在时，使用 iroh 的系统随机源生成私钥和 Endpoint ID，并以 ~0600~ 权限原子发布；新建目录权限为 ~0700~ 。并发创建不覆盖已发布的身份，符号链接和非普通文件被拒绝。身份文件包含 ~version: 1~ 、 ~secret_key~ 和 ~endpoint_id~ ，读取时验证公私钥匹配，损坏时通知并报错，不静默重新生成。
 
-生成成功通过共享 ~NotificationService~ 发送“已生成本地身份”，正文只有保存位置和 Endpoint ID；复用已有身份不重复通知。私钥保存在独立文件中，不进入配置 API、发现元数据、日志或通知；身份不会因注册失败或清空中转地址而删除。
+生成成功通过共享 ~NotificationService~ 发送“已生成本地身份”，正文只有保存位置和 Endpoint ID；复用已有身份不重复通知。私钥保存在独立文件中，不进入配置 API、发现元数据、日志或通知。身份不会因注册失败或清空中转配置而删除。
 
 ** 注册和生命周期
 
-“注册”表示使用持久化身份与配置中的 iroh-relay 建立并保持中转连接，确认 relay 已接受节点。当前不注册业务 ALPN，也不拨号或接收其他设备的业务连接。正式身份不复用旧验证密钥，没有固定 Endpoint ID、内置中转地址或公共 relay 回退；端点使用 Minimal preset、单一 Custom relay 并关闭 IP transport。
+只有地址和令牌都非空、且不全为空白时才开始注册；缺少任意一项均视为未配置，可以先后保存两项，第一项保存不连接、不发出注册失败通知。配置处理器使用包含本次候选值的模块快照判断，第二项提交时使用第一项已保存的值。完整配置中的地址须为 HTTP(S) URL，不接受账号、密码、查询或片段；TLS 验证保持启用，没有固定对端或备用 relay。
 
-非空地址须为有效 HTTP(S) URL，不接受账号、密码、查询或片段。共享访问令牌由 services 启动环境中的 ~LOKI_ASSISTANT_RELAY_TOKEN~ 提供，默认不携带令牌；地址只来自 ~network.relay_url~ ，不读取旧验证用的中转地址环境变量。不跳过 TLS 验证。
+“注册”表示使用本地持久化身份与指定 iroh-relay 建立中转连接，确认 relay 已接受节点；当前不注册业务 ALPN，也不拨号或接收其他设备的业务连接。注册最多等待 10 秒，认证拒绝提前失败。地址或令牌变化均重新注册，成功后才允许落盘，并在 ~committed~ 中替换旧连接、发送成功通知；失败发送失败通知，返回 ~config-change-rejected~ ，保留原配置和旧连接。相同配置已连接时不重复注册，失败后重新提交可以重试。
 
-配置提交处理器在新地址注册成功后才允许保存，最多等待 10 秒，认证拒绝提前失败。当前活动连接保持到落盘完成，然后在 ~committed~ 中切换并关闭旧连接、发送“中转注册成功”。失败发送“中转注册失败”，保存返回 HTTP 500 ~config-change-rejected~ ，保留原有 YAML、内存和连接。落盘失败在 ~rollback~ 中关闭候选连接并发送“中转配置保存失败”。清空地址成功后关闭连接；相同地址已在线时不重复注册，初始化失败后重新提交相同地址可重试。
+落盘失败时撤销候选连接并恢复原状态。清空任意一项在保存成功后关闭现有连接，保留身份；再次补齐后重新注册。启动时仍确保身份存在，配置完整才在后台注册；失败不影响本机 HTTP 服务。进程入口显式管理初始化和连接监控任务，构造模块不启动任务；关闭时取消任务并释放连接。
 
-~main.rs~ 在本机 HTTP 服务启动时显式启动网络初始化任务：即使地址为空也检查身份；地址非空时注册，并通知结果。初始化失败不终止本机服务，已有配置不被改写。关闭时取消初始化任务并关闭网络连接；~Services::build/load~ 仅组装依赖，不启动网络任务。通知使用注入的共享实例，转交失败只写日志，不改变注册和保存结果。
+** 本机网络状态
 
-测试只在临时目录保存身份；配置事务、失败通知和超时使用替身验证，真实 iroh 注册与认证测试使用随机端口的本机 relay，不依赖公网或用户配置。旧固定身份验证代码、CLI、Makefile 入口、手机验证库及相关脚本均已删除。
+网络模块向共享状态中心发布 ~network/my~ ，通过 ~GET /status/network/my~ 读取，其 ~value~ 目前只包含 ~status~ ：
+
+#+begin_src json
+{"api_version":"1","module_id":"network","key":"my","value":{"status":"disconnected"},"updated_at":1794890558}
+#+end_src
+
+| status | 含义 |
+|--------+------|
+| ~disconnected~ | 未连接，地址或令牌未配置完整，或服务正在关闭 |
+| ~connecting~ | 正在注册或等待连接 |
+| ~connected~ | 连接成功 |
+| ~failed~ | 连接失败且没有保留的可用连接 |
+
+注册期间状态查询立即返回，不等待注册完成。连接建立后，网络模块监听 iroh 的连接变化并继续发布；切换配置失败但保留旧连接时，状态继续反映旧连接。状态数据不包含令牌或私钥；令牌不进入日志、通知或状态接口。
+
+* 状态中心
+
+~modules/status~ 统一保存外部发布的模块/数据项数据，并提供 Rust 发布接口与版本为 ~1~ 的 HTTP 只读查询。该模块只处理名称校验、内存存储和序列化，具体值及更新时机由发布方负责；不读取配置、不查询 Emacs 或网络，不为查询启动业务程序。~Services~ 创建唯一 ~Arc<StatusService>~ ，业务发布方通过依赖注入共用这一实例。
+
+** 状态结构声明
+
+状态定义采用与配置元数据相同的编译期注册方式：业务模块在自己的 ~status.rs~ 中用 ~#[loki_status]~ 修饰无参数、无泛型的同步函数，返回 ~StatusModuleMetadata~ 。过程宏通过 ~linkme~ 注册到 ~STATUS_MODULES~ ，不在运行时注册，也不需要创建业务实例。当前 Emacs 声明 ~buffers~ 和 ~runtime~ ，网络模块声明 ~my~ 。
+
+~GET /stats/meta~ 返回 ~api_version~ 和完整 ~modules~ 列表；模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 和递归 ~schema~ ，数据路径为 ~/status/{模块 id}/{状态项 key}~ 。
+
+~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未连接、连接成功、连接失败和连接中的四个值及说明。
+
+元数据与运行时值分开维护：尚未发布数据时仍返回完整声明，查询元数据不改变状态和更新时间，也不返回运行时字段值、身份或令牌。声明用于结构发现及外部 HTTP 上报校验；外部发布的数据项必须已经声明。Rust 内部直接发布继续使用通用 JSON 值。HTTP 元数据接口保持只读。
+
+** 实例发布与数据查询
+
+发布方必须持有构造时注入的 ~status: Arc<StatusService>~ 字段，通过 ~self.status.publish(module_id, key, value)~ 或 ~self.status.publish_many(values)~ 发布值。~Services~ 创建实例并通过 ~Arc::clone~ 注入，Emacs 和网络模块都保存该共享引用。数据可以是 object、array、string、number、boolean 或 null；批量发布原子替换包含的数据项，保留其他模块和未提交项。例如：
+
+#+begin_src rust
+self.status.publish("network", "my", serde_json::json!({"status": "connected"}))?;
+#+end_src
+
+HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序的业务上报由所属模块接收，再调用持有实例的 ~self.status.publish_many_validated(values)~ 。校验按 ~GET /stats/meta~ 的 schema 递归检查整个批次：字段类型、必填字段、可空性、array 元素和 string 枚举；object 不接受未声明字段，未声明的模块或状态项也被拒绝。可选字段可以省略，允许可空的字段可为 null，不做字符串、数字和布尔值之间的自动转换。
+
+全部通过后才发布；任意一项错误都保留原有数据和全局、单项更新时间。HTTP 业务入口返回 400 ~invalid-request~ ，说明包含具体路径，不回显提交值。例如：
+
+#+begin_src json
+{"api_version":"1","code":"invalid-request","message":"请求无效：状态数据无效：emacs/buffers[0].modified：必须是 boolean"}
+#+end_src
+
+~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回 ~module_id~ 、 ~key~ 、 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ ，未发布时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
+
+模块名和键不能为空、不能包含 ~/~ 、不能为 ~.~ 或 ~..~ ；空批量发布或名称无效返回 ~StatusError~ ，整批不修改；HTTP 查询名称无效返回 400 ~invalid-request~ 。Rust 发布接口为 ~StatusService::publish~ 与 ~publish_many~ ，读取接口为 ~value~ 和 ~snapshot~ 。发布后的数据只保留在内存，重启后由各发布方重新设置，不写入 YAML。旧 Emacs 状态路由已迁移到本模块。
 
 * Emacs 模块
 
@@ -235,25 +285,19 @@ Lisp 求值与 buffer 列表查询传入 ~--alternate-editor=~ 和 ~--eval~ 。s
 
 ** Emacs 主动状态上报
 
-Emacs 模块主动向 services 上报状态，services 只保存内存中的最后快照，不为查询反向连接或启动 Emacs。状态请求按 app 和数据项组织，请求体是两层 JSON object：
+Emacs 包向本模块的 ~POST /emacs/receiver/status~ 主动上报 ~emacs/runtime~ 和 ~emacs/buffers~ 。~EmacsService~ 接收后调用注入的共享 ~StatusService::publish_many_validated~ Rust 接口校验并发布，不保留私有状态缓存，也不为上报反向连接 Emacs。请求示例：
 
 #+begin_src json
-{"emacs":{"runtime":{"pid":20349,"version":"31.1"},"buffer":[{"name":"Codex Agent @ loki-assistant","mode":"agent-shell-mode","directory":"/Users/example/project/","file":null,"modified":false}]}}
+{"emacs":{"runtime":{"pid":20349,"version":"31.1","started_at":1794880000,"reported_at":1794890558},"buffers":[{"name":"Codex Agent @ loki-assistant","mode":"agent-shell-mode","directory":"/Users/example/project/","file":null,"modified":false}]}}
 #+end_src
 
-~POST /emacs/status~ 对已存在 app 只替换本次请求包含的数据项，未包含的数据项保留；每次成功请求更新全局 ~updated_at~ Unix 秒。空 app、空数据项、名称包含 ~/~ 或 ~.~、~~..~~ 返回 400 ~invalid-request~ 。状态只保留到 services 重启，不写入用户配置文件。
-
-~GET /emacs/status~ 返回 ~api_version~、完整 ~status~ object 和全局 ~updated_at~；没有任何上报时返回空 object 和 ~updated_at: null~。~GET /emacs/status/{app}/{key}~ 返回单项的 ~app~、~key~、~value~ 和 ~updated_at~ ；未收到该项返回 404 ~status-not-found~ 。服务只返回缓存，不检查 Emacs 是否仍然运行。
-
-#+begin_src json
-{"api_version":"1","app":"emacs","key":"buffer","value":[],"updated_at":1794890558}
-#+end_src
+单独读取关注的 buffer 使用 ~GET /status/emacs/buffers~ ，返回通用状态包装；托盘使用 ~GET /status~ 读取各模块的 ~buffers~ 数据项并分组展示。读取只消费最后发布的快照，不检查 Emacs 是否仍然运行。通用读写协议见 [[*状态中心][状态中心]]。
 
 ** 统一 buffer 关注
 
 Emacs 包提供 ~loki-assistant-monitor-mode~，加载 ~loki-assistant~ 时默认启用。~loki-assistant-monitor-buffer~ 默认值为 ~(agent-shell-mode)~，表示关注该 mode 及其派生 mode；可在 Emacs 配置中改为其他 mode 符号列表。对应 mode hook 注册 buffer，~kill-buffer-hook~ 和 ~change-major-mode-hook~ 注销，注册集合不扫描或复制所有 buffer 状态。
 
-关注集合按固定数据项 ~emacs/buffer~ 上报。每个条目包含 buffer 名称、mode、工作目录、文件和 modified 状态；注册、注销和数据变化合并触发同步，默认每 5 秒发送一次 ~POST /emacs/status~ ；请求失败保留本地状态，下一次周期继续尝试，不立即循环重试。
+关注集合按固定数据项 ~emacs/buffers~ 上报。每个条目包含 buffer 名称、mode、工作目录、文件和 modified 状态；注册、注销和数据变化合并触发同步，默认每 5 秒发送一次 ~POST /emacs/receiver/status~ ；请求失败保留本地状态，下一次周期继续尝试，不立即循环重试。
 
 状态上报开关为 ~loki-assistant-monitor-mode~；关闭后移除 mode hook 和定时器，services 保留最后一次成功上报的数据。托盘读取缓存时不要求 Emacs 在线，点击 buffer 时通过 ~POST /emacs/activate?buffer=...~ 按名称查找并聚焦第一个匹配的 buffer；名称不存在返回 404 ~buffer-not-found~ 。
 
@@ -313,7 +357,7 @@ Emacs 模块将应用标识映射到固定入口，通过已有 gateway 连接�
 {"module_id":"emacs","title":"任务完成","buffer":"*scratch*","payload":{"task_id":"task-1"}}
 #+end_src
 
-~Services~ 创建并持有 ~Arc<notification::NotificationService>~ ，再通过 ~emacs::Module::new(config.service(), Arc::clone(&notification))~ 注入 Emacs 模块。~EmacsService~ 保存该共享引用，发送、查询状态和接收回执都调用同一个实例，不会自行创建通知服务、状态表或平台发送器。
+~Services~ 创建并持有 ~Arc<notification::NotificationService>~ ，再通过 ~emacs::Module::new(config.service(), Arc::clone(&notification), Arc::clone(&status))~ 注入 Emacs 模块。~EmacsService~ 保存该共享引用，发送、查询状态和接收回执都调用同一个实例，不会自行创建通知服务、状态表或平台发送器。
 
 默认处理器将 ~buffer~ 转换为 ~/emacs/activate?buffer=...~ 回调路径，省略时使用 ~/emacs/activate~ 。未收到 ~app~ 或收到 ~null~ 时，Emacs 模块将 ~app~ 补为 ~emacs~ 后提交通知模块；显式 ~app~ 按原值传递。center 按应用标识读取内置的 ~NotificationAppIcons/<app>.png~ ，已打包 ~emacs.png~ ，以 PNG 附件展示 Emacs 图标。~body~ 未提供时默认显示“点击显示 Emacs”。业务通知通过 ~NotificationService::send~ 发送，发送阶段不连接 Emacs 或执行 Lisp，避免同步上报期间回调 Emacs。
 

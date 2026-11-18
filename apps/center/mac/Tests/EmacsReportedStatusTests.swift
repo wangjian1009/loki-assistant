@@ -23,7 +23,7 @@ private actor StatusTestTransport {
         switch url.path {
         case "/healthz":
             body = #"{"service":"loki-services","status":"ok","version":"0.1.0","uptime_seconds":1}"#
-        case "/emacs/status":
+        case "/status":
             XCTAssertEqual(request.httpMethod, "GET")
             if blocked { await withCheckedContinuation { waiter = $0 } }
             if failing {
@@ -32,7 +32,7 @@ private actor StatusTestTransport {
             } else if let statusBody {
                 body = statusBody
             } else {
-                body = #"{"api_version":"1","updated_at":123,"status":{"emacs":{"buffer":[{"name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","file":null,"modified":false}]}}}"#
+                body = #"{"api_version":"1","updated_at":123,"status":{"emacs":{"buffers":[{"name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","file":null,"modified":false}]}}}"#
             }
         case "/emacs/activate":
             XCTAssertEqual(request.httpMethod, "POST")
@@ -70,7 +70,7 @@ final class EmacsReportedStatusTests: XCTestCase {
         try await client.activate(XCTUnwrap(snapshot.bufferGroups.first?.buffers.first))
         let paths = await transport.paths
         let query = await transport.query
-        XCTAssertEqual(paths, ["/healthz", "/emacs/status", "/healthz", "/emacs/activate"])
+        XCTAssertEqual(paths, ["/healthz", "/status", "/healthz", "/emacs/activate"])
         XCTAssertEqual(query, "中文会话")
     }
 
@@ -88,9 +88,9 @@ final class EmacsReportedStatusTests: XCTestCase {
         let transport = StatusTestTransport()
         await transport.setStatusBody(#"""
         {"api_version":"1","updated_at":123,"status":{
-          "tools":{"buffer":[{"name":"工具","mode":"fundamental-mode","directory":"/tmp/","modified":false}]},
-          "emacs":{"runtime":{"pid":42},"buffer":[{"name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","modified":false}]},
-          "empty":{"buffer":[]},"runtime-only":{"runtime":{"pid":42}}
+          "tools":{"buffers":[{"name":"工具","mode":"fundamental-mode","directory":"/tmp/","modified":false}]},
+          "emacs":{"runtime":{"pid":42},"buffers":[{"name":"中文会话","mode":"agent-shell-mode","directory":"/tmp/中文/","modified":false}]},
+          "empty":{"buffers":[]},"runtime-only":{"runtime":{"pid":42}}
         }}
         """#)
         let model = EmacsReportedStatusModel(client: Self.client(transport))
@@ -112,7 +112,7 @@ final class EmacsReportedStatusTests: XCTestCase {
     func testAllowsDuplicateBufferNamesWithinApp() async throws {
         let transport = StatusTestTransport()
         await transport.setStatusBody(#"""
-        {"api_version":"1","status":{"emacs":{"buffer":[
+        {"api_version":"1","status":{"emacs":{"buffers":[
           {"name":"一","mode":"fundamental-mode","directory":"/tmp/","modified":false},
           {"name":"二","mode":"fundamental-mode","directory":"/tmp/","modified":false}
         ]}},"updated_at":123}
@@ -150,7 +150,7 @@ final class EmacsReportedStatusTests: XCTestCase {
         await transport.setBlocked()
         let model = EmacsReportedStatusModel(client: Self.client(transport))
         model.menuDidOpen()
-        try await waitUntil { await transport.paths.contains("/emacs/status") }
+        try await waitUntil { await transport.paths.contains("/status") }
         model.menuDidClose()
         await transport.release()
         model.menuDidOpen()

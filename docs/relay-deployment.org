@@ -33,7 +33,7 @@ Caddy 保留既有域名站点，单独维护 IP 的 HTTP-01 路由与 TCP 8443 
 
 中继通过 ~IROH_RELAY_ACCESS_TOKEN~ 强制验证随机共享令牌。服务端文件为 ~/opt/loki-relay/relay.env~ ，目录权限 700，文件权限 600。缺少令牌时容器启动失败。
 
-services 从配置项 ~network.relay_url~ 读取中转地址，从进程环境中的 ~LOKI_ASSISTANT_RELAY_TOKEN~ 获取访问令牌。令牌经 HTTPS 发送，业务消息继续由端点之间的 QUIC 加密保护；证书校验必须保持启用。
+services 从配置项 ~network.relay_url~ 和 ~network.relay_token~ 读取中转地址与访问令牌；两项完整时才连接。令牌经 HTTPS 发送，业务消息继续由端点之间的 QUIC 加密保护；证书校验必须保持启用。
 
 services 的本地身份自动生成并保存在 ~~/.assistant/identity.json~ ，不再使用固定测试密钥；Endpoint ID 与中继访问令牌相互独立。
 

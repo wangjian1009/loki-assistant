@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 
-;; 由主包加载；mode hook 维护关注集合，定时向 services 同步 app/数据项快照。
+;; 由主包加载；mode hook 维护关注集合，定时向 services 同步 模块/数据项快照。
 
 ;;; Code:
 
@@ -15,7 +15,7 @@
 (defvar loki-assistant-monitor--buffers (make-hash-table :test #'eq))
 (cl-defstruct (loki-assistant-status-store
                (:constructor loki-assistant-status-store-create))
-  "所有待上报 app/数据项的结构化状态。"
+  "所有待上报 模块/数据项的结构化状态。"
   values)
 
 (defvar loki-assistant-status--store
@@ -217,7 +217,7 @@ FUNCTION 的第一个参数是当前值，后续参数为 ARGS；可用于 list/
   (loki-assistant-status-trigger-sync))
 
 (defun loki-assistant-status-sync ()
-  "异步将 app/数据项快照同步到 services；同一时刻最多一个请求。
+  "异步将 模块/数据项快照同步到 services；同一时刻最多一个请求。
 失败时保留数据，等待下次定时上报，不立即循环重试。"
   (interactive)
   (when loki-assistant-monitor--pending-timer
@@ -232,13 +232,13 @@ FUNCTION 的第一个参数是当前值，后续参数为 ARGS；可用于 list/
          (started_at . ,(floor (float-time (or before-init-time (current-time)))))
          (reported_at . ,(floor (float-time)))))
       (loki-assistant-status--set-internal
-       "emacs" "buffer" (loki-assistant-monitor--snapshot-buffers))
+       "emacs" "buffers" (loki-assistant-monitor--snapshot-buffers))
       (let ((epoch loki-assistant-monitor--epoch)
             (json-null :null) (json-false :false))
         (setq loki-assistant-monitor--inflight t loki-assistant-monitor--dirty nil)
         (condition-case err
             (loki-assistant-request
-             'post "/emacs/status" :body (json-encode (loki-assistant-status-store-values loki-assistant-status--store))
+             'post "/emacs/receiver/status" :body (json-encode (loki-assistant-status-store-values loki-assistant-status--store))
              :callback
              (lambda (response)
                (when (eq epoch loki-assistant-monitor--epoch)
