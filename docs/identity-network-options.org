@@ -150,6 +150,26 @@ mobile:   a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0
 
 ~.build/network-probe/result.json~ 记录双向回执、中继不可用结果与恢复结果；同目录 ~services*.log~、~mobile.log~、~layout.json~ 和 ~screenshot.png~ 保存两端证据，属于不提交的本地构建产物。
 
+* 公网中继实测（2026-11-18）
+
+放行云端 TCP 8443 后，使用 Mac services 与 HarmonyOS ARM64 模拟器 ~127.0.0.1:5557~ 完成公网中继验证。两端连接 ~https://8.153.207.23:8443~ ，访问令牌从忽略目录中的私有环境文件读取；services 在运行时读取配置，手机原生库在构建时注入相同配置并重新签名安装。中继部署见 [[file:relay-deployment.org][中继部署设计]]。
+
+本次未启动本地 relay、未建立 SSH 隧道或 ~hdc rport~ 中继转发。共享验证协议仍关闭 IP transport，两端按固定 Endpoint ID 经公网中继交换消息；services 的 HTTP 健康接口继续只监听本机 loopback。
+
+| 检查项 | 结果 |
+|--------+------|
+| 公网 HTTPS 入口及 TLS 证书校验 | HTTP 200，证书校验通过 |
+| 手机请求，services 校验并回复 | 通过：~mobile-hello → services-received~ |
+| services 主动发起 stream，手机校验并回复 | 通过：~services-hello → mobile-received~ |
+| services HTTP 健康检查 | 两轮均返回 ~status: "ok"~ |
+| 两端进程均重启后再次交换消息 | 通过，固定 Endpoint ID 与回执内容保持一致 |
+| 手机页面与 services 日志 | 页面显示“双向消息验证通过”，两轮日志均含 ~PROBE_PASS~ |
+| 错误中继令牌 | Mac 验证客户端被拒绝，无法进入双向通信 |
+
+结果与证据保存在忽略目录 ~.build/network-probe-public/~ ：~result.json~ 为汇总，~services*.log~ 与 ~mobile*.log~ 为两轮日志，~services*-health.json~ 为健康响应，~layout.json~ 与 ~screenshot.png~ 为手机页面证据。错误令牌检查结果位于 ~.build/relay-ecs/cloud-client.result.json~ 。记录不包含访问令牌；验证结束后关闭本次独立 services 验证进程，模拟器保留成功页面。
+
+实测证明 Rust services 与 HarmonyOS Rust/NAPI 前台应用能够通过带令牌认证的自建公网 HTTPS 中继，按 Endpoint ID 完成双向通信。模拟器与 Mac 共用宿主机网络，因此尚未覆盖两个独立物理网络、真实手机后台存活、公网 NAT 打洞或正式设备密钥持久化；重启身份保持使用的仍是公开固定测试密钥。
+
 * 来源
 
 - [[https://github.com/n0-computer/iroh][iroh README 与源码]]：按公钥拨号、QUIC、hole punching、relay、iroh-relay workspace。
