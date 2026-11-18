@@ -110,13 +110,12 @@ struct LokiAssistantApp: App {
                     }
                 }
         } label: {
-            ZStack(alignment: .bottomTrailing) {
-                Image(nsImage: Self.menuBarIcon)
+            Group {
                 if idleSleep.isEnabled {
                     Image(systemName: "moon.zzz.fill")
-                        .font(.system(size: 8, weight: .bold))
-                        .symbolRenderingMode(.monochrome)
-                        .foregroundStyle(.primary)
+                        .font(.system(size: 15, weight: .medium))
+                } else {
+                    Image(nsImage: Self.menuBarIcon)
                 }
             }
             .accessibilityLabel(idleSleep.isEnabled ? "Loki的助理，已阻止空闲休眠" : "Loki的助理")
