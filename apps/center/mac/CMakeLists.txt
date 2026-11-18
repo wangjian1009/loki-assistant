@@ -16,11 +16,13 @@ set(LOKI_APP_URL_SCHEME "loki-assistant" CACHE STRING "App URL scheme")
 set(LOKI_APP_SOURCES
     Sources/App/LokiAssistantApp.swift
     Sources/App/CenterLog.swift
+    Sources/App/IdleSleepController.swift
     Sources/App/ServiceStatusModel.swift
     Sources/App/ServiceSettingsClient.swift
     Sources/App/EmacsReportedStatus.swift
     Sources/App/SystemNotificationController.swift
     Sources/App/NotificationReceiptClient.swift
+    Sources/App/ServiceAPIError.swift
     Sources/Features/Dashboard/DashboardView.swift
 )
 list(TRANSFORM LOKI_APP_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")

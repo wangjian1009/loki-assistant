@@ -4,6 +4,7 @@ import SwiftUI
 struct DashboardView: View {
     let status: ServiceStatusModel
     let reportedStatus: EmacsReportedStatusModel
+    let idleSleep: IdleSleepController
     @State private var openingSettings = false
     @State private var openingLog = false
     @State private var appOpenError: String?
@@ -12,6 +13,27 @@ struct DashboardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             statusSummary
+            Divider()
+            Toggle(isOn: Binding(
+                get: { idleSleep.isEnabled },
+                set: { enabled in
+                    let operation = CenterLog.shared.start(
+                        "切换阻止空闲休眠",
+                        details: ["enabled": enabled ? "true" : "false"]
+                    )
+                    idleSleep.setEnabled(enabled)
+                    CenterLog.shared.finish(
+                        operation,
+                        result: "success",
+                        details: ["enabled": enabled ? "true" : "false"]
+                    )
+                }
+            )) {
+                Label(
+                    idleSleep.isEnabled ? "已阻止空闲休眠" : "阻止空闲休眠",
+                    systemImage: idleSleep.isEnabled ? "moon.zzz.fill" : "moon.zzz"
+                )
+            }
             Divider()
             monitoredBuffers
             Divider()

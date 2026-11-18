@@ -59,6 +59,7 @@ struct LokiAssistantApp: App {
     private let menuTrackingObserver: MenuTrackingObserver
     @State private var status: ServiceStatusModel
     @State private var reportedStatus: EmacsReportedStatusModel
+    @State private var idleSleep: IdleSleepController
 
     private static let menuBarIcon: NSImage = {
         // Xcode 将独立 PNG 的两种倍率合并为 TIFF，须通过 Bundle 加载。
@@ -73,6 +74,7 @@ struct LokiAssistantApp: App {
     init() {
         let reportedStatus = EmacsReportedStatusModel(logger: .shared)
         _reportedStatus = State(initialValue: reportedStatus)
+        _idleSleep = State(initialValue: IdleSleepController())
         menuTrackingObserver = MenuTrackingObserver(status: reportedStatus)
         // XCTest 的宿主进程不参与日常实例锁，也不轮询真实 services。
         let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
@@ -101,7 +103,7 @@ struct LokiAssistantApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            DashboardView(status: status, reportedStatus: reportedStatus)
+            DashboardView(status: status, reportedStatus: reportedStatus, idleSleep: idleSleep)
                 .onAppear {
                     Task {
                         await status.refresh()
