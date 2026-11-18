@@ -99,6 +99,19 @@ control-center:
 
 ~POST /config/validate~ 可提前校验配置而不保存。保存接口也执行相同检查；~Executable~ 必须指向存在、可执行的普通文件，输入程序名时按 ~PATH~ 和元数据建议目录解析并保存为绝对路径。无效输入返回错误，原有值及 YAML 文件不变。
 
+* 网络配置
+
+~network~ 模块提供“中转地址”配置项 ~relay_url~ ，类型为字符串，默认留空，表示未配置。可在 Emacs 服务配置界面的“网络”分组中编辑，或通过配置接口保存中转服务器的完整 URL：
+
+#+begin_src sh
+curl http://127.0.0.1:47321/meta/network
+curl -X PUT http://127.0.0.1:47321/data/network/relay_url \
+  -H 'Content-Type: application/json' \
+  -d '"https://relay.example.com:8443"'
+#+end_src
+
+该配置通过配置中心保存到 ~~/.assistant/config.yml~ 。当前仅提供地址配置，不会自动建立中转连接；独立 ~network-probe~ 验证命令仍使用其显式参数。
+
 * Emacs
 
 Emacs 的 Rust 配置入口为 ~modules/emacs/config.rs~ 中的 ~EmacsConfig~ ，构造时注入 ~Arc<ConfigService>~ 。每个配置项有独立读取方法；~emacsclient_path()~ 和 ~socket_name()~ 在每次使用时读取生效值及来源，不缓存连接配置。配置元数据通过静态方法和 ~#[loki_config]~ 注册，与 API 元数据使用相同的编译期发现方式。

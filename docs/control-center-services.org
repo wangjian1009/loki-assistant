@@ -16,6 +16,7 @@
 | ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
 | ~modules/config~ | 配置模型、数据读写和变化订阅 | 已实现基础能力 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
+| ~modules/network~ | 中转服务器地址配置 | 已实现配置项，尚未接入网络连接 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | LaunchAgent plist 和 launchctl 服务管理 | 已实现基础能力 |
@@ -40,6 +41,7 @@ services/
     │   ├── config/         配置模型、路由、存储和订阅
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
+    │   ├── network/        网络模块描述与中转地址配置元数据
 │   ├── notification/   系统通知发送、跳转封装和回执状态
     │   └── health/         健康状态路由
     ├── platform/macos/     LaunchAgent 管理
@@ -82,7 +84,7 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 
 ** 静态元数据
 
-配置元数据函数通过 ~#[loki_config]~ 声明。该过程宏与 ~#[loki_api]~ 一样在编译期生成 ~linkme~ 注册项，服务组合根不执行运行时注册。元数据函数须为无参数、无泛型的同步函数，返回 ~ConfigModuleMetadata~ ；当前配置中心、控制中心和 Emacs 模块均采用这一方式。
+配置元数据函数通过 ~#[loki_config]~ 声明。该过程宏与 ~#[loki_api]~ 一样在编译期生成 ~linkme~ 注册项，服务组合根不执行运行时注册。元数据函数须为无参数、无泛型的同步函数，返回 ~ConfigModuleMetadata~ ；当前配置中心、控制中心、Emacs 和网络模块均采用这一方式。
 
 #+begin_src rust
 #[loki_services_macros::loki_config]
@@ -165,6 +167,19 @@ control-center:
 文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
 
 启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
+
+* 网络模块
+
+~network~ 模块通过编译期描述加入服务发现，当前不提供独立业务 HTTP API。~GET /meta/network~ 返回配置元数据；~relay_url~ 的显示名称为“中转地址”，类型为 ~string~ ，非必填，默认值为空字符串，表示未配置。非空值用于保存中转服务器的完整 URL，例如 ~https://relay.example.com:8443~ 。当前仅按字符串类型校验，不探测服务器可达性。
+
+配置通过 ~GET /data/network/relay_url~ 读取，通过 ~PUT /data/network/relay_url~ 保存原始 JSON 字符串，沿用配置中心的来源标记、校验、YAML 持久化与变化订阅机制：
+
+#+begin_src yaml
+network:
+  relay_url: https://relay.example.com:8443
+#+end_src
+
+当前实现仅管理配置，不启动中转连接，也不改变独立 ~network-probe~ 验证命令的参数来源。
 
 * Emacs 模块
 

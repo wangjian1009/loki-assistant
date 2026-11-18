@@ -6,6 +6,8 @@
 
 当前实现控制中心服务框架、配置中心、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
+`modules/network/` 维护网络模块描述和中转地址 `relay_url` 配置元数据，通过现有配置中心读写；当前不建立独立业务路由或启动网络连接。
+
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
 `network-probe` 是显式启用的本地身份组网验证 feature：`modules/network_probe/` 维护共享验证协议和中继入口，由 `main.rs` 的独立命令管理运行期，不在 `Services::build()` 中自动启动，不注册业务 HTTP API。手机原生 crate 直接编译 `probe.rs`；固定私钥仅是公开测试材料，正式组网实现不得沿用。
