@@ -112,8 +112,24 @@ struct LokiAssistantApp: App {
         } label: {
             Group {
                 if idleSleep.isEnabled {
-                    Image(systemName: "moon.zzz.fill")
-                        .font(.system(size: 15, weight: .medium))
+                    ZStack(alignment: .bottomTrailing) {
+                        Image(nsImage: Self.menuBarIcon)
+                            .scaleEffect(0.86)
+                        ZStack {
+                            Circle()
+                                .fill(Color(nsColor: .windowBackgroundColor))
+                            Image(systemName: "moon.zzz.fill")
+                                .font(.system(size: 7, weight: .bold))
+                                .symbolRenderingMode(.monochrome)
+                                .foregroundStyle(.primary)
+                        }
+                        .frame(width: 11, height: 11)
+                        .overlay {
+                            Circle().stroke(.primary, lineWidth: 1)
+                        }
+                        .offset(x: 1, y: 1)
+                    }
+                    .frame(width: 20, height: 20)
                 } else {
                     Image(nsImage: Self.menuBarIcon)
                 }
