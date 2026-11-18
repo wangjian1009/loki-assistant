@@ -4,7 +4,7 @@
 
 ## 范围
 
-当前实现控制中心服务框架、配置中心、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
+当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
 `modules/network/` 维护网络模块描述和中转地址 `relay_url` 配置元数据，通过现有配置中心读写；当前不建立独立业务路由或启动网络连接。
 
@@ -36,6 +36,11 @@ src/
     │   ├── model.rs     模块元数据和 API 描述接口
     │   ├── protocol.rs  发现接口响应模型
     │   └── routes.rs    /discover 路由
+    ├── control_center/
+    │   ├── mod.rs       控制中心模块描述和导出
+    │   ├── config.rs    登录启动配置元数据
+    │   ├── service.rs   提交前 LaunchAgent 同步与落盘失败撤销
+    │   └── tests.rs     注入 launchctl 替身的提交与失败测试
     ├── emacs/
     │   ├── mod.rs       Emacs 模块入口、依赖注入和发现元数据
     │   ├── config.rs    EmacsConfig、配置项读取方法与静态配置元数据
@@ -89,6 +94,7 @@ src/modules/<module>/
 | `modules/emacs`         | `emacsclient` gateway、buffer 查询和激活、通知转换              | 本模块 `protocol`、`CommandRunner` trait、配置服务、注入的通知服务 |
 | `modules/notification` | 系统通知发送、通用跳转封装和回执状态                           | 本模块 `protocol`、`NotificationLauncher` trait |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
+| `modules/control_center` | 控制中心配置、菜单栏登录启动与失败撤销 | 配置处理器 trait、平台 LaunchAgent 管理器 |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
 | `platform/macos`        | LaunchAgent plist、launchctl 安装/卸载/启停/状态管理               | macOS API；不提供业务 HTTP 路由             |
 
@@ -102,7 +108,7 @@ modules/<module>
 └── service ──> runtime/platform trait
 ```
 
-`http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 使用 `#[loki_api(...)]` 声明接口信息；`Services::build()` 只负责路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
+`http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 使用 `#[loki_api(...)]` 声明接口信息；`Services::build()` 负责模块组装、配置处理器注入和路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
 
 配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。
 
@@ -110,9 +116,9 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 `POST /config/validate` 提供只读配置预检，与保存共用 `ConfigService::validate_value`。`Executable` 必须解析到存在且具有执行权限的普通文件，成功后规范化为绝对路径。校验失败禁止更新内存、YAML 与变化订阅；界面只消费服务端结果。文件系统校验测试使用临时文件，不执行待检查的程序。
 
-进程入口使用 `Services::load()` 读取用户文件后组装服务；`Services::build()`、`ConfigService::new()` 与 `from_registry()` 用于无文件实例。配置存储测试必须使用临时目录，不修改真实用户配置。写入成功后才更新内存并广播变化，写入失败应保留原有状态。
+进程入口使用 `Services::load()` 读取用户文件后组装服务；`Services::build()`、`ConfigService::new()` 与 `from_registry()` 用于无文件实例。配置存储测试必须使用临时目录，不修改真实用户配置。模块在组装阶段用 `ConfigService::with_change_handler` 注入提交前处理器，完整替换、合并和追加都先等待处理成功再落盘；处理失败返回 `config-change-rejected`，内存、YAML 和订阅均保持不变。处理器可读取旧值，不得递归提交；有外部状态时实现 `rollback`，供处理成功但落盘失败时撤销。写入成功后才更新内存并广播变化，写入失败应保留原有状态。
 
-`platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。
+`platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。`modules/control_center` 拥有 `control-center.center_auto_start` 元数据及处理器，在配置提交时调用 `set_login_startup` 同步托盘登录启动，模块构造和服务启动不自动操作 launchd；Emacs 只提交配置。
 
 `Services` 创建并持有 `Arc<notification::NotificationService>`，创建 `emacs::Module` 时通过 `Arc::clone` 注入。通知模块直接导出 `NotificationService`，发送、状态查询、回执和路由均通过该实例调用，不另设 `Module` 包装或 `service()` 取用入口。`EmacsService` 保存该 `Arc<NotificationService>` 引用，不得自行创建通知服务或平台发送器。Emacs 通知上报入口保留 `POST /emacs/receiver/notification`：本模块负责把可选 buffer 转成 `/emacs/activate` 回调路径，未收到 `app` 或收到 `null` 时补为 `emacs`（图标由 center 按应用标识从内置资源读取），再调用通知服务发送；不在发送期间连接 Emacs。
 

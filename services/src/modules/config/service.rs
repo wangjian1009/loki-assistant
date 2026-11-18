@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{fmt::Debug, future::Future, pin::Pin};
 
 use regex::Regex;
 use serde_json::Value;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use super::{
     model::{
@@ -18,6 +19,8 @@ pub struct ConfigService {
     metadata: Arc<RwLock<HashMap<String, ConfigModuleMetadata>>>,
     values: Arc<RwLock<StoredValues>>,
     changes: broadcast::Sender<ConfigChange>,
+    commits: Arc<Mutex<()>>,
+    handlers: HashMap<String, Arc<dyn ConfigChangeHandler>>,
     storage: Option<FileStorage>,
     executable_search_path: Vec<PathBuf>,
 }
@@ -28,6 +31,7 @@ pub struct ConfigChange {
     pub key: String,
     pub value: Value,
     pub operation: ConfigChangeOperation,
+    pub previous_value: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +39,18 @@ pub enum ConfigChangeOperation {
     Replace,
     Merge,
     Append,
+}
+
+pub type ChangeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// 提交前处理配置变化；不得递归提交配置。失败时处理器负责撤销自身的部分操作。
+pub trait ConfigChangeHandler: Debug + Send + Sync {
+    fn handle(&self, change: ConfigChange) -> ChangeFuture<'_>;
+
+    /// 处理成功但落盘失败时撤销外部操作；无外部状态的处理器可使用默认实现。
+    fn rollback(&self, _change: ConfigChange) -> ChangeFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub struct ModuleSubscription {
@@ -54,6 +70,12 @@ pub enum ConfigServiceError {
     InvalidValue(String),
     #[error("配置文件读写失败：{0}")]
     Storage(String),
+    #[error("配置变化处理失败：{module_id}/{key}：{message}")]
+    ChangeRejected {
+        module_id: String,
+        key: String,
+        message: String,
+    },
 }
 
 impl ConfigService {
@@ -97,6 +119,16 @@ impl ConfigService {
         Ok(service)
     }
 
+    /// 在服务组装阶段为模块配置提交处理器，每个模块至多一个。
+    pub fn with_change_handler(
+        mut self,
+        module_id: impl Into<String>,
+        handler: Arc<dyn ConfigChangeHandler>,
+    ) -> Self {
+        self.handlers.insert(module_id.into(), handler);
+        self
+    }
+
     pub fn with_executable_search_path(mut self, paths: Vec<PathBuf>) -> Self {
         self.executable_search_path = paths;
         self
@@ -112,6 +144,8 @@ impl ConfigService {
             metadata: Arc::new(RwLock::new(modules)),
             values: Arc::new(RwLock::new(HashMap::new())),
             changes,
+            commits: Arc::new(Mutex::new(())),
+            handlers: HashMap::new(),
             storage: None,
             executable_search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
@@ -253,7 +287,8 @@ impl ConfigService {
                 key: key.to_owned(),
             })?;
         let default = self.resolve_value(item, None).await?.map(|data| data.value);
-        let mut values = self.values.write().await;
+        let _commit = self.commits.lock().await;
+        let values = self.values.read().await.clone();
         let current = values
             .get(module_id)
             .and_then(|values| values.get(key))
@@ -296,7 +331,7 @@ impl ConfigService {
         } else {
             ConfigChangeOperation::Merge
         };
-        self.commit(&mut values, module_id, key, merged, operation)
+        self.commit(values, item, module_id, key, merged, operation)
             .await
     }
 
@@ -365,34 +400,70 @@ impl ConfigService {
         value: Value,
         operation: ConfigChangeOperation,
     ) -> Result<Value, ConfigServiceError> {
-        let mut values = self.values.write().await;
-        self.commit(&mut values, module_id, key, value, operation)
+        let metadata = self.module_metadata(module_id).await?;
+        let item = metadata
+            .item(key)
+            .ok_or_else(|| ConfigServiceError::ItemNotFound {
+                module_id: module_id.to_owned(),
+                key: key.to_owned(),
+            })?;
+        let _commit = self.commits.lock().await;
+        let values = self.values.read().await.clone();
+        self.commit(values, item, module_id, key, value, operation)
             .await
     }
 
     async fn commit(
         &self,
-        values: &mut StoredValues,
+        mut values: StoredValues,
+        item: &ConfigItemMetadata,
         module_id: &str,
         key: &str,
         value: Value,
         operation: ConfigChangeOperation,
     ) -> Result<Value, ConfigServiceError> {
-        let mut updated = values.clone();
-        updated
-            .entry(module_id.to_owned())
-            .or_default()
-            .insert(key.to_owned(), value.clone());
-        if let Some(storage) = &self.storage {
-            storage.write(updated.clone()).await?;
-        }
-        *values = updated;
-        let _ = self.changes.send(ConfigChange {
+        let previous_value = self
+            .resolve_value(
+                item,
+                values.get(module_id).and_then(|entries| entries.get(key)),
+            )
+            .await?
+            .map(|data| data.value);
+        let change = ConfigChange {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
             value: value.clone(),
             operation,
-        });
+            previous_value,
+        };
+        let handler = self.handlers.get(module_id);
+        if let Some(handler) = handler {
+            handler.handle(change.clone()).await.map_err(|message| {
+                ConfigServiceError::ChangeRejected {
+                    module_id: module_id.to_owned(),
+                    key: key.to_owned(),
+                    message,
+                }
+            })?;
+        }
+        values
+            .entry(module_id.to_owned())
+            .or_default()
+            .insert(key.to_owned(), value.clone());
+        if let Some(storage) = &self.storage {
+            if let Err(error) = storage.write(values.clone()).await {
+                if let Some(handler) = handler {
+                    if let Err(message) = handler.rollback(change.clone()).await {
+                        return Err(ConfigServiceError::Storage(format!(
+                            "{error}；撤销配置处理失败：{message}"
+                        )));
+                    }
+                }
+                return Err(error);
+            }
+        }
+        *self.values.write().await = values;
+        let _ = self.changes.send(change);
         Ok(value)
     }
 }
@@ -577,6 +648,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, json!({"a": 1, "b": 2}));
+    }
+
+    #[derive(Debug, Default)]
+    struct TestHandler {
+        seen: std::sync::Mutex<Vec<ConfigChange>>,
+        reject: std::sync::atomic::AtomicBool,
+        service: std::sync::OnceLock<std::sync::Weak<ConfigService>>,
+    }
+
+    impl ConfigChangeHandler for TestHandler {
+        fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
+            Box::pin(async move {
+                if let Some(service) = self.service.get().and_then(|service| service.upgrade()) {
+                    // 处理器可以读取提交前的值，不被写锁阻塞。
+                    let previous = service
+                        .value(&change.module_id, &change.key)
+                        .await
+                        .ok()
+                        .map(|data| data.value);
+                    assert_eq!(previous, change.previous_value);
+                }
+                self.seen.lock().unwrap().push(change);
+                tokio::task::yield_now().await;
+                if self.reject.load(Ordering::SeqCst) {
+                    Err("业务拒绝修改".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handlers_can_read_old_values_and_reject_replace_merge_and_append() {
+        for data_type in [ConfigDataType::Dictionary, ConfigDataType::List] {
+            let fixture = Fixture::new();
+            let path = fixture.0.join("config.yml");
+            let mut metadata = metadata();
+            metadata.items[1].data_type = data_type.clone();
+            metadata.items[1].default = Some(if data_type == ConfigDataType::List {
+                json!([0])
+            } else {
+                json!({"base":true})
+            });
+            let handler = Arc::new(TestHandler::default());
+            let service = Arc::new(
+                ConfigService::load_with_metadata(&path, vec![metadata])
+                    .unwrap()
+                    .with_change_handler("module_a", handler.clone()),
+            );
+            handler.service.set(Arc::downgrade(&service)).unwrap();
+            let mut changes = service.subscribe();
+            // 预检不执行处理器。
+            service
+                .validate_value("module_a", "config_a", &json!("新值"))
+                .await
+                .unwrap();
+            assert!(handler.seen.lock().unwrap().is_empty());
+            service
+                .replace("module_a", "config_a", json!("旧值"))
+                .await
+                .unwrap();
+            changes.try_recv().unwrap();
+            let saved = fs::read(&path).unwrap();
+            handler.reject.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                service.replace("module_a", "config_a", json!("新值")).await,
+                Err(ConfigServiceError::ChangeRejected { .. })
+            ));
+            let partial = if data_type == ConfigDataType::List {
+                json!([1])
+            } else {
+                json!({"extra":1})
+            };
+            assert!(matches!(
+                service
+                    .partial("module_a", "config_b", partial.clone())
+                    .await,
+                Err(ConfigServiceError::ChangeRejected { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), saved);
+            assert_eq!(
+                service.value("module_a", "config_a").await.unwrap().value,
+                json!("旧值")
+            );
+            assert_eq!(
+                service.value("module_a", "config_b").await.unwrap().source,
+                ConfigValueSource::Default
+            );
+            assert!(changes.try_recv().is_err());
+            handler.reject.store(false, Ordering::SeqCst);
+            let (first, second) = tokio::join!(
+                service.partial("module_a", "config_b", partial.clone()),
+                service.partial("module_a", "config_b", partial)
+            );
+            first.unwrap();
+            second.unwrap();
+            let expected = if data_type == ConfigDataType::List {
+                json!([0, 1, 1])
+            } else {
+                json!({"base":true,"extra":1})
+            };
+            assert_eq!(
+                service.value("module_a", "config_b").await.unwrap().value,
+                expected
+            );
+            let seen = handler.seen.lock().unwrap();
+            assert_eq!(seen.last().unwrap().value, expected);
+            assert_eq!(
+                seen.last().unwrap().operation,
+                if data_type == ConfigDataType::List {
+                    ConfigChangeOperation::Append
+                } else {
+                    ConfigChangeOperation::Merge
+                }
+            );
+        }
     }
 
     struct Fixture(PathBuf);

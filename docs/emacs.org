@@ -54,7 +54,7 @@
 
 * 服务配置管理
 
-加载包后执行 ~M-x loki-assistant-config~ ，或从仓库根目录执行 ~make emacs-config~ 。菜单栏“设置”调用 services 的 ~POST /emacs/apps/open?app=config~ ，由服务打开该界面并聚焦图形 frame；目标 Emacs 需要已将本包加入 ~load-path~ 。首次连接尚未运行的 server 时，启动行为沿用 [[file:control-center-services.org::*配置和连接][Emacs gateway 的连接约定]]。原来的 ~apps/config-editor~ 原生 App 已由此界面替代。
+加载包后执行 ~M-x loki-assistant-config~ ，或从仓库根目录执行 ~make emacs-config~ 。菜单栏“设置”调用 services 的 ~POST /emacs/apps/open?app=config~ ，由服务打开该界面并聚焦图形 frame；目标 Emacs 需要已将本包加入 ~load-path~ 。首次连接尚未运行的 server 时，启动行为沿用 [[file:control-center-services.org::*配置和连接][Emacs gateway 的连接约定]]。
 
 界面使用 Emacs 内置 widget，与 Customize 采用相同的字段、复选框和按钮交互。所有可编辑模块按名称分组展示，配置名称、说明和类型从 ~GET /meta~ 动态读取，再并行请求各模块的 ~GET /data/{module_id}~ ；完整读取成功后一起展示。默认值、用户设置和未设置有明确标记，编辑后显示“已修改，尚未保存”。加载失败显示实际原因，可用“刷新 / 重试”重新获取。
 
@@ -73,9 +73,9 @@
 
 配置由 services 保存到 ~~/.assistant/config.yml~ ，不写入 Emacs ~custom-file~ 。保存成功后使用服务端响应更新值和来源；错误在对应项旁标红并保留输入。程序查找、类型和业务校验以 services 为准；提交时再次校验，不把预检成功当作保存成功。保存期间继续输入的内容会保留，不被旧响应覆盖。接口协议见 [[file:control-center-services.org::*配置中心][配置中心]]。
 
-“控制中心”的“登录时自动启动”保存成功后，由 Emacs 同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent；开启时生成 plist，已注册则 ~kickstart~ ，否则 ~bootstrap~ ，关闭时卸载并删除 plist。默认使用仓库 Debug 菜单栏程序；使用其他构建目录时，调整 ~loki-assistant-config-center-executable~ 。日志位于 ~~/Library/Logs/LokiAssistant/center.log~ 和 ~~/Library/Logs/LokiAssistant/center.error.log~ 。同步失败会明确提示“配置已保存，登录启动同步失败”，可检查构建路径或系统错误后再次点击该项“保存”重试。
+“控制中心”的“登录时自动启动”由 services 控制中心模块在配置提交前同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent，系统操作成功后才保存配置。失败时保留原值和当前输入，并在该项显示服务端错误，修复后可再次保存。自定义托盘构建路径通过 services 启动环境中的 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 设置；Emacs 不再直接调用 launchctl，也不再提供本地托盘路径变量。具体行为见 [[file:control-center-services.org::*控制中心模块][控制中心模块]]。
 
-配置界面的 ERT 测试包含在 ~make emacs-test~ 中，覆盖真实 loopback HTTP 加载和校验保存、失败保留输入、完整快照、过期回调、保存期间继续编辑，以及使用临时目录和 launchctl 替身的登录启动管理；不修改真实用户配置或 LaunchAgent。
+配置界面的 ERT 测试包含在 ~make emacs-test~ 中，覆盖真实 loopback HTTP 加载和校验保存、失败保留输入、完整快照、过期回调、保存期间继续编辑以及提交处理器拒绝时的界面反馈；登录启动的系统操作由 services 使用临时目录和 launchctl 替身测试。
 
 * 通用 HTTP 请求
 

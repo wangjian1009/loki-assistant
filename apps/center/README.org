@@ -6,7 +6,7 @@
 
 应用通过系统的 ~launchctl~ 查询 LaunchAgent 是否运行；随后读取 ~~/.assistant/service~ 获取服务端口，再通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色启动按钮。不包含 Emacs 会话、语音输入或其他旧版功能。
 
-在 Emacs 配置界面的“控制中心”模块开启“登录时自动启动”后，使用 ~cc.loki-assistant.center~ 用户级 LaunchAgent 在 GUI 登录时启动托盘。重复开启会检查现有注册并启动任务；未注册时重新加载。重启 services 仅重启 Rust 服务，托盘由自己的 LaunchAgent 管理。
+在 Emacs 配置界面的“控制中心”模块开启“登录时自动启动”时，由 services 的控制中心模块先同步系统设置，成功后才保存配置；失败会显示具体错误并保留输入。使用 ~cc.loki-assistant.center~ 用户级 LaunchAgent 在 GUI 登录时启动托盘。重复开启会检查现有注册并启动任务；未注册时重新加载。重启 services 仅重启 Rust 服务，托盘由自己的 LaunchAgent 管理。
 
 应用承接 services 的通用系统通知，通过 ~UNUserNotificationCenter~ 展示 macOS 系统通知。首次接收时会请求通知权限；点击后按通用导航 URL 回调 services，由所属业务模块执行跳转。Emacs 通知未指定 buffer 时显示 Emacs，指定时定位存活 buffer；services 的 Emacs 模块在未收到 ~app~ 时补为 ~emacs~ 。center 根据 ~app~ 从内置资源读取 PNG 图标附件，不读取调用方指定的图标、路径或应用 Bundle ID。完整协议见 [[file:../../docs/control-center-services.org::*系统通知模块][系统通知模块协议]]。
 

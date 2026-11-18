@@ -68,6 +68,7 @@ pub struct LaunchdServiceSpec {
     pub stderr_path: Option<PathBuf>,
     pub run_at_load: bool,
     pub keep_alive: bool,
+    pub session_type: Option<String>,
 }
 
 impl LaunchdServiceSpec {
@@ -82,6 +83,7 @@ impl LaunchdServiceSpec {
             stderr_path: None,
             run_at_load: true,
             keep_alive: true,
+            session_type: None,
         }
     }
 
@@ -99,6 +101,9 @@ impl LaunchdServiceSpec {
         xml.push_str("</array>\n");
         append_bool(&mut xml, "RunAtLoad", self.run_at_load);
         append_bool(&mut xml, "KeepAlive", self.keep_alive);
+        if let Some(session_type) = &self.session_type {
+            append_string(&mut xml, "LimitLoadToSessionType", session_type);
+        }
         if let Some(path) = &self.working_directory {
             append_string(&mut xml, "WorkingDirectory", &path.to_string_lossy());
         }
@@ -176,6 +181,133 @@ impl<R: CommandRunner> LaunchdManager<R> {
         self.home_directory
             .join("Library/LaunchAgents")
             .join(format!("{}.plist", spec.label))
+    }
+
+    /// 同步登录启动；重复设置可重试，失败时尽量恢复原有 plist 与加载状态。
+    pub fn set_login_startup(
+        &self,
+        spec: &LaunchdServiceSpec,
+        enabled: bool,
+    ) -> Result<(), LaunchdError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = self.plist_path(spec);
+        let original = match fs::read(&path) {
+            Ok(data) => Some(data),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(LaunchdError::Io {
+                    operation: "读取登录启动配置",
+                    source,
+                });
+            }
+        };
+        if enabled {
+            let metadata = fs::metadata(&spec.executable).map_err(|source| LaunchdError::Io {
+                operation: "检查托盘可执行文件",
+                source,
+            })?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                return Err(LaunchdError::InvalidSpec(
+                    "托盘程序必须是可执行的普通文件，请先构建并检查路径".to_owned(),
+                ));
+            }
+        }
+        let was_loaded = self
+            .runner
+            .run(&self.launchctl, &["print".to_owned(), self.target(spec)])?
+            .success;
+        let mut loaded = was_loaded;
+        let result = (|| {
+            if enabled {
+                let plist = spec.render_plist()?;
+                fs::create_dir_all(path.parent().expect("LaunchAgent 路径应包含父目录")).map_err(
+                    |source| LaunchdError::Io {
+                        operation: "创建 LaunchAgent 目录",
+                        source,
+                    },
+                )?;
+                for output in [&spec.stdout_path, &spec.stderr_path].into_iter().flatten() {
+                    if let Some(parent) = output.parent() {
+                        fs::create_dir_all(parent).map_err(|source| LaunchdError::Io {
+                            operation: "创建托盘日志目录",
+                            source,
+                        })?;
+                    }
+                }
+                fs::write(&path, plist).map_err(|source| LaunchdError::Io {
+                    operation: "写入登录启动配置",
+                    source,
+                })?;
+                self.run_launchctl("启用登录启动", &["enable".to_owned(), self.target(spec)])?;
+                if loaded {
+                    self.run_launchctl("启动托盘", &["kickstart".to_owned(), self.target(spec)])?;
+                } else {
+                    self.run_launchctl(
+                        "加载托盘",
+                        &[
+                            "bootstrap".to_owned(),
+                            self.domain(),
+                            path.to_string_lossy().into_owned(),
+                        ],
+                    )?;
+                    loaded = true;
+                }
+            } else {
+                if loaded {
+                    self.run_launchctl("卸载托盘", &["bootout".to_owned(), self.target(spec)])?;
+                    loaded = false;
+                }
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|source| LaunchdError::Io {
+                        operation: "删除登录启动配置",
+                        source,
+                    })?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let restored = (|| {
+                if let Some(original) = original {
+                    fs::write(&path, original).map_err(|source| LaunchdError::Io {
+                        operation: "恢复登录启动配置",
+                        source,
+                    })?;
+                } else if path.exists() {
+                    fs::remove_file(&path).map_err(|source| LaunchdError::Io {
+                        operation: "清理登录启动配置",
+                        source,
+                    })?;
+                }
+                if loaded != was_loaded {
+                    if was_loaded {
+                        self.run_launchctl(
+                            "恢复托盘加载",
+                            &[
+                                "bootstrap".to_owned(),
+                                self.domain(),
+                                path.to_string_lossy().into_owned(),
+                            ],
+                        )?;
+                    } else {
+                        self.run_launchctl(
+                            "撤销托盘加载",
+                            &["bootout".to_owned(), self.target(spec)],
+                        )?;
+                    }
+                }
+                Ok::<_, LaunchdError>(())
+            })();
+            return match restored {
+                Ok(()) => Err(error),
+                Err(restore) => Err(LaunchdError::CommandFailed {
+                    operation: "同步登录启动",
+                    message: format!("{error}；恢复失败：{restore}"),
+                }),
+            };
+        }
+        Ok(())
     }
 
     pub fn install(&self, spec: &LaunchdServiceSpec) -> Result<PathBuf, LaunchdError> {

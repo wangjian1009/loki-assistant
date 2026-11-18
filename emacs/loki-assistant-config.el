@@ -8,19 +8,6 @@
 
 (require 'loki-assistant)
 (require 'wid-edit)
-(require 'xml)
-
-(defconst loki-assistant-config--directory
-  (file-name-directory (or load-file-name buffer-file-name))
-  "配置界面源码所在目录。")
-
-(defcustom loki-assistant-config-center-executable
-  (expand-file-name "../apps/center/mac/.build/Debug/LokiAssistant.app/Contents/MacOS/LokiAssistant"
-                    loki-assistant-config--directory)
-  "登录启动使用的菜单栏可执行文件；自定义构建目录时需调整。"
-  :type 'file
-  :group 'loki-assistant)
-
 (cl-defstruct (loki-assistant-config--entry
                (:constructor loki-assistant-config--entry-create))
   module item value source field baseline status busy error)
@@ -342,18 +329,12 @@
                        :body (loki-assistant-config--json value)
                        :callback
                        (lambda (result)
-                         ;; 即使界面已关闭，已保存的登录启动选项仍需同步。
                          (let* ((stored (plist-get result :data))
                                 (ok (and (plist-get result :ok)
                                          (equal (alist-get 'module_id stored) module)
                                          (equal (alist-get 'key stored) key)
                                          (loki-assistant-config--valid-value-p stored)))
                                 (failure (unless ok (loki-assistant-config--error result))))
-                           (when (and ok (equal module "control-center") (equal key "center_auto_start"))
-                             (condition-case launch-error
-                                 (loki-assistant-config--autostart (eq (alist-get 'value stored) t))
-                               (error (setq failure (concat "配置已保存，登录启动同步失败："
-                                                            (error-message-string launch-error))))))
                            (in-buffer
                             (lambda ()
                               (when ok
@@ -397,56 +378,6 @@
                   "提交的修改已保存；仍有新的编辑尚未保存。"
                 "所有修改已保存。"))))))
       (next t))))
-
-(defun loki-assistant-config--launchctl (&rest arguments)
-  "运行 launchctl ARGUMENTS，返回状态码与输出，不通过 shell。"
-  (with-temp-buffer
-    (let ((status (apply #'call-process "/bin/launchctl" nil t nil arguments)))
-      (cons status (string-trim (buffer-string))))))
-
-(defun loki-assistant-config--autostart (enabled)
-  "同步 ENABLED 到菜单栏用户级 LaunchAgent。"
-  (unless (eq system-type 'darwin) (error "登录启动仅支持 macOS"))
-  (loki-assistant-config--apply-autostart
-   enabled
-   (expand-file-name "~/Library/LaunchAgents/cc.loki-assistant.center.plist")
-   loki-assistant-config-center-executable
-   (expand-file-name "~/Library/Logs/LokiAssistant")
-   (format "gui/%d" (user-uid))))
-
-(defun loki-assistant-config--apply-autostart (enabled plist executable logs domain)
-  "将 ENABLED 应用到 PLIST、EXECUTABLE、LOGS 和 DOMAIN，便于隔离测试。"
-  (let ((label "cc.loki-assistant.center")
-        (target (concat domain "/cc.loki-assistant.center")))
-    (cl-labels ((checked (&rest arguments)
-                  (let ((result (apply #'loki-assistant-config--launchctl arguments)))
-                    (unless (eq (car result) 0)
-                      (error "launchctl %s：%s" (car arguments) (cdr result))))))
-      (if enabled
-          (progn
-            (unless (and (file-regular-p executable) (file-executable-p executable))
-              (error "托盘程序不可执行，请先构建并检查 loki-assistant-config-center-executable"))
-            (make-directory (file-name-directory plist) t)
-            (make-directory logs t)
-            (with-temp-file plist
-              (insert "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-              (xml-print
-               `((plist ((version . "1.0"))
-                        (dict nil (key nil "Label") (string nil ,label)
-                              (key nil "ProgramArguments")
-                              (array nil (string nil ,(expand-file-name executable)))
-                              (key nil "RunAtLoad") (true nil)
-                              (key nil "KeepAlive") (false nil)
-                              (key nil "LimitLoadToSessionType") (string nil "Aqua")
-                              (key nil "StandardOutPath") (string nil ,(concat logs "/center.log"))
-                              (key nil "StandardErrorPath") (string nil ,(concat logs "/center.error.log")))))))
-            (checked "enable" target)
-            (if (eq (car (loki-assistant-config--launchctl "print" target)) 0)
-                (checked "kickstart" target)
-              (checked "bootstrap" domain plist)))
-        (when (eq (car (loki-assistant-config--launchctl "print" target)) 0)
-          (checked "bootout" target))
-        (when (file-exists-p plist) (delete-file plist))))))
 
 ;;;###autoload
 (defun loki-assistant-config ()

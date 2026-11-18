@@ -5,4 +5,5 @@ pub mod notification;
 
 pub use launchd::{
     CommandOutput, CommandRunner, LaunchdError, LaunchdManager, LaunchdServiceSpec, LaunchdStatus,
+    ProcessCommandRunner,
 };

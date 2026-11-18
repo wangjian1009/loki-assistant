@@ -14,7 +14,8 @@
 | ~services~ | 业务模块组合和路由组合 | 已实现 |
 | ~http~ | loopback HTTP server | 已实现 |
 | ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
-| ~modules/config~ | 配置模型、数据读写和变化订阅 | 已实现基础能力 |
+| ~modules/config~ | 配置模型、提交前处理、数据读写和变化订阅 | 已实现基础能力 |
+| ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
 | ~modules/network~ | 中转服务器地址配置 | 已实现配置项，尚未接入网络连接 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
@@ -28,7 +29,7 @@
 
 services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该文件获取服务地址和端口，再请求 HTTP 接口；不应在客户端写死服务端口。
 
-业务模块在自己的目录中维护 ~model.rs~、~protocol.rs~、~routes.rs~ 和业务逻辑。HTTP API 使用 ~#[loki_api]~ 声明，模块描述通过 ~linkme~ 在编译/链接阶段收集；~Services::build~ 只负责路由组合。
+业务模块在自己的目录中维护 ~model.rs~、~protocol.rs~、~routes.rs~ 和业务逻辑。HTTP API 使用 ~#[loki_api]~ 声明，模块描述通过 ~linkme~ 在编译/链接阶段收集；~Services::build~ 负责模块组装、配置处理器注入和路由组合。
 
 * 目录
 
@@ -38,7 +39,8 @@ services/
 └── src/
     ├── http/               公共 HTTP server
     ├── modules/
-    │   ├── config/         配置模型、路由、存储和订阅
+    │   ├── config/         配置模型、路由、提交处理、存储和订阅
+    │   ├── control_center/ 控制中心配置和登录启动处理器
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
     │   ├── network/        网络模块描述与中转地址配置元数据
@@ -151,7 +153,23 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 
 不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
 
-Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入；校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，“日志”调用 ~POST /emacs/apps/open?app=logs~ 并打开 ~~/.assistant/loki-assistant.log.org~ ，应用加载、日志文件打开和窗口聚焦由 services 的 Emacs 模块负责；登录启动仍由配置界面同步管理用户级 LaunchAgent。
+Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入；校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，“日志”调用 ~POST /emacs/apps/open?app=logs~ 并打开 ~~/.assistant/loki-assistant.log.org~ ，应用加载、日志文件打开和窗口聚焦由 services 的 Emacs 模块负责；登录启动由 services 的控制中心模块在配置提交前处理。
+
+** 提交前变化处理
+
+模块在组装阶段通过 ~ConfigService::with_change_handler(module_id, handler)~ 注入一个 ~ConfigChangeHandler~ 。~handle~ 接收 ~ConfigChange~ ，包含 ~module_id~ 、 ~key~ 、规范化后的候选 ~value~ 、 ~operation~ 和提交前生效的 ~previous_value~ ，返回异步处理结果；未设置且无默认值时旧值为 ~None~ 。字典和列表处理器接收合并或追加后的完整值。未注册处理器的模块直接进入存储阶段。
+
+提交顺序为：校验、串行取得最新值、等待模块处理器成功、原子写入 YAML、更新内存、广播变化。处理器可读取提交前配置，不得递归提交配置。相同值的重复提交也会执行处理器，便于修复外部状态后重试。~POST /config/validate~ 只预检，不调用处理器，不保证系统操作成功。
+
+处理器失败返回 HTTP 500 ~config-change-rejected~ ，包含模块、键和具体失败原因；原有 YAML、内存值和来源保持不变，不广播变化。示例：
+
+#+begin_src json
+{"code":"config-change-rejected","message":"配置变化处理失败：control-center/center_auto_start：加载托盘失败：系统拒绝操作"}
+#+end_src
+
+处理器应自行撤销失败操作的部分副作用；如果处理成功但写入 YAML 失败，配置中心调用其 ~rollback~ 方法撤销外部操作，再返回 ~config-storage-error~ 。无外部状态的处理器可使用默认的空撤销实现；有外部状态的处理器必须实现撤销。撤销失败的原因附在返回的错误说明中，配置仍不提交。事务由独立任务完成，HTTP 请求取消不会取消已接受的处理和保存。
+
+变化订阅仍是提交成功后的通知接口：~subscribe~ 或 ~subscribe_module~ 的接收方不参与提交结果判定。手动修改 YAML 不触发处理器，重启只加载值；需要同步系统设置时应通过配置接口提交。
 
 ** YAML 存储
 
@@ -167,6 +185,14 @@ control-center:
 文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
 
 启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
+
+* 控制中心模块
+
+~control-center~ 通过静态模块描述加入服务发现，配置元数据归属 ~modules/control_center/config.rs~ 。现有 ~center_auto_start~ 键保持兼容，类型为 ~boolean~ ，默认 ~false~ ，通过 ~GET /meta/control-center~ 和通用配置接口访问；没有独立业务 HTTP 路由。
+
+~Services~ 为它注入提交前处理器。提交 ~center_auto_start~ 时，由该模块同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent：开启先检查托盘可执行文件，生成包含 ~RunAtLoad=true~ 、 ~KeepAlive=false~ 和 ~LimitLoadToSessionType=Aqua~ 的 plist，再执行 ~enable~ ，已加载则 ~kickstart~ ，否则 ~bootstrap~ ；关闭时对已加载任务执行 ~bootout~ 并删除 plist。重复关闭未安装的任务成功。系统调用使用独立参数，在阻塞任务中执行；测试注入 ~CommandRunner~ ，不操作真实用户的 launchd。
+
+托盘默认路径为构建仓库的 ~apps/center/mac/.build/Debug/LokiAssistant.app/Contents/MacOS/LokiAssistant~ 。自定义构建位置时，在 services 启动环境中设置绝对路径 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 。日志位于 ~~/Library/Logs/LokiAssistant/center.log~ 和 ~~/Library/Logs/LokiAssistant/center.error.log~ 。Emacs 仅提交该配置，失败时显示服务端说明并保留输入；构造模块和服务启动不自动修改 LaunchAgent。
 
 * 网络模块
 

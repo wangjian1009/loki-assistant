@@ -211,7 +211,9 @@ fn error_response(error: ConfigServiceError) -> Response {
         }
         ConfigServiceError::ValueNotSet { .. } => StatusCode::NOT_FOUND,
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
-        ConfigServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ConfigServiceError::Storage(_) | ConfigServiceError::ChangeRejected { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
     (
         status,
@@ -230,6 +232,7 @@ fn error_code(error: &ConfigServiceError) -> &'static str {
         ConfigServiceError::ValueNotSet { .. } => "config-not-set",
         ConfigServiceError::InvalidValue(_) => "invalid-config",
         ConfigServiceError::Storage(_) => "config-storage-error",
+        ConfigServiceError::ChangeRejected { .. } => "config-change-rejected",
     }
 }
 

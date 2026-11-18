@@ -6,8 +6,17 @@ use syn::{ItemFn, LitStr, Result, Token, parse::Parse, parse_macro_input};
 #[proc_macro_attribute]
 pub fn loki_config(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
-    if !attr.is_empty() || !function.sig.inputs.is_empty() || function.sig.asyncness.is_some() || !function.sig.generics.params.is_empty() {
-        return syn::Error::new_spanned(&function.sig, "loki_config 仅支持无参数、无泛型的同步元数据函数").to_compile_error().into();
+    if !attr.is_empty()
+        || !function.sig.inputs.is_empty()
+        || function.sig.asyncness.is_some()
+        || !function.sig.generics.params.is_empty()
+    {
+        return syn::Error::new_spanned(
+            &function.sig,
+            "loki_config 仅支持无参数、无泛型的同步元数据函数",
+        )
+        .to_compile_error()
+        .into();
     }
     let name = &function.sig.ident;
     let registration = format_ident!("__LOKI_CONFIG_{}", name);

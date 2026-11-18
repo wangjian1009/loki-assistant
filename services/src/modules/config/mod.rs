@@ -24,11 +24,6 @@ fn config_metadata() -> ConfigModuleMetadata {
     Module::config_metadata()
 }
 
-#[loki_config]
-fn control_center_metadata() -> ConfigModuleMetadata {
-    Module::control_center_metadata()
-}
-
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static CONFIG_MODULE: ModuleRegistration = ModuleRegistration {
     id: "config",
@@ -53,6 +48,12 @@ impl Module {
         Ok(Self {
             service: Arc::new(ConfigService::load(ConfigService::storage_path()?)?),
         })
+    }
+
+    pub fn from_service(service: ConfigService) -> Self {
+        Self {
+            service: Arc::new(service),
+        }
     }
 
     pub fn router(&self) -> Router {
@@ -88,28 +89,6 @@ impl Module {
             description: "提供配置模型、配置数据读取、更新和变化订阅。".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             items: Vec::new(),
-        }
-    }
-
-    pub fn control_center_metadata() -> ConfigModuleMetadata {
-        ConfigModuleMetadata {
-            id: "control-center".to_owned(),
-            name: "控制中心".to_owned(),
-            description: "控制菜单栏程序的启动行为。".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            items: vec![model::ConfigItemMetadata {
-                key: "center_auto_start".to_owned(),
-                name: "登录时自动启动".to_owned(),
-                description: "登录 macOS 后自动启动菜单栏程序。".to_owned(),
-                data_type: model::ConfigDataType::Boolean,
-                required: false,
-                default: Some(serde_json::Value::Bool(false)),
-                dictionary: None,
-                list: None,
-                checker: None,
-                file_path: None,
-                executable: None,
-            }],
         }
     }
 }

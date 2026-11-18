@@ -186,41 +186,7 @@
         (should (loki-assistant-config--dirty-p flag))
         (should (string-match-p "保存已停止" (buffer-string)))))))
 
-(ert-deftest loki-assistant-config-test-autostart-isolated ()
-  (let* ((directory (make-temp-file "loki-launch-" t))
-         (executable (expand-file-name "含空格 & 托盘" directory))
-         (plist (expand-file-name "agents/center.plist" directory))
-         (logs (expand-file-name "logs" directory))
-         (registered nil) calls)
-    (unwind-protect
-        (progn
-          (with-temp-file executable (insert "测试文件，不执行"))
-          (set-file-modes executable #o700)
-          (cl-letf (((symbol-function 'loki-assistant-config--launchctl)
-                     (lambda (&rest args)
-                       (push args calls)
-                       (cons (if (equal (car args) "print") (if registered 0 1) 0) ""))))
-            (loki-assistant-config--apply-autostart t plist executable logs "gui/123")
-            (should (member (list "bootstrap" "gui/123" plist) calls))
-            (with-temp-buffer
-              (insert-file-contents plist)
-              (should (equal (caar (xml-parse-region (point-min) (point-max))) 'plist))
-              (should (string-match-p "&amp;" (buffer-string))))
-            (setq registered t calls nil)
-            (loki-assistant-config--apply-autostart t plist executable logs "gui/123")
-            (should (member '("kickstart" "gui/123/cc.loki-assistant.center") calls))
-            (should-not (assoc "bootstrap" calls))
-            (loki-assistant-config--apply-autostart nil plist executable logs "gui/123")
-            (should-not (file-exists-p plist))
-            (should (member '("bootout" "gui/123/cc.loki-assistant.center") calls))
-            (setq registered nil calls nil)
-            (loki-assistant-config--apply-autostart nil plist executable logs "gui/123")
-            (should-not (assoc "bootout" calls))
-            (should-error
-             (loki-assistant-config--apply-autostart t plist "/missing" logs "gui/123"))))
-      (delete-directory directory t))))
-
-(ert-deftest loki-assistant-config-test-autostart-failure-is-distinct ()
+(ert-deftest loki-assistant-config-test-change-handler-failure-preserves-input ()
   (loki-assistant-config-test--with-buffer
     (loki-assistant-config--render
      '(((id . "control-center") (name . "控制中心")
@@ -232,14 +198,15 @@
                  (lambda (method _path &rest args)
                    (funcall (plist-get args :callback)
                             (if (eq method 'post) '(:ok t :data ((valid . t)))
-                              '(:ok t :data ((module_id . "control-center") (key . "center_auto_start")
-                                              (value . t) (source . "user")))))))
-                ((symbol-function 'loki-assistant-config--autostart)
-                 (lambda (_) (error "launchctl 失败"))))
+                              '(:ok nil :error-message "登录启动处理失败：launchctl 失败"
+                                     :data ((code . "config-change-rejected")
+                                               (message . "登录启动处理失败：launchctl 失败"))))))))
         (loki-assistant-config--submit entry t)
-        (should (equal (loki-assistant-config--entry-source entry) "user"))
+        (should (equal (loki-assistant-config--entry-source entry) "default"))
+        (should (widget-value (loki-assistant-config--entry-field entry)))
+        (should (loki-assistant-config--dirty-p entry))
         (should-not (loki-assistant-config--entry-busy entry))
-        (should (string-prefix-p "配置已保存，登录启动同步失败" (loki-assistant-config--entry-error entry)))))))
+        (should (string-match-p "launchctl 失败" (loki-assistant-config--entry-error entry)))))))
 
 (provide 'loki-assistant-config-tests)
 ;;; loki-assistant-config-tests.el ends here

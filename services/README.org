@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏应用提供 services 状态监控和启动入口，托盘登录启动由 Emacs 配置界面管理。
+当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏应用提供 services 状态监控和启动入口，托盘登录启动由 services 的控制中心模块在配置提交时处理。
 
 服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
@@ -12,7 +12,7 @@
 
 模块边界、目录职责和跨模块协议见 [[file:../docs/control-center-services.org][控制中心 services 模块规划]]。
 
-业务模块各自维护交互协议和 HTTP 路由：在 ~src/modules/<module>/~ 内放置 ~protocol.rs~、~routes.rs~ 及需要的 ~service.rs~，handler 使用 ~#[loki_api(...)]~ 声明接口信息，并用 ~linkme~ 静态切片提交模块描述。~http~ 只提供 loopback server 和公共 HTTP 能力，不设集中式 ~protocol~ 目录。~Services::build~ 只组合路由，不负责运行时注册元数据。新增模块应尽量只新增一个目录，跨模块只共享稳定的基础设施。
+业务模块各自维护交互协议和 HTTP 路由：在 ~src/modules/<module>/~ 内放置 ~protocol.rs~、~routes.rs~ 及需要的 ~service.rs~，handler 使用 ~#[loki_api(...)]~ 声明接口信息，并用 ~linkme~ 静态切片提交模块描述。~http~ 只提供 loopback server 和公共 HTTP 能力，不设集中式 ~protocol~ 目录。~Services::build~ 组装模块、注入配置处理器并组合路由，元数据仍在编译期注册。新增模块应尽量只新增一个目录，跨模块只共享稳定的基础设施。
 
 * 开发
 
@@ -93,11 +93,17 @@ control-center:
   center_auto_start: false
 #+end_src
 
-通过配置接口保存后，services 原子替换 YAML 文件，成功后更新内存并发出变化通知；写入失败不会更新生效值。文件权限为 ~0600~ 。直接手工修改文件后需重启 services。配置文件无法读取、YAML 无效或已知配置值校验失败时，服务启动会报错。
+通过配置接口保存时，services 先等待所属模块的配置变化处理器成功，再原子替换 YAML 文件，成功后更新内存并发出变化通知；处理或写入失败不会更新生效值。处理器失败返回 ~config-change-rejected~ 和具体原因；处理成功但落盘失败时调用处理器撤销外部操作。文件权限为 ~0600~ 。直接手工修改文件后需重启 services。配置文件无法读取、YAML 无效或已知配置值校验失败时，服务启动会报错。
 
 读取接口返回 ~{value, source}~，其中 ~source~ 为 ~user~ 或 ~default~ 。没有用户设置时使用静态默认值或按元数据搜索得到的程序路径；这些默认值不写入文件。完整协议见 [[file:../docs/control-center-services.org::*配置中心][配置中心协议]]。
 
 ~POST /config/validate~ 可提前校验配置而不保存。保存接口也执行相同检查；~Executable~ 必须指向存在、可执行的普通文件，输入程序名时按 ~PATH~ 和元数据建议目录解析并保存为绝对路径。无效输入返回错误，原有值及 YAML 文件不变。
+
+* 控制中心配置
+
+“控制中心”的 ~center_auto_start~ 保持默认 ~false~ 。在 Emacs 配置界面开启“登录时自动启动”，或通过 ~PUT /data/control-center/center_auto_start~ 提交 JSON ~true~ 时，控制中心模块先同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent；系统操作成功后才保存配置。关闭时卸载任务并删除 plist；失败返回系统错误，界面保留输入，可修复后重新保存。模块构造和服务启动不会自动修改 LaunchAgent。
+
+默认使用仓库的 Debug 菜单栏可执行文件；使用其他构建位置时，在 services 启动环境设置 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 为绝对路径。详细操作和处理器接口见 [[file:../docs/control-center-services.org::*控制中心模块][控制中心模块]] 与 [[file:../docs/control-center-services.org::*提交前变化处理][提交前变化处理]]。
 
 * 网络配置
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::{
-    modules::{config, discover, emacs, health, notification::NotificationService},
+    modules::{config, control_center, discover, emacs, health, notification::NotificationService},
     runtime::RuntimeState,
 };
 
@@ -22,14 +22,19 @@ pub type CoreService = Services;
 
 impl Services {
     pub fn build() -> Self {
-        Self::with_config(config::Module::new())
+        Self::with_config(config::service::ConfigService::from_registry())
     }
 
     pub fn load() -> Result<Self, config::service::ConfigServiceError> {
-        Ok(Self::with_config(config::Module::load()?))
+        Ok(Self::with_config(config::service::ConfigService::load(
+            config::service::ConfigService::storage_path()?,
+        )?))
     }
 
-    fn with_config(config: config::Module) -> Self {
+    fn with_config(config: config::service::ConfigService) -> Self {
+        let config = config::Module::from_service(
+            config.with_change_handler("control-center", control_center::handler()),
+        );
         let health = health::Module::new();
         let discover = discover::Module::new();
         let notification = Arc::new(NotificationService::new());
