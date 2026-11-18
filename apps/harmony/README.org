@@ -2,7 +2,7 @@
 
 * 项目说明
 
-这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS。当前仅完成应用入口初始化，主页面保持空白，为后续接入辅助能力预留运行容器。
+这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS。当前主页面提供身份组网的本地验证：通过 Rust/NAPI 原生库连接 iroh-relay，按固定 Endpoint ID 与 services 交换双向消息，显示身份与结果。页面启动后自动验证，也可点击“重新验证”。正式辅助能力和后台常驻尚未实现。
 
 应用、Ability 和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。根目录 ~make export-icons~ 将图标导出为 ~AppScope/resources/base/media/app_icon.png~ 的 1024 × 1024 PNG；构建直接使用仓库中的导出资源。设计与导出说明见 [[file:../../docs/icon-design.org][图标设计]]。
 
@@ -12,6 +12,8 @@
 
 - ~/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw~
 - ~/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc~
+
+原生验证库还需要 Rust 1.91 或更新版本，以及 ~aarch64-unknown-linux-ohos~ 标准库，可通过 ~rustup target add aarch64-unknown-linux-ohos~ 安装。当前原生库仅构建 ARM64，覆盖本机 ARM64 模拟器；X86_64 模拟器尚未适配。~make build~ 自动执行 ~make native-probe~ ，将固定版本的 iroh 1.4.1 与 NAPI 桥接编译为共享库并打入 HAP。
 
 在本目录执行：
 
@@ -41,3 +43,17 @@ make deploy      # 检查真机，构建、安装并启动
 - ~.signing/org-tasks.p12~ ：与证书配套的本地私钥库，由 Git 忽略；新开发环境需要恢复此文件。
 
 签名脚本从 macOS Keychain 的 ~org-tasks-signing~ / ~development~ 条目读取密码，通过 stdin 交给 JVM 内的签名工具；密码不写入工程配置或命令行。签名前校验签名材料的有效期、Profile 包名以及证书与私钥是否配套。
+
+* 本地身份组网验证
+
+先启动一个 API 24 的 ARM64 HarmonyOS 模拟器，在根目录通过 ~make harmony-devices~ 获取设备 ID，再运行：
+
+#+begin_src sh
+make network-probe-local HDC_TARGET=<模拟器 ID>
+#+end_src
+
+入口自动构建 services 与 HAP、启动本地中继和独立 services 验证实例，用 ~hdc rport~ 将模拟器的 ~127.0.0.1:3340~ 转发至 Mac 同名端口，随后安装并运行应用。脚本核对手机原生日志与 services 的成功回执，重启两端验证身份保持，停止中继验证失败，再恢复连接，并保存 UI 快照、截图和 JSON 结果到根目录 ~.build/network-probe/~ 。执行结束时关闭本次启动的中继和 services，清理本次建立的端口转发，手机保留最终结果页面。
+
+固定身份、消息版本、ALPN 和 relay URL 统一维护在 ~services/src/modules/network_probe/probe.rs~ ，手机原生 crate 直接编译该验证源码。两端只启用 relay transport，没有 IP 直连或公共 DNS/relay 依赖。代码中的私钥是公开的测试材料，不能用于正式配对或身份认证。
+
+需要手动运行时，分别在两个终端执行根目录的 ~make network-probe-relay~ 和 ~make network-probe-services~，然后通过 ~hdc -t <模拟器 ID> rport tcp:3340 tcp:3340~ 建立转发，再执行 ~make harmony-install HDC_TARGET=<模拟器 ID>~ 和 ~make harmony-run HDC_TARGET=<模拟器 ID>~ 。验证只覆盖前台应用和本机中继，不代表公网 NAT 穿透或手机后台存活已验证。

@@ -46,6 +46,42 @@ curl http://127.0.0.1:47321/data/config
 
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
 
+* 身份组网本地验证
+
+~network-probe~ Cargo feature 提供隔离的 iroh 1.4.1 验证能力，默认构建不启用。根目录 ~make network-probe-relay~ 启动监听 ~127.0.0.1:3340~ 的 iroh-relay；~make network-probe-services~ 启动固定身份的 services 节点，并在随机 loopback HTTP 端口保留现有路由。验证实例不读取用户配置、不获取正式服务锁，也不覆盖服务 pfile。
+
+手机先发送 ~mobile-hello~ ，services 回复 ~services-received~ ；services 再主动打开另一条双向 QUIC stream，发送 ~services-hello~ ，等待 ~mobile-received~ ，最后向手机发送完整成功回执。连接按固定 Endpoint ID 验证身份，两端禁用 IP transport，只经过本地中继。握手、消息读取和回执有时间及大小限制；未知身份或不匹配的消息返回验证失败。
+
+一键模拟器验证入口为根目录 ~make network-probe-local HDC_TARGET=<模拟器 ID>~，覆盖实际手机原生库、服务重启身份保持、中继不可用与恢复。日志、JSON 结果和手机截图写入 ~.build/network-probe/~ 。手机安装、SDK 和签名要求见 [[file:../apps/harmony/README.org::*本地身份组网验证][手机本地验证说明]]；协议和适用边界见 [[file:../docs/identity-network-options.org][身份组网调研]]。
+
+* 云端中继安装与管理
+
+~services/relay/~ 维护独立中继的镜像与安装脚本。根目录 ~make relay-image~ 校验 iroh-relay 1.4.1 上游 Linux AMD64 musl 发布包的固定 SHA256，构建 ~loki/iroh-relay:1.4.1~ 。运行包使用上游发布的可执行文件，不在小内存 ECS 上编译 Rust；上游源码见 [[https://github.com/n0-computer/iroh/tree/v1.4.1/iroh-relay][iroh-relay 1.4.1]]。
+
+服务器安装目录需要镜像压缩包 ~iroh-relay-image.tar.gz~、仅管理员可读的 ~relay.env~、~install.sh~ 和 ~enable-ip-https.sh~。镜像通过 ~docker image save~ 导出并 gzip 压缩；环境文件包含随机生成的 ~IROH_RELAY_ACCESS_TOKEN~ 。在该目录安装容器与 IP HTTPS：
+
+#+begin_src sh
+sudo sh install.sh
+sudo sh enable-ip-https.sh 8.153.207.23 8443
+#+end_src
+
+安装复用已有 Docker 和 Caddy。中继容器为 ~loki-iroh-relay~ ，后端只映射 ~127.0.0.1:3340~ ；公网入口为 ~https://8.153.207.23:8443~。Certbot 在独立 venv 中申请并续期公网 IP 证书，无需 DNS；HTTP-01 验证要求公网 TCP 80 可达，中继要求安全组放行 TCP 8443。最终设计及维护位置见 [[file:../docs/relay-deployment.org][中继部署设计]]。
+
+Docker 服务开机启动，容器使用 ~unless-stopped~ 。证书由云端 systemd 定时器每日检查两次，临近到期时自动续签，并更新证书、校验配置和平滑重载 Caddy。常用管理命令：
+
+#+begin_src sh
+sudo docker ps --filter name=loki-iroh-relay
+sudo docker logs --tail 50 loki-iroh-relay
+sudo docker restart loki-iroh-relay
+sudo docker stop loki-iroh-relay
+sudo docker start loki-iroh-relay
+sudo systemctl status loki-relay-cert-renew.timer
+sudo systemctl list-timers loki-relay-cert-renew.timer
+sudo journalctl -u loki-relay-cert-renew.service
+#+end_src
+
+客户端私有环境文件使用 ~LOKI_ASSISTANT_RELAY_URL=https://8.153.207.23:8443~ 和 ~LOKI_ASSISTANT_RELAY_TOKEN~。根目录 ~make relay-verify RELAY_ENV_FILE=<私有环境文件>~ 验证双向消息和错误令牌拒绝，结果写入环境文件旁的 ~.result.json~ ，不包含令牌。services 验证模式在运行时读取这些变量，HarmonyOS 原生库也支持构建时注入同名变量。包含令牌的文件和构建产物只能放入忽略目录，不提交到仓库。
+
 * 配置存储
 
 services 启动时加载 ~~/.assistant/config.yml~ ，首次成功保存时按需创建文件。文件只保存用户设置，按模块和配置项组织，例如：

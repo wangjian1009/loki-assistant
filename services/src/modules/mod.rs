@@ -4,4 +4,6 @@ pub mod config;
 pub mod discover;
 pub mod emacs;
 pub mod health;
+#[cfg(feature = "network-probe")]
+pub mod network_probe;
 pub mod notification;

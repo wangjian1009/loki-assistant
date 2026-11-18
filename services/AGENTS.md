@@ -8,6 +8,8 @@
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
+`network-probe` 是显式启用的本地身份组网验证 feature：`modules/network_probe/` 维护共享验证协议和中继入口，由 `main.rs` 的独立命令管理运行期，不在 `Services::build()` 中自动启动，不注册业务 HTTP API。手机原生 crate 直接编译 `probe.rs`；固定私钥仅是公开测试材料，正式组网实现不得沿用。
+
 ## 模块划分
 
 服务层采用单一 Cargo crate，按职责划分 Rust module。`main.rs` 是唯一进程入口和组合根；其他模块不自行启动线程、监听端口或读取全局配置。

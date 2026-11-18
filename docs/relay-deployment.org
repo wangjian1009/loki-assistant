@@ -1,0 +1,77 @@
+#+TITLE: Loki Hub 中继部署设计
+
+* 部署目标
+
+| 项目 | 设计结论 |
+|------+----------|
+| 运维别名 | ~loki-hub~，通过 hosts 映射到 ~8.153.207.23~ |
+| 系统主机名 | ~kouki~ |
+| SSH | ~user1@loki-hub~ ，使用 SSH 公钥认证 |
+| 系统与架构 | Ubuntu 26.04.1 LTS，Linux AMD64 |
+| 中继入口 | ~https://8.153.207.23:8443~，直接使用公网 IP，不依赖 DNS |
+| 中继实现 | iroh-relay 1.4.1，独立 Docker 容器 |
+| TLS 终止 | 宿主机 Caddy 2.6.2，加载公网 IP 证书 |
+
+中继只转发 iroh 流量，不暴露 services 的本机 HTTP 接口。客户端按 Endpoint ID 寻址并验证对端身份；公网 IP 是中继的传输入口，不作为业务节点身份。
+
+* 网络边界
+
+| 入口 | 用途与访问规则 |
+|------+----------------|
+| TCP 8443 | HTTPS/WebSocket 中继入口；阿里云安全组入方向须放行。手机使用动态地址时，来源为 ~0.0.0.0/0~ |
+| TCP 80 | 公网 IP 证书的 HTTP-01 验证与续期，必须对外可达 |
+| TCP 22 | SSH 运维，沿用既有访问规则 |
+| 127.0.0.1:3340 | Caddy 转发到 Docker 中继，仅宿主机可访问 |
+
+容器内部监听 ~0.0.0.0:3340~ ，Docker 仅映射到宿主机 loopback。HTTPS 请求经 Caddy 转换为本机 HTTP/WebSocket 后交给容器。当前关闭 QUIC 地址发现，公网中继不需要 UDP；端点 QUIC 数据仍可经 relay 转发。
+
+Caddy 保留既有域名站点，单独维护 IP 的 HTTP-01 路由与 TCP 8443 中继入口。该 IP 在 TCP 80 只提供 ~/.well-known/acme-challenge/*~ 文件，其他路径返回 404。
+
+全局 ~default_sni~ 指向公网 IP，以支持不携带 SNI 的 IP TLS 客户端，以及云服务器公网 NAT 与本机地址不同的情况。携带域名 SNI 的请求继续使用原站点证书。
+
+* 访问控制
+
+中继通过 ~IROH_RELAY_ACCESS_TOKEN~ 强制验证随机共享令牌。服务端文件为 ~/opt/loki-relay/relay.env~ ，目录权限 700，文件权限 600。缺少令牌时容器启动失败。
+
+客户端使用 ~LOKI_ASSISTANT_RELAY_URL~ 和 ~LOKI_ASSISTANT_RELAY_TOKEN~ 。令牌经 HTTPS 发送，业务消息继续由端点之间的 QUIC 加密保护；证书校验必须保持启用。
+
+验证节点仍使用代码中的固定测试身份。固定测试密钥只用于验证协议，中继访问权限由独立随机令牌控制。
+
+* IP 证书与自动续期
+
+证书由 Let's Encrypt 签发，使用 ~shortlived~ 配置，SAN 为 ~IP Address:8.153.207.23~ ，有效期约 6 天（160 小时）。通过 TCP 80 的 HTTP-01 验证 IP 控制权，不需要 A/AAAA 记录。
+
+Certbot 5.10.0 安装在独立 Python venv 中，负责签发和续期。Caddy 加载证书文件，不负责自动申请 IP 证书。维护任务全部在云服务器上执行，不依赖手机或 Mac 持续在线。
+
+| 文件或任务 | 职责 |
+|------------+------|
+| ~/opt/loki-relay/certbot/~ | Certbot venv |
+| ~/opt/loki-relay/letsencrypt/~ | 正式 ACME 账号、证书与续期配置 |
+| ~/opt/loki-relay/letsencrypt/live/loki-relay-ip/~ | 当前证书源文件 |
+| ~/var/lib/loki-relay/acme/~ | HTTP-01 验证文件目录 |
+| ~/etc/caddy/loki-relay/fullchain.pem~ | Caddy 使用的完整证书链 |
+| ~/etc/caddy/loki-relay/privkey.pem~ | Caddy 使用的私钥，root:caddy，权限 640 |
+| ~/opt/loki-relay/deploy-ip-certificate.sh~ | 续期后复制证书、校验配置并重载 Caddy |
+| ~loki-relay-cert-renew.timer~ | 每日 00:00、12:00 检查，随机延迟最多 1 小时；开机 10 分钟后也检查 |
+| ~loki-relay-cert-renew.service~ | 以 root 运行 ~certbot renew~ ，仅临近到期时续签 |
+
+定时器开机启用，设置 ~Persistent=true~ 。证书更新后平滑重载 Caddy。证书、私钥、ACME 账号和访问令牌不提交到仓库。
+
+* 容器与自启动
+
+| 项目 | 设计结论 |
+|------+----------|
+| 容器名称 | ~loki-iroh-relay~ |
+| 镜像 | ~loki/iroh-relay:1.4.1~ |
+| 构建输入 | 上游 Linux AMD64 musl 发布包，固定版本并校验 SHA256 |
+| 运行环境 | scratch 镜像，无 shell，使用非 root 用户 |
+| 运行限制 | 只读文件系统、移除 capabilities、禁止提权、384MiB 内存、0.5 CPU、128 个进程 |
+| 开机启动 | Docker 系统服务启用，容器使用 ~unless-stopped~ |
+| 故障恢复 | 异常退出自动恢复；管理员手动停止后保持停止 |
+| 配置备份 | 安装脚本维护的 Caddy 配置备份位于 ~/opt/loki-relay/~ |
+
+* 维护入口
+
+部署源码位于 ~services/relay/~。~install.sh~ 安装容器，~enable-ip-https.sh~ 配置 IP HTTPS、HTTP-01 路由、证书与定时器。构建、安装、管理和检查命令集中维护在 [[file:../services/README.org::*云端中继安装与管理][services README]] 与根目录 Makefile。
+
+公网 IP 变化时，需要重新配置 IP 证书和客户端中继地址。访问令牌变更时，需要同步服务端环境文件与客户端配置，并重建容器以载入新的环境变量。

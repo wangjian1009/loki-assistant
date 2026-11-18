@@ -16,7 +16,7 @@ BUNDLE_NAME := cc.loki.assistant.mobile
 ABILITY_NAME := EntryAbility
 HAP_FILE := entry/build/default/outputs/default/entry-default-signed.hap
 
-.PHONY: build deps check-sdk install run deploy devices clean help
+.PHONY: build native-probe deps check-sdk install run deploy devices clean help
 
 check-sdk:
 	@test -d "$(DEVECO_SDK_HOME)" || { echo "未找到 HarmonyOS SDK：$(DEVECO_SDK_HOME)" >&2; exit 1; }
@@ -29,7 +29,10 @@ deps: check-sdk
 	"$(OHPM)" install --all
 	cd entry && "$(OHPM)" install
 
-build: deps
+native-probe: check-sdk
+	DEVECO_HOME="$(DEVECO_HOME)" sh scripts/build-network-probe.sh
+
+build: deps native-probe
 	rm -f "$(HAP_FILE)"
 	"$(HVIGORW)" default@PackingCheck default@CollectDebugSymbol --mode module \
 	  -p module=entry@default -p product=default -p buildMode=debug -p debuggable=true --no-daemon
@@ -61,6 +64,7 @@ help:
 	  'make deps     检查 SDK 并安装 HarmonyOS 工程依赖' \
 	  'make check-sdk 检查 HarmonyOS SDK 安装' \
 	  'make build    构建 Debug HAP，使用 OrgTasksDebug 调试签名' \
+	  'make native-probe 构建身份组网验证的 Rust/NAPI 原生库（需 OHOS Rust target）' \
 	  'make install  安装到已连接的 HarmonyOS 设备' \
 	  'make run      启动手机应用' \
 	  'make deploy   检查真机，构建、安装并启动' \

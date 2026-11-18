@@ -115,6 +115,41 @@ Reticulum 的 identity、destination hash 和传播节点概念很有吸引力�
 4. 验证通过后再增加服务发现、ACL、密钥轮换和消息持久化；relay 访问控制先使用 shared token，接入账号系统后改 HTTP callout。
 5. 如果测试证明产品只需要中心消息转发，保留 NATS 作为简化路径：手机使用 WebSocket，services 使用 async-nats，node ID 和 ACL 放在 Loki 服务层。
 
+* 本地验证实现
+
+本轮新增实际验证入口，使用 iroh 与 iroh-relay 1.4.1，而非调研阶段的 1.0 示例。正式组网模块、账号配对与生产部署仍未实现；以下实现仅验证源代码接入路径。
+
+- services 通过显式的 ~network-probe~ feature 和命令作为节点，另一个命令启动本机 iroh-relay，监听 ~127.0.0.1:3340~ 。
+- HarmonyOS ARM64 应用通过本地 Rust staticlib 与 C++ NAPI 桥接调用真实 iroh，异步任务不阻塞 ArkTS UI。共享协议源码是 ~services/src/modules/network_probe/probe.rs~ ，两端使用同样的 ALPN 和消息校验。
+- services 私钥种子为 32 个 ~0x11~ ，手机为 32 个 ~0x22~ ，由 iroh 派生固定 Endpoint ID。这是公开测试身份，正式产品必须替换为每设备生成并安全保存的密钥。
+- 手机按 services Endpoint ID 加本地 relay URL 发起连接，services 用握手认证后的 remote ID 校验固定手机身份。手机请求与 services 主动请求使用两条独立双向 stream；成功回执只有在两边消息内容都校验通过后才返回。
+- 双端使用 ~presets::Minimal~，只配置本地 relay，并调用 ~clear_ip_transports()~ 禁用 IP transport；不使用公共地址发现服务，也不把对端 IP 放入连接地址。模拟器仅通过 ~hdc rport~ 访问宿主机的 relay。
+- ~make network-probe-local~ 在指定的已连接模拟器上验证双向消息、重启身份保持、中继停止时失败、恢复后成功，并保存 ~.build/network-probe/~ 下的日志、截图、UI 布局与 JSON 结果。入口在退出时清理自建进程与端口转发。
+
+这次验证范围为本机中继和前台 ARM64 模拟器；公网 NAT 打洞、跨网地址发现、真实手机后台保活、密钥轮换与生产 ACL 仍需后续单独验证。运行方式只维护在 [[file:../apps/harmony/README.org::*本地身份组网验证][手机 README]] 和 Makefile，本文不复制安装流程。
+
+** 实测记录（2026-11-18）
+
+在本机 HarmonyOS 6.1.1 / API 24 的 ARM64 模拟器 ~LokiNetworkProbe~ 上完成验证。手机进程实际加载 Rust/NAPI 共享库，services 同时提供可访问的 loopback HTTP 服务；节点之间的通信走 iroh QUIC，经独立本地 relay 转发。
+
+| 检查项 | 结果 |
+|--------+------|
+| 手机发送请求，services 校验并回复 | 通过 |
+| services 主动打开 stream 发送请求，手机校验并回复 | 通过 |
+| services 与手机均重启后身份保持一致 | 通过 |
+| 停止唯一 relay 后，手机超时并明确报告失败 | 通过 |
+| 恢复 relay 和 services 后重新验证 | 通过 |
+| 手机页面与 services 日志均记录成功 | 通过 |
+
+实测固定 Endpoint ID：
+
+#+begin_example
+services: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
+mobile:   a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0
+#+end_example
+
+~.build/network-probe/result.json~ 记录双向回执、中继不可用结果与恢复结果；同目录 ~services*.log~、~mobile.log~、~layout.json~ 和 ~screenshot.png~ 保存两端证据，属于不提交的本地构建产物。
+
 * 来源
 
 - [[https://github.com/n0-computer/iroh][iroh README 与源码]]：按公钥拨号、QUIC、hole punching、relay、iroh-relay workspace。

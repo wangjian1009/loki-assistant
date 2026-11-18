@@ -6,7 +6,7 @@
 
 - 根目录 `center/`：预留编排目录。
 - `apps/center/`：macOS 菜单栏状态入口。
-- `apps/harmony/`：HarmonyOS 手机执行中心，目前提供可运行的空白主页面工程。
+- `apps/harmony/`：HarmonyOS 手机执行中心，目前提供基于 Rust/NAPI 的本地身份组网验证页面。
 
 服务配置界面位于 `emacs/loki-assistant-config.el`；菜单栏设置通过 services 的 Emacs gateway 打开，不保留独立原生编辑器。应用之间不共享旧版 UI 或 Emacs 控制代码；跨应用能力以 services 的 HTTP 元数据和接口为准。
 

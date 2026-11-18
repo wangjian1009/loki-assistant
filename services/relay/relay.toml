@@ -1,0 +1,6 @@
+# TLS 由宿主机 Caddy 终止；容器端口仅映射到 loopback。
+http_bind_addr = "0.0.0.0:3340"
+enable_metrics = false
+enable_quic_addr_discovery = false
+# 必须通过 IROH_RELAY_ACCESS_TOKEN 提供访问令牌，否则启动失败。
+access.shared_token = []

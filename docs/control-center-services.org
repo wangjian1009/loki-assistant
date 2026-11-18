@@ -21,6 +21,9 @@
 | ~platform/macos~ | LaunchAgent plist 和 launchctl 服务管理 | 已实现基础能力 |
 | ~apps/center~ | 菜单栏显示 services 状态 | 已实现最小入口 |
 | ~emacs/loki-assistant-config.el~ | Customize 风格的服务配置管理 | 已实现 |
+| ~modules/network_probe~ | 固定身份、强制本地 relay 的双向消息验证，不注册 HTTP API | 已实现验证入口，需显式启用 feature |
+
+~network_probe~ 是本地验证模式，不属于正式跨设备服务接口。它由 ~main.rs~ 的独立命令显式启动，默认 services 启动行为保持不变；HTTP 仍限于 loopback。手机编译同一份验证协议，并通过 NAPI 调用 Rust iroh。协议、公开测试身份及验证边界集中维护于 [[file:identity-network-options.org::*本地验证实现][本地验证实现]]；构建与运行入口见 [[file:../apps/harmony/README.org::*本地身份组网验证][手机说明]]。
 
 services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该文件获取服务地址和端口，再请求 HTTP 接口；不应在客户端写死服务端口。
 
