@@ -110,9 +110,17 @@ struct LokiAssistantApp: App {
                     }
                 }
         } label: {
-            Image(nsImage: Self.menuBarIcon)
-                .accessibilityLabel("Loki的助理")
-                .help("Loki的助理")
+            ZStack(alignment: .bottomTrailing) {
+                Image(nsImage: Self.menuBarIcon)
+                if idleSleep.isEnabled {
+                    Image(systemName: "moon.zzz.fill")
+                        .font(.system(size: 8, weight: .bold))
+                        .symbolRenderingMode(.monochrome)
+                        .foregroundStyle(.primary)
+                }
+            }
+            .accessibilityLabel(idleSleep.isEnabled ? "Loki的助理，已阻止空闲休眠" : "Loki的助理")
+            .help(idleSleep.isEnabled ? "Loki的助理：已阻止空闲休眠" : "Loki的助理")
         }
         .menuBarExtraStyle(.menu)
     }
