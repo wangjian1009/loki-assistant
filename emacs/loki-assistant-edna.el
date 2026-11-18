@@ -10,7 +10,6 @@
 
 (require 'org)
 (require 'org-edna)
-(require 'org-id)
 (require 'cl-lib)
 (require 'calendar)
 
@@ -160,7 +159,6 @@
                (flow (cl-find-if (lambda (items) (member old-state items)) org-todo-sets))
                (state (or (cl-find-if (lambda (item) (member item org-not-done-keywords)) flow)
                           (car org-not-done-keywords)))
-               (id (org-id-new))
                (system-time-locale "C")
                (created (format-time-string "[%Y-%m-%d %a %H:%M]"
                                             (or loki-assistant-edna-now (org-current-time)))))
@@ -172,7 +170,7 @@
                     (if priority (format "[#%c] " priority) "") title
                     (if tags (concat " :" (string-join tags ":") ":") "") "\n"
                     "SCHEDULED: " stamp "\n:PROPERTIES:\n:CREATED: " created
-                    "\n:ID: " id "\n"
+                    "\n"
                     (if trigger (concat ":TRIGGER: " trigger "\n") "") ":END:\n")
             ;; 新增待办后恢复已完成祖先；由 Org 更新统计与日志。
             (goto-char next)
