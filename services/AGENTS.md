@@ -6,11 +6,11 @@
 
 当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
-`modules/network/` 维护网络模块描述和中转地址 `relay_url` 配置元数据，通过现有配置中心读写；当前不建立独立业务路由或启动网络连接。
+`modules/network/` 维护 `relay_url` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，不新增独立业务路由。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
-`network-probe` 是显式启用的本地身份组网验证 feature：`modules/network_probe/` 维护共享验证协议和中继入口，由 `main.rs` 的独立命令管理运行期，不在 `Services::build()` 中自动启动，不注册业务 HTTP API。手机原生 crate 直接编译 `probe.rs`；固定私钥仅是公开测试材料，正式组网实现不得沿用。
+
 
 ## 模块划分
 
@@ -36,6 +36,13 @@ src/
     │   ├── model.rs     模块元数据和 API 描述接口
     │   ├── protocol.rs  发现接口响应模型
     │   └── routes.rs    /discover 路由
+    ├── network/
+    │   ├── mod.rs       网络模块描述和导出
+    │   ├── config.rs    中转地址元数据
+    │   ├── identity.rs  ~/.assistant/identity.json 安全读写与随机身份生成
+    │   ├── relay.rs     可注入的中转注册器与 iroh 连接
+    │   ├── service.rs   配置处理、启动注册、连接切换与通知
+    │   └── tests.rs     身份、事务、通知与随机端口 relay 测试
     ├── control_center/
     │   ├── mod.rs       控制中心模块描述和导出
     │   ├── config.rs    登录启动配置元数据
@@ -94,6 +101,7 @@ src/modules/<module>/
 | `modules/emacs`         | `emacsclient` gateway、buffer 查询和激活、通知转换              | 本模块 `protocol`、`CommandRunner` trait、配置服务、注入的通知服务 |
 | `modules/notification` | 系统通知发送、通用跳转封装和回执状态                           | 本模块 `protocol`、`NotificationLauncher` trait |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
+| `modules/network` | 身份持久化、中转注册和通知 | 配置处理器 trait、注入的通知服务、iroh 适配 |
 | `modules/control_center` | 控制中心配置、菜单栏登录启动与失败撤销 | 配置处理器 trait、平台 LaunchAgent 管理器 |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
 | `platform/macos`        | LaunchAgent plist、launchctl 安装/卸载/启停/状态管理               | macOS API；不提供业务 HTTP 路由             |
@@ -116,7 +124,7 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 `POST /config/validate` 提供只读配置预检，与保存共用 `ConfigService::validate_value`。`Executable` 必须解析到存在且具有执行权限的普通文件，成功后规范化为绝对路径。校验失败禁止更新内存、YAML 与变化订阅；界面只消费服务端结果。文件系统校验测试使用临时文件，不执行待检查的程序。
 
-进程入口使用 `Services::load()` 读取用户文件后组装服务；`Services::build()`、`ConfigService::new()` 与 `from_registry()` 用于无文件实例。配置存储测试必须使用临时目录，不修改真实用户配置。模块在组装阶段用 `ConfigService::with_change_handler` 注入提交前处理器，完整替换、合并和追加都先等待处理成功再落盘；处理失败返回 `config-change-rejected`，内存、YAML 和订阅均保持不变。处理器可读取旧值，不得递归提交；有外部状态时实现 `rollback`，供处理成功但落盘失败时撤销。写入成功后才更新内存并广播变化，写入失败应保留原有状态。
+进程入口使用 `Services::load()` 读取用户文件后组装服务；`Services::build()`、`ConfigService::new()` 与 `from_registry()` 用于无文件实例。配置存储测试必须使用临时目录，不修改真实用户配置。模块在组装阶段用 `ConfigService::with_change_handler` 注入提交前处理器，完整替换、合并和追加都先等待处理成功再落盘；处理失败返回 `config-change-rejected`，内存、YAML 和订阅均保持不变。处理器可读取旧值，不得递归提交；有外部状态时实现 `rollback`，供处理成功但落盘失败时撤销。写入成功后才更新内存并广播变化，再调用 `committed` 完成连接切换与成功通知；该回调失败只记日志。写入失败应保留原有状态。
 
 `platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。`modules/control_center` 拥有 `control-center.center_auto_start` 元数据及处理器，在配置提交时调用 `set_login_startup` 同步托盘登录启动，模块构造和服务启动不自动操作 launchd；Emacs 只提交配置。
 
@@ -143,3 +151,5 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 ## 检查
 
 在 `services/` 目录执行 `cargo fmt --check` 和 `cargo test --workspace`。修改跨模块协议时，同时检查 `docs/control-center-services.org` 及调用方；纯文档变更不增加实现测试。
+
+网络身份只在缺失时通过系统随机源生成，以 `0600` 权限原子保存；损坏或公私钥不匹配时禁止覆盖。生成身份与注册结果均通过注入的共享通知服务发送，私钥和令牌不得进入通知、日志或 HTTP 元数据。旧的固定测试身份、验证 CLI 和手机验证桥接已删除；真实 relay 测试仅使用本机随机端口与临时身份。

@@ -47,6 +47,11 @@ pub type ChangeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Se
 pub trait ConfigChangeHandler: Debug + Send + Sync {
     fn handle(&self, change: ConfigChange) -> ChangeFuture<'_>;
 
+    /// 配置落盘、内存更新后完成外部状态切换；错误只记录，不能撤回已提交配置。
+    fn committed(&self, _change: ConfigChange) -> ChangeFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// 处理成功但落盘失败时撤销外部操作；无外部状态的处理器可使用默认实现。
     fn rollback(&self, _change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async { Ok(()) })
@@ -463,7 +468,12 @@ impl ConfigService {
             }
         }
         *self.values.write().await = values;
-        let _ = self.changes.send(change);
+        let _ = self.changes.send(change.clone());
+        if let Some(handler) = handler {
+            if let Err(error) = handler.committed(change).await {
+                eprintln!("配置已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
+            }
+        }
         Ok(value)
     }
 }

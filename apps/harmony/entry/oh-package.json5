@@ -5,7 +5,5 @@
   "main": "",
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "liblokiprobe.so": "file:./src/main/cpp/types/liblokiprobe"
-  }
+  "dependencies": {}
 }

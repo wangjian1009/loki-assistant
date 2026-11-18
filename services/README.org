@@ -46,14 +46,6 @@ curl http://127.0.0.1:47321/data/config
 
 服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
 
-* 身份组网本地验证
-
-~network-probe~ Cargo feature 提供隔离的 iroh 1.4.1 验证能力，默认构建不启用。根目录 ~make network-probe-relay~ 启动监听 ~127.0.0.1:3340~ 的 iroh-relay；~make network-probe-services~ 启动固定身份的 services 节点，并在随机 loopback HTTP 端口保留现有路由。验证实例不读取用户配置、不获取正式服务锁，也不覆盖服务 pfile。
-
-手机先发送 ~mobile-hello~ ，services 回复 ~services-received~ ；services 再主动打开另一条双向 QUIC stream，发送 ~services-hello~ ，等待 ~mobile-received~ ，最后向手机发送完整成功回执。连接按固定 Endpoint ID 验证身份，两端禁用 IP transport，只经过本地中继。握手、消息读取和回执有时间及大小限制；未知身份或不匹配的消息返回验证失败。
-
-一键模拟器验证入口为根目录 ~make network-probe-local HDC_TARGET=<模拟器 ID>~，覆盖实际手机原生库、服务重启身份保持、中继不可用与恢复。日志、JSON 结果和手机截图写入 ~.build/network-probe/~ 。手机安装、SDK 和签名要求见 [[file:../apps/harmony/README.org::*本地身份组网验证][手机本地验证说明]]；协议和适用边界见 [[file:../docs/identity-network-options.org][身份组网调研]]。
-
 * 云端中继安装与管理
 
 ~services/relay/~ 维护独立中继的镜像与安装脚本。根目录 ~make relay-image~ 校验 iroh-relay 1.4.1 上游 Linux AMD64 musl 发布包的固定 SHA256，构建 ~loki/iroh-relay:1.4.1~ 。运行包使用上游发布的可执行文件，不在小内存 ECS 上编译 Rust；上游源码见 [[https://github.com/n0-computer/iroh/tree/v1.4.1/iroh-relay][iroh-relay 1.4.1]]。
@@ -80,7 +72,7 @@ sudo systemctl list-timers loki-relay-cert-renew.timer
 sudo journalctl -u loki-relay-cert-renew.service
 #+end_src
 
-客户端私有环境文件使用 ~LOKI_ASSISTANT_RELAY_URL=https://8.153.207.23:8443~ 和 ~LOKI_ASSISTANT_RELAY_TOKEN~。根目录 ~make relay-verify RELAY_ENV_FILE=<私有环境文件>~ 验证双向消息和错误令牌拒绝，结果写入环境文件旁的 ~.result.json~ ，不包含令牌。services 验证模式在运行时读取这些变量，HarmonyOS 原生库也支持构建时注入同名变量。包含令牌的文件和构建产物只能放入忽略目录，不提交到仓库。
+客户端的中转地址来自 ~network.relay_url~ ，没有默认中转或固定对端。需要共享令牌的 relay，由 services 进程环境中的 ~LOKI_ASSISTANT_RELAY_TOKEN~ 提供；令牌不写入网络身份文件、不通过配置接口返回，也不进入通知。以 LaunchAgent 运行时也需向该进程提供环境变量，交互 shell 中的变量不会自动传入已经运行的服务。TLS 证书验证始终启用。
 
 * 配置存储
 
@@ -105,9 +97,11 @@ control-center:
 
 默认使用仓库的 Debug 菜单栏可执行文件；使用其他构建位置时，在 services 启动环境设置 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 为绝对路径。详细操作和处理器接口见 [[file:../docs/control-center-services.org::*控制中心模块][控制中心模块]] 与 [[file:../docs/control-center-services.org::*提交前变化处理][提交前变化处理]]。
 
-* 网络配置
+* 网络身份与中转注册
 
-~network~ 模块提供“中转地址”配置项 ~relay_url~ ，类型为字符串，默认留空，表示未配置。可在 Emacs 服务配置界面的“网络”分组中编辑，或通过配置接口保存中转服务器的完整 URL：
+~network~ 模块在服务启动或提交 ~relay_url~ 时检查 ~~/.assistant/identity.json~ 。缺失时自动生成随机身份，以 ~0600~ 权限原子保存，并通过共享通知模块发送“已生成本地身份”，只展示 Endpoint ID。已有身份会复用，重启和更换中转均不改变身份；文件损坏时返回错误并通知，不自动覆盖。
+
+“中转地址” ~relay_url~ 默认为空：空值不连接任何服务器，启动时仍确保本地身份存在。填写 HTTP(S) 中转地址后，模块使用该身份连接指定的 iroh-relay，完成注册；没有固定测试身份、对端或备用 relay。地址变更时先注册新连接，注册成功且配置落盘后替换旧连接并发送“中转注册成功”。失败或超时通过通知模块发送“中转注册失败”，保存请求返回 ~config-change-rejected~ ，原配置与旧连接保持不变。清空地址在保存成功后关闭连接，但保留身份。
 
 #+begin_src sh
 curl http://127.0.0.1:47321/meta/network
@@ -116,7 +110,9 @@ curl -X PUT http://127.0.0.1:47321/data/network/relay_url \
   -d '"https://relay.example.com:8443"'
 #+end_src
 
-该配置通过配置中心保存到 ~~/.assistant/config.yml~ 。当前仅提供地址配置，不会自动建立中转连接；独立 ~network-probe~ 验证命令仍使用其显式参数。
+服务启动后会在后台注册已保存的非空地址；失败会发出通知，本机 HTTP 服务继续运行，可修复网络或令牌后重新提交相同地址重试。每次注册最多等待 10 秒，认证被拒绝会提前返回具体错误。通知转交失败写入服务错误日志，不改变注册结果。落盘失败会关闭候选连接，保留旧连接，并发送配置保存失败通知。
+
+当前只实现身份保存和 relay 注册，不接收业务消息、不自动连接手机或其他固定设备；设备配对和业务消息协议仍待实现。测试使用临时目录、通知替身以及随机端口的本机 relay，覆盖真实注册和令牌认证；不会修改用户身份或连接公网服务。完整约定见 [[file:../docs/control-center-services.org::*网络模块][网络模块]]。
 
 * Emacs
 

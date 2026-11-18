@@ -14,5 +14,3 @@ apps/harmony/build/
 apps/harmony/entry/build/
 apps/harmony/oh_modules/
 apps/harmony/entry/oh_modules/
-apps/harmony/entry/src/main/rust/target/
-apps/harmony/entry/libs/

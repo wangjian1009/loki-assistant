@@ -8,7 +8,7 @@ Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的�
 
 services 提供本机 loopback HTTP 服务、服务发现、配置数据、系统通知、Emacs gateway 和 macOS LaunchAgent 管理。Mac 菜单栏应用展示 services 状态并承接系统通知，点击后回调 services 执行对应业务跳转。
 
-~apps/harmony/~ 使用 HarmonyOS Stage 模式与 ArkTS，目前提供身份组网的本地验证页面，通过 Rust/NAPI 原生库连接本地 iroh-relay，与 services 验证固定身份和双向消息。正式辅助能力、设备配对与后台常驻尚未实现。
+services 的网络模块自动生成并保存本地身份，按 ~network.relay_url~ 注册中转，并通过通知模块报告结果。~apps/harmony/~ 使用 HarmonyOS Stage 模式与 ArkTS，目前提供执行中心入口；手机辅助能力、设备配对与后台常驻尚未实现。
 
 ~emacs/~ 中的 ~loki-assistant~ Emacs Lisp 包提供服务配置管理、异步 services HTTP 请求与通知发送，支持目标 buffer、标题、正文、应用标识和处理器选择；失败时返回明确错误。
 
@@ -86,11 +86,7 @@ make emacs-test
 | make services-test | 执行 services workspace 测试 |
 | make services-fmt | 检查 services Rust 格式 |
 | make services-run | 运行 services |
-| make network-probe-relay | 启动本地 iroh-relay，仅监听 127.0.0.1:3340 |
-| make network-probe-services | 启动 services 身份组网验证节点 |
-| make network-probe-local HDC_TARGET=<模拟器 ID> | 构建、安装并验证双向消息、重启身份保持与中继中断恢复 |
 | make relay-image | 校验上游发布包并构建固定版本的 Linux AMD64 中继镜像 |
-| make relay-verify RELAY_ENV_FILE=<环境文件> | 验证中继的双向消息与无效令牌拒绝 |
 | make install-service | 注册 services LaunchAgent |
 | make uninstall-service | 取消注册 services LaunchAgent |
 | make start-service | 启动 services LaunchAgent |

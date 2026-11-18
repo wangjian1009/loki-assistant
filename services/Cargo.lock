@@ -106,12 +106,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "arc-swap"
 version = "1.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1696,7 +1690,6 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 name = "loki-services"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "axum",
  "iroh",
  "iroh-relay",
@@ -1711,6 +1704,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tower",
+ "url",
  "uuid",
 ]
 

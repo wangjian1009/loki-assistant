@@ -115,60 +115,13 @@ Reticulum 的 identity、destination hash 和传播节点概念很有吸引力�
 4. 验证通过后再增加服务发现、ACL、密钥轮换和消息持久化；relay 访问控制先使用 shared token，接入账号系统后改 HTTP callout。
 5. 如果测试证明产品只需要中心消息转发，保留 NATS 作为简化路径：手机使用 WebSocket，services 使用 async-nats，node ID 和 ACL 放在 Loki 服务层。
 
-* 本地验证实现
+* 已完成验证与当前实现
 
-本轮新增实际验证入口，使用 iroh 与 iroh-relay 1.4.1，而非调研阶段的 1.0 示例。正式组网模块、账号配对与生产部署仍未实现；以下实现仅验证源代码接入路径。
+2026-11-18 已使用 iroh 与 iroh-relay 1.4.1 完成本机 ARM64 HarmonyOS 模拟器与 Rust services 的前台双向消息验证，覆盖中继停止、恢复和进程重启。随后经 ~https://8.153.207.23:8443~ 完成带共享令牌和 TLS 校验的公网中继双向验证，错误令牌被拒绝。模拟器与 Mac 共用宿主机网络，尚未覆盖两个独立物理网络、真实手机后台存活或公网 NAT 打洞。
 
-- services 通过显式的 ~network-probe~ feature 和命令作为节点，另一个命令启动本机 iroh-relay，监听 ~127.0.0.1:3340~ 。
-- HarmonyOS ARM64 应用通过本地 Rust staticlib 与 C++ NAPI 桥接调用真实 iroh，异步任务不阻塞 ArkTS UI。共享协议源码是 ~services/src/modules/network_probe/probe.rs~ ，两端使用同样的 ALPN 和消息校验。
-- services 私钥种子为 32 个 ~0x11~ ，手机为 32 个 ~0x22~ ，由 iroh 派生固定 Endpoint ID。这是公开测试身份，正式产品必须替换为每设备生成并安全保存的密钥。
-- 手机按 services Endpoint ID 加本地 relay URL 发起连接，services 用握手认证后的 remote ID 校验固定手机身份。手机请求与 services 主动请求使用两条独立双向 stream；成功回执只有在两边消息内容都校验通过后才返回。
-- 双端使用 ~presets::Minimal~，只配置本地 relay，并调用 ~clear_ip_transports()~ 禁用 IP transport；不使用公共地址发现服务，也不把对端 IP 放入连接地址。模拟器仅通过 ~hdc rport~ 访问宿主机的 relay。
-- ~make network-probe-local~ 在指定的已连接模拟器上验证双向消息、重启身份保持、中继停止时失败、恢复后成功，并保存 ~.build/network-probe/~ 下的日志、截图、UI 布局与 JSON 结果。入口在退出时清理自建进程与端口转发。
+这些是选型验证的历史结果。固定测试身份、预设对端、验证 CLI、手机 Rust/NAPI 验证库和脚本已清理，不再提供运行入口。原验证产物属于忽略的本地构建记录，不作为正式运行依赖。
 
-这次验证范围为本机中继和前台 ARM64 模拟器；公网 NAT 打洞、跨网地址发现、真实手机后台保活、密钥轮换与生产 ACL 仍需后续单独验证。运行方式只维护在 [[file:../apps/harmony/README.org::*本地身份组网验证][手机 README]] 和 Makefile，本文不复制安装流程。
-
-** 实测记录（2026-11-18）
-
-在本机 HarmonyOS 6.1.1 / API 24 的 ARM64 模拟器 ~LokiNetworkProbe~ 上完成验证。手机进程实际加载 Rust/NAPI 共享库，services 同时提供可访问的 loopback HTTP 服务；节点之间的通信走 iroh QUIC，经独立本地 relay 转发。
-
-| 检查项 | 结果 |
-|--------+------|
-| 手机发送请求，services 校验并回复 | 通过 |
-| services 主动打开 stream 发送请求，手机校验并回复 | 通过 |
-| services 与手机均重启后身份保持一致 | 通过 |
-| 停止唯一 relay 后，手机超时并明确报告失败 | 通过 |
-| 恢复 relay 和 services 后重新验证 | 通过 |
-| 手机页面与 services 日志均记录成功 | 通过 |
-
-实测固定 Endpoint ID：
-
-#+begin_example
-services: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
-mobile:   a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0
-#+end_example
-
-~.build/network-probe/result.json~ 记录双向回执、中继不可用结果与恢复结果；同目录 ~services*.log~、~mobile.log~、~layout.json~ 和 ~screenshot.png~ 保存两端证据，属于不提交的本地构建产物。
-
-* 公网中继实测（2026-11-18）
-
-放行云端 TCP 8443 后，使用 Mac services 与 HarmonyOS ARM64 模拟器 ~127.0.0.1:5557~ 完成公网中继验证。两端连接 ~https://8.153.207.23:8443~ ，访问令牌从忽略目录中的私有环境文件读取；services 在运行时读取配置，手机原生库在构建时注入相同配置并重新签名安装。中继部署见 [[file:relay-deployment.org][中继部署设计]]。
-
-本次未启动本地 relay、未建立 SSH 隧道或 ~hdc rport~ 中继转发。共享验证协议仍关闭 IP transport，两端按固定 Endpoint ID 经公网中继交换消息；services 的 HTTP 健康接口继续只监听本机 loopback。
-
-| 检查项 | 结果 |
-|--------+------|
-| 公网 HTTPS 入口及 TLS 证书校验 | HTTP 200，证书校验通过 |
-| 手机请求，services 校验并回复 | 通过：~mobile-hello → services-received~ |
-| services 主动发起 stream，手机校验并回复 | 通过：~services-hello → mobile-received~ |
-| services HTTP 健康检查 | 两轮均返回 ~status: "ok"~ |
-| 两端进程均重启后再次交换消息 | 通过，固定 Endpoint ID 与回执内容保持一致 |
-| 手机页面与 services 日志 | 页面显示“双向消息验证通过”，两轮日志均含 ~PROBE_PASS~ |
-| 错误中继令牌 | Mac 验证客户端被拒绝，无法进入双向通信 |
-
-结果与证据保存在忽略目录 ~.build/network-probe-public/~ ：~result.json~ 为汇总，~services*.log~ 与 ~mobile*.log~ 为两轮日志，~services*-health.json~ 为健康响应，~layout.json~ 与 ~screenshot.png~ 为手机页面证据。错误令牌检查结果位于 ~.build/relay-ecs/cloud-client.result.json~ 。记录不包含访问令牌；验证结束后关闭本次独立 services 验证进程，模拟器保留成功页面。
-
-实测证明 Rust services 与 HarmonyOS Rust/NAPI 前台应用能够通过带令牌认证的自建公网 HTTPS 中继，按 Endpoint ID 完成双向通信。模拟器与 Mac 共用宿主机网络，因此尚未覆盖两个独立物理网络、真实手机后台存活、公网 NAT 打洞或正式设备密钥持久化；重启身份保持使用的仍是公开固定测试密钥。
+当前 services 的 ~modules/network~ 使用随机生成且持久化的本地身份，按配置注册 relay，处理配置变化并通过通知模块报告结果；实现边界见 [[file:control-center-services.org::*网络模块][网络模块]]。手机仅保留执行中心入口。设备配对、正式业务消息、安全存储迁移、密钥轮换与手机后台网络仍需后续实现。
 
 * 来源
 

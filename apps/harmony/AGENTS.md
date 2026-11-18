@@ -5,9 +5,7 @@
 ## 约定
 
 - `entry/src/main/ets/entryability/EntryAbility.ets` 是应用入口 Ability。
-- `entry/src/main/ets/pages/Index.ets` 是本地身份组网验证页面，通过 `liblokiprobe.so` 异步调用 Rust。
-- `entry/src/main/rust/` 编译共享验证协议与 iroh；`entry/src/main/cpp/` 维护最小 NAPI 桥接。共享源码位于 `services/src/modules/network_probe/probe.rs`，公开测试身份和消息不得各自复制一份。
-- 原生库通过 `scripts/build-network-probe.sh` 编译 OHOS ARM64 并打入 HAP；`entry/libs/` 与 Rust target 是构建产物，不提交。此阶段只验证前台模拟器，不宣称支持公网打洞、真实设备后台常驻或正式密钥管理。
+- `entry/src/main/ets/pages/Index.ets` 是执行中心入口；当前不自动连接预设服务，不保留固定身份的组网验证页面、Rust/NAPI 库或构建脚本。
 - `bundleName` 为 `cc.loki.assistant.mobile`。
 - 应用、Ability 和启动窗口图标统一引用 `$media:app_icon`；`AppScope/resources/base/media/app_icon.png` 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
 - 使用 DevEco Studio 内置 Hvigor 构建；常用操作统一维护在本目录 `Makefile` 和根目录 `Makefile` 中。

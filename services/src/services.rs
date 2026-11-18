@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::Router;
 
 use crate::{
-    modules::{config, control_center, discover, emacs, health, notification::NotificationService},
+    modules::{
+        config, control_center, discover, emacs, health, network, notification::NotificationService,
+    },
     runtime::RuntimeState,
 };
 
@@ -15,6 +17,7 @@ pub struct Services {
     pub config: config::Module,
     pub notification: Arc<NotificationService>,
     pub emacs: emacs::Module,
+    pub network: Arc<network::NetworkService>,
 }
 
 /// 与需求文档中的 CoreService 名称兼容的别名。
@@ -32,12 +35,25 @@ impl Services {
     }
 
     fn with_config(config: config::service::ConfigService) -> Self {
-        let config = config::Module::from_service(
-            config.with_change_handler("control-center", control_center::handler()),
-        );
         let health = health::Module::new();
         let discover = discover::Module::new();
         let notification = Arc::new(NotificationService::new());
+        let identity = config::service::ConfigService::storage_path()
+            .map(|path| network::IdentityStore::new(path.with_file_name("identity.json")))
+            .map_err(|error| error.to_string());
+        let network = Arc::new(network::NetworkService::new(
+            identity,
+            Arc::new(network::IrohRelayRegistrar::new(
+                std::env::var("LOKI_ASSISTANT_RELAY_TOKEN").ok(),
+            )),
+            Arc::clone(&notification),
+            Duration::from_secs(10),
+        ));
+        let config = config::Module::from_service(
+            config
+                .with_change_handler("control-center", control_center::handler())
+                .with_change_handler("network", network.clone()),
+        );
         let emacs = emacs::Module::new(config.service(), Arc::clone(&notification));
 
         Self {
@@ -46,6 +62,7 @@ impl Services {
             config,
             notification,
             emacs,
+            network,
         }
     }
 

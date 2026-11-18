@@ -11,8 +11,7 @@ OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
 .PHONY: emacs-load emacs-test emacs-config export-icons
-.PHONY: network-probe-build network-probe-relay network-probe-services network-probe-local
-.PHONY: relay-image relay-verify
+.PHONY: relay-image
 
 .PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
 
@@ -30,11 +29,7 @@ help:
 	  'make services-test   执行 services Rust 测试' \
 	  'make services-fmt    检查 services Rust 格式' \
 	  'make services-run    运行 services 本地服务' \
-	  'make network-probe-relay 启动本地 iroh 中继（127.0.0.1:3340）' \
-	  'make network-probe-services 启动 services 身份验证节点' \
-	  'make network-probe-local 构建并在指定 HarmonyOS 模拟器验证双向消息' \
 	  'make relay-image     构建 ECS 使用的固定版本 iroh-relay Docker 镜像' \
-	  'make relay-verify    用 RELAY_ENV_FILE 中的私有配置验证双向消息与令牌拒绝' \
 	  'make install-service 注册 services 用户级 LaunchAgent' \
 	  'make uninstall-service 取消注册 services 用户级 LaunchAgent' \
 	  'make start-service   启动 services 用户级 LaunchAgent' \
@@ -113,24 +108,8 @@ services-fmt:
 services-run:
 	"$(CARGO)" run --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml"
 
-network-probe-build:
-	"$(CARGO)" build --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" --features network-probe
-
 relay-image:
 	python3 "$(PROJECT_ROOT)/scripts/build-relay-image.py"
-
-relay-verify: network-probe-build
-	@test -n "$(RELAY_ENV_FILE)" || { echo '请通过 RELAY_ENV_FILE 指定私有客户端环境文件。' >&2; exit 1; }
-	python3 "$(PROJECT_ROOT)/scripts/verify-relay-endpoint.py" --env-file "$(RELAY_ENV_FILE)" --check-denied
-
-network-probe-relay: network-probe-build
-	"$(PROJECT_ROOT)/services/target/debug/loki-services" network-probe-relay
-
-network-probe-services: network-probe-build
-	"$(PROJECT_ROOT)/services/target/debug/loki-services" network-probe
-
-network-probe-local: network-probe-build harmony-build
-	python3 "$(PROJECT_ROOT)/scripts/verify-network-probe.py" --target "$(HDC_TARGET)" $(if $(DEVECO_HOME),--deveco "$(DEVECO_HOME)")
 
 install-service:
 	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- install-service

@@ -17,15 +17,12 @@
 | ~modules/config~ | 配置模型、提交前处理、数据读写和变化订阅 | 已实现基础能力 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
-| ~modules/network~ | 中转服务器地址配置 | 已实现配置项，尚未接入网络连接 |
+| ~modules/network~ | 本地身份持久化、中转注册和结果通知 | 已实现 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | LaunchAgent plist 和 launchctl 服务管理 | 已实现基础能力 |
 | ~apps/center~ | 菜单栏显示 services 状态 | 已实现最小入口 |
 | ~emacs/loki-assistant-config.el~ | Customize 风格的服务配置管理 | 已实现 |
-| ~modules/network_probe~ | 固定身份、强制本地 relay 的双向消息验证，不注册 HTTP API | 已实现验证入口，需显式启用 feature |
-
-~network_probe~ 是本地验证模式，不属于正式跨设备服务接口。它由 ~main.rs~ 的独立命令显式启动，默认 services 启动行为保持不变；HTTP 仍限于 loopback。手机编译同一份验证协议，并通过 NAPI 调用 Rust iroh。协议、公开测试身份及验证边界集中维护于 [[file:identity-network-options.org::*本地验证实现][本地验证实现]]；构建与运行入口见 [[file:../apps/harmony/README.org::*本地身份组网验证][手机说明]]。
 
 services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该文件获取服务地址和端口，再请求 HTTP 接口；不应在客户端写死服务端口。
 
@@ -43,7 +40,7 @@ services/
     │   ├── control_center/ 控制中心配置和登录启动处理器
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
-    │   ├── network/        网络模块描述与中转地址配置元数据
+    │   ├── network/        本地身份、中转注册、配置处理与通知
 │   ├── notification/   系统通知发送、跳转封装和回执状态
     │   └── health/         健康状态路由
     ├── platform/macos/     LaunchAgent 管理
@@ -169,6 +166,8 @@ Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明�
 
 处理器应自行撤销失败操作的部分副作用；如果处理成功但写入 YAML 失败，配置中心调用其 ~rollback~ 方法撤销外部操作，再返回 ~config-storage-error~ 。无外部状态的处理器可使用默认的空撤销实现；有外部状态的处理器必须实现撤销。撤销失败的原因附在返回的错误说明中，配置仍不提交。事务由独立任务完成，HTTP 请求取消不会取消已接受的处理和保存。
 
+处理器还可实现 ~committed~ 回调：配置已落盘并更新内存、广播变化后，在该回调内完成资源切换和成功通知。回调失败只记录日志，不能撤回已经成功保存的配置。网络模块使用此回调关闭旧连接，防止落盘失败时提前丢弃旧连接或发出成功通知。
+
 变化订阅仍是提交成功后的通知接口：~subscribe~ 或 ~subscribe_module~ 的接收方不参与提交结果判定。手动修改 YAML 不触发处理器，重启只加载值；需要同步系统设置时应通过配置接口提交。
 
 ** YAML 存储
@@ -196,16 +195,25 @@ control-center:
 
 * 网络模块
 
-~network~ 模块通过编译期描述加入服务发现，当前不提供独立业务 HTTP API。~GET /meta/network~ 返回配置元数据；~relay_url~ 的显示名称为“中转地址”，类型为 ~string~ ，非必填，默认值为空字符串，表示未配置。非空值用于保存中转服务器的完整 URL，例如 ~https://relay.example.com:8443~ 。当前仅按字符串类型校验，不探测服务器可达性。
+~network~ 通过编译期描述加入服务发现，不提供独立业务 HTTP API。~GET /meta/network~ 返回 ~relay_url~ 配置，显示名称为“中转地址”，类型为 ~string~ ，默认空字符串。读取和提交仍使用 ~GET /data/network/relay_url~ 与 ~PUT /data/network/relay_url~ 。
 
-配置通过 ~GET /data/network/relay_url~ 读取，通过 ~PUT /data/network/relay_url~ 保存原始 JSON 字符串，沿用配置中心的来源标记、校验、YAML 持久化与变化订阅机制：
+** 本地身份
 
-#+begin_src yaml
-network:
-  relay_url: https://relay.example.com:8443
-#+end_src
+服务启动及接收网络配置提交时检查 ~~/.assistant/identity.json~ 。文件不存在时，使用 iroh 的系统随机源生成私钥和 Endpoint ID，并以 ~0600~ 权限原子发布；新建目录权限为 ~0700~ 。并发创建不覆盖已发布的身份，符号链接和非普通文件被拒绝。身份文件包含 ~version: 1~ 、 ~secret_key~ 和 ~endpoint_id~ ，读取时验证公私钥匹配，损坏时通知并报错，不静默重新生成。
 
-当前实现仅管理配置，不启动中转连接，也不改变独立 ~network-probe~ 验证命令的参数来源。
+生成成功通过共享 ~NotificationService~ 发送“已生成本地身份”，正文只有保存位置和 Endpoint ID；复用已有身份不重复通知。私钥保存在独立文件中，不进入配置 API、发现元数据、日志或通知；身份不会因注册失败或清空中转地址而删除。
+
+** 注册和生命周期
+
+“注册”表示使用持久化身份与配置中的 iroh-relay 建立并保持中转连接，确认 relay 已接受节点。当前不注册业务 ALPN，也不拨号或接收其他设备的业务连接。正式身份不复用旧验证密钥，没有固定 Endpoint ID、内置中转地址或公共 relay 回退；端点使用 Minimal preset、单一 Custom relay 并关闭 IP transport。
+
+非空地址须为有效 HTTP(S) URL，不接受账号、密码、查询或片段。共享访问令牌由 services 启动环境中的 ~LOKI_ASSISTANT_RELAY_TOKEN~ 提供，默认不携带令牌；地址只来自 ~network.relay_url~ ，不读取旧验证用的中转地址环境变量。不跳过 TLS 验证。
+
+配置提交处理器在新地址注册成功后才允许保存，最多等待 10 秒，认证拒绝提前失败。当前活动连接保持到落盘完成，然后在 ~committed~ 中切换并关闭旧连接、发送“中转注册成功”。失败发送“中转注册失败”，保存返回 HTTP 500 ~config-change-rejected~ ，保留原有 YAML、内存和连接。落盘失败在 ~rollback~ 中关闭候选连接并发送“中转配置保存失败”。清空地址成功后关闭连接；相同地址已在线时不重复注册，初始化失败后重新提交相同地址可重试。
+
+~main.rs~ 在本机 HTTP 服务启动时显式启动网络初始化任务：即使地址为空也检查身份；地址非空时注册，并通知结果。初始化失败不终止本机服务，已有配置不被改写。关闭时取消初始化任务并关闭网络连接；~Services::build/load~ 仅组装依赖，不启动网络任务。通知使用注入的共享实例，转交失败只写日志，不改变注册和保存结果。
+
+测试只在临时目录保存身份；配置事务、失败通知和超时使用替身验证，真实 iroh 注册与认证测试使用随机端口的本机 relay，不依赖公网或用户配置。旧固定身份验证代码、CLI、Makefile 入口、手机验证库及相关脚本均已删除。
 
 * Emacs 模块
 

@@ -1,4 +1,14 @@
 mod config;
+mod identity;
+mod relay;
+mod service;
+
+pub use identity::IdentityStore;
+pub use relay::{IrohRelayRegistrar, RelayRegistrar, RelaySession};
+pub use service::NetworkService;
+
+#[cfg(test)]
+mod tests;
 
 use crate::modules::discover::registry::ModuleRegistration;
 
@@ -6,6 +16,6 @@ use crate::modules::discover::registry::ModuleRegistration;
 static NETWORK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "network",
     name: "网络",
-    description: "管理中转服务器地址配置。",
+    description: "管理本地网络身份与中转注册。",
     version: env!("CARGO_PKG_VERSION"),
 };

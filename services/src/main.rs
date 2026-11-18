@@ -9,19 +9,6 @@ use loki_services::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match env::args().nth(1).as_deref() {
-        #[cfg(feature = "network-probe")]
-        Some("network-probe-relay") => {
-            loki_services::modules::network_probe::run_relay().await?;
-        }
-        #[cfg(feature = "network-probe")]
-        Some("network-probe") => run_network_probe().await?,
-        #[cfg(feature = "network-probe")]
-        Some("network-probe-client") => {
-            println!(
-                "{}",
-                loki_services::modules::network_probe::probe::run_mobile().await?
-            );
-        }
         Some("install-service") => install_service()?,
         Some("uninstall-service") => uninstall_service()?,
         Some("start-service") => start_service()?,
@@ -37,20 +24,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "network-probe")]
-async fn run_network_probe() -> Result<(), Box<dyn std::error::Error>> {
-    // 验证实例使用独立的随机 loopback 端口，不占用正式服务的锁和 pfile。
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let runtime = Arc::new(RuntimeState::new(Arc::new(Services::build())));
-    eprintln!("验证 services HTTP：http://{}", listener.local_addr()?);
-    tokio::select! {
-        result = http::serve(listener, runtime) => result?,
-        result = loki_services::modules::network_probe::probe::run_services() => result?,
-        _ = tokio::signal::ctrl_c() => {},
-    }
-    Ok(())
-}
-
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_config = RuntimeConfig::from_env()?;
     let _instance_lock = ServiceInstanceLock::acquire()?;
@@ -58,18 +31,29 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let service_pfile = ServicePfile::for_listener(listener.local_addr()?);
     let services = Arc::new(Services::load()?);
     let service_path = service_pfile.write()?;
-    let runtime = Arc::new(RuntimeState::new(services));
+    let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
+    let network = Arc::clone(&services.network);
+    let config = services.config.service();
+    let network_start = tokio::spawn(async move {
+        if let Err(error) = network.start(config).await {
+            eprintln!("网络初始化失败：{error}");
+        }
+    });
 
     eprintln!(
         "loki-services listening on http://{} (health: /healthz)",
         listener.local_addr()?
     );
 
-    tokio::select! {
-        result = http::serve(listener, runtime) => result?,
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    let result = tokio::select! {
+        result = http::serve(listener, runtime) => result,
+        _ = tokio::signal::ctrl_c() => Ok(())
+    };
+    network_start.abort();
+    let _ = network_start.await;
+    services.network.shutdown().await;
     service_pfile.remove_if_owner()?;
+    result?;
     eprintln!("services information removed: {}", service_path.display());
     Ok(())
 }
@@ -141,8 +125,4 @@ fn print_help() {
     println!("  stop-service       停止用户级 LaunchAgent");
     println!("  restart-service    重启用户级 LaunchAgent");
     println!("  service-status     查询用户级 LaunchAgent 状态");
-    #[cfg(feature = "network-probe")]
-    println!("  network-probe / network-probe-relay  启动本地身份组网验证节点或中继");
-    #[cfg(feature = "network-probe")]
-    println!("  network-probe-client  使用手机身份执行一次双向验证");
 }
