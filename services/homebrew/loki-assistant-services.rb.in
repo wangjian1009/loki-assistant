@@ -1,0 +1,29 @@
+# 由 scripts/homebrew-service.py 为当前本机构建生成。
+class LokiAssistantServices < Formula
+  desc "Loki Assistant 本机控制中心服务"
+  homepage "https://github.com/wangjian1009/loki-assistant"
+  url @ARCHIVE_URL@
+  version @VERSION@
+  sha256 @SHA256@
+  license "MIT"
+  depends_on :macos
+
+  def install
+    bin.install "loki-services"
+  end
+
+  service do
+    run [opt_bin/"loki-services"]
+    keep_alive true
+    working_dir Dir.home
+    environment_variables HOME: Dir.home,
+                          PATH: "#{HOMEBREW_PREFIX}/bin:#{HOMEBREW_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin",
+                          LOKI_ASSISTANT_CENTER_EXECUTABLE: @CENTER_EXECUTABLE@
+    log_path "#{Dir.home}/Library/Logs/LokiAssistant/services.log"
+    error_log_path "#{Dir.home}/Library/Logs/LokiAssistant/services.error.log"
+  end
+
+  test do
+    assert_match "loki-services", shell_output("#{bin}/loki-services --help")
+  end
+end

@@ -31,3 +31,7 @@ Resources/NotificationAppIcons/<app>.png  按应用标识命名的内置通知�
 ```
 
 增加 Swift 源文件时同步修改 `CMakeLists.txt`，不要直接修改生成的 Xcode 工程。
+
+托盘仅展示 services 状态，通过 `NotificationReceiptClient.discoverEndpoint` 共用文件锁、pfile 与 loopback 校验；不依赖 LaunchAgent label，不提供服务启停操作。services 自身由 Homebrew 管理；托盘自身的登录启动仍由 services 控制中心模块管理。
+
+`make test-mac` 使用独立的 `TEST_BUILD_DIR`、`LOKI_APP_BUNDLE_IDENTIFIER` 与 `LOKI_APP_URL_SCHEME`，测试宿主不得复用正式托盘的实例标识或通知 URL scheme。默认 App 构建仍使用项目约定的 Bundle ID 与 `loki-assistant` scheme。

@@ -28,7 +28,8 @@
   `(with-temp-buffer
      (loki-assistant-config-mode)
      (setq loki-assistant-config--generation (list nil))
-     ,@body))
+     (unwind-protect (progn ,@body)
+       (loki-assistant-config--stop-wait-timer))))
 
 (defun loki-assistant-config-test--fixture ()
   "绘制配置快照，用于控件和保存测试。"
@@ -207,6 +208,205 @@
         (should (loki-assistant-config--dirty-p entry))
         (should-not (loki-assistant-config--entry-busy entry))
         (should (string-match-p "launchctl 失败" (loki-assistant-config--entry-error entry)))))))
+
+(defun loki-assistant-config-test--respond (request response)
+  "将 RESPONSE 交给记录的 REQUEST 回调。"
+  (funcall (plist-get (nth 2 request) :callback) response))
+
+(ert-deftest loki-assistant-config-test-waits-through-validation-and-save-with-new-edits ()
+  (loki-assistant-config-test--with-buffer
+    (loki-assistant-config-test--fixture)
+    (let ((entry (loki-assistant-config-test--entry "text"))
+          (loki-assistant-config-save-timeout 120)
+          (loki-assistant-request-timeout 10) requests)
+      (cl-letf (((symbol-function 'loki-assistant-request)
+                 (lambda (method path &rest args)
+                   (setq requests (nconc requests (list (list method path args)))))))
+        (widget-value-set (loki-assistant-config--entry-field entry) "提交值")
+        (loki-assistant-config--submit entry t)
+        (should (string-match-p "正在校验" (buffer-string)))
+        (should (timerp loki-assistant-config--wait-timer))
+        (dolist (button (append loki-assistant-config--buttons
+                                (loki-assistant-config--entry-buttons entry)))
+          (should (widget-get button :inactive)))
+        (should-error (loki-assistant-config--submit entry t) :type 'user-error)
+        (should-error (loki-assistant-config-refresh) :type 'user-error)
+        (setf (loki-assistant-config--entry-started-at entry) (- (float-time) 4))
+        (loki-assistant-config--show-wait)
+        (should (string-match-p "已等待 4 秒" (buffer-string)))
+        (widget-value-set (loki-assistant-config--entry-field entry) "新的编辑")
+        (widget-apply (loki-assistant-config--entry-field entry) :notify)
+        (loki-assistant-config-test--respond (pop requests) '(:ok t :data ((valid . t))))
+        (should (string-match-p "正在执行并保存" (buffer-string)))
+        (should (= (plist-get (nth 2 (car requests)) :timeout) loki-assistant-config-save-timeout))
+        (should (> loki-assistant-config-save-timeout loki-assistant-request-timeout))
+        (loki-assistant-config-test--respond
+         (pop requests)
+         '(:ok t :data ((module_id . "test") (key . "text") (value . "提交值") (source . "user"))))
+        (should (equal (widget-value (loki-assistant-config--entry-field entry)) "新的编辑"))
+        (should (equal (loki-assistant-config--entry-baseline entry) "提交值"))
+        (should (string-match-p "仍有新的编辑尚未保存" (buffer-string)))
+        (should-not loki-assistant-config--wait-timer)
+        (should-not (loki-assistant-config--entry-busy entry))
+        (dolist (button (append loki-assistant-config--buttons
+                                (loki-assistant-config--entry-buttons entry)))
+          (should-not (widget-get button :inactive)))))))
+
+(ert-deftest loki-assistant-config-test-failed-save-keeps-new-input-and-allows-retry ()
+  (loki-assistant-config-test--with-buffer
+    (loki-assistant-config-test--fixture)
+    (let ((entry (loki-assistant-config-test--entry "text")) requests)
+      (cl-letf (((symbol-function 'loki-assistant-request)
+                 (lambda (method path &rest args)
+                   (setq requests (nconc requests (list (list method path args)))))))
+        (widget-value-set (loki-assistant-config--entry-field entry) "提交值")
+        (loki-assistant-config--submit entry t)
+        (loki-assistant-config-test--respond (pop requests) '(:ok t :data ((valid . t))))
+        (widget-value-set (loki-assistant-config--entry-field entry) "保留新输入")
+        (loki-assistant-config-test--respond
+         (pop requests) '(:ok nil :error-code "config-change-rejected" :error-message "中转注册失败"))
+        (should (string-match-p "中转注册失败" (buffer-string)))
+        (should (equal (widget-value (loki-assistant-config--entry-field entry)) "保留新输入"))
+        (should (equal (loki-assistant-config--entry-baseline entry) "原值"))
+        (should (equal (loki-assistant-config--entry-source entry) "default"))
+        (should-not loki-assistant-config--wait-timer)
+        (loki-assistant-config--submit entry t)
+        (should-not (loki-assistant-config--entry-error entry))
+        (loki-assistant-config-test--respond
+         (pop requests) '(:ok t :data ((valid . :false) (error . ((message . "预检失败"))))))
+        (should (string-match-p "预检失败" (buffer-string)))
+        (should-not requests)
+        (should-not loki-assistant-config--wait-timer)))))
+
+(ert-deftest loki-assistant-config-test-unknown-save-requires-refresh-before-retry ()
+  (dolist (response '((:ok nil :error-code "timeout" :error-message "请求超时")
+                      (:ok nil :error-code "transport-error" :error-message "连接中断")
+                      (:ok t :data ((unexpected . t)))
+                      (:ok t :data ["unexpected"])))
+    (loki-assistant-config-test--with-buffer
+      (loki-assistant-config-test--fixture)
+      (let ((entry (loki-assistant-config-test--entry "text")) requests)
+        (cl-letf (((symbol-function 'loki-assistant-request)
+                   (lambda (method path &rest args)
+                     (setq requests (nconc requests (list (list method path args))))))
+                  ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+          (widget-value-set (loki-assistant-config--entry-field entry) "未知结果的值")
+          (loki-assistant-config--submit entry t)
+          (loki-assistant-config-test--respond (pop requests) '(:ok t :data ((valid . t))))
+          (loki-assistant-config-test--respond (pop requests) response)
+          (should (string-match-p "保存结果未知" (buffer-string)))
+          (should (string-match-p "刷新核对" (buffer-string)))
+          (should (loki-assistant-config--entry-uncertain entry))
+          (should-not loki-assistant-config--wait-timer)
+          (should (equal (widget-value (loki-assistant-config--entry-field entry)) "未知结果的值"))
+          (should-error (loki-assistant-config--submit entry t) :type 'user-error)
+          (should-error (loki-assistant-config-save) :type 'user-error)
+          (should-not requests)
+          (dolist (button (loki-assistant-config--entry-buttons entry))
+            (should (widget-get button :inactive)))
+          (loki-assistant-config-refresh)
+          (should (equal (nth 1 (car requests)) "/meta"))
+          (let* ((json-object-type 'alist) (json-array-type 'vector) (json-key-type 'symbol)
+                 (meta (json-read-from-string loki-assistant-config-test--meta)))
+            (loki-assistant-config-test--respond (pop requests) (list :ok t :data meta)))
+          (let* ((json-object-type 'alist) (json-array-type 'vector) (json-key-type 'symbol)
+                 (json-false :false)
+                 (data (json-read-from-string loki-assistant-config-test--data)))
+            (loki-assistant-config-test--respond (pop requests) (list :ok t :data data)))
+          (should-not (loki-assistant-config--entry-uncertain
+                       (loki-assistant-config-test--entry "text")))
+          (should-not loki-assistant-config--loading))))))
+
+(ert-deftest loki-assistant-config-test-batch-progress-stops-at-specific-failure ()
+  (loki-assistant-config-test--with-buffer
+    (loki-assistant-config-test--fixture)
+    (let ((text (loki-assistant-config-test--entry "text"))
+          (flag (loki-assistant-config-test--entry "flag")) requests)
+      (cl-letf (((symbol-function 'loki-assistant-request)
+                 (lambda (method path &rest args)
+                   (setq requests (nconc requests (list (list method path args)))))))
+        (widget-value-set (loki-assistant-config--entry-field text) "新值")
+        (widget-value-set (loki-assistant-config--entry-field flag) t)
+        (loki-assistant-config-save)
+        (should (string-match-p "正在保存 1/2 项：文本" (buffer-string)))
+        (loki-assistant-config-test--respond (pop requests) '(:ok t :data ((valid . t))))
+        (loki-assistant-config-test--respond
+         (pop requests) '(:ok t :data ((module_id . "test") (key . "text") (value . "新值") (source . "user"))))
+        (should (string-match-p "正在保存 2/2 项：开关" (buffer-string)))
+        (loki-assistant-config-test--respond (pop requests) '(:ok t :data ((valid . t))))
+        (loki-assistant-config-test--respond
+         (pop requests) '(:ok nil :error-code "config-change-rejected" :error-message "系统拒绝操作"))
+        (should (string-match-p "保存已停止（已完成 1/2 项）：开关：系统拒绝操作" (buffer-string)))
+        (should-not (loki-assistant-config--dirty-p text))
+        (should (loki-assistant-config--dirty-p flag))
+        (should-not loki-assistant-config--saving-all)
+        (should-not loki-assistant-config--wait-timer)
+        (should-not requests)
+        (dolist (button loki-assistant-config--buttons)
+          (should-not (widget-get button :inactive)))))))
+
+(ert-deftest loki-assistant-config-test-closing-buffer-stops-wait-and-ignores-response ()
+  ;; with-temp-buffer 会抑制 buffer hooks，使用普通 buffer 验证真实关闭流程。
+  (let ((buffer (generate-new-buffer " *loki-config-close-test*")) request timer)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (loki-assistant-config-mode)
+            (setq loki-assistant-config--generation (list nil))
+            (loki-assistant-config-test--fixture)
+            (cl-letf (((symbol-function 'loki-assistant-request)
+                       (lambda (method path &rest args) (setq request (list method path args)))))
+              (loki-assistant-config--submit (loki-assistant-config-test--entry "text") t)
+              (setq timer loki-assistant-config--wait-timer)
+              (should (memq timer timer-list))))
+          (kill-buffer buffer)
+          (should-not (memq timer timer-list))
+          (loki-assistant-config-test--respond request '(:ok t :data ((valid . t)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (when timer (cancel-timer timer)))))
+
+(ert-deftest loki-assistant-config-test-real-http-waits-longer-than-read-timeout ()
+  (let ((loki-assistant-request-timeout 0.1)
+        (loki-assistant-config-save-timeout 1)
+        timers)
+    (unwind-protect
+        (loki-assistant-test--with-server (lambda (&rest _) nil)
+          (set-process-filter
+           server
+           (lambda (process chunk)
+             (loki-assistant-test--filter
+              (lambda (headers _body)
+                (if (string-prefix-p "POST /config/validate " headers)
+                    '(200 "{\"valid\":true}")
+                  (push
+                   (run-at-time
+                    0.2 nil
+                    (lambda ()
+                      (when (process-live-p process)
+                        (let ((body "{\"module_id\":\"test\",\"key\":\"text\",\"value\":\"delayed\",\"source\":\"user\"}"))
+                          (process-send-string
+                           process
+                           (concat (format "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+                                           (string-bytes body)) body))
+                          (process-send-eof process)))))
+                   timers)
+                  nil))
+              process chunk)))
+          (loki-assistant-config-test--with-buffer
+            (loki-assistant-config-test--fixture)
+            (let ((entry (loki-assistant-config-test--entry "text")))
+              (widget-value-set (loki-assistant-config--entry-field entry) "delayed")
+              (loki-assistant-config--submit entry t)
+              (loki-assistant-config-test--wait
+               (lambda () (eq (loki-assistant-config--entry-busy entry) 'saving)))
+              (should (string-match-p "正在执行并保存" (buffer-string)))
+              (loki-assistant-config-test--wait
+               (lambda () (not (loki-assistant-config--entry-busy entry))))
+              (should (string-match-p "保存成功" (buffer-string)))
+              (should-not (loki-assistant-config--entry-uncertain entry))
+              (should-not (loki-assistant-config--entry-error entry))
+              (should-not loki-assistant-config--wait-timer))))
+      (mapc #'cancel-timer timers))))
 
 (provide 'loki-assistant-config-tests)
 ;;; loki-assistant-config-tests.el ends here

@@ -4,7 +4,7 @@
 
 当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本和启动时间；启动时间来自服务发现文件的 ~started_at~ ，不逐秒更新运行时长。services 不可达时显示不可用状态。
 
-应用通过系统的 ~launchctl~ 查询 LaunchAgent 是否运行；随后读取 ~~/.assistant/service~ 获取服务端口，再通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色启动按钮。不包含 Emacs 会话、语音输入或其他旧版功能。
+应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色“未运行”。托盘只显示服务状态，services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。不包含 Emacs 会话、语音输入或其他旧版功能。
 
 在 Emacs 配置界面的“控制中心”模块开启“登录时自动启动”时，由 services 的控制中心模块先同步系统设置，成功后才保存配置；失败会显示具体错误并保留输入。使用 ~cc.loki-assistant.center~ 用户级 LaunchAgent 在 GUI 登录时启动托盘。重复开启会检查现有注册并启动任务；未注册时重新加载。重启 services 仅重启 Rust 服务，托盘由自己的 LaunchAgent 管理。
 
@@ -48,6 +48,8 @@ make restart-center
 #+end_src
 
 修改菜单栏 App 后使用 ~make restart-center~ ，确保旧实例退出并加载新的 binary。
+
+~make test-mac~ 使用独立构建目录、测试宿主 Bundle ID 和 URL scheme，避免与正在使用的托盘实例争用 LaunchServices 注册；测试只验证协议与状态逻辑，不操作真实服务。
 
 需要 macOS、CMake 3.30 及以上和支持 Swift 6 的 Xcode。构建配置及源文件列表以 [[file:mac/CMakeLists.txt][CMakeLists.txt]] 为准。
 

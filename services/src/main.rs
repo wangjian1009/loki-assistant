@@ -1,20 +1,13 @@
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, sync::Arc};
 
 use loki_services::{
     Services, http,
-    platform::macos::{LaunchdManager, LaunchdServiceSpec},
     runtime::{RuntimeConfig, RuntimeState, ServiceInstanceLock, ServicePfile},
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match env::args().nth(1).as_deref() {
-        Some("install-service") => install_service()?,
-        Some("uninstall-service") => uninstall_service()?,
-        Some("start-service") => start_service()?,
-        Some("stop-service") => stop_service()?,
-        Some("restart-service") => restart_service()?,
-        Some("service-status") => service_status()?,
         Some("--help") | Some("-h") => print_help(),
         Some(command) => {
             return Err(format!("未知命令：{command}，使用 --help 查看支持的命令").into());
@@ -45,9 +38,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         listener.local_addr()?
     );
 
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = tokio::select! {
         result = http::serve(listener, runtime) => result,
-        _ = tokio::signal::ctrl_c() => Ok(())
+        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = terminate.recv() => Ok(())
     };
     network_start.abort();
     let _ = network_start.await;
@@ -58,71 +53,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn install_service() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = service_spec()?;
-    let path = LaunchdManager::new()?.install(&spec)?;
-    println!("已注册 LaunchAgent：{}", path.display());
-    Ok(())
-}
-
-fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = service_spec()?;
-    LaunchdManager::new()?.uninstall(&spec)?;
-    println!("已取消注册 LaunchAgent：{}", spec.label);
-    Ok(())
-}
-
-fn start_service() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = service_spec()?;
-    LaunchdManager::new()?.start(&spec)?;
-    println!("已启动 LaunchAgent：{}", spec.label);
-    Ok(())
-}
-
-fn stop_service() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = service_spec()?;
-    LaunchdManager::new()?.stop(&spec)?;
-    println!("已停止 LaunchAgent：{}", spec.label);
-    Ok(())
-}
-
-fn restart_service() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = service_spec()?;
-    LaunchdManager::new()?.restart(&spec)?;
-    println!("已重启 LaunchAgent：{}", spec.label);
-    Ok(())
-}
-
-fn service_status() -> Result<(), Box<dyn std::error::Error>> {
-    let spec = service_spec()?;
-    println!("{:?}", LaunchdManager::new()?.status(&spec)?);
-    Ok(())
-}
-
-fn service_spec() -> Result<LaunchdServiceSpec, Box<dyn std::error::Error>> {
-    let executable = env::current_exe()?;
-    let mut spec = LaunchdServiceSpec::new("cc.loki-assistant.services", executable);
-    if let Some(address) = env::var_os("LOKI_ASSISTANT_HTTP_ADDR") {
-        spec.environment.insert(
-            "LOKI_ASSISTANT_HTTP_ADDR".to_owned(),
-            address.to_string_lossy().into_owned(),
-        );
-    }
-    if let Some(home) = env::var_os("HOME") {
-        let log_directory = PathBuf::from(home).join("Library/Logs/LokiAssistant");
-        spec.stdout_path = Some(log_directory.join("services.log"));
-        spec.stderr_path = Some(log_directory.join("services.error.log"));
-    }
-    Ok(spec)
-}
-
 fn print_help() {
     println!("loki-services");
     println!("  无参数       启动本地 HTTP 服务");
-    println!("  install-service   注册当前可执行文件为用户级 LaunchAgent");
-    println!("  uninstall-service 取消注册用户级 LaunchAgent");
-    println!("  start-service      启动用户级 LaunchAgent");
-    println!("  stop-service       停止用户级 LaunchAgent");
-    println!("  restart-service    重启用户级 LaunchAgent");
-    println!("  service-status     查询用户级 LaunchAgent 状态");
+    println!("  服务管理     使用 brew services 或根目录 Makefile");
 }

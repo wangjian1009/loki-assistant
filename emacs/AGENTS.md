@@ -4,7 +4,7 @@
 - `loki-assistant.el` 是包入口，提供 `loki-assistant` feature、同名配置组、异步 HTTP 请求和通知发送。
 - 每次 HTTP 请求从 services pfile 发现 loopback 地址；不硬编码端口。通知通过通用请求接口发送，使用 `module_id` 选择服务端处理器。
 - `loki-assistant-tests.el` 使用临时 pfile 和真实 loopback listener 验证协议与错误反馈，不发送真实系统通知、不改动用户配置。
-- `loki-assistant-config.el` 提供 Customize 风格的 services 配置管理；通过 widget 展示动态元数据，完整加载模块实例后统一展示，预检与保存走现有 HTTP API，不复制服务端业务校验。保存时捕获模块、键和值，旧响应不覆盖新的输入；失败保留输入并显示服务端错误。
+- `loki-assistant-config.el` 提供 Customize 风格的 services 配置管理；通过 widget 展示动态元数据，完整加载模块实例后统一展示，预检与保存走现有 HTTP API，不复制服务端业务校验。保存时捕获模块、键和值，区分校验和执行保存阶段，显示等待时长与批量进度；等待期间禁用重复操作，保留编辑能力。成功更新保存基线，旧响应不覆盖新的输入；失败保留输入并显示服务端错误。保存使用独立超时，结果未知时暂停再次提交并要求刷新核对；关闭 buffer 清理等待计时器。
 - 登录启动由 services 的控制中心模块在配置提交前处理；界面只提交配置，失败时保留输入并显示服务端错误，不直接管理 LaunchAgent。
 - `loki-assistant-monitor.el` 提供主动状态上报和统一 buffer 关注；默认 `loki-assistant-monitor-buffer` 为 `(agent-shell-mode)`，通过 mode hook 注册并通过 `POST /emacs/status` 同步。关闭 `loki-assistant-monitor-mode` 时移除 hook 和定时器，保留 services 最后状态。
 - `loki-assistant-monitor-tests.el` 覆盖关注生命周期、状态分组、请求合并、过期响应和失败保留，纳入 `make emacs-test`。

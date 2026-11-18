@@ -20,7 +20,7 @@
 | ~modules/network~ | 本地身份持久化、中转注册和结果通知 | 已实现 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
-| ~platform/macos~ | LaunchAgent plist 和 launchctl 服务管理 | 已实现基础能力 |
+| ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |
 | ~apps/center~ | 菜单栏显示 services 状态 | 已实现最小入口 |
 | ~emacs/loki-assistant-config.el~ | Customize 风格的服务配置管理 | 已实现 |
 
@@ -460,13 +460,8 @@ services 通过独立参数调用 ~/usr/bin/open -g~ ，将通知 JSON 编码到
 
 * macOS 服务管理
 
-#+begin_src sh
-make install-service
-make start-service
-make service-status
-make restart-service
-make stop-service
-make uninstall-service
-#+end_src
+services 自身由 Homebrew formula ~loki-assistant/local/loki-assistant-services~ 管理，注册与注销由根目录 ~make install-service~ 和 ~make uninstall-service~ 编排。安装当前本机构建后可直接通过 ~brew services list~ 和 ~brew services info loki-assistant-services~ 查看状态；更换源码后通过 ~make restart-service~ 更新构建并重启。具体操作与环境配置集中维护在 [[file:../services/README.org::*macOS 服务管理][services README]]。
 
-~make restart-service~ 会重新编译 services 并重启同一路径的 Debug binary。LaunchAgent 管理器使用用户级 domain，不在服务启动时自动修改用户配置。
+安装成功后清理旧的 ~cc.loki-assistant.services~ 自管 LaunchAgent，Rust binary 不再提供安装、卸载或启停该任务的 CLI。SIGTERM 和 Ctrl-C 共用服务关闭流程。托盘状态只依赖服务锁、pfile 和 HTTP 健康检查，不解释 Homebrew 任务名称，也不提供 services 启停按钮。
+
+托盘自己的 ~cc.loki-assistant.center~ 登录启动仍由控制中心配置处理器管理，和 Homebrew 服务管理相互独立。

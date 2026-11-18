@@ -20,7 +20,7 @@
 
 ```text
 src/
-├── main.rs              读取配置、绑定 listener、处理 Ctrl-C
+├── main.rs              读取配置、绑定 listener、处理 Ctrl-C/SIGTERM
 ├── lib.rs               crate 模块导出
 ├── services.rs          Services 组合根和模块路由注册
 ├── runtime.rs           进程启动配置、启动时间等运行时状态
@@ -104,7 +104,7 @@ src/modules/<module>/
 | `modules/network` | 身份持久化、中转注册和通知 | 配置处理器 trait、注入的通知服务、iroh 适配 |
 | `modules/control_center` | 控制中心配置、菜单栏登录启动与失败撤销 | 配置处理器 trait、平台 LaunchAgent 管理器 |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
-| `platform/macos`        | LaunchAgent plist、launchctl 安装/卸载/启停/状态管理               | macOS API；不提供业务 HTTP 路由             |
+| `platform/macos`        | 托盘登录启动的 LaunchAgent plist 与 launchctl 管理               | macOS API；不提供业务 HTTP 路由             |
 
 依赖方向固定为：
 
@@ -126,7 +126,7 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 进程入口使用 `Services::load()` 读取用户文件后组装服务；`Services::build()`、`ConfigService::new()` 与 `from_registry()` 用于无文件实例。配置存储测试必须使用临时目录，不修改真实用户配置。模块在组装阶段用 `ConfigService::with_change_handler` 注入提交前处理器，完整替换、合并和追加都先等待处理成功再落盘；处理失败返回 `config-change-rejected`，内存、YAML 和订阅均保持不变。处理器可读取旧值，不得递归提交；有外部状态时实现 `rollback`，供处理成功但落盘失败时撤销。写入成功后才更新内存并广播变化，再调用 `committed` 完成连接切换与成功通知；该回调失败只记日志。写入失败应保留原有状态。
 
-`platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；真正安装或卸载服务由上层显式触发。`modules/control_center` 拥有 `control-center.center_auto_start` 元数据及处理器，在配置提交时调用 `set_login_startup` 同步托盘登录启动，模块构造和服务启动不自动操作 launchd；Emacs 只提交配置。
+`platform/macos::LaunchdManager` 只管理用户级 `LaunchAgent`，通过独立参数调用 `/bin/launchctl`，不经过 shell。测试必须注入 `CommandRunner`，不得在单元测试中操作真实用户的 launchd；托盘的系统设置由上层显式触发。services 自身使用 Homebrew services，由根目录 Makefile 调用 `scripts/homebrew-service.py` 管理，本机 formula 模板为 `services/homebrew/loki-assistant-services.rb.in`；不得恢复 Rust CLI 自管 services LaunchAgent。`modules/control_center` 拥有 `control-center.center_auto_start` 元数据及处理器，在配置提交时调用 `set_login_startup` 同步托盘登录启动，模块构造和服务启动不自动操作 launchd；Emacs 只提交配置。
 
 `Services` 创建并持有 `Arc<notification::NotificationService>`，创建 `emacs::Module` 时通过 `Arc::clone` 注入。通知模块直接导出 `NotificationService`，发送、状态查询、回执和路由均通过该实例调用，不另设 `Module` 包装或 `service()` 取用入口。`EmacsService` 保存该 `Arc<NotificationService>` 引用，不得自行创建通知服务或平台发送器。Emacs 通知上报入口保留 `POST /emacs/receiver/notification`：本模块负责把可选 buffer 转成 `/emacs/activate` 回调路径，未收到 `app` 或收到 `null` 时补为 `emacs`（图标由 center 按应用标识从内置资源读取），再调用通知服务发送；不在发送期间连接 Emacs。
 

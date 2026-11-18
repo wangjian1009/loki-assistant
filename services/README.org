@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。LaunchAgent 管理器支持生成 plist、安装、卸载、启动、停止、重启和状态查询；菜单栏应用提供 services 状态监控和启动入口，托盘登录启动由 services 的控制中心模块在配置提交时处理。
+当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。services 自身由 Homebrew services 管理，菜单栏应用只展示服务状态，提供设置、日志与业务入口；托盘登录启动仍由 services 的控制中心模块在配置提交时管理用户级 LaunchAgent。
 
 服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
@@ -162,17 +162,22 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 * macOS 服务管理
 
-LaunchAgent label 为 ~cc.loki-assistant.services~ ；修改 label 后需要先取消旧服务注册，再重新执行 ~make install-service~ 。
+services 使用本地 formula ~loki-assistant/local/loki-assistant-services~ ，统一由 ~brew services~ 管理；服务以当前用户运行，不使用 sudo。托盘的 ~cc.loki-assistant.center~ LaunchAgent 仍归 services 控制中心模块管理，与 services 自身的启停相互独立。托盘只显示服务状态，不提供启动或停止 services 的操作。
 
-~make install-service~ 会使用当前 Debug 可执行文件注册用户级 LaunchAgent，并将日志写入 ~~/Library/Logs/LokiAssistant/~ ；~make uninstall-service~ 可取消注册。安装和卸载会调用系统的 ~launchctl~ ，需要用户显式执行。
+根目录 ~make install-service~ 编译当前 Debug binary，生成带 SHA256 校验的本机安装包与本地 tap formula，安装到 Homebrew Cellar，然后启动并注册 services。首次迁移会在新 formula 安装成功后卸载旧 ~cc.loki-assistant.services~ 任务并删除旧 plist，避免两个服务争用端口和锁；托盘任务、用户配置和身份均保留。重复执行安装可更新本机构建。
 
-已注册服务可以使用 ~make start-service~、~make stop-service~、~make restart-service~ 和 ~make service-status~ 管理。停止操作会卸载当前用户 domain 中的 LaunchAgent，但保留 plist，之后可以再次启动。
+~make uninstall-service~ 停止并注销 Homebrew 服务、卸载 formula，保留 ~~/.assistant/~ 、托盘启动设置和日志。~make start-service~ 、 ~make stop-service~ 与 ~make service-status~ 分别调用 Homebrew 的启动、停止与状态查询。修改代码后使用 ~make restart-service~ ，它会重新编译和更新已安装的 binary，再通过 Homebrew 重启；直接 ~brew services restart~ 只重启已安装的版本。
 
-修改 services 源码后，执行以下命令刷新正在运行的服务：
+可直接使用以下命令查看和管理已安装的服务：
 
 #+begin_src sh
-make restart-service
-make service-status
+brew services list
+brew services info loki-assistant-services
+brew services restart loki-assistant-services
+brew services stop loki-assistant-services
+brew services start loki-assistant-services
 #+end_src
 
-~make restart-service~ 会先由 Cargo 编译当前 Debug binary，再让 launchd 重启同一路径的可执行文件。修改服务 label、可执行文件路径或 LaunchAgent 配置时，需要重新执行 ~make install-service~ 。
+服务 stdout 和 stderr 继续保存在 ~~/Library/Logs/LokiAssistant/services.log~ 与 ~services.error.log~ 。自定义监听地址、中转令牌或托盘可执行文件时，在 ~~/.homebrew/services/loki-assistant-services.env~ 中按 ~KEY=value~ 设置 ~LOKI_ASSISTANT_HTTP_ADDR~ 、 ~LOKI_ASSISTANT_RELAY_TOKEN~ 或 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ ，权限设为 ~0600~ ，再重启 Homebrew 服务；也可通过 ~HOMEBREW_USER_CONFIG_HOME~ 改变配置目录。迁移时会在该文件缺失的情况下保留旧 plist 或当前命令环境中的这些设置，已有文件不覆盖，令牌不会输出。
+
+Rust binary 只提供服务运行入口和 ~--help~ ，不再包含自管 services LaunchAgent 的安装与启停命令。Homebrew 停止服务时的 SIGTERM 与 Ctrl-C 均走相同的关闭流程，释放中转连接和服务发现信息。

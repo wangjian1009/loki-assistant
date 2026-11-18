@@ -3,10 +3,12 @@
 PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR ?= $(PROJECT_ROOT)/apps/center/mac/.build
 RELEASE_BUILD_DIR ?= $(BUILD_DIR)/release
+TEST_BUILD_DIR ?= $(BUILD_DIR)/tests
 CONFIG ?= Debug
 CMAKE ?= cmake
 CTEST ?= ctest
 CARGO ?= cargo
+BREW ?= brew
 OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
@@ -30,12 +32,12 @@ help:
 	  'make services-fmt    检查 services Rust 格式' \
 	  'make services-run    运行 services 本地服务' \
 	  'make relay-image     构建 ECS 使用的固定版本 iroh-relay Docker 镜像' \
-	  'make install-service 注册 services 用户级 LaunchAgent' \
-	  'make uninstall-service 取消注册 services 用户级 LaunchAgent' \
-	  'make start-service   启动 services 用户级 LaunchAgent' \
-	  'make stop-service    停止 services 用户级 LaunchAgent' \
-	  'make restart-service 重启 services 用户级 LaunchAgent' \
-	  'make service-status  查询 services 用户级 LaunchAgent 状态' \
+	  'make install-service 构建并注册 services 到 brew services' \
+	  'make uninstall-service 停止并卸载 services Homebrew formula' \
+	  'make start-service   通过 brew services 启动 services' \
+	  'make stop-service    通过 brew services 停止 services' \
+	  'make restart-service 重建、更新并重启 services Homebrew 服务' \
+	  'make service-status  查询 brew services 中的 services 状态' \
 	  'make emacs-load      通过 emacsclient 重新加载 Emacs 包' \
 	  'make emacs-test      通过 emacsclient 执行 Emacs ERT 测试' \
 	  'make release         构建 Release Mac 菜单栏应用' \
@@ -50,7 +52,7 @@ help:
 	  'make harmony-clean   清理 HarmonyOS 构建产物' \
 	  'make clean           清理构建产物' \
 	  '' \
-	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR CMAKE CTEST CARGO OPEN EMACSCLIENT DEVECO_HOME HDC_TARGET'
+	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR TEST_BUILD_DIR CMAKE CTEST CARGO BREW OPEN EMACSCLIENT DEVECO_HOME HDC_TARGET'
 
 emacs-load:
 	"$(EMACSCLIENT)" --eval "(progn \
@@ -96,8 +98,10 @@ build: configure
 
 test: test-mac services-test
 
-test-mac: build
-	"$(CTEST)" --test-dir "$(BUILD_DIR)" -C "$(CONFIG)" --output-on-failure
+test-mac:
+	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(TEST_BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON -DLOKI_APP_BUNDLE_IDENTIFIER=cc.loki-assistant.center.testhost -DLOKI_APP_URL_SCHEME=loki-assistant-testhost
+	"$(CMAKE)" --build "$(TEST_BUILD_DIR)" --config "$(CONFIG)"
+	"$(CTEST)" --test-dir "$(TEST_BUILD_DIR)" -C "$(CONFIG)" --output-on-failure
 
 services-test:
 	"$(CARGO)" test --workspace --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml"
@@ -112,22 +116,22 @@ relay-image:
 	python3 "$(PROJECT_ROOT)/scripts/build-relay-image.py"
 
 install-service:
-	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- install-service
+	python3 "$(PROJECT_ROOT)/scripts/homebrew-service.py" install --brew "$(BREW)" --cargo "$(CARGO)"
 
 uninstall-service:
-	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- uninstall-service
+	python3 "$(PROJECT_ROOT)/scripts/homebrew-service.py" uninstall --brew "$(BREW)" --cargo "$(CARGO)"
 
 start-service:
-	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- start-service
+	python3 "$(PROJECT_ROOT)/scripts/homebrew-service.py" start --brew "$(BREW)" --cargo "$(CARGO)"
 
 stop-service:
-	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- stop-service
+	python3 "$(PROJECT_ROOT)/scripts/homebrew-service.py" stop --brew "$(BREW)" --cargo "$(CARGO)"
 
 restart-service:
-	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- restart-service
+	python3 "$(PROJECT_ROOT)/scripts/homebrew-service.py" restart --brew "$(BREW)" --cargo "$(CARGO)"
 
 service-status:
-	"$(CARGO)" run --quiet --manifest-path "$(PROJECT_ROOT)/services/Cargo.toml" -- service-status
+	python3 "$(PROJECT_ROOT)/scripts/homebrew-service.py" status --brew "$(BREW)" --cargo "$(CARGO)"
 
 run: build
 	"$(OPEN)" "$(BUILD_DIR)/$(CONFIG)/LokiAssistant.app"
@@ -173,6 +177,9 @@ harmony-devices:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" devices
 
 harmony-clean:
+	@if [ -f "$(TEST_BUILD_DIR)/CMakeCache.txt" ]; then \
+	  "$(CMAKE)" --build "$(TEST_BUILD_DIR)" --config "$(CONFIG)" --target clean; \
+	fi
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" clean
 
 clean:

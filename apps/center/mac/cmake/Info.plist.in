@@ -36,9 +36,9 @@
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>cc.loki-assistant.center.notification</string>
+            <string>@LOKI_APP_BUNDLE_IDENTIFIER@.notification</string>
             <key>CFBundleURLSchemes</key>
-            <array><string>loki-assistant</string></array>
+            <array><string>@LOKI_APP_URL_SCHEME@</string></array>
         </dict>
     </array>
 </dict>

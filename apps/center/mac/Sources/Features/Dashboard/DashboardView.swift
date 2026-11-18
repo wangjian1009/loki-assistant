@@ -11,7 +11,7 @@ struct DashboardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            statusButton
+            statusSummary
             Divider()
             monitoredBuffers
             Divider()
@@ -106,56 +106,35 @@ struct DashboardView: View {
     }
 
     @ViewBuilder
-    private var statusButton: some View {
+    private var statusSummary: some View {
         switch status.status {
         case let .healthy(health):
-            Button {
-            } label: {
-                Label {
-                    if let startedAt = status.startedAt {
-                        Text("\(health.version) · 启动于 \(startedAt.formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))")
-                            .monospacedDigit()
-                    } else {
-                        Text(health.version)
-                    }
-                } icon: {
-                    statusDot
-                }
-            }
-            .disabled(true)
-            .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        case .stopped:
-            Button {
-                Task { await status.start() }
-            } label: {
-                Label("启动", systemImage: "circle.fill")
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(.gray, .gray)
-            }
-            .help("启动 services")
-            .buttonStyle(.borderless)
-            .frame(width: 170, alignment: .leading)
-        case .unknown:
-            statusInfoButton("检查中…")
-        case .starting:
-            statusInfoButton("启动中…")
-        case .unavailable:
-            statusInfoButton("不可用")
-        }
-    }
-
-    private func statusInfoButton(_ title: String) -> some View {
-        Button {
-        } label: {
             Label {
-                Text(title)
+                if let startedAt = status.startedAt {
+                    Text("\(health.version) · 启动于 \(startedAt.formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))")
+                        .monospacedDigit()
+                } else {
+                    Text(health.version)
+                }
             } icon: {
                 statusDot
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .stopped:
+            statusInfo("未运行")
+        case .unknown:
+            statusInfo("检查中…")
+        case .unavailable:
+            statusInfo("不可用")
         }
-        .disabled(true)
-        .buttonStyle(.borderless)
+    }
+
+    private func statusInfo(_ title: String) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            statusDot
+        }
         .frame(width: 170, alignment: .leading)
     }
 
@@ -170,8 +149,6 @@ struct DashboardView: View {
         case .healthy:
             .green
         case .unknown:
-            .gray
-        case .starting:
             .gray
         case .stopped:
             .gray

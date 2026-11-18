@@ -50,7 +50,7 @@ make emacs-config
 
 也可在加载包后执行 ~M-x loki-assistant-config~ ，或通过菜单栏“设置”打开。界面按模块显示配置，提供校验、保存、撤销编辑和文件选择；详见 [[file:docs/emacs.org::*服务配置管理][服务配置管理]]。
 
-注册、启动和停止 services 用户级 LaunchAgent：
+通过 Homebrew 注册、启动和停止 services（安装后立即启动）：
 
 #+begin_src sh
 make install-service
@@ -58,6 +58,8 @@ make start-service
 make service-status
 make stop-service
 #+end_src
+
+安装后可直接用 ~brew services list~ 或 ~brew services info loki-assistant-services~ 查看状态。services 自身由 Homebrew 管理，托盘只显示状态；托盘的登录启动继续在 services 的“控制中心”配置中管理。具体安装和环境配置见 [[file:services/README.org::*macOS 服务管理][macOS 服务管理]]。
 
 * 开发操作
 
@@ -87,12 +89,12 @@ make emacs-test
 | make services-fmt | 检查 services Rust 格式 |
 | make services-run | 运行 services |
 | make relay-image | 校验上游发布包并构建固定版本的 Linux AMD64 中继镜像 |
-| make install-service | 注册 services LaunchAgent |
-| make uninstall-service | 取消注册 services LaunchAgent |
-| make start-service | 启动 services LaunchAgent |
-| make stop-service | 停止 services LaunchAgent |
-| make restart-service | 重启 services LaunchAgent |
-| make service-status | 查询 services LaunchAgent 状态 |
+| make install-service | 编译并注册 services 到 brew services |
+| make uninstall-service | 停止并卸载 services Homebrew formula |
+| make start-service | 通过 brew services 启动 services |
+| make stop-service | 通过 brew services 停止 services |
+| make restart-service | 重建、更新并重启 services Homebrew 服务 |
+| make service-status | 查询 brew services 中的 services 状态 |
 | make emacs-load | 通过 emacsclient 重新加载 Emacs 包 |
 | make emacs-test | 通过 emacsclient 执行 Emacs ERT 测试 |
 | make harmony-deps | 检查 SDK 并安装 HarmonyOS 工程依赖 |

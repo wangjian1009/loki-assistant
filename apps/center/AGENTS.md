@@ -11,6 +11,6 @@
 - 菜单每次开始 tracking 时从 services 的 `/emacs/status` 读取最新快照，按 `app` 分组展示各应用的 `buffer` 列表；菜单关闭取消请求，不后台轮询。点击使用 buffer 名称请求 `/emacs/activate`，重复名称按服务端返回的第一个匹配项处理。
 - 菜单打开、设置、日志和 agent-shell 切换都是用户操作，结果记录到 `~/.assistant/loki-assistant.log.org`；一级标题记录用户操作，二级标题记录本次操作的 HTTP 调用，文件最多保留最近 500 条一级操作。
 - “设置”和“日志”请求 services 的 `POST /emacs/apps/open?app=config|logs`；应用加载、日志文件打开、固定 Lisp 和图形 frame 聚焦均属于服务端，不在 Swift 中维护 Emacs 脚本。应用不存在时展示服务端 `app-not-found` 的中文说明。请求前检查服务文件锁和健康状态；失败显示服务端原因，不自动重试。
-- 应用启动后不创建 Dock 主窗口；菜单栏菜单显示连接状态和版本，后台自动监控 services；停止时提供灰色启动按钮。
+- 应用启动后不创建 Dock 主窗口；菜单栏菜单显示连接状态和版本，后台自动监控 services；停止时显示灰色“未运行”。托盘不提供 services 启停，不调用 launchctl；服务管理统一交给 Homebrew 和根目录 Makefile。
 
 - 点击时重新发现 services 并向解包后的本机回调路径发送一次 POST，不自动重试、不在 App 中实现 Emacs buffer 操作。通知接口仅接收 `app` 应用标识，不支持指定图标。图标按 `mac/Resources/NotificationAppIcons/<app>.png` 命名并随 App 打包，以 PNG 附件展示；已提供 `emacs`。标识仅允许小写字母、数字、`-` 和 `_`；缺省或资源不存在时展示文字通知。

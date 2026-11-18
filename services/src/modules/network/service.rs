@@ -51,7 +51,7 @@ impl NetworkService {
     }
 
     async fn notify(&self, title: &str, body: String) {
-        if let Err(error) = self
+        match self
             .notification
             .send(NotificationRequest {
                 title: title.to_owned(),
@@ -61,7 +61,11 @@ impl NetworkService {
             })
             .await
         {
-            eprintln!("{title}，通知转交失败：{error}");
+            Ok(receipt) => eprintln!(
+                "{title}：通知已转交，notification_id={}",
+                receipt.notification_id
+            ),
+            Err(error) => eprintln!("{title}，通知转交失败：{error}"),
         }
     }
 

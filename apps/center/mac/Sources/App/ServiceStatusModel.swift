@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 import Observation
 
@@ -31,29 +30,31 @@ struct ServiceEndpoint: Codable, Equatable, Sendable {
 
 enum ServiceStatus: Equatable, Sendable {
     case unknown
-    case starting
     case healthy(HealthResponse)
     case stopped
     case unavailable(String)
 }
 
-private struct LaunchctlResult: Sendable {
-    let status: Int32
-    let output: String
-}
-
 @MainActor
 @Observable
 final class ServiceStatusModel {
-    nonisolated static let serviceFileURL = FileManager.default.homeDirectoryForCurrentUser
-        .appending(path: ".assistant/service")
-    nonisolated static let serviceLabel = "cc.loki-assistant.services"
-    nonisolated static let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
+    typealias Discover = @Sendable () throws -> ServiceEndpoint
+    typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
     private(set) var status: ServiceStatus = .unknown
     private(set) var lastUpdated: Date?
     private(set) var startedAt: Date?
     @ObservationIgnored private var monitoringTask: Task<Void, Never>?
+    @ObservationIgnored private let discover: Discover
+    @ObservationIgnored private let transport: Transport
+
+    init(
+        discover: @escaping Discover = { try NotificationReceiptClient.discoverEndpoint() },
+        transport: @escaping Transport = { try await URLSession.shared.data(for: $0) }
+    ) {
+        self.discover = discover
+        self.transport = transport
+    }
 
     func startMonitoring() {
         guard monitoringTask == nil else { return }
@@ -67,111 +68,30 @@ final class ServiceStatusModel {
 
     func refresh() async {
         do {
-            let printResult = try await runLaunchctl(["print", serviceTarget])
-            guard printResult.status == 0 else {
-                status = .stopped
-                startedAt = nil
-                lastUpdated = Date()
-                return
+            // 与通知回执共用文件锁和 pfile 发现，不依赖任何服务管理器的任务名。
+            let endpoint = try discover()
+            let request = URLRequest(
+                url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/healthz"),
+                cachePolicy: .reloadIgnoringLocalCacheData,
+                timeoutInterval: 5
+            )
+            let (data, response) = try await transport(request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                throw URLError(.badServerResponse)
             }
-            let endpoint = try readEndpoint()
-            let health = try await fetchHealth(endpoint: endpoint)
+            let health = try JSONDecoder().decode(HealthResponse.self, from: data)
+            guard health.service == "loki-services", health.status == "ok" else {
+                throw URLError(.cannotParseResponse)
+            }
             status = .healthy(health)
             startedAt = Date(timeIntervalSince1970: TimeInterval(endpoint.startedAt))
-            lastUpdated = Date()
+        } catch NotificationReceiptError.serviceUnavailable {
+            status = .stopped
+            startedAt = nil
         } catch {
             status = .unavailable(error.localizedDescription)
             startedAt = nil
-            lastUpdated = Date()
         }
-    }
-
-    func start() async {
-        status = .starting
-        do {
-            let plistURL = Self.plistURL
-            guard FileManager.default.fileExists(atPath: plistURL.path) else {
-                throw ServiceError.notRegistered
-            }
-            let printResult = try await runLaunchctl(["print", serviceTarget])
-            if printResult.status == 0 {
-                _ = try await runLaunchctl(["kickstart", "-k", serviceTarget])
-            } else {
-                _ = try await runLaunchctl(["bootstrap", serviceDomain, plistURL.path])
-            }
-            await refresh()
-        } catch {
-            status = .unavailable(error.localizedDescription)
-            lastUpdated = Date()
-        }
-    }
-
-    private var serviceDomain: String {
-        "gui/\(getuid())"
-    }
-
-    private var serviceTarget: String {
-        "\(serviceDomain)/\(Self.serviceLabel)"
-    }
-
-    private static var plistURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/LaunchAgents")
-            .appending(path: "\(serviceLabel).plist")
-    }
-
-    private func fetchHealth(endpoint: ServiceEndpoint) async throws -> HealthResponse {
-        guard let url = URL(string: "http://\(endpoint.host):\(endpoint.port)/healthz") else {
-            throw URLError(.badURL)
-        }
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw URLError(.badServerResponse)
-        }
-        let health = try JSONDecoder().decode(HealthResponse.self, from: data)
-        guard health.status == "ok" else {
-            throw URLError(.cannotParseResponse)
-        }
-        return health
-    }
-
-    private func readEndpoint() throws -> ServiceEndpoint {
-        let data = try Data(contentsOf: Self.serviceFileURL)
-        return try JSONDecoder().decode(ServiceEndpoint.self, from: data)
-    }
-
-    private func runLaunchctl(_ arguments: [String]) async throws -> LaunchctlResult {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            process.executableURL = Self.launchctlURL
-            process.arguments = arguments
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
-            process.terminationHandler = { process in
-                let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                let text = String(data: error.isEmpty ? output : error, encoding: .utf8) ?? ""
-                continuation.resume(returning: LaunchctlResult(status: process.terminationStatus, output: text))
-            }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
-    }
-}
-
-private enum ServiceError: LocalizedError {
-    case notRegistered
-
-    var errorDescription: String? {
-        switch self {
-        case .notRegistered:
-            "services 尚未注册 LaunchAgent"
-        }
+        lastUpdated = Date()
     }
 }
