@@ -268,5 +268,8 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
 (require 'loki-assistant-monitor)
 (loki-assistant-monitor-mode 1)
 
+(with-eval-after-load 'org-edna
+  (require 'loki-assistant-edna))
+
 (provide 'loki-assistant)
 ;;; loki-assistant.el ends here

@@ -221,3 +221,49 @@ Agent 的 ~permission-request~ 和 ~turn-complete~ 事件通过
 
 远程输入接收尚未实现；后续交互命令暂定命名为
 ~loki-assistant-agent-shell-receive-input~ ，以便与通知和文件输入能力保持同一命名空间。
+
+* Org Edna 排程扩展
+
+加载 ~loki-assistant~ 后，包会在 Org Edna 加载时自动接入 ~loki-assistant-edna~ ，无需将函数写入个人配置。扩展提供 ~loki-scheduled-next!~ 、 ~loki-deadline-next!~ 与 ~loki-spawn-next!~ ，支持按星期集合安排计划、截止与后继任务。
+
+动作参数为 ~BASE DAY...~ ，基准支持 ~source~ 、 ~target~ 和 ~today~ ；星期为 ~mon~ 至 ~sun~ 的非空集合。~source~ 使用来源任务的对应规划日期与时刻，~target~ 使用目标任务已有的对应规划日期与时刻，~today~ 使用当前自然日及目标原有时刻。结果严格晚于基准日期；夏令时切换时仍保留原时刻，不跳过或重复日期。
+
+** 已有任务依次排程
+
+适用于已经列出的有限次数任务。把同组条目放在独立父标题下，只在第一项设置规则：
+
+#+begin_src org
+** 乐刻健身
+*** TODO 乐刻健身 - 1
+SCHEDULED: <2026-07-09 Thu 11:30-13:00>
+:PROPERTIES:
+:TRIGGER: next-sibling loki-scheduled-next!(source tue thu) chain!("TRIGGER")
+:END:
+*** TODO 乐刻健身 - 2
+*** TODO 乐刻健身 - 3
+#+end_src
+
+完成第一项时，~next-sibling~ 选择同一父标题下的下一个已有条目；~loki-scheduled-next!~ 安排到下一个周二或周四，并保留 ~11:30-13:00~ 。~chain!("TRIGGER")~ 将本条触发规则整项复制给目标，后续完成时依次传递。上例第二项得到 ~<2026-07-14 Tue 11:30-13:00>~ ，第三项得到 ~<2026-07-16 Thu 11:30-13:00>~ 。
+
+后续项不必提前填写触发器；此方式不新增任务。最后一项找不到下一个同级条目时自动结束，也不会越过父标题影响其他任务组。若链中后续动作失败，本次完成状态、日期修改和触发器复制一同回滚。
+
+** 自动创建后继
+
+每次完成后需要创建新任务时，使用：
+
+#+begin_src org
+:TRIGGER: self loki-spawn-next!(source tue thu)
+#+end_src
+
+新后继位于目标整个子树之后，标题末尾的连续阿拉伯数字自动加一，前缀和补零位宽保留；没有数字后缀时沿用原标题。自身标签、显式优先级和触发器继续保留，并使用新的 UUID ~ID~ 与 ~CREATED~ 。规划只写入下一次 ~SCHEDULED~ ，不复制正文、子任务、旧 ID 或其他规划。创建后通过目标的 ~LOKI_NEXT_ID~ 关联后继，重新打开再完成会复用已有后继，避免重复创建。
+
+例如 ~游泳 @ 2026-11 @ 2~ 的计划为 ~<2026-11-18 Wed 13:00>~ ，使用 ~self loki-spawn-next!(source mon wed fri)~ 完成后，会生成：
+
+#+begin_src org
+*** TODO 游泳 @ 2026-11 @ 3
+SCHEDULED: <2026-11-20 Fri 13:00>
+#+end_src
+
+新节点继承相同触发器，继续完成会生成 ~游泳 @ 2026-11 @ 4~ ，计划为 ~<2026-11-23 Mon 13:00>~ 。原节点标题和已有关闭日志保持不变；重新打开再完成仍复用原先的后继，不再次递增已有后继的标题。
+
+相关 ERT 检查已纳入 ~make emacs-test~ ，覆盖星期推进、时刻范围、夏令时、25 项已有任务链、末项结束、原生 Edna 动作、后继幂等、游泳任务尾号递增及失败回滚。完整行为设计与两端一致性约定维护在 Org Tasks 项目的 ~docs/core/TRIGGER触发器设计.org~ 。
