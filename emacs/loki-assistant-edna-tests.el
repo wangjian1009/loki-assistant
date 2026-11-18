@@ -54,12 +54,15 @@
       (should-error (org-todo "DONE"))
       (should (equal source (buffer-string))))))
 
-(ert-deftest loki-assistant-edna-test-invalid-links-never-create-another-node ()
-  (dolist (id '("missing" "self" "duplicate"))
-    (let ((source (format "* TODO Task\n:PROPERTIES:\n:ID: self\n:LOKI_NEXT_ID: %s\n:TRIGGER: self loki-spawn-next!(today mon wed fri)\n:END:\n* Other\n:PROPERTIES:\n:ID: duplicate\n:END:\n* Another\n:PROPERTIES:\n:ID: duplicate\n:END:\n" id)))
-      (loki-assistant-edna-test-with-org source
-        (should-error (org-todo "DONE"))
-        (should (equal source (buffer-string)))))))
+(ert-deftest loki-assistant-edna-test-legacy-successor-property-does-not-affect-creation ()
+  (loki-assistant-edna-test-with-org
+      "* TODO Task 1\nSCHEDULED: <2026-11-13 Fri>\n:PROPERTIES:\n:LOKI_NEXT_ID: missing\n:TRIGGER: self loki-spawn-next!(source mon wed fri)\n:END:\n"
+    (org-todo "DONE")
+    (goto-char (point-min))
+    (should (equal (org-entry-get nil "LOKI_NEXT_ID") "missing"))
+    (org-next-visible-heading 1)
+    (should (equal (org-get-heading t t t) "Task 2"))
+    (should-not (org-entry-get nil "LOKI_NEXT_ID"))))
 
 (ert-deftest loki-assistant-edna-test-hourly-repeat-cannot-lose-its-clock ()
   (let ((source "* TODO Task\nSCHEDULED: <2026-11-13 Fri>\n:PROPERTIES:\n:TRIGGER: next-sibling loki-scheduled-next!(source mon)\n:END:\n* TODO Target\nSCHEDULED: <2026-11-12 Thu 09:00 +1h>\n"))
@@ -67,14 +70,24 @@
       (should-error (org-todo "DONE"))
       (should (equal source (buffer-string))))))
 
-(ert-deftest loki-assistant-edna-test-reopen-reuses-the-existing-successor ()
-  (loki-assistant-edna-test-with-org "* TODO Task\nSCHEDULED: <2026-11-13 Fri>\n:PROPERTIES:\n:TRIGGER: self loki-spawn-next!(source mon wed fri)\n:END:\n"
+(ert-deftest loki-assistant-edna-test-reopen-creates-another-successor-with-a-new-id ()
+  (loki-assistant-edna-test-with-org
+      "* TODO Task 1\nSCHEDULED: <2026-11-13 Fri>\n:PROPERTIES:\n:TRIGGER: self loki-spawn-next!(source mon wed fri)\n:END:\n"
     (org-todo "DONE")
-    (let ((completed (buffer-string)))
+    (goto-char (point-min))
+    (org-next-visible-heading 1)
+    (let ((first-id (org-entry-get nil "ID")))
+      (should first-id)
       (goto-char (point-min))
       (org-todo "TODO")
       (org-todo "DONE")
-      (should (equal completed (buffer-string))))))
+      (goto-char (point-min))
+      (should-not (org-entry-get nil "LOKI_NEXT_ID"))
+      (org-next-visible-heading 1)
+      (should (equal (org-get-heading t t t) "Task 2"))
+      (should-not (equal (org-entry-get nil "ID") first-id))
+      (should (= (how-many "^\\* TODO Task 2$" (point-min) (point-max)) 2))
+      (should (= (how-many "^\\* " (point-min) (point-max)) 3)))))
 
 (ert-deftest loki-assistant-edna-test-weekdays-advance-strictly-and-handle-leap-day ()
   (dolist (case '(("2026-11-16 Mon" (mon wed fri) "2026-11-18 Wed")
@@ -116,8 +129,9 @@
       (cl-letf (((symbol-function 'org-current-time) (lambda (&rest _) fixed-time)))
         (org-todo "DONE")))
     (goto-char (point-min))
-    (let ((next-id (org-entry-get nil "LOKI_NEXT_ID")))
-      (should next-id)
+    (let ((source-id (org-entry-get nil "ID")))
+      (should (equal source-id "original"))
+      (should-not (org-entry-get nil "LOKI_NEXT_ID"))
       (should (equal (org-get-todo-state) "DONE"))
       (org-forward-heading-same-level 1)
       (should (= (org-outline-level) 1))
@@ -125,8 +139,8 @@
       (should (equal (org-get-heading t t t) "Repeat"))
       (should (= (org-element-property :priority (org-element-at-point)) ?A))
       (should (equal (org-get-tags nil t) '("work")))
-      (should (equal (org-entry-get nil "ID") next-id))
-      (should-not (equal next-id "original"))
+      (should (org-entry-get nil "ID"))
+      (should-not (equal (org-entry-get nil "ID") source-id))
       (should (equal (org-entry-get nil "CREATED") "[2026-11-13 Fri 12:34]"))
       (should (equal (org-entry-get nil "SCHEDULED") "<2026-11-16 Mon 09:00-10:00>"))
       (should (equal (org-entry-get nil "TRIGGER") "self loki-spawn-next!(source mon wed fri)"))
@@ -224,9 +238,9 @@
         (should (equal (org-get-todo-state) "TODO"))
         (should (equal (org-entry-get nil "SCHEDULED") "<2026-11-20 Fri 13:00>"))
         (should (equal (org-entry-get nil "TRIGGER") rule))
-        (let ((third (point-marker)) (third-id (org-entry-get nil "ID")))
+        (let ((third (copy-marker (point) t)) (third-id (org-entry-get nil "ID")))
           (should third-id)
-          (should (equal (org-with-point-at second (org-entry-get nil "LOKI_NEXT_ID")) third-id))
+          (should-not (org-with-point-at second (org-entry-get nil "LOKI_NEXT_ID")))
           (org-todo "DONE")
           (org-forward-heading-same-level 1)
           (should (equal (org-get-heading t t t) "游泳 @ 2026-11 @ 4"))
@@ -235,11 +249,15 @@
           (org-with-point-at second
             (org-todo "TODO")
             (org-todo "DONE"))
+          (org-with-point-at second
+            (org-forward-heading-same-level 1)
+            (should (equal (org-get-heading t t t) "游泳 @ 2026-11 @ 3"))
+            (should-not (equal (org-entry-get nil "ID") third-id)))
           (org-with-point-at third
             (should (equal (org-get-heading t t t) "游泳 @ 2026-11 @ 3"))
             (should (equal (org-entry-get nil "ID") third-id))
             (should (equal (org-entry-get nil "SCHEDULED") "<2026-11-20 Fri 13:00>"))))
-        (should (= (how-many "^\\*\\*\\* " (point-min) (point-max)) 4))
+        (should (= (how-many "^\\*\\*\\* " (point-min) (point-max)) 5))
         (goto-char (point-min))
         (search-forward "*** DONE 游泳 @ 2026-11 @ 1")
         (beginning-of-line)
@@ -264,7 +282,7 @@
                   ("练习12课" . "练习12课") ("练习１２" . "练习１２")))
     (should (equal (loki-assistant-edna-next-title (car pair)) (cdr pair)))))
 
-(ert-deftest loki-assistant-edna-test-spawn-numbered-successors-and-reuse ()
+(ert-deftest loki-assistant-edna-test-spawn-numbered-successors-on-each-completion ()
   (loki-assistant-edna-test-with-org
       "* TODO [#A] 练习009 :work2:\nSCHEDULED: <2026-11-13 Fri>\n:PROPERTIES:\n:TRIGGER: self loki-spawn-next!(source mon wed fri)\n:END:\n"
     (org-todo "DONE")
@@ -272,7 +290,8 @@
       (goto-char (point-min))
       (org-todo "TODO")
       (org-todo "DONE")
-      (should (equal completed (buffer-string))))
+      (should-not (equal completed (buffer-string))))
+    (should (= (how-many "^\\* " (point-min) (point-max)) 3))
     (goto-char (point-min))
     (org-next-visible-heading 1)
     (should (equal (org-get-heading t t t) "练习010"))

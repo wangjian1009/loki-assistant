@@ -9,7 +9,7 @@
 - `loki-assistant-monitor.el` 提供主动状态上报和统一 buffer 关注；默认 `loki-assistant-monitor-buffer` 为 `(agent-shell-mode)`，通过 mode hook 注册并通过 `POST /emacs/receiver/status` 同步。关闭 `loki-assistant-monitor-mode` 时移除 hook 和定时器，保留 services 最后状态。
 - `loki-assistant-monitor-tests.el` 覆盖关注生命周期、状态分组、请求合并、过期响应和失败保留，纳入 `make emacs-test`。
 - `loki-assistant-config-tests.el` 覆盖配置界面和 HTTP 流程，纳入 `make emacs-test`。
-- `loki-assistant-edna.el` 由包入口在 Org Edna 加载后加载，提供与 Org Tasks Core 一致的星期排程与后继兄弟创建；`loki-assistant-edna-tests.el` 验证星期推进、夏令时、已有任务链、事务回滚、后继幂等和标题尾号递增，纳入 `make emacs-test`。Edna 动作入口遵循 `org-edna-action/loki-...!` 命名，其余定义使用模块前缀。
+- `loki-assistant-edna.el` 由包入口在 Org Edna 加载后加载，提供与 Org Tasks Core 一致的星期排程与后继兄弟创建；`loki-assistant-edna-tests.el` 验证星期推进、夏令时、已有任务链、事务回滚、重复完成创建和标题尾号递增，纳入 `make emacs-test`。Edna 动作入口遵循 `org-edna-action/loki-...!` 命名，其余定义使用模块前缀。
 - 新增变量、函数和 feature 统一使用 `loki-assistant-` 前缀，文件启用 `lexical-binding`。
 - 注释、docstring 和面向用户的文本使用中文；按实际功能需要拆分文件。
 
@@ -22,4 +22,4 @@
 - 仅运行与改动相关的检查，不运行无关的 Mac 或 services 测试。
 - HTTP 或通知实现变更后执行 `make emacs-test`，通过现有 Emacs server 运行 ERT，不退出用户 Emacs。
 
-`loki-spawn-next!` 新建后继时递增目标标题末尾的连续阿拉伯数字，保留前缀与补零位宽；没有数字后缀则保留原标题。已有 `LOKI_NEXT_ID` 关联时直接复用，不重新排程或重命名已有后继。
+`loki-spawn-next!` 新建后继时递增目标标题末尾的连续阿拉伯数字，保留前缀与补零位宽；没有数字后缀则保留原标题。每次执行都创建新任务，不维护后继关联或查找已有后继；重新完成会再次创建，标题只根据当前目标递增，不扫描其他兄弟任务的编号。

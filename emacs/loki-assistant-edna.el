@@ -3,7 +3,7 @@
 ;;; Commentary:
 
 ;; 为 Org Edna 增加 loki-scheduled-next!、loki-deadline-next! 和
-;; loki-spawn-next!，与 Org Tasks Core 共用日期和后继关联约定。
+;; loki-spawn-next!，与 Org Tasks Core 共用日期和后继标题约定。
 ;; 由 loki-assistant 在 Org Edna 加载后自动加载，不修改个人配置。
 
 ;;; Code:
@@ -121,21 +121,6 @@
   (atomic-change-group
     (loki-assistant-edna-set-next last-entry base weekdays "DEADLINE")))
 
-(defun loki-assistant-edna-local-id (id)
-  "在本文件中查找唯一 ID，不读取全局 ID 数据库或其他文件。"
-  (save-excursion
-    (save-restriction
-      (widen)
-      (goto-char (point-min))
-      (let (found)
-        (while (re-search-forward org-heading-regexp nil t)
-          (beginning-of-line)
-          (when (equal id (org-entry-get nil "ID"))
-            (when found (error "Loki 后继 ID 在本文件中不唯一"))
-            (setq found (point-marker)))
-          (forward-line 1))
-        found))))
-
 (defun loki-assistant-edna-next-title (title)
   "将 TITLE 末尾的 ASCII 数字串递增，保留前导零及其他文字。"
   (if (not (string-match "[0-9]+\\'" title))
@@ -153,7 +138,7 @@
         result))))
 
 (defun org-edna-action/loki-spawn-next! (last-entry &optional base &rest weekdays)
-  "在目标子树后创建下一次兄弟任务，递增标题末尾数字；已有后继时复用关联。"
+  "在目标子树后新建后继，递增标题末尾数字；每次执行都创建新任务。"
   (loki-assistant-edna-check-rule base weekdays)
   (loki-assistant-edna-check-node)
   (unless (and (markerp last-entry)
@@ -165,48 +150,39 @@
       (widen)
       (org-back-to-heading t)
       (atomic-change-group
-        (let* ((target (point-marker))
-               (next-id (org-entry-get nil "LOKI_NEXT_ID")))
-          (if next-id
-              (let ((next (loki-assistant-edna-local-id next-id)))
-                (unless (and next (/= next target))
-                  (error "Loki 后继关联失效，请检查本文件 LOKI_NEXT_ID"))
-                (org-with-point-at next (loki-assistant-edna-check-node)))
-            (let* ((stamp (loki-assistant-edna-next-stamp last-entry base weekdays "SCHEDULED"))
-                   (level (org-outline-level))
-                   (title (loki-assistant-edna-next-title (org-get-heading t t t)))
-                   (priority (org-element-property :priority (org-element-at-point)))
-                   (tags (org-get-tags nil t))
-                   (trigger (org-entry-get nil "TRIGGER"))
-                   (old-state (org-get-todo-state))
-                   (flow (cl-find-if (lambda (items) (member old-state items)) org-todo-sets))
-                   (state (or (cl-find-if (lambda (item) (member item org-not-done-keywords)) flow)
-                              (car org-not-done-keywords)))
-                   (id (org-id-new))
-                   (system-time-locale "C")
-                   (created (format-time-string "[%Y-%m-%d %a %H:%M]"
-                                                (or loki-assistant-edna-now (org-current-time)))))
-              (unless state (error "Loki 后继没有可用的待办状态"))
-              (org-end-of-subtree t t)
-              (unless (bolp) (insert "\n"))
-              (let ((next (point-marker)))
-                (insert (make-string level ?*) " " state " "
-                        (if priority (format "[#%c] " priority) "") title
-                        (if tags (concat " :" (string-join tags ":") ":") "") "\n"
-                        "SCHEDULED: " stamp "\n:PROPERTIES:\n:CREATED: " created
-                        "\n:ID: " id "\n"
-                        (if trigger (concat ":TRIGGER: " trigger "\n") "") ":END:\n")
-                (goto-char target)
-                (org-entry-put nil "LOKI_NEXT_ID" id)
-                ;; 新增待办后恢复已完成祖先；由 Org 更新统计与日志。
-                (goto-char next)
-                (org-update-parent-todo-statistics)
-                (while (org-up-heading-safe)
-                  (when (member (org-get-todo-state) org-done-keywords)
-                    (let* ((flow (cl-find-if (lambda (items) (member (org-get-todo-state) items)) org-todo-sets))
-                           (pending (or (cl-find-if (lambda (item) (member item org-not-done-keywords)) flow)
-                                        (car org-not-done-keywords))))
-                      (org-todo pending))))))))))))
+        (let* ((stamp (loki-assistant-edna-next-stamp last-entry base weekdays "SCHEDULED"))
+               (level (org-outline-level))
+               (title (loki-assistant-edna-next-title (org-get-heading t t t)))
+               (priority (org-element-property :priority (org-element-at-point)))
+               (tags (org-get-tags nil t))
+               (trigger (org-entry-get nil "TRIGGER"))
+               (old-state (org-get-todo-state))
+               (flow (cl-find-if (lambda (items) (member old-state items)) org-todo-sets))
+               (state (or (cl-find-if (lambda (item) (member item org-not-done-keywords)) flow)
+                          (car org-not-done-keywords)))
+               (id (org-id-new))
+               (system-time-locale "C")
+               (created (format-time-string "[%Y-%m-%d %a %H:%M]"
+                                            (or loki-assistant-edna-now (org-current-time)))))
+          (unless state (error "Loki 后继没有可用的待办状态"))
+          (org-end-of-subtree t t)
+          (unless (bolp) (insert "\n"))
+          (let ((next (point-marker)))
+            (insert (make-string level ?*) " " state " "
+                    (if priority (format "[#%c] " priority) "") title
+                    (if tags (concat " :" (string-join tags ":") ":") "") "\n"
+                    "SCHEDULED: " stamp "\n:PROPERTIES:\n:CREATED: " created
+                    "\n:ID: " id "\n"
+                    (if trigger (concat ":TRIGGER: " trigger "\n") "") ":END:\n")
+            ;; 新增待办后恢复已完成祖先；由 Org 更新统计与日志。
+            (goto-char next)
+            (org-update-parent-todo-statistics)
+            (while (org-up-heading-safe)
+              (when (member (org-get-todo-state) org-done-keywords)
+                (let* ((flow (cl-find-if (lambda (items) (member (org-get-todo-state) items)) org-todo-sets))
+                       (pending (or (cl-find-if (lambda (item) (member item org-not-done-keywords)) flow)
+                                    (car org-not-done-keywords))))
+                  (org-todo pending))))))))))
 
 (defun loki-assistant-edna-todo-transaction (original &rest args)
   "Loki 动作失败时回滚本次状态变化及全部文件内联动。"
