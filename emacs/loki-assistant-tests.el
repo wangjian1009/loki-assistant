@@ -94,7 +94,7 @@
   (dolist (status '(400 404 503))
     (loki-assistant-test--with-server
         (lambda (_headers _body)
-          (list status "{\"code\":\"notification-handler-not-found\",\"message\":\"未注册处理器\"}"))
+          (list status "{\"api_version\":\"1\",\"status\":404,\"error\":{\"source\":\"business\",\"code\":\"notification-handler-not-found\",\"message\":\"未注册处理器\"}}"))
       (let ((response (loki-assistant-test--await
                        (lambda (callback)
                          (loki-assistant-request "GET" "/missing" :callback callback)))))

@@ -192,8 +192,13 @@ async fn failed_handler_returns_http_error_without_modifying_config_or_notifying
     assert_eq!(response.status(), 500);
     let error: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(error["code"], "config-change-rejected");
-    assert!(error["message"].as_str().unwrap().contains("系统拒绝操作"));
+    assert_eq!(error["error"]["code"], "config-change-rejected");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("系统拒绝操作")
+    );
     assert_eq!(fs::read(&path).unwrap(), original);
     assert_eq!(
         module

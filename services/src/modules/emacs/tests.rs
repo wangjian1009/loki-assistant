@@ -372,6 +372,82 @@ async fn http_preserves_existing_routes_with_versioned_json() {
 }
 
 #[tokio::test]
+async fn capture_full_forwards_page_and_returns_pending_response() {
+    let page = json!({
+        "title": "网页标题",
+        "url": "https://example.com/article/1",
+        "captured_at": "2026-11-18T12:30:00.000Z",
+        "body": "* 正文\n"
+    });
+    let capture = json!({
+        "status": "pending",
+        "url": "https://example.com/article/1"
+    });
+    let (service, runner, _) = service(vec![Ok(wire(json!({
+        "result": capture.to_string()
+    })))]);
+    let (status, body) = request(service, "POST", "/emacs/capture/full", page).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["api_version"], "1");
+    assert_eq!(body["status"], "pending");
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].1[3].contains("loki-assistant-capture-full"));
+    assert!(calls[0].1[3].contains("https://example.com/article/1"));
+}
+
+#[tokio::test]
+async fn capture_full_rejects_invalid_page_before_gateway() {
+    let (service, runner, _) = service(vec![]);
+    let (status, body) = request(
+        service,
+        "POST",
+        "/emacs/capture/full",
+        json!({
+            "title": "标题\n",
+            "url": "https://example.com/article/1",
+            "captured_at": "2026-11-18T12:30:00.000Z",
+            "body": "正文"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid-request");
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn capture_full_maps_emacs_capture_conflicts() {
+    let capture = json!({
+        "error": {
+            "code": "capture-busy",
+            "message": "请先完成当前捕获"
+        }
+    });
+    let (service, _, _) = service(vec![Ok(wire(json!({
+        "result": capture.to_string()
+    })))]);
+    let (status, body) = request(
+        service,
+        "POST",
+        "/emacs/capture/full",
+        json!({
+            "title": "标题",
+            "url": "https://example.com/article/1",
+            "captured_at": "2026-11-18T12:30:00.000Z",
+            "body": "正文"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "capture-busy");
+    assert_eq!(
+        body["error"]["message"],
+        "Emacs capture 失败 [capture-busy]：请先完成当前捕获"
+    );
+}
+
+#[tokio::test]
 async fn http_maps_errors_to_stable_json_codes() {
     let (service, _, _) = service(vec![Ok(wire(json!({"error":"测试 Lisp 错误"})))]);
     let (status, body) = request(
@@ -382,12 +458,12 @@ async fn http_maps_errors_to_stable_json_codes() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["code"], "lisp-error");
+    assert_eq!(body["error"]["code"], "lisp-error");
     let (status, body) =
         request(service.clone(), "POST", "/emacs/eval", json!({"script":42})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["api_version"], "1");
-    assert_eq!(body["code"], "invalid-request");
+    assert_eq!(body["error"]["code"], "invalid-request");
     let (status, body) = request(
         service,
         "POST",
@@ -396,7 +472,7 @@ async fn http_maps_errors_to_stable_json_codes() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["code"], "notification-handler-not-found");
+    assert_eq!(body["error"]["code"], "notification-handler-not-found");
 }
 
 #[tokio::test]
@@ -412,7 +488,15 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 8);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 9);
+            let capture = body["apis"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|api| api["id"] == "capture-full")
+                .unwrap();
+            assert_eq!(capture["method"], "POST");
+            assert_eq!(capture["path"], "/emacs/capture/full");
             let open_app = body["apis"]
                 .as_array()
                 .unwrap()
@@ -511,7 +595,7 @@ async fn notification_reports_launch_failure_as_json_error() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["code"], "notification-failed");
+    assert_eq!(body["error"]["code"], "notification-failed");
 }
 
 #[tokio::test]
@@ -552,7 +636,7 @@ async fn notification_receipts_are_queryable_idempotent_and_terminal() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["code"], "notification-receipt-conflict");
+    assert_eq!(body["error"]["code"], "notification-receipt-conflict");
     let (_, state) = request(service, "GET", &path, Value::Null).await;
     assert_eq!(state["status"], "submitted");
     assert!(runner.calls.lock().unwrap().is_empty());
@@ -589,7 +673,7 @@ async fn failed_receipt_preserves_details_and_rejects_unknown_or_invalid_results
     ] {
         let (status, body) = request(service.clone(), method, &path, body).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["code"], "notification-not-found");
+        assert_eq!(body["error"]["code"], "notification-not-found");
     }
     let restarted = EmacsService::new(
         EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
@@ -670,7 +754,7 @@ async fn activation_preserves_buffer_name_and_reports_missing_target() {
     assert_eq!(body["buffer"], buffer);
     let (status, body) = request(service.clone(), "POST", &path, Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["code"], "buffer-not-found");
+    assert_eq!(body["error"]["code"], "buffer-not-found");
     let (status, _) = request(service, "POST", "/emacs/activate?buffer=", Value::Null).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let calls = runner.calls.lock().unwrap();
@@ -710,9 +794,9 @@ async fn activation_reports_connection_failure_without_retry_or_opening_another_
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["code"], "emacs-unavailable");
+        assert_eq!(body["error"]["code"], "emacs-unavailable");
         assert!(
-            body["message"]
+            body["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("无法连接目标 Emacs")
@@ -720,7 +804,7 @@ async fn activation_reports_connection_failure_without_retry_or_opening_another_
     }
     let (status, body) = request(service, "POST", "/emacs/activate?buffer=old", Value::Null).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["code"], "invalid-emacs-response");
+    assert_eq!(body["error"]["code"], "invalid-emacs-response");
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
     for (program, args) in calls.iter() {
@@ -747,7 +831,7 @@ async fn activation_timeout_has_a_clear_error_and_does_not_retry() {
     ));
     let (status, body) = request(service, "POST", "/emacs/activate?buffer=old", Value::Null).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(body["code"], "emacs-timeout");
+    assert_eq!(body["error"]["code"], "emacs-timeout");
 }
 
 #[tokio::test]
@@ -956,8 +1040,8 @@ async fn open_app_rejects_invalid_and_unknown_identifiers_without_execution() {
         let (status, body) = request(service.clone(), "POST", path, Value::Null).await;
         assert_eq!(status, expected);
         assert_eq!(body["api_version"], "1");
-        assert_eq!(body["code"], code);
-        assert!(!body["message"].as_str().unwrap().is_empty());
+        assert_eq!(body["error"]["code"], code);
+        assert!(!body["error"]["message"].as_str().unwrap().is_empty());
     }
     assert!(runner.calls.lock().unwrap().is_empty());
 }
@@ -984,8 +1068,8 @@ async fn open_app_preserves_missing_package_lisp_and_connection_failures() {
         )
         .await;
         assert_eq!(status, expected);
-        assert_eq!(body["code"], code);
-        assert!(!body["message"].as_str().unwrap().is_empty());
+        assert_eq!(body["error"]["code"], code);
+        assert!(!body["error"]["message"].as_str().unwrap().is_empty());
     }
     assert_eq!(runner.calls.lock().unwrap().len(), 4);
 }
@@ -1001,7 +1085,7 @@ async fn open_app_reports_timeout() {
     ));
     let (status, body) = request(service, "POST", "/emacs/apps/open?app=config", Value::Null).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(body["code"], "emacs-timeout");
+    assert_eq!(body["error"]["code"], "emacs-timeout");
 }
 
 #[tokio::test]
@@ -1027,7 +1111,7 @@ async fn buffer_activation_resolves_name_in_emacs_without_starting_a_daemon() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["code"], "buffer-not-found");
+    assert_eq!(body["error"]["code"], "buffer-not-found");
     for path in ["/emacs/activate?buffer="] {
         assert_eq!(
             request(service.clone(), "POST", path, Value::Null).await.0,
@@ -1074,7 +1158,7 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
     ] {
         let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert_eq!(body["code"], "invalid-request");
+        assert_eq!(body["error"]["code"], "invalid-request");
         assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
     }
     assert!(runner.calls.lock().unwrap().is_empty());
@@ -1159,9 +1243,12 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
         let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body["api_version"], "1");
-        assert_eq!(body["code"], "invalid-request");
+        assert_eq!(body["error"]["code"], "invalid-request");
         assert!(
-            body["message"].as_str().unwrap().contains(expected),
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
             "{body}"
         );
         assert!(!body.to_string().contains("DO_NOT_ECHO_VALUE"));

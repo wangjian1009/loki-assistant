@@ -1,0 +1,40 @@
+#+TITLE: Loki Assistant Chrome 插件
+#+LANGUAGE: zh-CN
+
+* 状态
+
+Chrome 插件第一版已实现。跨模块协议和功能边界见
+[[file:../docs/chrome-extension.org][Chrome 插件与全文捕获设计]]。
+
+* 结构
+
+插件使用 Manifest V3，点击图标显示功能菜单，当前只有“全文保存”（功能标识
+=org-capture= ）。页面在浏览器内转换为 Org 文本，再提交到固定的
+=http://127.0.0.1:47321/emacs/capture/full=。
+
+Emacs 不需要启动 HTTP 服务；services 通过 =emacsclient= 调用
+=loki-assistant-capture-full= 。
+
+* 构建
+
+在本目录运行：
+
+#+begin_src sh
+npm run build
+#+end_src
+
+构建后，在 Chrome 打开 =chrome://extensions/=，启用开发者模式，选择
+仓库根目录下的 =dist/chrome-plugin= 加载未打包扩展。
+
+services 使用非默认端口时，需先修改插件源码中的固定地址，再重新构建和加载。
+
+运行单元测试：
+
+#+begin_src sh
+npm test
+#+end_src
+
+* 第三方代码
+
+=extension/features/org-capture/html2org/= 来自本地参考项目，许可证见
+[[file:extension/features/org-capture/html2org/LICENSE][copy-as-org-mode 许可证]]，转换器源码保留其原始许可声明。

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Loki Assistant</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <button id="org-capture" type="button">全文保存</button>
+    </main>
+    <dialog id="capture-dialog">
+      <h1>Org Capture</h1>
+      <p id="status" role="status" aria-live="polite"></p>
+      <button id="dialog-close" type="button" disabled>关闭</button>
+    </dialog>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

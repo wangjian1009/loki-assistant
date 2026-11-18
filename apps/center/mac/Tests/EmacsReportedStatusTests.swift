@@ -28,7 +28,7 @@ private actor StatusTestTransport {
             if blocked { await withCheckedContinuation { waiter = $0 } }
             if failing {
                 code = 404
-                body = #"{"code":"status-not-found","message":"尚未收到 buffer 上报"}"#
+                body = #"{"api_version":"1","status":404,"error":{"source":"business","code":"status-not-found","message":"尚未收到 buffer 上报"}}"#
             } else if let statusBody {
                 body = statusBody
             } else {

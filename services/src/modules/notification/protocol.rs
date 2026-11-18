@@ -45,10 +45,3 @@ pub struct NotificationStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
-
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub api_version: String,
-    pub code: String,
-    pub message: String,
-}

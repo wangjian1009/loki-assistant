@@ -4,11 +4,13 @@
 
 ## 范围
 
-当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块与 Emacs gateway。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
+当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块、Emacs gateway 与浏览器全文捕获。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送、全文捕获和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
 `modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
+
+HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/code/message`；`source` 仅使用 `services`、`emacs`、`business`，`code`、`message` 必须为非空字符串，客户端按 `code` 判断并显示 `message`，不得新增模块专用错误外壳。
 
 
 
@@ -108,7 +110,7 @@ src/modules/<module>/
 | `http`                  | loopback listener、公共 middleware、请求体限制和 server 生命周期 | `runtime`；不拥有业务协议                  |
 | `modules/health`        | 服务健康检查和基础运行状态                                       | `runtime`、`serde`                         |
 | `modules/discover`      | 返回完整模块目录、模块列表和单模块元数据                         | `linkme` 静态模块/API 描述切片             |
-| `modules/emacs`         | `emacsclient` gateway、buffer 查询和激活、通知转换              | 本模块 `protocol`、`CommandRunner` trait、配置服务、注入的通知服务 |
+| `modules/emacs`         | `emacsclient` gateway、buffer 查询和激活、通知转换、全文捕获     | 本模块 `protocol`、`CommandRunner` trait、配置服务、注入的通知服务 |
 | `modules/notification` | 系统通知发送、通用跳转封装和回执状态                           | 本模块 `protocol`、`NotificationLauncher` trait |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
 | `modules/status` | 由业务方设置的通用状态存储与查询 | JSON、内存锁；不依赖具体业务模块 |

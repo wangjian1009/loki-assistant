@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从公共 SVG 母版导出 macOS 与 HarmonyOS 应用所需的图标。"""
+"""从公共 SVG 母版导出 macOS、HarmonyOS 与 Chrome 插件所需的图标。"""
 
 from pathlib import Path
 import shutil
@@ -61,6 +61,13 @@ def export_harmony(app_png: Path, media: Path) -> None:
     shutil.copyfile(app_png, media / "app_icon.png")
 
 
+def export_chrome(app_source: Path, icons: Path) -> None:
+    """使用 Chrome 专用彩色母版，确保放大的主体在深浅主题下均可辨认。"""
+    icons.mkdir(parents=True)
+    for size in (16, 20, 24, 32, 48, 64, 128):
+        render(app_source, icons / f"icon-{size}.png", size)
+
+
 def main() -> None:
     """所有格式生成成功后再更新各应用资源，不依赖当前工作目录。"""
     for executable in ("rsvg-convert", "iconutil"):
@@ -71,12 +78,14 @@ def main() -> None:
     sources = root / "resources" / "icons"
     mac_resources = Path("apps/center/mac/Resources")
     harmony_media = Path("apps/harmony/AppScope/resources/base/media")
+    chrome_icons = Path("chrome-plugin/extension/icons")
     with tempfile.TemporaryDirectory(prefix="loki-icon-export-") as temporary:
         staging = Path(temporary)
         app_png = export_macos(sources / "loki-assistant-v1.svg",
                                sources / "loki-assistant-menu-v1.svg",
                                sources / "loki-assistant-menu-sleep-v1.svg", staging / mac_resources)
         export_harmony(app_png, staging / harmony_media)
+        export_chrome(sources / "loki-assistant-chrome-v1.svg", staging / chrome_icons)
         for generated in staging.rglob("*"):
             if generated.is_file():
                 output = root / generated.relative_to(staging)
@@ -84,6 +93,7 @@ def main() -> None:
                 shutil.copyfile(generated, output)
     print(f"macOS 图标已导出：{root / mac_resources}")
     print(f"HarmonyOS 图标已导出：{root / harmony_media / 'app_icon.png'}")
+    print(f"Chrome 图标已导出：{root / chrome_icons}")
 
 
 if __name__ == "__main__":

@@ -333,7 +333,7 @@ async fn failed_change_returns_http_error_and_preserves_old_connection_and_file(
     assert_eq!(response.status(), 500);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["code"], "config-change-rejected");
+    assert_eq!(body["error"]["code"], "config-change-rejected");
     assert_eq!(fs::read(fixture.root.join("config.yml")).unwrap(), saved);
     assert_eq!(
         module

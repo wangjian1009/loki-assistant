@@ -19,7 +19,10 @@ use crate::modules::notification::{
 
 use super::{
     config::EmacsConfig,
-    protocol::{Buffer, Notification, NotificationReceipt, NotificationStatusResponse},
+    protocol::{
+        Buffer, FullCaptureRequest, FullCaptureResult, Notification, NotificationReceipt,
+        NotificationStatusResponse,
+    },
 };
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
@@ -107,6 +110,8 @@ pub enum EmacsError {
     BufferNotFound,
     #[error("Emacs 应用不存在或未安装：{0}")]
     AppNotFound(String),
+    #[error("Emacs capture 失败 [{code}]：{message}")]
+    Capture { code: String, message: String },
 }
 
 pub struct EmacsService {
@@ -237,6 +242,58 @@ impl EmacsService {
         let json: String = serde_json::from_str(&result)
             .map_err(|error| EmacsError::InvalidResponse(error.to_string()))?;
         serde_json::from_str(&json).map_err(|error| EmacsError::InvalidResponse(error.to_string()))
+    }
+
+    pub async fn capture_full(
+        &self,
+        request: FullCaptureRequest,
+    ) -> Result<FullCaptureResult, EmacsError> {
+        validate_full_capture_request(&request)?;
+        let request_json = serde_json::to_string(&request)
+            .map_err(|error| EmacsError::InvalidRequest(error.to_string()))?;
+        let argument = serde_json::to_string(&request_json)
+            .map_err(|error| EmacsError::InvalidRequest(error.to_string()))?;
+        let script = format!(
+            r#"(progn
+  (require 'json)
+  (if (require 'loki-assistant-capture nil t)
+      (if (fboundp 'loki-assistant-capture-full)
+          (loki-assistant-capture-full {argument})
+        (json-encode '((error . ((code . "capture-not-installed")
+                                  (message . "Emacs 未提供 loki-assistant-capture-full。"))))))
+    (json-encode '((error . ((code . "capture-not-installed")
+                              (message . "Emacs 未加载 loki-assistant-capture。")))))))"#,
+            argument = argument
+        );
+        let result = self.eval(&script).await?;
+        let wire: CaptureWire = serde_json::from_str(&result)
+            .map_err(|error| EmacsError::InvalidResponse(format!("capture 响应无效：{error}")))?;
+        if let Some(error) = wire.error {
+            return Err(EmacsError::Capture {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        let result = FullCaptureResult {
+            status: wire
+                .status
+                .ok_or_else(|| EmacsError::InvalidResponse("capture 响应缺少 status".to_owned()))?,
+            url: wire
+                .url
+                .ok_or_else(|| EmacsError::InvalidResponse("capture 响应缺少 url".to_owned()))?,
+            document: wire.document,
+        };
+        if !matches!(result.status.as_str(), "pending" | "existing")
+            || result.url.trim().is_empty()
+            || result.url != request.url
+            || (result.status == "existing" && result.document.is_none())
+            || (result.status == "pending" && result.document.is_some())
+        {
+            return Err(EmacsError::InvalidResponse(
+                "capture 响应的状态或文档字段无效".to_owned(),
+            ));
+        }
+        Ok(result)
     }
 
     pub async fn open_app(&self, app: &str) -> Result<(), EmacsError> {
@@ -396,6 +453,61 @@ impl EmacsService {
             .await
             .map_err(Into::into)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureWire {
+    status: Option<String>,
+    url: Option<String>,
+    document: Option<super::protocol::FullCaptureDocument>,
+    error: Option<CaptureWireError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureWireError {
+    code: String,
+    message: String,
+}
+
+fn validate_full_capture_request(request: &FullCaptureRequest) -> Result<(), EmacsError> {
+    if request.title.trim().is_empty()
+        || request.title.contains('\r')
+        || request.title.contains('\n')
+    {
+        return Err(EmacsError::InvalidRequest(
+            "title 必须是非空且不含换行的字符串".to_owned(),
+        ));
+    }
+    if request.body.trim().is_empty() {
+        return Err(EmacsError::InvalidRequest(
+            "body 必须是非空字符串".to_owned(),
+        ));
+    }
+    if request.body.len() > 16 * 1024 * 1024 {
+        return Err(EmacsError::InvalidRequest(
+            "body 超过 16 MiB 限制".to_owned(),
+        ));
+    }
+    if request.url.chars().any(char::is_whitespace) {
+        return Err(EmacsError::InvalidRequest(
+            "url 不能包含空白字符".to_owned(),
+        ));
+    }
+    let parsed = url::Url::parse(&request.url)
+        .map_err(|_| EmacsError::InvalidRequest("url 必须是有效的绝对 URL".to_owned()))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(EmacsError::InvalidRequest(
+            "url 必须是绝对 HTTP 或 HTTPS URL".to_owned(),
+        ));
+    }
+    let timestamp = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+        .expect("captured_at 正则有效");
+    if !timestamp.is_match(&request.captured_at) {
+        return Err(EmacsError::InvalidRequest(
+            "captured_at 必须是 UTC RFC 3339 时间".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn activation_script(buffer: &str) -> String {

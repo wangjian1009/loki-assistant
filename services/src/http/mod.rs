@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+pub mod error;
+
 use axum::Router;
 
 use crate::runtime::RuntimeState;

@@ -88,8 +88,9 @@
                                         :null-object :null :false-object :false))
         (error (setq parse-error (error-message-string err)))))
     (let* ((object (and (listp data) data))
-           (code (alist-get 'code object))
-           (message (alist-get 'message object)))
+           (error-object (or (alist-get 'error object) object))
+           (code (alist-get 'code error-object))
+           (message (alist-get 'message error-object)))
       (list :ok (and success (not parse-error))
             :status http-status :headers headers :body body :data data
             :error-code (cond ((not http-status) "transport-error")
@@ -270,6 +271,11 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
 
 (with-eval-after-load 'org-edna
   (require 'loki-assistant-edna))
+
+(if (featurep 'org-roam)
+    (require 'loki-assistant-capture)
+  (with-eval-after-load 'org-roam
+    (require 'loki-assistant-capture)))
 
 (provide 'loki-assistant)
 ;;; loki-assistant.el ends here

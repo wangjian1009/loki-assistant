@@ -22,7 +22,7 @@ use self::{config::EmacsConfig, service::EmacsService};
 static EMACS_MODULE: ModuleRegistration = ModuleRegistration {
     id: "emacs",
     name: "Emacs",
-    description: "执行 Emacs Lisp、查询 buffer 并分发模块通知。",
+    description: "执行 Emacs Lisp、查询 buffer、处理浏览器全文捕获并分发模块通知。",
     version: env!("CARGO_PKG_VERSION"),
 };
 

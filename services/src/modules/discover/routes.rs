@@ -1,14 +1,9 @@
-use axum::{
-    Json, Router,
-    extract::Path,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-};
+use crate::http::error::{ErrorSource, response as error_response};
+use axum::{Json, Router, extract::Path, http::StatusCode, response::Response, routing::get};
 
 use super::{
     model::ModuleMetadata,
-    protocol::{DiscoverError, DiscoverResponse, ModuleListResponse},
+    protocol::{DiscoverResponse, ModuleListResponse},
     registry,
 };
 
@@ -68,14 +63,12 @@ async fn get_module(Path(module_id): Path<String>) -> Result<Json<ModuleMetadata
         .cloned()
         .map(Json)
         .ok_or_else(|| {
-            (
+            error_response(
                 StatusCode::NOT_FOUND,
-                Json(DiscoverError {
-                    code: "module-not-found".to_owned(),
-                    message: format!("未找到模块：{module_id}"),
-                }),
+                ErrorSource::Services,
+                "module-not-found",
+                format!("未找到模块：{module_id}"),
             )
-                .into_response()
         })
 }
 
@@ -149,6 +142,6 @@ mod tests {
 
         let (status, body) = get_json("/discover/modules/missing").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["code"], "module-not-found");
+        assert_eq!(body["error"]["code"], "module-not-found");
     }
 }

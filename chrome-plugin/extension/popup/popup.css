@@ -1,0 +1,10 @@
+:root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+body { width: 280px; margin: 0; color: #1f2933; background: #fff; }
+main { padding: 12px; }
+button { width: 100%; padding: 9px 12px; border: 1px solid #3c806b; border-radius: 6px; color: #fff; background: #3c806b; font-size: 14px; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+dialog { width: 240px; padding: 16px; border: 0; border-radius: 8px; color: #1f2933; box-shadow: 0 8px 28px #0003; }
+dialog::backdrop { background: #0004; }
+dialog h1 { margin: 0 0 14px; font-size: 16px; }
+dialog p { min-height: 36px; margin: 0 0 12px; color: #53616d; font-size: 13px; line-height: 1.45; }
+dialog button { background: #53616d; border-color: #53616d; }

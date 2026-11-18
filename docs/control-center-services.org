@@ -16,7 +16,7 @@
 | ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
 | ~modules/config~ | 配置模型、提交前处理、数据读写和变化订阅 | 已实现基础能力 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
-| ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
+| ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/network~ | 本地身份持久化、中转注册和结果通知 | 已实现 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
@@ -28,6 +28,14 @@
 services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该文件获取服务地址和端口，再请求 HTTP 接口；不应在客户端写死服务端口。
 
 业务模块在自己的目录中维护 ~model.rs~、~protocol.rs~、~routes.rs~ 和业务逻辑。HTTP API 使用 ~#[loki_api]~ 声明，模块描述通过 ~linkme~ 在编译/链接阶段收集；~Services::build~ 负责模块组装、配置处理器注入和路由组合。
+
+** 错误响应原则
+
+所有 HTTP 错误统一返回 ~api_version~、HTTP 数字 ~status~ 和 ~error{source,code,message}~；~source~ 只能是 ~services~、~emacs~ 或 ~business~，~code~ 和 ~message~ 为非空字符串，客户端按 ~code~ 处理并显示 ~message~。
+
+#+begin_src json
+{"api_version":"1","status":409,"error":{"source":"business","code":"capture-busy","message":"Emacs 中已有未完成捕获，请先保存或取消。"}}
+#+end_src
 
 * 目录
 
@@ -72,6 +80,7 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 | POST | ~/notification/{id}/receipt~ | 接收菜单栏应用处理回执 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
 | POST | ~/emacs/apps/open~ | 按 app 查询参数打开 Emacs 应用 |
+| POST | ~/emacs/capture/full~ | 接收浏览器生成的 Org 全文并进入 Loki Assistant 捕获 |
 | GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
 | GET | ~/status~ | 读取全部模块发布的状态 |
 | GET | ~/status/{module_id}/{key}~ | 读取指定状态数据项 |
@@ -148,7 +157,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 配置值无效时仍返回 HTTP 200，使用 ~valid: false~ 和错误说明表示预检结果：
 
 #+begin_src json
-{"module_id":"emacs","key":"emacsclient_path","valid":false,"error":{"code":"invalid-config","message":"配置值无效：emacsclient 位置：文件不存在：/missing/emacsclient"}}
+{"module_id":"emacs","key":"emacsclient_path","valid":false,"error":{"source":"business","code":"invalid-config","message":"配置值无效：emacsclient 位置：文件不存在：/missing/emacsclient"}}
 #+end_src
 
 不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
@@ -164,7 +173,7 @@ Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明�
 处理器失败返回 HTTP 500 ~config-change-rejected~ ，包含模块、键和具体失败原因；原有 YAML、内存值和来源保持不变，不广播变化。示例：
 
 #+begin_src json
-{"code":"config-change-rejected","message":"配置变化处理失败：control-center/center_auto_start：加载托盘失败：系统拒绝操作"}
+{"api_version":"1","status":500,"error":{"source":"business","code":"config-change-rejected","message":"配置变化处理失败：control-center/center_auto_start：加载托盘失败：系统拒绝操作"}}
 #+end_src
 
 处理器应自行撤销失败操作的部分副作用；如果处理成功但写入 YAML 失败，配置中心调用其 ~rollback~ 方法撤销外部操作，再返回 ~config-storage-error~ 。无外部状态的处理器可使用默认的空撤销实现；有外部状态的处理器必须实现撤销。撤销失败的原因附在返回的错误说明中，配置仍不提交。事务由独立任务完成，HTTP 请求取消不会取消已接受的处理和保存。
@@ -258,7 +267,7 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 全部通过后才发布；任意一项错误都保留原有数据和全局、单项更新时间。HTTP 业务入口返回 400 ~invalid-request~ ，说明包含具体路径，不回显提交值。例如：
 
 #+begin_src json
-{"api_version":"1","code":"invalid-request","message":"请求无效：状态数据无效：emacs/buffers[0].modified：必须是 boolean"}
+{"api_version":"1","status":400,"error":{"source":"business","code":"invalid-request","message":"请求无效：状态数据无效：emacs/buffers[0].modified：必须是 boolean"}}
 #+end_src
 
 ~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回 ~module_id~ 、 ~key~ 、 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ ，未发布时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
@@ -282,6 +291,61 @@ Rust 侧由 ~modules/emacs/config.rs~ 的 ~EmacsConfig~ 定义配置项、默认
 Lisp 求值与 buffer 列表查询传入 ~--alternate-editor=~ 和 ~--eval~ 。server 不可用时，由 emacsclient 启动目标 Emacs daemon 并连接；不会因为普通 Lisp 错误重复求值。已打开但未运行 server 的 Emacs 与新 daemon 可能是两个进程。Emacs daemon 的启动依赖服务运行环境中的 Emacs 可执行程序和用户配置。指定 buffer 的激活使用下述禁止启动的连接策略。
 
 同一 gateway 内的求值串行执行。每次外部进程调用和自定义通知处理器执行最多等待 30 秒，排队时间不计入此限制。超时或请求取消会终止 emacsclient 子进程，但不会保证中止已经在 Emacs 中开始的 Lisp，也不会终止自动启动的 daemon。
+
+** 浏览器全文捕获
+
+~POST /emacs/capture/full~ 是 Chrome 插件使用的唯一服务入口。services 只接收浏览器
+已经转换好的 Org 文本，不连接 Emacs HTTP 服务、不下载网页，也不执行正文中的 Lisp。
+请求字段为 ~title~、~url~、~captured_at~ 和 ~body~；标题不能含换行，来源必须是绝对
+HTTP(S) URL，时间使用 UTC RFC 3339 的 ~Z~ 后缀，正文按 UTF-8 字节限制为 16 MiB。
+未知字段、格式错误和超限请求返回 HTTP 400 ~invalid-request~，不会调用 Emacs。
+
+#+begin_src json
+{
+  "title": "网页标题",
+  "url": "https://example.com/article/1",
+  "captured_at": "2026-11-18T12:30:00.000Z",
+  "body": "* 正文\n"
+}
+#+end_src
+
+services 使用现有 Emacs gateway 调用固定的
+=loki-assistant-capture-full=，并要求目标 Emacs 已加载
+=loki-assistant-capture=。成功建立捕获缓冲区返回 HTTP 202：
+
+#+begin_src json
+{"api_version":"1","status":"pending","url":"https://example.com/article/1"}
+#+end_src
+
+同一来源已有已保存文档时返回 HTTP 200 ~existing~，同时激活原节点；不覆盖或追加正文。
+同一来源正在捕获时复用原捕获缓冲区并返回 ~pending~；其他来源存在未完成捕获时返回
+HTTP 409 ~capture-busy~，第一版不排队。202 只表示捕获缓冲区已打开，不表示文件已经
+保存；用户需要在 Emacs 中使用 =C-c C-c= 或 =C-c C-k=。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "status": "existing",
+  "url": "https://example.com/article/1",
+  "document": {"id":"...", "title":"网页标题", "relative_path":"article/1.org"}
+}
+#+end_src
+
+Emacs 端由 =emacs/loki-assistant-capture.el= 提供
+=loki-assistant-capture-full=。它使用自有的
+=loki-assistant-capture-templates=（结构兼容 =org-roam-capture-templates=）作为单次
+=org-roam-capture= 调用的模板，不要求用户预先把模板写入 org-roam 全局变量，也不改变
+手动 =org-roam-capture= 的模板列表。Emacs 配置中的 =f= 模板以 =org-roam-directory= 为
+根目录，使用时间戳和 slug 生成文件名，把来源写入 =ROAM_REFS=，保存后显式更新 org-roam
+索引。
+正文按字面插入，不能通过页面内容执行模板或 Lisp 表达式。
+
+插件固定请求 =http://127.0.0.1:47321/emacs/capture/full=，不读取 services pfile，不提供
+端口设置或 token。services 若通过 =LOKI_ASSISTANT_HTTP_ADDR= 使用其他端口，需要同步修改
+插件源码后重新加载。Chrome 插件使用 loopback host permission；普通网页不获得该接口的
+跨域写入能力。Emacs 未加载 capture 模块、没有图形 frame、gateway 不可用或超时，分别
+返回 ~capture-not-installed~、~emacs-ui-unavailable~、~emacs-unavailable~ 或
+~emacs-timeout~，客户端显示服务端中文说明。
 
 ** Emacs 主动状态上报
 
@@ -320,7 +384,7 @@ Emacs 模块将应用标识映射到固定入口，通过已有 gateway 连接�
 缺少或为空的 ~app~ 返回 HTTP 400 ~invalid-request~ 。未知应用在调用 gateway 前返回 HTTP 404 ~app-not-found~ ；已知应用在目标 Emacs 中未安装（无法加载对应 feature）也返回相同错误。标识不会作为 Lisp 符号或脚本执行。
 
 #+begin_src json
-{"api_version":"1","code":"app-not-found","message":"Emacs 应用不存在或未安装：missing"}
+{"api_version":"1","status":404,"error":{"source":"business","code":"app-not-found","message":"Emacs 应用不存在或未安装：missing"}}
 #+end_src
 
 应用代码加载或运行失败返回 ~lisp-error~ ，连接、超时和无效响应沿用下表错误约定。控制中心将服务端 ~message~ 显示在“无法打开配置”弹窗中，关闭请求期间的重复点击，不自动重试；用户可在修复后再次点击。
@@ -416,7 +480,7 @@ Emacs 包提供异步通知函数，内部读取 services pfile 并复用通用 
 ** 错误
 
 #+begin_src json
-{"api_version":"1","code":"lisp-error","message":"Emacs Lisp 执行失败：示例错误"}
+{"api_version":"1","status":422,"error":{"source":"emacs","code":"lisp-error","message":"Emacs Lisp 执行失败：示例错误"}}
 #+end_src
 
 | HTTP 状态 | code | 含义 |

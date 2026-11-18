@@ -55,18 +55,14 @@ struct ServiceSettingsClient: Sendable {
         operation?.call("POST /emacs/apps/open", result: statusCode == 200 ? "success" : "failure", details: ["app": app, "http_status": "\(statusCode)"])
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard response.statusCode == 200 else {
-            let error = try? JSONDecoder().decode(SettingsErrorResponse.self, from: data)
-            throw ServiceSettingsError.failed(error?.message ?? "打开 Emacs 应用失败（HTTP \(response.statusCode)）")
+            let error = try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data)
+            throw ServiceSettingsError.failed(error?.error.message ?? "打开 Emacs 应用失败（HTTP \(response.statusCode)）")
         }
         let result = try JSONDecoder().decode(SettingsOpenResponse.self, from: data)
         guard result.apiVersion == "1", result.app == app, result.opened else {
             throw ServiceSettingsError.failed("Emacs 未确认应用已打开")
         }
     }
-}
-
-private struct SettingsErrorResponse: Decodable {
-    let message: String
 }
 
 private struct SettingsOpenResponse: Decodable {

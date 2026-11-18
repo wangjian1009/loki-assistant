@@ -147,7 +147,7 @@ final class NotificationReceiptTests: XCTestCase {
 
     func testClickPreservesServicesFailureMessageWithoutRetry() async throws {
         for (status, message) in [(404, "目标 buffer 已不存在"), (503, "无法连接目标 Emacs，请确认 server 已启动"), (504, "Emacs 调用超时")] {
-            let stub = ReceiptStub(statuses: [status], errorBody: try JSONSerialization.data(withJSONObject: ["api_version": "1", "code": "test-error", "message": message]))
+            let stub = ReceiptStub(statuses: [status], errorBody: try JSONSerialization.data(withJSONObject: ["api_version": "1", "status": status, "error": ["source": "business", "code": "test-error", "message": message]]))
             let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) }, retryDelay: { _ in XCTFail("点击操作不自动重试") })
             do {
                 try await client.activate(SystemNotification.legacyNavigationURL(buffer: "旧通知"))

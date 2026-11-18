@@ -54,6 +54,30 @@
 
 关闭 ~loki-assistant-monitor-mode~ 会移除 hooks 和定时器；services 保留最后一次成功数据直到重启。状态接口的完整响应和托盘读取约定见 [[file:control-center-services.org::*Emacs 主动状态上报][Emacs 主动状态上报]]。
 
+* 浏览器全文捕获
+
+加载 ~loki-assistant~ 后，若 ~org-roam~ 已加载会自动加载
+~loki-assistant-capture~；services 也会在处理
+~POST /emacs/capture/full~ 时通过 gateway 要求加载该模块。该模块不启动 HTTP 服务，
+Chrome 只连接 services 的固定 loopback 地址。
+
+入口函数为 ~loki-assistant-capture-full~，接收 services 转交的 JSON 字符串，使用
+浏览器已经转换好的标题、来源 URL、抓取时间和 Org 正文建立捕获缓冲区。正文按字面插入，
+不执行其中的模板或 Lisp 表达式。用户在 Emacs 中使用 =C-c C-c= 保存，或 =C-c C-k= 取消。
+
+全文捕获模板由 Emacs 配置文件中的 ~loki-assistant-capture-templates~ 提供，结构兼容
+~org-roam-capture-templates~；Loki Assistant 固定使用 key 为 ~f~ 的项，不需要额外配置
+~full~ 或选择 key。该模板只在 Loki Assistant 的单次 ~org-roam-capture-~ 调用中使用，
+不写入全局 ~org-roam-capture-templates~，因此手动执行 ~org-roam-capture~ 不会看到或
+使用该模板。可通过 Customize 调整目录、文件名、头部和正文位置；浏览器请求不能提交
+模板、路径或 Lisp 表达式。
+
+来源 URL 写入 ~ROAM_REFS~ 用于去重；已保存来源会打开原节点，不覆盖正文。同一来源已有
+未完成捕获时复用原缓冲区，不同来源存在未完成捕获时返回冲突。保存后模块显式更新
+org-roam 索引，索引失败会在 Emacs 中保留错误状态并提示处理。
+
+完整请求、响应和错误码见 [[file:control-center-services.org::*浏览器全文捕获][services 浏览器全文捕获接口]]。
+
 * 服务配置管理
 
 加载包后执行 ~M-x loki-assistant-config~ ，或从仓库根目录执行 ~make emacs-config~ 。菜单栏“设置”调用 services 的 ~POST /emacs/apps/open?app=config~ ，由服务打开该界面并聚焦图形 frame；目标 Emacs 需要已将本包加入 ~load-path~ 。首次连接尚未运行的 server 时，启动行为沿用 [[file:control-center-services.org::*配置和连接][Emacs gateway 的连接约定]]。

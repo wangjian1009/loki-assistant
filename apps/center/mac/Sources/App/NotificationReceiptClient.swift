@@ -44,10 +44,6 @@ enum NotificationActivationError: Error, LocalizedError {
     }
 }
 
-private struct ActivationErrorResponse: Decodable {
-    let message: String
-}
-
 struct NotificationReceiptClient: Sendable {
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private let discover: @Sendable () throws -> ServiceEndpoint
@@ -124,7 +120,7 @@ struct NotificationReceiptClient: Sendable {
         let (data, response) = try await transport(request)
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard response.statusCode == 200 else {
-            let message = (try? JSONDecoder().decode(ActivationErrorResponse.self, from: data))?.message
+            let message = (try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data))?.error.message
             throw NotificationActivationError.rejected(status: response.statusCode, message: message?.isEmpty == false ? message : nil)
         }
     }

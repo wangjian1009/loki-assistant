@@ -1,15 +1,14 @@
 use super::{
     StatusService,
-    protocol::{
-        API_VERSION, ErrorResponse, StatusMetaResponse, StatusResponse, StatusValueResponse,
-    },
+    protocol::{API_VERSION, StatusMetaResponse, StatusResponse, StatusValueResponse},
     service::StatusError,
 };
+use crate::http::error::{ErrorSource, response};
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
     routing::get,
 };
 use loki_services_macros::loki_api;
@@ -73,16 +72,5 @@ fn error_response(error: StatusError) -> Response {
         StatusError::NotFound(..) => (StatusCode::NOT_FOUND, "status-not-found"),
         _ => (StatusCode::BAD_REQUEST, "invalid-request"),
     };
-    response(status, code, error.to_string())
-}
-fn response(status: StatusCode, code: &str, message: String) -> Response {
-    (
-        status,
-        Json(ErrorResponse {
-            api_version: API_VERSION.to_owned(),
-            code: code.to_owned(),
-            message,
-        }),
-    )
-        .into_response()
+    response(status, ErrorSource::Business, code, error.to_string())
 }

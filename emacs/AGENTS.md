@@ -10,6 +10,7 @@
 - `loki-assistant-monitor-tests.el` 覆盖关注生命周期、状态分组、请求合并、过期响应和失败保留，纳入 `make emacs-test`。
 - `loki-assistant-config-tests.el` 覆盖配置界面和 HTTP 流程，纳入 `make emacs-test`。
 - `loki-assistant-edna.el` 由包入口在 Org Edna 加载后加载，提供与 Org Tasks Core 一致的星期排程与后继兄弟创建；`loki-assistant-edna-tests.el` 验证星期推进、夏令时、已有任务链、事务回滚、重复完成创建和标题尾号递增，纳入 `make emacs-test`。Edna 动作入口遵循 `org-edna-action/loki-...!` 命名，其余定义使用模块前缀。
+- `loki-assistant-capture.el` 提供 `loki-assistant-capture-full`，接收 services gateway 转交的浏览器 Org 全文；固定使用 `loki-assistant-capture-templates` 中 key 为 `f` 的项调用 org-roam capture，不启动 HTTP 服务，也不修改 `org-roam-capture-templates`。
 - 新增变量、函数和 feature 统一使用 `loki-assistant-` 前缀，文件启用 `lexical-binding`。
 - 注释、docstring 和面向用户的文本使用中文；按实际功能需要拆分文件。
 

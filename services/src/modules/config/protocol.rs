@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::model::{ConfigModuleMetadata, ConfigValue};
+use crate::http::error::ApiError;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MetaResponse {
@@ -24,12 +25,6 @@ pub struct ValueResponse {
     pub data: ConfigValue,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct ConfigErrorResponse {
-    pub code: String,
-    pub message: String,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct ValidateRequest {
     pub module_id: String,
@@ -45,5 +40,5 @@ pub struct ValidateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ConfigErrorResponse>,
+    pub error: Option<ApiError>,
 }

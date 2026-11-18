@@ -4,15 +4,16 @@ use axum::{
     Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, post},
 };
 use loki_services_macros::loki_api;
 
 use super::{
-    protocol::{API_VERSION, ErrorResponse, NotificationReceipt, NotificationStatusResponse},
+    protocol::{NotificationReceipt, NotificationStatusResponse},
     service::{NotificationError, NotificationService},
 };
+use crate::http::error::{ErrorSource, response};
 
 pub fn router(service: Arc<NotificationService>) -> Router {
     Router::new()
@@ -59,26 +60,37 @@ async fn receipt(
 }
 
 pub(crate) fn error_response(error: NotificationError) -> Response {
-    let (status, code) = match error {
-        NotificationError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid-request"),
-        NotificationError::Launch(_) => (StatusCode::BAD_GATEWAY, "notification-failed"),
-        NotificationError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "notification-timeout"),
-        NotificationError::NotFound => (StatusCode::NOT_FOUND, "notification-not-found"),
-        NotificationError::ReceiptConflict => {
-            (StatusCode::CONFLICT, "notification-receipt-conflict")
-        }
+    let (status, code, source) = match error {
+        NotificationError::InvalidRequest(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+            ErrorSource::Services,
+        ),
+        NotificationError::Launch(_) => (
+            StatusCode::BAD_GATEWAY,
+            "notification-failed",
+            ErrorSource::Services,
+        ),
+        NotificationError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "notification-timeout",
+            ErrorSource::Services,
+        ),
+        NotificationError::NotFound => (
+            StatusCode::NOT_FOUND,
+            "notification-not-found",
+            ErrorSource::Business,
+        ),
+        NotificationError::ReceiptConflict => (
+            StatusCode::CONFLICT,
+            "notification-receipt-conflict",
+            ErrorSource::Business,
+        ),
         NotificationError::Capacity => (
             StatusCode::SERVICE_UNAVAILABLE,
             "notification-capacity-exceeded",
+            ErrorSource::Services,
         ),
     };
-    (
-        status,
-        Json(ErrorResponse {
-            api_version: API_VERSION.to_owned(),
-            code: code.to_owned(),
-            message: error.to_string(),
-        }),
-    )
-        .into_response()
+    response(status, source, code, error.to_string())
 }

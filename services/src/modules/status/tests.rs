@@ -90,7 +90,7 @@ async fn rust_publishers_merge_items_and_reject_invalid_batches_atomically() {
     }
     let (status, body) = request(service, "GET", "/status/emacs/missing", Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["code"], "status-not-found");
+    assert_eq!(body["error"]["code"], "status-not-found");
 }
 
 #[tokio::test]

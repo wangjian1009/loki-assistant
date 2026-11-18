@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::http::error::{ErrorSource, response as api_error_response};
 use crate::modules::status::protocol::{StatusResponse, StatusValues};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -12,9 +13,9 @@ use loki_services_macros::loki_api;
 
 use super::{
     protocol::{
-        API_VERSION, ActivationRequest, ActivationResponse, BuffersResponse, ErrorResponse,
-        EvalRequest, EvalResponse, Notification, NotificationReceipt, NotificationResponse,
-        NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
+        API_VERSION, ActivationRequest, ActivationResponse, BuffersResponse, EvalRequest,
+        EvalResponse, FullCaptureRequest, FullCaptureResponse, Notification, NotificationReceipt,
+        NotificationResponse, NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
     },
     service::{EmacsError, EmacsService},
 };
@@ -25,6 +26,7 @@ pub fn router(service: Arc<EmacsService>) -> Router {
         .route("/emacs/receiver/status", post(receive_status))
         .route("/emacs/activate", post(activate))
         .route("/emacs/apps/open", post(open_app))
+        .route("/emacs/capture/full", post(capture_full))
         .route("/emacs/receiver/notification", post(notification))
         .route(
             "/emacs/receiver/notification/{id}",
@@ -35,6 +37,7 @@ pub fn router(service: Arc<EmacsService>) -> Router {
             post(notification_receipt),
         )
         .route("/emacs/buffers", get(buffers))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024 + 4096))
         .with_state(service)
 }
 
@@ -86,6 +89,40 @@ async fn open_app(
         app: request.app,
         opened: true,
     }))
+}
+
+#[loki_api(
+    module = "emacs",
+    id = "capture-full",
+    method = "POST",
+    path = "/emacs/capture/full",
+    summary = "保存完整网页",
+    description = "协议版本 1：接收浏览器转换后的完整 Org 文本，通过 loki-assistant-capture-full 进入 Emacs 捕获流程。"
+)]
+async fn capture_full(
+    State(service): State<Arc<EmacsService>>,
+    request: Result<Json<FullCaptureRequest>, JsonRejection>,
+) -> Result<Response, Response> {
+    let Json(request) = request.map_err(json_error)?;
+    let result = service
+        .capture_full(request)
+        .await
+        .map_err(error_response)?;
+    let status = if result.status == "pending" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(FullCaptureResponse {
+            api_version: API_VERSION.to_owned(),
+            status: result.status,
+            url: result.url,
+            document: result.document,
+        }),
+    )
+        .into_response())
 }
 
 #[loki_api(
@@ -231,34 +268,93 @@ fn json_error(error: JsonRejection) -> Response {
 }
 
 fn error_response(error: EmacsError) -> Response {
-    let (status, code) = match &error {
-        EmacsError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid-request"),
-        EmacsError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "invalid-config"),
-        EmacsError::Process(_) | EmacsError::ConnectionFailed(_) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "emacs-unavailable")
-        }
-        EmacsError::CommandFailed { .. } => (StatusCode::BAD_GATEWAY, "emacsclient-failed"),
-        EmacsError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "emacs-timeout"),
-        EmacsError::Lisp(_) => (StatusCode::UNPROCESSABLE_ENTITY, "lisp-error"),
-        EmacsError::InvalidResponse(_) => (StatusCode::BAD_GATEWAY, "invalid-emacs-response"),
-        EmacsError::HandlerNotFound(_) => (StatusCode::NOT_FOUND, "notification-handler-not-found"),
-        EmacsError::HandlerAlreadyRegistered(_) => {
-            (StatusCode::CONFLICT, "notification-handler-exists")
-        }
-        EmacsError::Notification(_) => (StatusCode::BAD_GATEWAY, "notification-failed"),
+    let (status, source, code) = match &error {
+        EmacsError::InvalidRequest(_) => (
+            StatusCode::BAD_REQUEST,
+            ErrorSource::Services,
+            "invalid-request",
+        ),
+        EmacsError::Config(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorSource::Services,
+            "invalid-config",
+        ),
+        EmacsError::Process(_) | EmacsError::ConnectionFailed(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorSource::Emacs,
+            "emacs-unavailable",
+        ),
+        EmacsError::CommandFailed { .. } => (
+            StatusCode::BAD_GATEWAY,
+            ErrorSource::Emacs,
+            "emacsclient-failed",
+        ),
+        EmacsError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            ErrorSource::Emacs,
+            "emacs-timeout",
+        ),
+        EmacsError::Lisp(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorSource::Emacs,
+            "lisp-error",
+        ),
+        EmacsError::InvalidResponse(_) => (
+            StatusCode::BAD_GATEWAY,
+            ErrorSource::Emacs,
+            "invalid-emacs-response",
+        ),
+        EmacsError::HandlerNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            ErrorSource::Business,
+            "notification-handler-not-found",
+        ),
+        EmacsError::HandlerAlreadyRegistered(_) => (
+            StatusCode::CONFLICT,
+            ErrorSource::Business,
+            "notification-handler-exists",
+        ),
+        EmacsError::Notification(_) => (
+            StatusCode::BAD_GATEWAY,
+            ErrorSource::Services,
+            "notification-failed",
+        ),
         EmacsError::SystemNotification(error) => {
             return crate::modules::notification::routes::error_response(error.clone());
         }
-        EmacsError::BufferNotFound => (StatusCode::NOT_FOUND, "buffer-not-found"),
-        EmacsError::AppNotFound(_) => (StatusCode::NOT_FOUND, "app-not-found"),
+        EmacsError::BufferNotFound => (
+            StatusCode::NOT_FOUND,
+            ErrorSource::Business,
+            "buffer-not-found",
+        ),
+        EmacsError::AppNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            ErrorSource::Business,
+            "app-not-found",
+        ),
+        EmacsError::Capture { code, .. } => match code.as_str() {
+            "capture-not-installed" => (
+                StatusCode::NOT_FOUND,
+                ErrorSource::Business,
+                "capture-not-installed",
+            ),
+            "capture-busy" => (StatusCode::CONFLICT, ErrorSource::Business, "capture-busy"),
+            "capture-invalid" => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorSource::Business,
+                "capture-invalid",
+            ),
+            "emacs-ui-unavailable" => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorSource::Emacs,
+                "emacs-ui-unavailable",
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorSource::Business,
+                "capture-failed",
+            ),
+        },
     };
-    (
-        status,
-        Json(ErrorResponse {
-            api_version: API_VERSION.to_owned(),
-            code: code.to_owned(),
-            message: error.to_string(),
-        }),
-    )
-        .into_response()
+    api_error_response(status, source, code, error.to_string())
 }

@@ -139,6 +139,11 @@ curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
   -d '{"title":"任务完成","app":"emacs","buffer":"*scratch*"}'
 #+end_src
 
+Chrome 全文捕获使用固定的 ~POST /emacs/capture/full~。services 接收浏览器已经转换好的
+Org 文本，再通过 gateway 调用 Emacs 的 ~loki-assistant-capture-full~；Emacs 不启动独立
+HTTP 服务。请求字段和捕获状态见
+[[file:../docs/control-center-services.org::*浏览器全文捕获][浏览器全文捕获接口]]。
+
 配置修改从下次调用开始生效，并保存到 ~~/.assistant/config.yml~ 。不展开路径中的 ~ 和环境变量。~socket_name~ 默认为 ~server~ ，可在 Emacs 配置界面中改为目标 Emacs 的 socket 名称或绝对路径。gateway 显式传入该 socket，不依赖 ~EMACS_SOCKET_NAME~ 或 ~EMACS_SERVER_FILE~ ，也不在连接失败后回退到 TCP server 或其他实例。
 
 Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclient --alternate-editor=~ 自动启动目标 Emacs daemon；已运行但未启用 server 的 Emacs 不会自动接管连接。启动 Emacs 所需的程序和用户配置须在 services 运行环境中可用。services 以用户级 LaunchAgent 的用户身份运行。

@@ -22,13 +22,6 @@ pub struct StatusValueResponse {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub api_version: String,
-    pub code: String,
-    pub message: String,
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct StatusMetaResponse {
     pub api_version: String,

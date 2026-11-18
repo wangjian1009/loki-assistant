@@ -35,7 +35,7 @@ final class ServiceSettingsTests: XCTestCase {
                 let health = url.path == "/healthz"
                 let body = health
                     ? Data(#"{"service":"loki-services","status":"ok","version":"0.1.0","uptime_seconds":1}"#.utf8)
-                    : try JSONEncoder().encode(["code": code, "message": message])
+                    : try JSONSerialization.data(withJSONObject: ["api_version": "1", "status": status, "error": ["source": "business", "code": code, "message": message]])
                 return (body, HTTPURLResponse(url: url, statusCode: health ? 200 : status, httpVersion: nil, headerFields: nil)!)
             })
             do {

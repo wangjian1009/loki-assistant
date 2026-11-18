@@ -39,7 +39,6 @@ struct EmacsBufferGroup: Equatable, Identifiable, Sendable {
     var id: String { app }
 }
 
-private struct EmacsStatusAPIError: Decodable { let message: String }
 private struct EmacsBufferActivation: Decodable {
     let api_version: String
     let activation: String
@@ -92,7 +91,7 @@ struct EmacsReportedStatusClient: Sendable {
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         operation?.call(action, result: response.statusCode == 200 ? "success" : "failure", details: ["http_status": "\(response.statusCode)"])
         guard response.statusCode == 200 else {
-            let message = (try? JSONDecoder().decode(EmacsStatusAPIError.self, from: data))?.message
+            let message = (try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data))?.error.message
             throw EmacsReportedStatusError.failed(message ?? "Emacs 状态接口返回 HTTP \(response.statusCode)")
         }
         return data

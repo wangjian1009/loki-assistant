@@ -12,7 +12,7 @@ BREW ?= brew
 OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
-.PHONY: emacs-load emacs-test emacs-config export-icons
+.PHONY: emacs-load emacs-test emacs-config chrome-build chrome-test export-icons
 .PHONY: relay-image
 
 .PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
@@ -24,10 +24,12 @@ help:
 	  'make run             构建并启动 Mac 菜单栏应用' \
 	  'make restart-center  重建并重启 Mac 菜单栏应用' \
 	  'make xcode           生成并打开 Xcode 工程' \
-	  'make test            执行 Mac XCTest 和 services Rust 测试' \
+	  'make test            执行 Mac XCTest、services Rust 和 Chrome 插件测试' \
 	  'make test-mac        构建并执行 Mac XCTest' \
 	  'make emacs-config    打开 Emacs 服务配置管理界面' \
-	  'make export-icons    从公共 SVG 母版导出 macOS 和 HarmonyOS 图标' \
+	  'make chrome-build    构建 Chrome 插件' \
+	  'make chrome-test     构建并执行 Chrome 插件测试' \
+	  'make export-icons    从公共 SVG 母版导出 macOS、HarmonyOS 和 Chrome 图标' \
 	  'make services-test   执行 services Rust 测试' \
 	  'make services-fmt    检查 services Rust 格式' \
 	  'make services-run    运行 services 本地服务' \
@@ -57,7 +59,7 @@ help:
 emacs-load:
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (add-to-list 'load-path \"$(PROJECT_ROOT)/emacs\") \
-	  (dolist (feature '(loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
+	  (dolist (feature '(loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config))"
@@ -72,10 +74,11 @@ emacs-test: emacs-load
 	  (unwind-protect \
 	      (progn \
 	        (loki-assistant-monitor-mode -1) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-capture-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-monitor-tests.el\" nil t) \
-	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-monitor-test-\"))) \
+	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-capture-test-\"))) \
 	              (edna-stats \
 	               (when (require 'org-edna nil t) \
 	                 (load \"$(PROJECT_ROOT)/emacs/loki-assistant-edna-tests.el\" nil t) \
@@ -93,6 +96,12 @@ emacs-test: emacs-load
 	            (error \"Emacs 测试失败\")))) \
 	    (when monitor-enabled (loki-assistant-monitor-mode 1))))"
 
+chrome-build:
+	npm --prefix "$(PROJECT_ROOT)/chrome-plugin" run build
+
+chrome-test:
+	npm --prefix "$(PROJECT_ROOT)/chrome-plugin" test
+
 export-icons:
 	python3 "$(PROJECT_ROOT)/scripts/export-icons.py"
 
@@ -102,7 +111,7 @@ configure:
 build: configure
 	"$(CMAKE)" --build "$(BUILD_DIR)" --config "$(CONFIG)"
 
-test: test-mac services-test
+test: test-mac services-test chrome-test
 
 test-mac:
 	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(TEST_BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON -DLOKI_APP_BUNDLE_IDENTIFIER=cc.loki-assistant.center.testhost -DLOKI_APP_URL_SCHEME=loki-assistant-testhost

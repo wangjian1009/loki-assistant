@@ -13,9 +13,3 @@ pub struct DiscoverResponse {
 pub struct ModuleListResponse {
     pub modules: Vec<ModuleSummary>,
 }
-
-#[derive(Clone, Debug, Serialize)]
-pub struct DiscoverError {
-    pub code: String,
-    pub message: String,
-}

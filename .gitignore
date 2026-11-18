@@ -14,3 +14,6 @@ apps/harmony/build/
 apps/harmony/entry/build/
 apps/harmony/oh_modules/
 apps/harmony/entry/oh_modules/
+
+# Chrome extension build output
+/dist/chrome-plugin/

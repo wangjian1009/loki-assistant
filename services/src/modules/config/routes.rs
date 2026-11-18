@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
+use crate::http::error::{ApiError, ErrorSource, response as api_error_response};
+
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, post},
 };
 use loki_services_macros::loki_api;
@@ -13,8 +15,7 @@ use serde_json::Value;
 use super::{
     model::{ConfigModuleMetadata, ConfigValue, ConfigValueSource},
     protocol::{
-        ConfigErrorResponse, MetaResponse, ModuleDataResponse, ValidateRequest, ValidateResponse,
-        ValueResponse,
+        MetaResponse, ModuleDataResponse, ValidateRequest, ValidateResponse, ValueResponse,
     },
     service::{ConfigService, ConfigServiceError},
 };
@@ -51,7 +52,8 @@ async fn validate(
         Ok(value) => (Some(value), None),
         Err(error @ ConfigServiceError::InvalidValue(_)) => (
             None,
-            Some(ConfigErrorResponse {
+            Some(ApiError {
+                source: ErrorSource::Business,
                 code: error_code(&error).to_owned(),
                 message: error.to_string(),
             }),
@@ -205,7 +207,7 @@ async fn post_value(
 }
 
 fn error_response(error: ConfigServiceError) -> Response {
-    let status = match error {
+    let status = match &error {
         ConfigServiceError::ModuleNotFound(_) | ConfigServiceError::ItemNotFound { .. } => {
             StatusCode::NOT_FOUND
         }
@@ -215,14 +217,12 @@ fn error_response(error: ConfigServiceError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    (
+    api_error_response(
         status,
-        Json(ConfigErrorResponse {
-            code: error_code(&error).to_owned(),
-            message: error.to_string(),
-        }),
+        ErrorSource::Business,
+        error_code(&error),
+        error.to_string(),
     )
-        .into_response()
 }
 
 fn error_code(error: &ConfigServiceError) -> &'static str {
@@ -455,8 +455,13 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(body["code"], "invalid-config");
-        assert!(body["message"].as_str().unwrap().contains("文件不存在"));
+        assert_eq!(body["error"]["code"], "invalid-config");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("文件不存在")
+        );
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(
             service
