@@ -1,24 +1,64 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Loki Assistant 密码</title>
-    <link rel="stylesheet" href="popup.css">
-  </head>
-  <body>
-    <main id="app">
-      <header class="topbar"><strong>Loki Assistant</strong><button id="refresh" class="icon-button" title="刷新条目" aria-label="刷新条目">↻</button></header>
-      <nav class="tabs" aria-label="功能"><button class="tab active" data-view="password">密码</button><button class="tab" data-view="capture">全文保存</button></nav>
-      <section id="password-view">
-        <div class="search-row"><input id="search" type="search" autocomplete="off" placeholder="搜索密码条目…" aria-label="搜索密码条目"><button id="domain-toggle" class="filter-button" type="button" title="只显示当前网站">当前网站</button></div>
-        <p id="password-status" class="status" role="status" aria-live="polite">正在读取密码条目…</p>
-        <div id="entries" class="entries" aria-live="polite"></div>
-        <p class="read-only-note">当前 services 仅提供查询；新增、编辑和删除由服务端接口支持后再开放。</p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loki Assistant</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <svg class="symbols" aria-hidden="true"><defs>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="icon-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></symbol>
+    <symbol id="icon-user" viewBox="0 0 24 24"><circle cx="12" cy="7.5" r="3.5"/><path d="M5 21v-3a7 7 0 0 1 14 0v3"/></symbol>
+    <symbol id="icon-key" viewBox="0 0 24 24"><circle cx="15.5" cy="8.5" r="5.5"/><path d="m12 13-8 8H2v-4l3-3h3v-3"/></symbol>
+    <symbol id="icon-right" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+    <symbol id="icon-left" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/></symbol>
+    <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-page" viewBox="0 0 24 24"><path d="M14 2H5v20h14V7l-5-5Zm0 0v6h5M8 12h8m-8 4h6"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-1 8M20 4v6h-6"/></symbol>
+  </defs></svg>
+  <main id="app">
+    <header class="topbar">
+      <div class="brand"><img src="../icons/icon-32.png" width="29" height="29" alt=""><strong>Loki Assistant</strong></div>
+      <button id="connection" class="connection" aria-expanded="false" aria-controls="diagnostics"><span class="dot"></span><span id="connection-label">正在连接</span></button>
+    </header>
+    <div id="page-context" class="site"><svg class="icon" aria-hidden="true"><use href="#icon-globe"/></svg><span id="hostname">正在读取当前页面…</span></div>
+    <nav class="tabs" aria-label="功能">
+      <button class="tab" data-view="tools" aria-pressed="false">工具</button>
+      <button class="tab" data-view="password" aria-pressed="false">密码 <span id="match-count" class="count" aria-label="当前网站匹配数量">—</span></button>
+    </nav>
+    <div id="content" class="content">
+      <aside id="diagnostics" class="notice" hidden><p id="connection-detail">正在连接本机服务…</p><button id="refresh" class="text-button">重试连接</button></aside>
+      <p id="initial-loading" class="loading" role="status">正在检测当前页面…</p>
+      <section id="tools-view" aria-label="工具" hidden>
+        <div class="search-box"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><input id="tool-search" type="search" placeholder="搜索工具…" autocomplete="off" aria-label="搜索工具"></div>
+        <article id="capture-tool" class="tool-card">
+          <div class="tool-heading"><span class="tool-icon"><svg class="icon" aria-hidden="true"><use href="#icon-page"/></svg></span><div><h1>保存完整网页</h1><p>将当前页面保存为 Org 笔记</p></div></div>
+          <button id="org-capture" class="primary">保存到 Emacs <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+        </article>
+        <p id="tool-empty" class="empty" hidden>没有匹配的工具。</p>
+        <p id="capture-status" class="status" role="status" aria-live="polite"></p>
       </section>
-      <section id="capture-view" hidden><button id="org-capture" class="primary" type="button">保存当前完整网页</button><p id="capture-status" class="status" role="status" aria-live="polite"></p></section>
-    </main>
-    <dialog id="details-dialog"><form method="dialog" class="dialog-form"><button class="dialog-close" value="cancel" aria-label="关闭">×</button><h1 id="details-title">密码条目</h1><p id="details-path" class="muted"></p><div id="details-fields" class="details-fields"></div><div class="details-actions"><button id="details-fill" type="button" class="primary">填充当前页面</button><button id="details-open" type="button">打开网址</button></div><p id="details-status" class="status" role="status" aria-live="polite"></p></form></dialog>
-    <script type="module" src="popup.js"></script>
-  </body>
+      <section id="password-view" aria-label="密码列表" hidden>
+        <div class="search-box"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><button id="domain-scope" class="scope" title="移除网站过滤" aria-label="移除当前网站过滤">当前网站 ×</button><input id="search" type="search" autocomplete="off" placeholder="搜索密码条目…" aria-label="搜索密码条目" aria-controls="entries"></div>
+        <div class="list-heading"><span id="result-count">正在读取密码条目…</span><button id="domain-toggle" class="text-button">全部条目</button></div>
+        <div id="entries" class="entries"></div>
+        <div class="keyboard-hint"><span><kbd>↵</kbd> 填充选中条目</span><span><kbd>↑</kbd> <kbd>↓</kbd> 选择</span></div>
+      </section>
+      <section id="details-view" aria-label="密码详情" hidden>
+        <button id="details-back" class="back"><svg class="icon" aria-hidden="true"><use href="#icon-left"/></svg>返回密码列表</button>
+        <h1 id="details-title" class="details-title"></h1><p id="details-path" class="path"></p>
+        <p id="details-status" class="status" role="status" aria-live="polite"></p>
+        <div id="details-fields" class="details-fields"></div>
+        <div id="details-actions" hidden><button id="details-fill" class="primary">填充当前页面</button><button id="details-open" class="open-url text-button">打开条目网址 ↗</button></div>
+      </section>
+    </div>
+    <footer class="footer"><span id="password-status" class="status" role="status" aria-live="polite">正在连接本机服务…</span><span id="shortcut-hint" hidden>Ctrl + O 详情</span></footer>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
 </html>

@@ -4,6 +4,10 @@
 本文记录 Chrome 插件、services 和 Emacs capture 模块的已确认设计与实现边界。
 第一版实现已落在对应目录；本文仍作为跨模块协议和行为基准。
 
+弹窗布局、Browserpass 操作承载与工具入口见
+[[file:chrome-popup-design.org][Chrome 插件弹窗交互设计]]；工具在前的导航、按密码框选择默认页、紧凑列表和内页详情已实现，
+工具栏匹配数量角标也已实现；后续工具仍属规划。
+
 * 目标与范围
 
 Chrome Manifest V3 插件的功能菜单包含全文保存和只读密码查询：
@@ -78,13 +82,22 @@ chrome-plugin/
 #+end_src
 
 popup 只负责显示功能菜单、启动功能和显示结果。密码列表及详情请求在 popup 中按需发起，
-密码填充和全文保存通过 service worker 调度。每个功能由自己的目录导出入口，目录之间不共享
+当前标签页读取、密码框检测、密码填充和全文保存通过 service worker 调度。
+popup 使用 =page-context= 请求当前页面信息，使用 =capture-snapshot= 请求后台读取页面快照，
+在具备 DOM 的 popup 中转换为 Org，再以 =capture-full= 交给后台提交；service worker 不执行 DOM 转换。
+每个功能由自己的目录导出入口，目录之间不共享
 隐式全局状态。
 
-插件使用 =activeTab=、=scripting= 权限，以及访问
+插件使用 =activeTab=、=scripting=、=tabs= 权限，以及访问
 =http://127.0.0.1/*= 的 =host_permissions= 。不申请 cookies、下载、剪贴板或全部网页
 访问权限；复制使用扩展页面的 Clipboard API，不声明 =clipboardRead= 或 =clipboardWrite= 。
 Chrome 内部页面、Web Store、PDF 查看器和没有 HTML body 的页面直接显示不支持提示。
+
+=tabs= 用于用户点击插件前读取当前标签页 URL 并刷新密码匹配角标，不用于读取页面 DOM。
+角标在后台按当前 hostname 和端口匹配条目名称，不解密密码；扩展加载、安装、浏览器启动、
+导航、标签页激活、窗口切换和 popup 重新查询后自动更新。无匹配时留空，服务查询失败清除旧数字，
+通过图标提示说明查询未完成。迟到响应按 tabId、请求代次和最新 URL 检查，不能覆盖新页面的计数。
+并发查询仅共享进行中的条目列表请求，完成后不缓存名称。
 
 页面转换沿用参考项目的边界：复制可见的主文档 body，忽略脚本、样式、iframe、隐藏元素、
 Shadow DOM 和 canvas；链接转为绝对 HTTP(S) 地址；图片只保留远程地址，不转 Base64；
@@ -214,12 +227,50 @@ native host 的 =configure=、=list=、=fetch= 分别对应本插件的配置中
 
 插件保留以下可见行为：
 
+- 弹窗按“工具、密码”排列；可访问 frame 中有可见、可编辑密码框时默认进入密码页，否则进入工具页。
+  不读取密码框内容，不因匹配条目数量选择默认页；手动切换后，迟到的页面检测不改变当前页。
 - 条目列表默认按当前标签页 hostname 过滤，输入搜索词时按第一词模糊匹配、其余词做字面子串过滤；“全部条目”按钮取消域名过滤，Backspace 在搜索框为空时也会取消过滤。
-- 条目卡片支持填充用户名/密码、复制用户名、复制密码和打开详情；详情按需读取完整原文，显示标准字段和额外的 key/value 字段，并支持复制、填充及打开 URL。
+- 密码入口数字只统计当前网站匹配条目，不随搜索词改变；列表结果单独计数，查询失败显示未知，不能显示成零匹配。
+- 条目卡片支持填充用户名/密码、复制用户名、复制密码和打开详情；详情作为弹窗内页按需读取原文，密码默认遮罩，
+  显示标准字段和额外的 key/value 字段，并支持正确复制各字段、填充及打开 URL。返回保留搜索、过滤与列表位置。
 - 字段别名沿用 browserpass：=secret/password/pass=、=login/username/user=、=url/uri/website/site/link/launch=、=otp/totp= 和 =openid= 。没有显式密码时使用第一行，没有用户名时使用条目文件名。
-- OTP 支持 =otpauth://= URI 的 type、secret、algorithm、digits、period 和 Base32 secret-only 形式；使用 Web Crypto HMAC 计算当前 token。填充带 OTP 的条目后复制 token，和 browserpass 的自动复制行为一致。
-- =Enter= 填充第一项，=Ctrl+C= 复制密码，=Ctrl+Shift+C= 复制用户名，=Ctrl+O= 打开详情；扩展命令 =Ctrl+Shift+F= 填充当前网站最匹配的条目。
-- 表单填充在当前标签页的可访问 frame 中查找可见用户名和 password input，派发 =input/change= 事件；条目中设置 =autosubmit: true= 时提交所在 form。跨域受限 frame 或浏览器内部页面失败时显示明确说明。
+- OTP 支持 =otpauth://= URI 的 type、secret、algorithm、digits、period 和 Base32 secret-only 形式；使用 Web Crypto HMAC 计算 TOTP token，详情显示倒计时；HOTP 返回不支持提示。填充带 OTP 的条目后复制 token，和 browserpass 的自动复制行为一致。
+- 上下方向键选择条目，=Enter= 填充选中项，=Ctrl+C= 复制密码，=Ctrl+Shift+C= 复制用户名，=Ctrl+O= 打开详情；
+  搜索框有选区时保留文本复制，macOS 的 Cmd+C 不拦截。扩展命令 =Ctrl+Shift+F= 填充当前网站最匹配的条目。
+- 表单填充优先主文档，主文档没有所需密码或 OpenID 字段时才尝试有权限的同 origin frame，
+  受限 iframe 不影响主文档已经成功的结果。按登录 form 区分字段，排除隐藏、透明、只读、禁用、
+  尺寸过小和视口外输入框，派发聚焦、填充前后键盘与 =input/change= 、失焦事件。
+  条目中设置 =autosubmit: true= 时提交所在 form；浏览器内部页面或没有可填充字段时显示明确说明。
+
+** 华为登录页填充差异与修复
+
+2026-11-19 对照 browserpass-extension 3.13.0 的
+[[https://github.com/browserpass/browserpass-extension/blob/dcdd297b4bd4a2df53c59185d8a7888e2332113b/src/inject.js][inject.js]] 中的 =queryAllVisible= 、=form=、=update=，以及
+[[https://github.com/browserpass/browserpass-extension/blob/dcdd297b4bd4a2df53c59185d8a7888e2332113b/src/background.js][background.js]] 中的 =fillFields= 进行检查。
+
+华为登录页同时包含隐藏的 username/password 输入框和用户可见的实际登录框。旧实现只检查
+输入框自己的 display、visibility，隐藏父元素内的诱饵框仍被选中。用虚构数据在同一页面比较：
+旧 Loki 报告填充 2 个字段，但可见框均未改变，隐藏框写入 2 项；Browserpass 正确填充可见的
+用户名和密码。services 解密及条目解析正常，因此该问题位于页面定位阶段。
+
+| 比较项 | Browserpass | 旧 Loki | 修复后的 Loki |
+|--------+-------------+---------+---------------|
+| 可见性 | 尺寸、视口、visibility 与父元素透明度 | 只检查元素自身样式 | 检查尺寸、视口及祖先样式，排除隐藏诱饵 |
+| 用户名类型 | 仅 text/email/tel，按选择器排序 | textInputs 未排除 password 等类型 | 严格区分字段类型，优先 autocomplete 与用户名标记 |
+| 表单选择 | 识别登录 form，字段限制在该 form | 从整个文档分别取首项 | 优先含密码的登录 form，在同一 form 中选取字段 |
+| 页面事件 | 聚焦后重新定位，前后键盘与输入事件，最后 blur | 赋值后只有 input/change | 对齐事件阶段，聚焦替换输入框后重新定位 |
+| 赋值 | 同时设置 value attribute 与 property | 使用原生 setter | 保留原生 setter 以兼容受控输入，不把密码写入 HTML attribute |
+| frame 调度 | 主文档优先，再尝试 frame；跨 origin 有独立确认 | 一次注入所有 frame | 主文档优先，再尝试获授权的同 origin frame；不新增跨 origin 授权 |
+| Shadow DOM | 文档启动时追踪宿主，填充时查询 shadow roots | 不遍历 | 按需遍历 open Shadow DOM，不注入永久追踪脚本 |
+
+修复后在真实华为登录页再次使用虚构数据验证，可见用户名、密码均成功填入，隐藏框未写入；
+页面事件处理后值仍保留。验证不提交登录，不使用真实账号密码。单元测试覆盖隐藏诱饵、
+字段类型、登录 form、聚焦替换、受控 setter、事件、frame 回退和 origin 边界。
+
+后续兼容能力仍保持既有范围：没有 Browserpass 的跨 origin 确认与授权管理，不新增全部网页
+访问权限，也不声称已完整复刻其所有填充行为。
+
+** 查询范围与安全边界
 
 原版 browserpass 的最近使用统计、浏览器历史日志、Basic Auth 监听、跨 store 颜色设置、
 Native Messaging options 页和写入操作不在当前版本，因为当前扩展未申请相应权限且 services

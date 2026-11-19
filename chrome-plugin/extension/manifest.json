@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "minimum_chrome_version": "109",
   "description": "查询 pass 密码并填充当前网页，也可将网页保存为 Org 文档。",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "tabs"],
   "host_permissions": ["http://127.0.0.1/*"],
   "icons": {
     "16": "icons/icon-16.png",

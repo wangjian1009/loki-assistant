@@ -37,6 +37,7 @@ export function parseOtp(value) {
 
 export async function generateTotp(otp, timestamp = Date.now()) {
   const params = otp?.params || otp;
+  if (params.type && params.type !== "totp") throw new Error("当前只支持 TOTP 验证码。");
   const period = Number.isFinite(params.period) && params.period > 0 ? params.period : 30;
   const digits = [6, 7, 8].includes(params.digits) ? params.digits : 6;
   const counter = Math.floor(timestamp / 1000 / period);

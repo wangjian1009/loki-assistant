@@ -12,6 +12,28 @@ Chrome 插件已实现全文保存和只读密码查询。跨模块协议和功�
 =GET /password/entries= 和 =GET /password/entries/{*file}= 查询条目，支持当前域名筛选、模糊搜索、条目详情、用户名/密码/OTP 复制、当前页面表单填充和条目 URL 打开。全文保存功能仍通过固定的
 =http://127.0.0.1:47321/emacs/capture/full= 提交浏览器内转换后的 Org 文本。
 
+弹窗导航固定为“工具、密码”。打开时检测当前页面可访问 frame 中的可见、可编辑密码框：
+有密码框则默认进入密码页，否则进入工具页。默认页与密码库是否存在匹配条目无关；
+检测失败时进入工具页，仍可手动切换。手动选择不会被迟到的检测结果覆盖。
+
+工具页目前提供全文保存。密码页显示当前 hostname、网站匹配数量与可移除的网站过滤标签，
+支持方向键选择、Enter 填充、Ctrl+C 复制密码、Ctrl+Shift+C 复制用户名及 Ctrl+O 查看详情。
+Ctrl+C 在搜索框有文本选区时保留文本复制行为，macOS 的 Cmd+C 保持原生行为。
+详情在弹窗内切换，密码默认遮罩，返回保留搜索条件；带 TOTP 的条目显示验证码及剩余时间。
+不支持的 HOTP 会明确提示，不按 TOTP 计算。
+
+填充会排除隐藏父元素内、透明、只读、禁用、尺寸过小和视口外的输入框，并在同一个登录
+表单内区分用户名与密码。优先填充主文档，需要时才尝试有权限的同 origin frame；某个
+iframe 无法访问不会使主文档已经成功的填充变成失败。兼容性比较见
+[[file:../docs/chrome-extension.org::*华为登录页填充差异与修复][Browserpass 填充差异与修复]]。
+
+连接状态可点击查看原因并重试。Chrome 内部页不能填充或全文保存，但仍可搜索和复制密码。
+数字计数同时显示在弹窗的密码入口和工具栏图标角标。扩展加载、页面导航、切换标签页或窗口、
+以及弹窗重新查询时自动更新；有匹配时显示数量，无匹配时留空，查询失败不会显示成零匹配。
+角标只查询条目名称，不解密密码。为在点击图标前读取当前标签页 URL，插件声明 =tabs= 权限，
+不增加全部网页访问权限。首次使用前仍需在服务配置的“密码管理”中设置本地 pass 目录，
+具体配置见 [[file:../services/README.org::*密码查询][services 密码查询说明]]。
+
 services 只提供密码查询；新增、编辑、删除和密码生成按钮暂不开放，避免插件展示不存在的后端能力。原版 browserpass 的 Native Messaging host 由本插件的 HTTP 客户端替代，services 不读取浏览器设置或 =.browserpass.json= 。
 
 密码原文只在点击复制、详情或填充时按需读取，插件不持久化密码内容。OTP 在浏览器内按条目中的 =otpauth://= 或 Base32 secret 计算，填充带 OTP 的条目后会复制当前 token。
@@ -21,7 +43,7 @@ Emacs 不需要启动 HTTP 服务；services 通过 =emacsclient= 调用
 
 * 功能目录
 
-每个可复用能力位于独立目录：=password-query= 查询和解析、=password-search= 域名过滤和模糊排序、=password-copy= 字段复制、=password-fill= 表单填充、=password-otp= OTP、=password-manager= 业务组合，=org-capture= 负责全文保存。=popup= 只负责组合界面，=background= 负责填充和全文保存调度。
+每个可复用能力位于独立目录：=password-query= 查询和解析、=password-search= 域名过滤和模糊排序、=password-copy= 字段复制、=password-fill= 页面密码框检测与表单填充、=password-otp= OTP、=password-manager= 业务组合，=org-capture= 负责全文保存。=popup= 只负责组合界面，=background= 负责当前页面读取、填充和全文保存调度。
 
 * 构建
 
@@ -33,6 +55,7 @@ npm run build
 
 构建后，在 Chrome 打开 =chrome://extensions/=，启用开发者模式，选择
 仓库根目录下的 =dist/chrome-plugin= 加载未打包扩展。
+已加载的扩展在重新构建后，需要在扩展管理页点击重新加载。
 
 services 使用非默认端口时，需先修改插件源码中的固定地址，再重新构建和加载。
 

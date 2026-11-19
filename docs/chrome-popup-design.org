@@ -1,0 +1,281 @@
+#+TITLE: Chrome 插件弹窗交互设计
+#+LANGUAGE: zh-CN
+#+DATE: 2026-11-19
+
+* 设计状态
+
+本文记录弹窗设计及实施边界。工具在前的导航、按密码框选择默认页、紧凑列表、内页详情、
+密码遮罩、TOTP 倒计时、选中项快捷键、真实连接状态与已接入工具已落到插件。
+工具栏匹配数量角标也已实现，后续服务能力仍未实施。文末可交互 HTML 原型使用虚构数据，不读取密码、
+调用 services 或写入剪贴板。既有协议与实现边界仍以
+[[file:chrome-extension.org][Chrome 插件、密码查询与全文捕获设计]] 为准。
+
+* 核心布局
+
+采用“网站上下文 + 工具 / 密码 + 当前功能内容 + 轻量反馈”的结构。导航顺序固定为
+工具在前、密码在后；打开弹窗时根据当前页面是否存在密码输入框选择默认页。新增能力
+放进工具列表，不随能力增长持续增加顶层标签。
+
+** 默认页选择
+
+| 当前页面情况 | 默认页 |
+|--------------+--------|
+| 有可见、可编辑的密码输入框 | 密码 |
+| 没有密码输入框，或只有隐藏、禁用、只读的密码输入框 | 工具 |
+| 页面检测失败、页面不支持脚本或 frame 无权访问 | 工具，仍可手动进入密码页 |
+
+判断依据是当前页面的 =input[type=password]= ，与密码库是否存在匹配条目无关。
+有密码框但无匹配条目时，仍打开密码页并呈现无匹配状态；普通文章页面即使有匹配条目，
+也默认打开工具页。用户名先行、下一步才显示密码的登录页，在当前没有密码框时进入工具页。
+
+检测在用户打开弹窗后使用已有 activeTab 与 scripting 授权，只读取可访问 frame 内
+密码框的存在与可用性，不读取输入值，不新增全部网页访问权限。不可访问 frame 的结果
+视为未知，不猜测其中是否存在密码框。只要有一个可访问 frame 检测到可用密码框，就进入密码页。
+
+初始检测完成前保持中性加载状态，避免先展示工具再跳到密码。用户手动选择标签后，迟到的
+检测结果不得覆盖选择，当前这次打开期间不因页面动态变化强制跳页；下次重新打开再检测。
+进入选定页后聚焦该页搜索框。
+
+弹窗宽度为 440 CSS px，高度随内容变化，最大 580 CSS px，适配 Chrome 弹窗的高度限制。
+列表与详情的中间内容区独立滚动，标题、导航和操作反馈保留。详情替换密码列表，返回时
+恢复搜索、过滤、选中位置和滚动位置，不在小弹窗里叠加模态对话框。
+
+原型画布并列展示三个状态，实际插件每次只展示其中一个。原型使用“无密码框 / 有密码框”切换器模拟页面检测，不读取真实页面。画布上的说明与状态切换器
+属于设计评审工具，不进入插件。
+
+** 顶部与网站上下文
+
+- 顶部显示现有 Loki 图标、产品名与“服务已连接 / 正在连接 / 服务未连接”。连接成功
+  必须来自真实请求结果；点击状态打开轻量诊断，失败时提供重试，保留搜索输入。
+- 网站上下文显示当前完整 hostname，例如 =id1.cloud.huawei.com= 。长域名省略显示，
+  完整值通过可聚焦元素的说明暴露；不显示 URL 中的查询参数或令牌。
+- “密码”旁的数字只表示当前网站的匹配数量，不随搜索词变化；搜索结果数量单独显示。
+  工具页入口保持“工具”，不以未读数的形式标注工具数量。
+- 图标角标同样只表示当前网站匹配数量。无匹配时留空，查询失败不得伪装成 0。
+
+* 密码界面
+
+搜索框内部左侧放置可移除的“当前网站”过滤标签，右侧输入搜索词。移除标签或在
+空输入框按 Backspace 后切换到全部条目；明确提供“全部条目”入口，并能恢复当前网站。
+进入密码页时聚焦搜索框，沿用现有第一词模糊匹配、其余词字面过滤规则。
+
+华为示例中，网站上下文为 =id1.cloud.huawei.com= ，匹配条目为 =huawei.com.gpg= 。
+主标题显示 =huawei.com= ，次行显示配置的密码库名称与条目相对路径，避免把密码库名
+误当成用户名。列表查询只返回文件名，因此首页不额外解密获取用户名、OTP 或使用记录。
+匹配解释“匹配父域名 huawei.com”帮助理解两处域名不同的原因；只接受 hostname 相等或
+以点号分隔的子域匹配，=huawei.com.evil.example= 不得命中。
+
+整行主区域用于填充，右侧固定三个操作：复制用户名、复制密码、查看详情。图标使用
+统一线条，并提供 tooltip、aria-label 和清晰的键盘焦点。操作区域互不覆盖。
+
+只有一条记录时保持紧凑，不用无内容的固定高度填满画面。底部操作提示随当前页面和
+焦点变化；成功复制显示具体字段名称，失败显示可重试原因，不在反馈中暴露密码。
+
+** 键盘行为
+
+| 输入 | 拟定行为 |
+|------+----------|
+| 上 / 下 | 在结果中移动选中项，滚动保持选中项可见 |
+| Enter | 填充选中项；尚未选择时填充第一项 |
+| Ctrl+C | 搜索框无文本选区时复制选中条目的密码 |
+| Ctrl+Shift+C | 搜索框无文本选区时复制选中条目的用户名 |
+| Ctrl+O | 打开选中项详情 |
+| Backspace | 搜索框为空且限定当前网站时，移除网站过滤 |
+| Esc | 先退出详情或内联诊断；在首页交还 Chrome 的关闭行为 |
+| Ctrl+Shift+F | 沿用已有扩展命令，填充当前网站最匹配条目 |
+
+不拦截 macOS 的 Cmd+C 原生文本复制。选中项模型与文本选区判断已在插件中实现；
+文末原型仅演示局部交互，不安装全局快捷键。
+
+* 条目详情
+
+详情页保留网站上下文，头部提供返回；展示条目名称、密码库及相对路径。
+首次进入时按需解密。用户名和 URL 单独成行并提供相应动作，密码默认遮罩，只有点击
+显示才出现明文。额外字段逐一正确复制其自身值，不回落为复制用户名。
+
+带 OTP 的条目才展示 OTP 区域，显示当前 token、有效期和复制动作；不支持的类型给出
+明确提示。原型中的用户名、遮罩和验证码均为静态示例，不代表真实条目包含这些字段。
+主要按钮为“填充当前页面”，次要动作为“打开条目网址”；没有 URL 时隐藏打开入口。
+填充行为继续尊重现有 autosubmit 设置，带 OTP 的条目沿用填充后复制 token 的行为。
+
+* 工具页与能力扩展
+
+工具围绕用户动作组织，行内包含图标、名称、一行说明和进入 / 执行动作。搜索框在工具页
+只搜索已接入工具，不与密码条目混搜；没有可用密码框的页面默认进入工具页。每项能力独立拥有表单、执行中、
+结果与错误视图，不把配置和协议集中到 popup。
+
+| 分组 | 能力 | 当前情况 | 设计入口 |
+|------+------+----------+----------|
+| 网页与笔记 | 保存完整网页 | 已实现 | 工具页主要动作，提交后提示在 Emacs 确认 |
+| 网页与笔记 | 保存选中内容 | 规划 | 接入后显示，携带来源 URL |
+| 设备协作 | 发送到手机 | 规划 | 接入后进入目标设备选择与结果视图 |
+| 自动化 | 执行快捷动作 | 规划 | 接入后展示已配置动作，不放任意命令输入框 |
+
+设计原型显示“后续能力 · 规划”以讨论扩展空间；正式插件只展示已接入能力。
+不让用户面对一组不可点击的功能按钮。
+
+全文保存请求发起后显示进行中并防止重复提交；HTTP 202 显示“已在 Emacs 打开捕获，
+请确认保存”，不能显示“已保存”。已存在的来源显示“已打开已有文档”，超时显示结果未知，
+不自动重试。详情沿用已有协议，不在这里新增服务端接口。
+
+* Browserpass 能力承载
+
+| 能力 | 拟定位置 | 状态与约束 |
+|------+----------+------------|
+| 域名过滤、搜索、复制、填充 | 密码首页 | 已有基础能力，调整呈现 |
+| 字段详情、URL、OTP | 条目详情 | 已有基础能力，调整呈现 |
+| 数字角标 | 图标 | 已实现，与弹窗入口使用相同域名匹配规则 |
+| 选中项键盘导航 | 密码列表 | 已实现 |
+| 最近使用、历史 | 后续列表排序或筛选 | 当前未记录，不展示虚构时间 |
+| 多密码库 | 搜索过滤与条目次行 | 当前单库；未来协议支持后再增加切换 |
+| 新增、编辑、删除、密码生成 | 密码页新增入口与详情更多菜单 | 当前只读，不展示操作；服务端写入能力接入后开放 |
+| Basic Auth | 独立的认证响应流程 | 当前未实现，需要单独评审权限与协议 |
+| 服务配置 | 本机应用与既有配置管理 | 不新增扩展端口、token 或 Native Messaging 设置页 |
+
+新增入口可以放在密码页列表标题右侧；编辑、删除放在详情更多菜单，不挤占逐行高频操作。
+新增与编辑进入同一个弹窗内的表单页，提交成功后回到列表；删除需要就地确认，写入失败
+保留用户输入。这些均为未来交互设计，不暗示 services 当前具备写入接口。
+
+** 角标与权限边界
+
+插件增加 =tabs= 权限，在用户点击扩展前读取当前标签页 URL 以更新角标，不增加全部网页访问权限。
+原有 activeTab、scripting 与 loopback host permission 保持各自职责。后台只查询密码条目名称并
+按 hostname、端口匹配，不解密密码，不注入网页脚本，也不以页面是否存在密码框决定角标数量。
+
+扩展加载、安装、浏览器启动、导航、标签页激活、窗口切换和弹窗重新查询后刷新角标。
+新导航先清除旧数字，查询成功且有匹配时显示数量，无匹配时留空，服务失败时清空并用图标提示
+说明查询未完成。结果写入前按 tabId、请求代次、最新 URL 与待导航状态校验，丢弃旧页面的结果；
+同标签页的角标写入串行执行，关闭标签页时清理请求状态。并发查询只复用进行中的列表请求，完成后不缓存。
+
+* 状态与视觉
+
+| 状态 | 呈现 | 主要动作 |
+|------+------|----------|
+| 正在查询 | 中性状态与骨架，尚无计数 | 等待，不先显示 0 |
+| 当前网站无匹配 | 保留 hostname，显示没有匹配条目 | 查看全部条目 |
+| 搜索无结果 | 保留过滤与输入，显示搜索无结果 | 清空搜索或移除过滤 |
+| 服务未连接 | 独立错误提示，保留网站与输入 | 重试 |
+| Chrome 内部页等不支持页面 | 显示当前页面不支持填充 / 捕获 | 仍允许搜索与复制密码 |
+| 正在执行 | 只锁定当前动作，显示具体进度 | 防止重复提交 |
+| 复制或填充成功 | 原位轻量反馈，通过 aria-live 宣读 | 可继续操作 |
+
+沿用现有图标的深绿色与薄荷绿，配合暖白底、浅灰绿分隔线。正文 13–14 px，条目名称
+15 px，辅助文字不小于 11 px。主要动作使用深绿实底，次要动作使用边框或文字。
+状态除了颜色还必须有文字；可操作目标至少 32 px，主要按钮至少 40 px。
+原型采用浅色，实施时适配 prefers-color-scheme、键盘焦点和减少动画偏好。
+
+* 实施顺序与验收
+
+第一步实施工具在前的导航、按密码框选择默认页、搜索标签、紧凑条目、内页详情和真实连接状态，保留已有查询及填充协议。
+第二步补齐选中项快捷键、按字段正确复制及遮罩交互，并使用 tabs 权限实现自动角标；这部分已完成。
+第三步按后端能力逐项接入工具，不预先创建空功能模块。
+
+华为登录页存在可用密码输入框时默认进入密码页，显示实际 hostname 与真实条目匹配结果。
+无密码框的页面默认进入工具页；有密码框但无匹配条目仍进入密码页，手动选择不会被迟到检测覆盖。
+详情按需解密；密码默认不可见。无匹配、断开 services、只读条目及未支持页面均有准确反馈。
+全文保存只有在 Emacs 确认后才真正落盘，弹窗不得提前报告保存完成。
+
+* 可交互原型源码
+
+以下 HTML 可提取到临时文件后直接在浏览器打开。所有动作只更新原型界面，示例不访问真实
+页面、账号或服务；不需要安装依赖。原型内嵌的品牌图标来自 resources/icons 中的现有 SVG 母版。
+
+#+begin_src html
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Loki Assistant · 弹窗设计提案</title>
+<style>
+:root{color-scheme:light;--ink:#203b35;--muted:#73817a;--green:#245c49;--line:#e4e8e0;--mint:#e9f2e9;--paper:#fffefb;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:var(--ink);background:#eeeee7}
+*{box-sizing:border-box}body{margin:0}button,input{font:inherit}button{cursor:pointer;color:inherit}button:disabled{cursor:default}button:focus-visible,a:focus-visible{outline:2px solid #39835b;outline-offset:3px}button{border:0;background:none}button:hover:not(:disabled){filter:brightness(.94)}[hidden]{display:none!important}.ico{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}.small{width:16px;height:16px}.board{width:1496px;margin:auto;padding:48px 40px 32px}.eyebrow{font:11px ui-monospace,monospace;letter-spacing:2px;color:#597466}.intro{display:flex;justify-content:space-between;align-items:end;margin:12px 0 32px}.intro h1{font-size:32px;font-weight:600;letter-spacing:-1px;margin:0 0 10px}.intro p{font-size:14px;color:#6b786e;margin:0}.proposal{border:1px solid #cdd7ca;border-radius:20px;padding:8px 13px;font-size:12px;color:#63725f}.columns{display:grid;grid-template-columns:repeat(3,440px);gap:48px}.caption{display:flex;align-items:center;gap:10px;margin-bottom:14px;font-size:13px;font-weight:600}.num{font:11px ui-monospace,monospace;color:#7b8a77;border:1px solid #cbd5c6;padding:4px 6px;border-radius:5px}.popup{background:var(--paper);border:1px solid #d7ded2;border-radius:16px;overflow:hidden;box-shadow:0 8px 24px #3444320b;width:440px;max-height:580px;display:flex;flex-direction:column}.head{padding:18px 20px 15px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:15px;letter-spacing:-.3px}.logo{width:29px;height:29px}.connection{display:flex;align-items:center;gap:6px;font-size:11px;color:#57735c;padding:5px 0 5px 8px}.dot{width:6px;height:6px;border-radius:50%;background:#5a8b59}.site{margin:0 20px 13px;display:flex;align-items:center;gap:8px;font-size:12px;color:#6e7b70}.site .ico{color:#87927f}.site span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tabs{display:flex;padding:0 20px;gap:24px;border-bottom:1px solid var(--line);height:40px;flex-shrink:0}.tab{padding:0 1px 12px;font-size:13px;color:#7a8376;display:flex;gap:7px;align-items:center;position:relative}.tab.active{color:var(--green);font-weight:650}.tab.active:after{content:"";position:absolute;bottom:-1px;height:2px;background:var(--green);left:0;right:0}.count{font:10px ui-monospace,monospace;background:#edf2e8;border-radius:4px;padding:2px 5px;color:#64745b}.content{padding:18px 20px;overflow-y:auto;min-height:0}.search{display:flex;align-items:center;gap:8px;padding:9px 10px;border:1px solid #d7e0d2;border-radius:8px;background:#fff;height:42px}.search .ico{color:#899280}.scope{display:flex;gap:5px;align-items:center;background:#edf2e7;border-radius:4px;padding:4px 6px;white-space:nowrap;font-size:11px;color:#4c6b45}.scope .ico{width:12px;height:12px}.search input{width:0;min-width:0;flex:1;border:0;outline:none;background:none;font-size:12px;color:var(--ink)}.search input::placeholder{color:#939b8c}.section-label{display:flex;justify-content:space-between;align-items:center;margin:18px 0 9px;font-size:11px;color:#7b8775}.text-button{font-size:11px;color:#517150;padding:3px}.entry{border:1px solid #b7ceb5;border-radius:9px;background:#f2f6ec;overflow:hidden}.entry-body{display:flex;align-items:center;padding:14px 12px;gap:10px}.entry-main{display:flex;align-items:center;gap:11px;flex:1;min-width:0;padding:0;text-align:left}.avatar{width:35px;height:37px;display:grid;place-items:center;border:1px solid #e2e5d7;background:#fffefa;border-radius:7px;font-size:18px;color:#57754d;font-family:Georgia,serif}.entry-name{font-size:15px;font-weight:600;margin-bottom:5px}.path{font:10px ui-monospace,SFMono-Regular,monospace;color:#7b8672}.actions{display:flex;gap:3px}.icon-button{width:32px;height:32px;display:grid;place-items:center;border-radius:6px}.actions .icon-button:hover{background:#e2ecd9}.icon-button .ico{width:18px;height:18px}.match{border-top:1px solid #e2e9d8;padding:8px 12px;display:flex;gap:6px;align-items:center;font-size:10px;color:#728265}.match .ico{width:13px;height:13px}.hint{display:flex;align-items:center;gap:6px;font-size:11px;color:#7c8873;margin:14px 0 1px}.key{font:10px ui-monospace,monospace;border:1px solid #dce2d4;border-radius:4px;background:#fbfcf7;min-width:19px;text-align:center;padding:2px 4px;color:#76806d}.foot{border-top:1px solid var(--line);padding:11px 20px;display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:10px;color:#8b9380;background:#fcfcf7;flex-shrink:0}.feedback{display:flex;gap:6px;align-items:center;min-width:0}.feedback .ico{width:13px;height:13px}.back{display:flex;gap:6px;align-items:center;padding:0;font-size:12px;color:#6e7c65}.detail-heading{display:flex;gap:12px;align-items:center;margin:12px 0 13px}.detail-heading .avatar{width:40px;height:42px;font-size:22px}.detail-heading h2{font-size:19px;font-weight:600;margin:0 0 5px}.field{margin-bottom:11px}.field-title{font-size:11px;color:#859079;margin-bottom:6px;display:flex;justify-content:space-between}.field-value{height:41px;display:flex;align-items:center;justify-content:space-between;border:1px solid var(--line);background:#fff;border-radius:7px;padding:0 5px 0 11px;font-size:13px}.mono{font-family:ui-monospace,SFMono-Regular,monospace;letter-spacing:.3px}.field-buttons{display:flex}.otp-row{display:flex;justify-content:space-between;align-items:center;background:#f0f5e9;border:1px solid #e0e8d5;border-radius:8px;padding:10px 11px;margin:4px 0 17px}.otp-title{font-size:10px;color:#718365;margin-bottom:5px}.otp-number{font:21px ui-monospace,monospace;letter-spacing:3px}.otp-note{font-size:10px;color:#8a947c}.primary{background:var(--green);color:#fff;border-radius:7px;min-height:40px;padding:10px 14px;font-size:12px;display:flex;align-items:center;justify-content:center;gap:8px;width:100%}.primary .ico{width:16px;height:16px}.details-bottom{display:flex;justify-content:center;margin-top:11px;font-size:11px}.details-bottom button{font-size:11px;color:#6c7f61;display:flex;align-items:center;gap:5px}.details-bottom .ico{width:13px;height:13px}.tool-feature{border:1px solid #dbe3d1;border-radius:9px;padding:15px;background:#f5f7ef;margin-top:14px}.tool-feature-top{display:flex;align-items:center;gap:11px}.tool-icon{width:35px;height:35px;border-radius:8px;background:#e9efdf;color:#55714a;display:grid;place-items:center}.tool-feature h3{font-size:14px;margin:0 0 5px;font-weight:600}.tool-feature p{font-size:11px;color:#849074;margin:0}.tool-feature .primary{margin-top:15px}.planned-label{font-size:10px;color:#939b88;margin:20px 0 4px;display:flex;align-items:center;gap:8px}.planned-label:after{content:"";height:1px;background:var(--line);flex:1}.tool-row{display:flex;align-items:center;padding:9px 0;gap:12px;border-bottom:1px solid #edf0e6;opacity:.72}.tool-row:last-child{border-bottom:0}.tool-row>.ico{margin-left:2px;color:#7e8a71}.tool-row strong{font-size:12px;font-weight:500;display:block;margin-bottom:4px}.tool-row p{font-size:10px;color:#929b85;margin:0}.soon{margin-left:auto;font-size:10px;border:1px solid #e0e5d8;border-radius:4px;padding:3px 5px;color:#8d967e}.notes{font-size:12px;line-height:1.9;color:#77836e;margin:18px 2px 0}.notes strong{color:#435b3c;font-weight:600}.switcher{display:flex;gap:5px;margin:20px 0 0}.switcher button{font-size:11px;color:#7c886f;border:1px solid #d4dccb;border-radius:5px;padding:5px 8px}.switcher .selected{background:#e1e9d8;color:#4d6944;border-color:#bbccae}.empty{padding:23px 8px;text-align:center}.empty h3{font-size:13px;font-weight:500;margin:8px 0}.empty p{font-size:11px;color:#8d967d;line-height:1.7;margin:0 0 12px}.empty .ico{color:#819174;width:24px;height:24px}.offline{color:#986b4e}.offline .dot{background:#b38661}.diagnostic{background:#f3f5ec;border:1px solid #dce4d1;border-radius:7px;padding:10px;font-size:11px;line-height:1.7;margin-bottom:12px}.closing{border-top:1px solid #d6decf;margin-top:34px;padding-top:17px;display:flex;justify-content:space-between;font-size:11px;color:#829076}.closing strong{font-weight:500;color:#566e4c}
+</style>
+</head>
+<body>
+<svg style="display:none" aria-hidden="true"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="m7 7 10 10M7 17 17 7"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="7.5" r="3.5"/><path d="M5 21v-3a7 7 0 0 1 14 0v3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><circle cx="15.5" cy="8.5" r="5.5"/><path d="m12 13-8 8H2v-4l3-3h3v-3"/></symbol>
+<symbol id="i-right" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+<symbol id="i-left" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 11 3 3 5-5"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M14 3h7v7m0-7L10 14M10 4H4v16h16v-6"/></symbol>
+<symbol id="i-page" viewBox="0 0 24 24"><path d="M14 2H5v20h14V7l-5-5Zm0 0v6h5M8 12h8m-8 4h6"/></symbol>
+<symbol id="i-select" viewBox="0 0 24 24"><path d="M4 8V4h4m8 0h4v4m0 8v4h-4m-8 0H4v-4M8 9h8m-8 5h6"/></symbol>
+<symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></symbol>
+<symbol id="i-bolt" viewBox="0 0 24 24"><path d="m13 2-9 12h7l-1 8 10-13h-8z"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-1 8M20 4v6h-6"/></symbol>
+</defs></svg>
+<main class="board">
+  <div class="eyebrow">LOKI ASSISTANT / CHROME EXTENSION</div>
+  <header class="intro"><div><h1>登录顺手，工具随行。</h1><p>保留 Browserpass 的直接，让更多能力有自己的位置。</p></div><span class="proposal">交互设计提案 · 示例数据</span></header>
+  <div class="columns">
+    <section><div class="caption"><span class="num">01</span> 工具中心 <span style="font-weight:400;color:#89927e">/ 无密码框时默认</span></div><article class="popup" id="tools-preview" data-start="auto" data-has-password="false"></article><div class="switcher" aria-label="模拟当前页面"><button class="selected" data-page-password="false">无密码框</button><button data-page-password="true">有密码框</button></div><p class="notes"><strong>顶层入口稳定，能力逐步接入。</strong><br>已接入工具可直接使用；<br>规划项仅在本设计稿中展示。</p></section>
+    <section><div class="caption"><span class="num">02</span> 密码界面 <span style="font-weight:400;color:#89927e">/ 有密码框时默认</span></div><article class="popup" id="home-preview" data-start="auto" data-has-password="true"></article><div class="switcher" aria-label="设计状态"><button class="selected" data-state="normal">匹配 1 项</button><button data-state="empty">无匹配</button><button data-state="offline">服务断开</button></div><p class="notes"><strong>保持 Browserpass 的操作密度。</strong><br>网站过滤、搜索和填充都在第一屏；<br>用户名、密码与详情，右侧一步直达。</p></section>
+    <section><div class="caption"><span class="num">03</span> 条目详情 <span style="font-weight:400;color:#89927e">/ 弹窗内切换</span></div><article class="popup" id="detail-preview" data-start="detail"></article><p class="notes"><strong>需要时展开，不打断当前任务。</strong><br>按需读取详情，密码默认遮罩；<br>OTP、URL 与额外字段各有位置。</p></section>
+  </div>
+  <footer class="closing"><span><strong>440 px</strong> 弹窗宽度 &nbsp;·&nbsp; 内容自适应 &nbsp;·&nbsp; 最高 580 px</span><span>设计原型：不读取密码、不调用服务、不写入剪贴板</span></footer>
+</main>
+<script>
+const icon=(name,cls='')=>`<svg class="ico ${cls}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
+const action=(name,label,act)=>`<button class="icon-button" title="${label}" aria-label="${label}" data-action="${act}">${icon(name)}</button>`;
+const logo=`<svg class="logo" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <title>Loki Assistant Chrome 图标：放大的 L 与回应气泡</title>
+  <desc>Chrome 专用版本，主体放大 45% 并上移居中，适配深浅色工具栏。</desc>
+  <defs>
+    <linearGradient id="base" x1="200" y1="70" x2="810" y2="960" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#183F3B"/>
+      <stop offset="0.56" stop-color="#102B2A"/>
+      <stop offset="1" stop-color="#0B1E20"/>
+    </linearGradient>
+    <radialGradient id="light" cx="0" cy="0" r="1" gradientTransform="translate(300 150) rotate(55) scale(790 700)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5AE3BA" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#5AE3BA" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="250" y1="100" x2="740" y2="920" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0.2"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.035"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.07"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="324" y1="280" x2="700" y2="750" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E5FFF4"/>
+      <stop offset="0.48" stop-color="#B6F8DD"/>
+      <stop offset="1" stop-color="#6BE2B7"/>
+    </linearGradient>
+    <linearGradient id="reply" x1="539" y1="288" x2="718" y2="447" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#83F6CB"/>
+      <stop offset="1" stop-color="#43D1AD"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="1024" height="1024" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="16" stdDeviation="19" flood-color="#031815" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="202" fill="url(#base)"/>
+  <rect x="64" y="64" width="896" height="896" rx="202" fill="url(#light)"/>
+  <rect x="65.5" y="65.5" width="893" height="893" rx="200.5" stroke="url(#edge)" stroke-width="3"/>
+  <g transform="translate(512 512) scale(1.45) translate(-512 -526)" filter="url(#shadow)">
+    <path d="M356 280C326 280 302 304 302 334V590C302 660 358 716 428 716H548V754C548 770 568 778 580 768L708 669C729 653 718 620 692 620H444C431 620 420 609 420 596V334C420 304 396 280 366 280H356Z" fill="url(#mark)"/>
+    <path d="M579 280H666C697 280 722 305 722 336V365C722 396 697 421 666 421H636L589 460C578 469 563 461 563 447V419C539 412 522 390 522 365V336C522 305 547 280 579 280Z" fill="url(#reply)"/>
+  </g>
+</svg>`;
+let demoState='normal';
+function home(root){const unavailable=demoState==='offline'||demoState==='empty'&&root.demoScope!==false;return `<div class="search">${icon('search','small')}<button class="scope" data-action="scope" title="移除网站过滤">当前网站 ${icon('x')}</button><input aria-label="搜索密码条目" placeholder="搜索密码条目…"></div><div class="section-label"><span class="result-label">${demoState==='offline'?'查询未完成':demoState==='empty'?'当前网站 · 0 项匹配':'当前网站 · 1 项匹配'}</span><button class="text-button" data-action="all">全部条目</button></div>${unavailable?`<div class="empty">${icon(demoState==='offline'?'refresh':'search')}<h3>${demoState==='offline'?'暂时无法连接本机服务':'当前网站没有匹配条目'}</h3><p>${demoState==='offline'?'恢复连接后重试，搜索内容会保留。':'可以查看全部条目，或尝试搜索。'}</p><button class="text-button" data-action="${demoState==='offline'?'retry':'all'}">${demoState==='offline'?'重试连接':'查看全部条目'} ${icon('right','small')}</button></div>`:`<div class="entry"><div class="entry-body"><button class="entry-main" data-action="fill"><span class="avatar">h</span><span><div class="entry-name">huawei.com</div><div class="path">pass / huawei.com.gpg</div></span></button><div class="actions">${action('user','复制用户名','copy-user')}${action('key','复制密码','copy-password')}${action('right','查看详情','detail')}</div></div><div class="match">${icon('check')}<span>匹配父域名 huawei.com</span></div></div>`}<div class="hint"><span class="key">↵</span> 填充选中条目 <span style="margin-left:auto;display:flex;align-items:center;gap:4px"><span class="key">↑</span><span class="key">↓</span> 选择</span></div>`}
+function detail(){return `<button class="back" data-action="password">${icon('left','small')}返回密码列表</button><div class="detail-heading"><div class="avatar">h</div><div><h2>huawei.com</h2><div class="path">pass / huawei.com.gpg</div></div></div><div class="field"><div class="field-title">用户名 <span>示例字段</span></div><div class="field-value"><span>示例账号</span>${action('copy','复制用户名','copy-user')}</div></div><div class="field"><div class="field-title">密码</div><div class="field-value"><span class="mono secret">••••••••••••</span><span class="field-buttons">${action('eye','显示示例密码','reveal')}${action('copy','复制密码','copy-password')}</span></div></div><div class="otp-row"><div><div class="otp-title">一次性验证码 · 示例字段</div><div class="otp-number">123 456</div></div><div style="display:flex;align-items:center;gap:8px"><span class="otp-note">静态示例</span>${action('copy','复制验证码','copy-otp')}</div></div><button class="primary" data-action="fill">${icon('arrow')}填充当前页面</button><div class="details-bottom"><button data-action="url">打开条目网址 ${icon('external')}</button></div>`}
+function tools(){return `<div class="search">${icon('search','small')}<input aria-label="搜索工具" placeholder="搜索工具…"></div><div class="tool-feature" data-tool="保存完整网页"><div class="tool-feature-top"><span class="tool-icon">${icon('page')}</span><div><h3>保存完整网页</h3><p>将当前页面保存为 Org 笔记</p></div></div><button class="primary" data-action="capture">保存到 Emacs ${icon('arrow')}</button></div><div class="planned-label">后续能力 · 规划</div><div class="tool-row" data-tool="保存选中内容">${icon('select')}<div><strong>保存选中内容</strong><p>只留下需要的那一段</p></div><span class="soon">规划</span></div><div class="tool-row" data-tool="发送到手机">${icon('phone')}<div><strong>发送到手机</strong><p>在另一台设备继续</p></div><span class="soon">规划</span></div><div class="tool-row" data-tool="执行快捷动作">${icon('bolt')}<div><strong>执行快捷动作</strong><p>运行已配置的个人工作流</p></div><span class="soon">规划</span></div><p class="tool-empty" hidden style="font-size:12px;color:#849074">没有匹配的工具。</p>`}
+function render(root,view){root.dataset.view=view;const offline=demoState==='offline'&&root.id==='home-preview';root.innerHTML=`<header class="head"><div class="brand">${logo}Loki Assistant</div><button class="connection ${offline?'offline':''}" data-action="connection"><span class="dot"></span>${offline?'服务未连接':'服务已连接'}</button></header><div class="site" title="id1.cloud.huawei.com">${icon('globe','small')}<span>id1.cloud.huawei.com</span></div><nav class="tabs" aria-label="功能"><button class="tab ${view==='tools'?'active':''}" data-action="tools" aria-current="${view==='tools'?'page':'false'}">工具</button><button class="tab ${view!=='tools'?'active':''}" data-action="password" aria-current="${view!=='tools'?'page':'false'}">密码 <span class="count">${demoState==='offline'?'—':demoState==='empty'?'0':'1'}</span></button></nav><div class="content"><div class="diagnostic" hidden>此处展示连接诊断。原型未连接真实服务。<br><button class="text-button" data-action="retry">重试连接</button></div>${view==='detail'?detail():view==='tools'?tools():home(root)}</div><footer class="foot"><span class="feedback" role="status" aria-live="polite">${icon('shield')}<span>${view==='detail'?'示例字段 · 密码按需读取':'设计预览 · 未连接真实服务'}</span></span><span>${view==='tools'?'工具中心':'Ctrl + O 详情'}</span></footer>`;if(view==='password'){const scope=root.querySelector('.scope');scope.hidden=root.demoScope===false;if(root.demoScope===false){root.querySelector('.result-label').textContent='全部条目 · 示例库 1 项';root.querySelector('[data-action="all"]').textContent='当前网站'}const input=root.querySelector('input');input.value=root.demoQuery||'';if(input.value)input.dispatchEvent(new Event('input',{bubbles:true}))}}
+function defaultView(hasPasswordInput){return hasPasswordInput?'password':'tools'}
+function notify(root,message){root.querySelector('.feedback').innerHTML=icon('check')+`<span>${message}</span>`}
+document.querySelectorAll('.popup').forEach(root=>{render(root,root.dataset.start==='auto'?defaultView(root.dataset.hasPassword==='true'):root.dataset.start);root.addEventListener('click',event=>{const button=event.target.closest('[data-action]');if(!button)return;const a=button.dataset.action;if(['password','detail','tools'].includes(a)){render(root,a);return}if(a.startsWith('copy-')){notify(root,`${a==='copy-user'?'用户名':a==='copy-otp'?'验证码':'密码'}复制效果演示 · 未写入剪贴板`)}else if(a==='fill')notify(root,'填充效果演示 · 未操作真实页面');else if(a==='reveal'){const value=root.querySelector('.secret');const visible=value.textContent.includes('•');value.textContent=visible?'Demo-only-2026':'••••••••••••';button.setAttribute('aria-label',visible?'隐藏示例密码':'显示示例密码');button.title=visible?'隐藏示例密码':'显示示例密码'}else if(a==='scope'||a==='all'){root.demoScope=a==='all'&&root.demoScope===false;render(root,'password');notify(root,root.demoScope?'已恢复当前网站过滤':'已切换全部条目 · 示例数据')}else if(a==='capture'){button.textContent='演示：已在 Emacs 打开捕获';notify(root,'效果演示 · 实际需在 Emacs 确认保存')}else if(a==='connection'){const d=root.querySelector('.diagnostic');d.hidden=!d.hidden}else if(a==='retry'){notify(root,'已演示重试 · 未发起真实请求')}else if(a==='url')notify(root,'打开网址效果演示 · 未导航')});root.addEventListener('input',event=>{if(event.target.tagName!=='INPUT')return;const query=event.target.value.trim().toLowerCase();if(root.dataset.view==='tools'){let found=0;root.querySelectorAll('[data-tool]').forEach(item=>{item.hidden=!item.dataset.tool.toLowerCase().includes(query);if(!item.hidden)found++});root.querySelector('.tool-empty').hidden=found>0}else{root.demoQuery=event.target.value;const entry=root.querySelector('.entry');if(entry){entry.hidden=!('huawei.com pass'.includes(query));root.querySelector('.result-label').textContent=entry.hidden?'搜索结果 · 0 项':'搜索结果 · 1 项';notify(root,entry.hidden?'没有搜索结果，可清空搜索词。':'设计预览 · 未连接真实服务')}}});root.addEventListener('keydown',event=>{if(event.key==='Escape'&&root.dataset.view==='detail')render(root,'password');if(event.key==='Enter'&&root.dataset.view==='password'&&demoState==='normal'&&!root.querySelector('.entry')?.hidden)notify(root,'填充效果演示 · 未操作真实页面');if(event.key==='Backspace'&&event.target.tagName==='INPUT'&&!event.target.value){const s=root.querySelector('.scope');if(s)s.click()}})});
+document.querySelectorAll('[data-state]').forEach(button=>button.addEventListener('click',()=>{demoState=button.dataset.state;const homeRoot=document.querySelector('#home-preview');homeRoot.demoScope=true;homeRoot.demoQuery='';document.querySelectorAll('[data-state]').forEach(b=>b.classList.toggle('selected',b===button));render(document.querySelector('#home-preview'),'password')}));
+document.querySelectorAll('[data-page-password]').forEach(button=>button.addEventListener('click',()=>{const root=document.querySelector('#tools-preview');root.dataset.hasPassword=button.dataset.pagePassword;document.querySelectorAll('[data-page-password]').forEach(b=>b.classList.toggle('selected',b===button));render(root,defaultView(root.dataset.hasPassword==='true'))}));
+</script>
+</body>
+</html>
+#+end_src

@@ -1,12 +1,36 @@
 import { captureFull } from "../shared/services-client.js";
-import { CAPTURE_FULL } from "../shared/messages.js";
+import { CAPTURE_FULL, CAPTURE_SNAPSHOT } from "../shared/messages.js";
 import { PASSWORD_FILL, PASSWORD_FILL_BEST } from "../shared/messages.js";
 import { fetchEntry, listEntries } from "../features/password-query/api.js";
 import { parsePasswordEntry } from "../features/password-query/entry.js";
 import { rankEntries } from "../features/password-search/search.js";
-import { fillPage } from "../features/password-fill/fill.js";
+import { fillAccessibleFrames } from "../features/password-fill/fill.js";
+import { readPageContext } from "../features/password-fill/context.js";
+import { PAGE_CONTEXT, PASSWORD_BADGE_REFRESH } from "../shared/messages.js";
+import { collectCurrentPage } from "../features/org-capture/current-page.js";
+import { installPasswordBadge } from "../features/password-manager/badge.js";
+
+const passwordBadge = installPasswordBadge();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === PASSWORD_BADGE_REFRESH) {
+    passwordBadge.refreshActive()
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+  if (message?.type === PAGE_CONTEXT) {
+    readPageContext()
+      .then((context) => sendResponse({ ok: true, ...context }))
+      .catch(() => sendResponse({ ok: false, error: "无法读取当前标签页，可手动选择功能。" }));
+    return true;
+  }
+  if (message?.type === CAPTURE_SNAPSHOT) {
+    collectCurrentPage()
+      .then((page) => sendResponse({ ok: true, page }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (message?.type === PASSWORD_FILL || message?.type === PASSWORD_FILL_BEST) {
     fillPassword(message)
       .then((result) => sendResponse({ ok: true, ...result }))
@@ -45,15 +69,11 @@ async function fillPassword(message) {
   }
   if (typeof file !== "string") throw new Error("密码条目标识无效。");
   const entry = parsePasswordEntry(file, await fetchEntry(file));
-  const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, allFrames: true },
-    func: fillPage,
-    args: [{
-      login: entry.fields.login || "",
-      secret: entry.fields.secret || "",
-      openid: entry.fields.openid || "",
-      autoSubmit: entry.settings.autoSubmit === true,
-    }],
+  const results = await fillAccessibleFrames(chrome, tab, {
+    login: entry.fields.login || "",
+    secret: entry.fields.secret || "",
+    openid: entry.fields.openid || "",
+    autoSubmit: entry.settings.autoSubmit === true,
   });
   const filled = results.reduce((count, result) => count + Number(result.result?.filled || 0), 0);
   if (!filled) throw new Error("当前页面没有找到可填充的登录表单。");
