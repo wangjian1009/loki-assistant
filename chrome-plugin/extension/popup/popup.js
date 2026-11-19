@@ -9,7 +9,7 @@ import { loadEntry, copyableValue } from "../features/password-manager/manager.j
 const $ = (id) => document.getElementById(id);
 const state = {
   tab: null, files: [], domainOnly: true, view: null, manualView: false,
-  loaded: false, loadError: "", listRequest: 0, selectedFile: null,
+  loaded: false, loading: false, contextReady: false, loadError: "", listRequest: 0, selectedFile: null,
   entry: null, detailRequest: 0, otpTimer: null, listScroll: 0, busy: false,
 };
 
@@ -78,6 +78,15 @@ function showView(view, { manual = false, focus = true } = {}) {
   if (state.view === "password" && view !== "password") state.listScroll = $("content").scrollTop;
   if (state.view === "details" && view !== "details") clearDetails();
   state.view = view;
+  const passwordMode = view !== "tools";
+  $("connection").hidden = !passwordMode;
+  $("page-context").hidden = !passwordMode;
+  $("password-footer").hidden = !passwordMode;
+  $("match-count").hidden = !passwordMode || !state.loaded;
+  if (!passwordMode) {
+    $("diagnostics").hidden = true;
+    $("connection").setAttribute("aria-expanded", "false");
+  }
   $("initial-loading").hidden = true;
   for (const name of ["tools", "password", "details"]) $(name + "-view").hidden = name !== view;
   for (const tab of document.querySelectorAll(".tab")) {
@@ -87,7 +96,11 @@ function showView(view, { manual = false, focus = true } = {}) {
   }
   $("shortcut-hint").hidden = view !== "password";
   $("content").scrollTop = view === "password" ? state.listScroll : 0;
-  if (focus) (view === "tools" ? $("tool-search") : view === "password" ? $("search") : $("details-back")).focus({ preventScroll: true });
+  if (focus) {
+    const target = view === "tools" ? document.querySelector("#tools-view .tool-tile:not(:disabled)") || document.querySelector('.tab[data-view="tools"]') : view === "password" ? $("search") : $("details-back");
+    target.focus({ preventScroll: true });
+  }
+  if (view === "password" && state.contextReady && !state.loaded && !state.loading) void loadFiles();
 }
 
 function renderEntries() {
@@ -99,6 +112,7 @@ function renderEntries() {
   $("domain-toggle").hidden = !currentOrigin();
   const matches = currentOrigin() ? rankedEntries("", true).length : null;
   $("match-count").textContent = state.loaded && matches !== null ? String(matches) : "—";
+  $("match-count").hidden = state.view === "tools" || !state.loaded;
   $("result-count").textContent = state.loaded ? `${$("search").value.trim() ? "搜索结果" : state.domainOnly && currentOrigin() ? "当前网站" : "全部条目"} · ${ranked.length} 项` : state.loadError ? "密码条目未加载" : "正在读取密码条目…";
   if (!state.loaded || !ranked.length) {
     const empty = element("div", "empty");
@@ -157,6 +171,8 @@ function setScope(domainOnly) {
 }
 
 async function loadFiles() {
+  if (state.loading) return;
+  state.loading = true;
   const request = ++state.listRequest;
   state.loadError = "";
   state.loaded = false;
@@ -176,6 +192,8 @@ async function loadFiles() {
     state.loadError = error.message;
     setConnection("服务未连接", error.message, "failed");
     setStatus(error.message, true);
+  } finally {
+    if (request === state.listRequest) state.loading = false;
   }
   renderEntries();
   void sendMessage({ type: PASSWORD_BADGE_REFRESH }).catch(() => {});
@@ -316,18 +334,22 @@ async function openEntryUrl() {
 async function capture() {
   const button = $("org-capture");
   button.disabled = true;
-  $("capture-status").classList.remove("error");
-  $("capture-status").textContent = "正在读取并转换当前页面…";
+  button.setAttribute("aria-busy", "true");
+  $("tool-status").classList.remove("error");
+  $("tool-status").textContent = "正在读取并转换当前页面…";
   try {
     const snapshot = await sendMessage({ type: CAPTURE_SNAPSHOT });
     if (!snapshot?.ok) throw new Error(snapshot?.error || "未能读取页面内容。");
     const response = await sendMessage({ type: CAPTURE_FULL, page: convertPage(snapshot.page) });
     if (!response?.ok) throw new Error(response?.error || "捕获失败。");
-    $("capture-status").textContent = response.status;
+    $("tool-status").textContent = response.status;
   } catch (error) {
-    $("capture-status").textContent = error.message;
-    $("capture-status").classList.add("error");
-  } finally { button.disabled = !currentOrigin(); }
+    $("tool-status").textContent = error.message;
+    $("tool-status").classList.add("error");
+  } finally {
+    button.disabled = !currentOrigin();
+    button.setAttribute("aria-busy", "false");
+  }
 }
 
 for (const tab of document.querySelectorAll(".tab")) tab.addEventListener("click", () => showView(tab.dataset.view, { manual: true }));
@@ -343,11 +365,6 @@ $("org-capture").addEventListener("click", capture);
 $("details-back").addEventListener("click", () => showView("password", { manual: true }));
 $("details-fill").addEventListener("click", () => state.entry && fill(state.entry.file));
 $("details-open").addEventListener("click", openEntryUrl);
-$("tool-search").addEventListener("input", () => {
-  const match = "保存完整网页 Org 笔记 Emacs".toLowerCase().includes($("tool-search").value.trim().toLowerCase());
-  $("capture-tool").hidden = !match;
-  $("tool-empty").hidden = match;
-});
 $("search").addEventListener("keydown", (event) => {
   const entries = rankedEntries();
   const selected = entries.findIndex((item) => item.file === state.selectedFile);
@@ -378,25 +395,30 @@ document.addEventListener("keydown", (event) => {
 window.addEventListener("pagehide", clearDetails);
 
 async function initialize() {
-  const loading = loadFiles();
   try {
     const context = await sendMessage({ type: PAGE_CONTEXT });
     if (!context?.ok) throw new Error(context?.error || "无法读取当前页面，可手动选择功能。");
     state.tab = context.tab;
+    state.contextReady = true;
     const origin = currentOrigin();
     $("hostname").textContent = origin?.hostname || "当前页面不支持填充或全文保存";
     $("hostname").title = origin?.hostname || "仍可搜索和复制密码";
     $("org-capture").disabled = !origin;
-    if (!origin) $("capture-status").textContent = "当前页面不支持全文保存，仍可切换到密码搜索和复制。";
+    if (!origin) $("org-capture").title = "当前页面不支持全文保存";
     if (!state.manualView) showView(context.hasPasswordInput ? "password" : "tools");
     if (context.detectionError) setStatus(context.detectionError, true);
   } catch (error) {
+    state.contextReady = true;
     $("hostname").textContent = "无法读取当前页面";
     $("org-capture").disabled = true;
     if (!state.manualView) showView("tools");
+    $("tool-status").textContent = "无法读取当前页面，请重新打开插件后重试。";
+    $("tool-status").classList.add("error");
     setStatus(error.message, true);
   }
-  renderEntries();
-  await loading;
+  if (state.view === "password") {
+    if (state.loaded) renderEntries();
+    else if (!state.loading) void loadFiles();
+  }
 }
 initialize();

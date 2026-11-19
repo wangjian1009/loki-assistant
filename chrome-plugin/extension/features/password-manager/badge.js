@@ -68,7 +68,7 @@ export function installPasswordBadge(browser = chrome) {
   });
   browser.runtime.onInstalled.addListener(refreshActive);
   browser.runtime.onStartup.addListener(refreshActive);
-  void browser.action.setBadgeBackgroundColor({ color: "#245c49" }).catch(() => {});
+  void browser.action.setBadgeBackgroundColor({ color: "#626262" }).catch(() => {});
   // service worker 因重新加载或休眠恢复而启动时，也刷新当前页面。
   refreshActive();
   return badge;

@@ -24,24 +24,21 @@
   <main id="app">
     <header class="topbar">
       <div class="brand"><img src="../icons/icon-32.png" width="29" height="29" alt=""><strong>Loki Assistant</strong></div>
-      <button id="connection" class="connection" aria-expanded="false" aria-controls="diagnostics"><span class="dot"></span><span id="connection-label">正在连接</span></button>
+      <button id="connection" class="connection" aria-expanded="false" aria-controls="diagnostics" hidden><span class="dot"></span><span id="connection-label">尚未查询</span></button>
     </header>
-    <div id="page-context" class="site"><svg class="icon" aria-hidden="true"><use href="#icon-globe"/></svg><span id="hostname">正在读取当前页面…</span></div>
+    <div id="page-context" class="site" hidden><svg class="icon" aria-hidden="true"><use href="#icon-globe"/></svg><span id="hostname">正在读取当前页面…</span></div>
     <nav class="tabs" aria-label="功能">
       <button class="tab" data-view="tools" aria-pressed="false">工具</button>
-      <button class="tab" data-view="password" aria-pressed="false">密码 <span id="match-count" class="count" aria-label="当前网站匹配数量">—</span></button>
+      <button class="tab" data-view="password" aria-pressed="false">密码 <span id="match-count" class="count" aria-label="当前网站匹配数量" hidden>—</span></button>
     </nav>
     <div id="content" class="content">
       <aside id="diagnostics" class="notice" hidden><p id="connection-detail">正在连接本机服务…</p><button id="refresh" class="text-button">重试连接</button></aside>
       <p id="initial-loading" class="loading" role="status">正在检测当前页面…</p>
       <section id="tools-view" aria-label="工具" hidden>
-        <div class="search-box"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><input id="tool-search" type="search" placeholder="搜索工具…" autocomplete="off" aria-label="搜索工具"></div>
-        <article id="capture-tool" class="tool-card">
-          <div class="tool-heading"><span class="tool-icon"><svg class="icon" aria-hidden="true"><use href="#icon-page"/></svg></span><div><h1>保存完整网页</h1><p>将当前页面保存为 Org 笔记</p></div></div>
-          <button id="org-capture" class="primary">保存到 Emacs <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
-        </article>
-        <p id="tool-empty" class="empty" hidden>没有匹配的工具。</p>
-        <p id="capture-status" class="status" role="status" aria-live="polite"></p>
+        <div class="tool-grid" aria-label="页面工具">
+          <button id="org-capture" class="tool-tile" title="将完整网页保存到 Emacs，确认后存为 Org 笔记" disabled><span class="tool-icon"><svg class="icon" aria-hidden="true"><use href="#icon-page"/></svg></span><span>全文保存</span></button>
+        </div>
+        <p id="tool-status" class="status" role="status" aria-live="polite"></p>
       </section>
       <section id="password-view" aria-label="密码列表" hidden>
         <div class="search-box"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><button id="domain-scope" class="scope" title="移除网站过滤" aria-label="移除当前网站过滤">当前网站 ×</button><input id="search" type="search" autocomplete="off" placeholder="搜索密码条目…" aria-label="搜索密码条目" aria-controls="entries"></div>
@@ -57,7 +54,7 @@
         <div id="details-actions" hidden><button id="details-fill" class="primary">填充当前页面</button><button id="details-open" class="open-url text-button">打开条目网址 ↗</button></div>
       </section>
     </div>
-    <footer class="footer"><span id="password-status" class="status" role="status" aria-live="polite">正在连接本机服务…</span><span id="shortcut-hint" hidden>Ctrl + O 详情</span></footer>
+    <footer id="password-footer" class="footer" hidden><span id="password-status" class="status" role="status" aria-live="polite"></span><span id="shortcut-hint" hidden>Ctrl + O 详情</span></footer>
   </main>
   <script type="module" src="popup.js"></script>
 </body>
