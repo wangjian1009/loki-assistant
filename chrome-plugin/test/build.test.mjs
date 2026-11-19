@@ -24,4 +24,6 @@ test("dist/chrome-plugin/ 的 popup 和后台只加载构建后的 JavaScript", 
   await checkModule(new URL(script[1], htmlURL));
   await checkModule(new URL(manifest.background.service_worker, root));
   assert.ok([...visited].some((url) => url.endsWith("/html2org/turndown.js")));
+  assert.ok([...visited].some((url) => url.endsWith("/password-query/api.js")));
+  assert.ok([...visited].some((url) => url.endsWith("/password-otp/otp.js")));
 });

@@ -1,4 +1,4 @@
-import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripTypeScriptTypes } from "node:module";
@@ -6,27 +6,44 @@ import { stripTypeScriptTypes } from "node:module";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const extension = join(root, "extension");
 const dist = fileURLToPath(new URL("../../dist/chrome-plugin/", import.meta.url));
-const source = join(extension, "features", "org-capture");
-const output = join(dist, "features", "org-capture");
-
 await rm(dist, { recursive: true, force: true });
-await mkdir(join(output, "html2org"), { recursive: true });
 
-for (const name of await readdir(join(source, "html2org"))) {
-  if (!name.endsWith(".ts")) continue;
-  const input = await readFile(join(source, "html2org", name), "utf8");
-  const javascript = stripTypeScriptTypes(input).replace(
-    /(from\s+["'])(\.\/[\w-]+)(["'])/g,
-    "$1$2.js$3",
+function rewriteImports(source) {
+  return source.replace(
+    /(\b(?:from|import\s*\()\s*["'])(\.\.?\/[^"']+?)(["'])/g,
+    (_match, prefix, specifier, suffix) => {
+      if (specifier.endsWith(".ts")) {
+        return `${prefix}${specifier.slice(0, -3)}.js${suffix}`;
+      }
+      if (/\.(?:js|json|css|html|png|svg)$/u.test(specifier)) {
+        return `${prefix}${specifier}${suffix}`;
+      }
+      return `${prefix}${specifier}.js${suffix}`;
+    },
   );
-  await writeFile(join(output, "html2org", name.replace(/\.ts$/, ".js")), javascript);
 }
 
-const capture = await readFile(join(source, "capture.js"), "utf8");
-await writeFile(
-  join(output, "capture.js"),
-  capture.replaceAll(/\.ts(["'])/g, ".js$1"),
-);
+async function copySourceTree(sourceDir, outputDir) {
+  await mkdir(outputDir, { recursive: true });
+  for (const name of await readdir(sourceDir)) {
+    const sourcePath = join(sourceDir, name);
+    const outputPath = join(outputDir, name.replace(/\.ts$/u, ".js"));
+    const sourceStat = await stat(sourcePath);
+    if (sourceStat.isDirectory()) {
+      await copySourceTree(sourcePath, outputPath);
+      continue;
+    }
+    if (name.endsWith(".ts")) {
+      await writeFile(outputPath, rewriteImports(stripTypeScriptTypes(await readFile(sourcePath, "utf8"))));
+    } else if (name.endsWith(".js")) {
+      await writeFile(outputPath, rewriteImports(await readFile(sourcePath, "utf8")));
+    } else {
+      await cp(sourcePath, outputPath);
+    }
+  }
+}
+
+await copySourceTree(join(extension, "features"), join(dist, "features"));
 
 for (const name of ["manifest.json", "popup", "background", "shared", "icons"]) {
   const input = join(extension, name);

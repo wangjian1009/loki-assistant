@@ -3,18 +3,22 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Loki Assistant</title>
+    <title>Loki Assistant 密码</title>
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main>
-      <button id="org-capture" type="button">全文保存</button>
+    <main id="app">
+      <header class="topbar"><strong>Loki Assistant</strong><button id="refresh" class="icon-button" title="刷新条目" aria-label="刷新条目">↻</button></header>
+      <nav class="tabs" aria-label="功能"><button class="tab active" data-view="password">密码</button><button class="tab" data-view="capture">全文保存</button></nav>
+      <section id="password-view">
+        <div class="search-row"><input id="search" type="search" autocomplete="off" placeholder="搜索密码条目…" aria-label="搜索密码条目"><button id="domain-toggle" class="filter-button" type="button" title="只显示当前网站">当前网站</button></div>
+        <p id="password-status" class="status" role="status" aria-live="polite">正在读取密码条目…</p>
+        <div id="entries" class="entries" aria-live="polite"></div>
+        <p class="read-only-note">当前 services 仅提供查询；新增、编辑和删除由服务端接口支持后再开放。</p>
+      </section>
+      <section id="capture-view" hidden><button id="org-capture" class="primary" type="button">保存当前完整网页</button><p id="capture-status" class="status" role="status" aria-live="polite"></p></section>
     </main>
-    <dialog id="capture-dialog">
-      <h1>Org Capture</h1>
-      <p id="status" role="status" aria-live="polite"></p>
-      <button id="dialog-close" type="button" disabled>关闭</button>
-    </dialog>
+    <dialog id="details-dialog"><form method="dialog" class="dialog-form"><button class="dialog-close" value="cancel" aria-label="关闭">×</button><h1 id="details-title">密码条目</h1><p id="details-path" class="muted"></p><div id="details-fields" class="details-fields"></div><div class="details-actions"><button id="details-fill" type="button" class="primary">填充当前页面</button><button id="details-open" type="button">打开网址</button></div><p id="details-status" class="status" role="status" aria-live="polite"></p></form></dialog>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

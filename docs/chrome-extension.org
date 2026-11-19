@@ -1,4 +1,4 @@
-#+TITLE: Chrome 插件与全文捕获设计
+#+TITLE: Chrome 插件、密码查询与全文捕获设计
 #+LANGUAGE: zh-CN
 
 本文记录 Chrome 插件、services 和 Emacs capture 模块的已确认设计与实现边界。
@@ -6,14 +6,15 @@
 
 * 目标与范围
 
-第一版增加一个 Chrome Manifest V3 插件。用户点击扩展图标后看到功能菜单，菜单当前只包含一项：
+Chrome Manifest V3 插件的功能菜单包含全文保存和只读密码查询：
 
 | 显示名称 | 功能标识 | 行为 |
 |----------+----------+------|
 | 全文保存 | =org-capture= | 读取当前完整网页，转换为 Org 文本并提交到 Loki Assistant |
+| 密码 | =password-query= | 查询 pass 条目，复制字段并填充当前网页 |
 
-功能菜单保留按功能扩展的边界，后续能力可以增加新的功能目录和菜单项，不改变已有的
-=org-capture= 请求协议。
+功能菜单保留按功能扩展的边界，每个能力使用独立功能目录；后续能力不得把协议和实现堆回
+=popup=，也不改变已有的 =org-capture= 请求协议。
 
 本次功能明确分为三层：
 
@@ -59,9 +60,15 @@ chrome-plugin/
 │   ├── background/                   service worker，串行执行功能请求
 │   │   └── service-worker.js
 │   ├── features/
-│   │   └── org-capture/              全文保存功能
-│   │       ├── capture.js            页面快照和 HTML 到 Org 转换
-│   │       └── html2org/              转换器及其许可证
+│   │   ├── org-capture/              全文保存功能
+│   │   │   ├── capture.js            页面快照和 HTML 到 Org 转换
+│   │   │   └── html2org/              转换器及其许可证
+│   │   ├── password-query/           services 查询和 pass 原文解析
+│   │   ├── password-search/          域名过滤和模糊排序
+│   │   ├── password-copy/            字段复制
+│   │   ├── password-fill/            表单填充
+│   │   ├── password-otp/             OTP 解析和 TOTP
+│   │   └── password-manager/         密码业务组合
 │   ├── shared/                       不属于某个功能的代码
 │   │   ├── services-client.js        固定地址和 HTTP 请求
 │   │   └── messages.js               popup 与 service worker 消息
@@ -70,13 +77,14 @@ chrome-plugin/
 └── test/                             转换、请求和扩展交互测试
 #+end_src
 
-popup 只负责显示功能菜单、启动 =org-capture= 和显示结果。页面读取、转换和请求在
-service worker 中完成，避免 popup 因窗口关闭而中断请求。每个功能由自己的目录导出
-“检查当前标签页、生成请求、解释响应”的入口。
+popup 只负责显示功能菜单、启动功能和显示结果。密码列表及详情请求在 popup 中按需发起，
+密码填充和全文保存通过 service worker 调度。每个功能由自己的目录导出入口，目录之间不共享
+隐式全局状态。
 
 插件使用 =activeTab=、=scripting= 权限，以及访问
 =http://127.0.0.1/*= 的 =host_permissions= 。不申请 cookies、下载、剪贴板或全部网页
-访问权限。Chrome 内部页面、Web Store、PDF 查看器和没有 HTML body 的页面直接显示不支持提示。
+访问权限；复制使用扩展页面的 Clipboard API，不声明 =clipboardRead= 或 =clipboardWrite= 。
+Chrome 内部页面、Web Store、PDF 查看器和没有 HTML body 的页面直接显示不支持提示。
 
 页面转换沿用参考项目的边界：复制可见的主文档 body，忽略脚本、样式、iframe、隐藏元素、
 Shadow DOM 和 canvas；链接转为绝对 HTTP(S) 地址；图片只保留远程地址，不转 Base64；
@@ -190,6 +198,36 @@ Content-Type: application/json
 =emacsclient_path=、=socket_name= 和串行 gateway。services 不把请求内容拼接进 shell，
 而是用 JSON 字符串参数传给固定的 Emacs Lisp 入口。
 
+* browserpass 查询行为兼容
+
+本插件参考 browserpass-extension 3.13.0 和 browserpass-native 3.x 的查询行为。原版
+native host 的 =configure=、=list=、=fetch= 分别对应本插件的配置中心、
+=GET /password/entries= 和 =GET /password/entries/{*file}= ；原版 =tree= 、=save=、
+=delete= 不对应当前 services 的只读接口，因此界面不提供新增、编辑、删除或生成密码。
+原版的四字节 Native Messaging framing、=status/version/data= 响应和多 password store
+设置由项目现有的 loopback HTTP、=api_version/status/error= 错误模型和单一配置目录替代。
+源码入口包括 [[https://github.com/browserpass/browserpass-extension/blob/dcdd297b4bd4a2df53c59185d8a7888e2332113b/src/background.js][extension/src/background.js]] 的 =hostAction= 、=parseFields=、填充和复制分发，
+以及 [[https://github.com/browserpass/browserpass-native/blob/7c62896ca318cf44fcab5d041a93525119e69a5d/request/process.go][native/request/process.go]]、
+[[https://github.com/browserpass/browserpass-native/blob/7c62896ca318cf44fcab5d041a93525119e69a5d/request/list.go][request/list.go]] 和
+[[https://github.com/browserpass/browserpass-native/blob/7c62896ca318cf44fcab5d041a93525119e69a5d/request/fetch.go][request/fetch.go]]；字段和 OTP 规则来自
+[[https://github.com/browserpass/browserpass-extension/blob/dcdd297b4bd4a2df53c59185d8a7888e2332113b/src/helpers/base.js][extension/src/helpers/base.js]] 与 =background.js= 。
+
+插件保留以下可见行为：
+
+- 条目列表默认按当前标签页 hostname 过滤，输入搜索词时按第一词模糊匹配、其余词做字面子串过滤；“全部条目”按钮取消域名过滤，Backspace 在搜索框为空时也会取消过滤。
+- 条目卡片支持填充用户名/密码、复制用户名、复制密码和打开详情；详情按需读取完整原文，显示标准字段和额外的 key/value 字段，并支持复制、填充及打开 URL。
+- 字段别名沿用 browserpass：=secret/password/pass=、=login/username/user=、=url/uri/website/site/link/launch=、=otp/totp= 和 =openid= 。没有显式密码时使用第一行，没有用户名时使用条目文件名。
+- OTP 支持 =otpauth://= URI 的 type、secret、algorithm、digits、period 和 Base32 secret-only 形式；使用 Web Crypto HMAC 计算当前 token。填充带 OTP 的条目后复制 token，和 browserpass 的自动复制行为一致。
+- =Enter= 填充第一项，=Ctrl+C= 复制密码，=Ctrl+Shift+C= 复制用户名，=Ctrl+O= 打开详情；扩展命令 =Ctrl+Shift+F= 填充当前网站最匹配的条目。
+- 表单填充在当前标签页的可访问 frame 中查找可见用户名和 password input，派发 =input/change= 事件；条目中设置 =autosubmit: true= 时提交所在 form。跨域受限 frame 或浏览器内部页面失败时显示明确说明。
+
+原版 browserpass 的最近使用统计、浏览器历史日志、Basic Auth 监听、跨 store 颜色设置、
+Native Messaging options 页和写入操作不在当前版本，因为当前扩展未申请相应权限且 services
+只提供查询。它们不能由前端假装实现；未来后端增加写入和配置协议后再逐项开放。
+
+密码原文只在详情、复制或填充操作时读取，不写入 Chrome storage、页面属性或 services
+日志。查询响应不缓存；services 的密码接口统一返回 =Cache-Control: no-store= 。
+
 Chrome 扩展请求需要本机 loopback host permission。若 Chrome 对 JSON POST 触发预检，
 services 只对 =chrome-extension://= Origin 提供必要的 =OPTIONS= 和 CORS 响应，不向普通
 网页开放跨域写入；其他本机 API 的行为保持不变。
@@ -257,7 +295,7 @@ frame 时返回 =emacs-ui-unavailable= ；不因为捕获请求自动创建第�
 |------------+------------|
 | =chrome-plugin/extension/features/org-capture/= | DOM 快照、HTML 到 Org 转换、功能状态 |
 | =chrome-plugin/extension/shared/services-client.js= | 使用固定地址调用 services、解析统一响应 |
-| =chrome-plugin/extension/popup/= | 功能菜单和中文提示；当前仅显示“全文保存” |
+| =chrome-plugin/extension/popup/= | 密码查询、全文保存功能菜单和中文提示 |
 | =services/src/modules/emacs/protocol.rs= | 请求、成功响应和错误协议 DTO |
 | =services/src/modules/emacs/routes.rs= | =POST /emacs/capture/full= handler 和 API 元数据 |
 | =services/src/modules/emacs/service.rs= | 输入转发、gateway 调用、响应解析和错误映射 |

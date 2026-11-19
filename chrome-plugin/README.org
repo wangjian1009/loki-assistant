@@ -3,17 +3,25 @@
 
 * 状态
 
-Chrome 插件第一版已实现。跨模块协议和功能边界见
+Chrome 插件已实现全文保存和只读密码查询。跨模块协议和功能边界见
 [[file:../docs/chrome-extension.org][Chrome 插件与全文捕获设计]]。
 
 * 结构
 
-插件使用 Manifest V3，点击图标显示功能菜单，当前只有“全文保存”（功能标识
-=org-capture= ）。页面在浏览器内转换为 Org 文本，再提交到固定的
-=http://127.0.0.1:47321/emacs/capture/full=。
+插件使用 Manifest V3，点击图标显示功能菜单。密码功能通过 services 的
+=GET /password/entries= 和 =GET /password/entries/{*file}= 查询条目，支持当前域名筛选、模糊搜索、条目详情、用户名/密码/OTP 复制、当前页面表单填充和条目 URL 打开。全文保存功能仍通过固定的
+=http://127.0.0.1:47321/emacs/capture/full= 提交浏览器内转换后的 Org 文本。
+
+services 只提供密码查询；新增、编辑、删除和密码生成按钮暂不开放，避免插件展示不存在的后端能力。原版 browserpass 的 Native Messaging host 由本插件的 HTTP 客户端替代，services 不读取浏览器设置或 =.browserpass.json= 。
+
+密码原文只在点击复制、详情或填充时按需读取，插件不持久化密码内容。OTP 在浏览器内按条目中的 =otpauth://= 或 Base32 secret 计算，填充带 OTP 的条目后会复制当前 token。
 
 Emacs 不需要启动 HTTP 服务；services 通过 =emacsclient= 调用
 =loki-assistant-capture-full= 。
+
+* 功能目录
+
+每个可复用能力位于独立目录：=password-query= 查询和解析、=password-search= 域名过滤和模糊排序、=password-copy= 字段复制、=password-fill= 表单填充、=password-otp= OTP、=password-manager= 业务组合，=org-capture= 负责全文保存。=popup= 只负责组合界面，=background= 负责填充和全文保存调度。
 
 * 构建
 

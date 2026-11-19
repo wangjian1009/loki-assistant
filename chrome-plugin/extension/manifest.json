@@ -3,7 +3,7 @@
   "name": "Loki Assistant",
   "version": "0.1.0",
   "minimum_chrome_version": "109",
-  "description": "将当前完整网页转换为 Org 文档并提交给 Loki Assistant。",
+  "description": "查询 pass 密码并填充当前网页，也可将网页保存为 Org 文档。",
   "permissions": ["activeTab", "scripting"],
   "host_permissions": ["http://127.0.0.1/*"],
   "icons": {
@@ -30,5 +30,11 @@
   "background": {
     "service_worker": "background/service-worker.js",
     "type": "module"
+  },
+  "commands": {
+    "fillBest": {
+      "suggested_key": { "default": "Ctrl+Shift+F" },
+      "description": "使用当前网站最匹配的密码填充表单"
+    }
   }
 }
