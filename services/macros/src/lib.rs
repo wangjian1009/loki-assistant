@@ -125,6 +125,7 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
         .split('{')
         .skip(1)
         .filter_map(|part| part.split('}').next())
+        .map(|name| name.strip_prefix('*').unwrap_or(name))
         .filter(|name| !name.is_empty())
         .map(|name| {
             let name = name.to_owned();

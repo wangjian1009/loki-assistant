@@ -4,11 +4,13 @@
 
 ## 范围
 
-当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块、Emacs gateway 与浏览器全文捕获。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送、全文捕获和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
+当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块、只读密码查询、Emacs gateway 与浏览器全文捕获。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送、全文捕获和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
 `modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
+
+`modules/password/` 维护本地 `store_dir`、`pass_path` 配置和只读查询协议。业务 HTTP 仅提供 `GET /password/entries` 和 `GET /password/entries/{*file}`，单条文件标识由路径传递，不接受 JSON 查询请求体。条目列表通过 `pass ls` 获取，解密通过固定的 `pass show --` 获取，不直接读取条目内容或调用 GPG；文件系统只用于目录、普通文件和路径边界检查。命令执行经本模块可注入的 `CommandRunner`，不复用 Emacs gateway。HTTP 不接收程序、库目录或任意命令参数，不提供密码写入操作；明文与 pass/GPG 原始错误不进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身，不读取真实密码库。
 
 HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/code/message`；`source` 仅使用 `services`、`emacs`、`business`，`code`、`message` 必须为非空字符串，客户端按 `code` 判断并显示 `message`，不得新增模块专用错误外壳。
 
@@ -116,6 +118,7 @@ src/modules/<module>/
 | `modules/status` | 由业务方设置的通用状态存储与查询 | JSON、内存锁；不依赖具体业务模块 |
 | `modules/network` | 身份持久化、中转注册和通知 | 配置处理器 trait、注入的通知服务、iroh 适配 |
 | `modules/control_center` | 控制中心配置、菜单栏登录启动与失败撤销 | 配置处理器 trait、平台 LaunchAgent 管理器 |
+| `modules/password` | 本地 pass 目录配置、条目列表与只读解密 | 本模块 `CommandRunner` trait、配置服务、文件元数据检查 |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
 | `platform/macos`        | 托盘登录启动的 LaunchAgent plist 与 launchctl 管理               | macOS API；不提供业务 HTTP 路由             |
 

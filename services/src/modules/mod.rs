@@ -7,5 +7,6 @@ pub mod emacs;
 pub mod health;
 pub mod network;
 pub mod notification;
+pub mod password;
 
 pub mod status;

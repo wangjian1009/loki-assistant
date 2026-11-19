@@ -5,7 +5,7 @@ use axum::Router;
 use crate::{
     modules::{
         config, control_center, discover, emacs, health, network,
-        notification::NotificationService, status::StatusService,
+        notification::NotificationService, password, status::StatusService,
     },
     runtime::RuntimeState,
 };
@@ -20,6 +20,7 @@ pub struct Services {
     pub status: Arc<StatusService>,
     pub emacs: emacs::Module,
     pub network: Arc<network::NetworkService>,
+    pub password: password::Module,
 }
 
 /// 与需求文档中的 CoreService 名称兼容的别名。
@@ -61,6 +62,7 @@ impl Services {
             Arc::clone(&notification),
             Arc::clone(&status),
         );
+        let password = password::Module::new(config.service());
 
         Self {
             health,
@@ -70,6 +72,7 @@ impl Services {
             status,
             emacs,
             network,
+            password,
         }
     }
 
@@ -81,6 +84,7 @@ impl Services {
             .merge(self.notification.router())
             .merge(self.status.router())
             .merge(self.emacs.router())
+            .merge(self.password.router())
     }
 }
 

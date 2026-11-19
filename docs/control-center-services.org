@@ -19,6 +19,7 @@
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/network~ | 本地身份持久化、中转注册和结果通知 | 已实现 |
+| ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |
@@ -31,7 +32,7 @@ services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该�
 
 ** 错误响应原则
 
-所有 HTTP 错误统一返回 ~api_version~、HTTP 数字 ~status~ 和 ~error{source,code,message}~；~source~ 只能是 ~services~、~emacs~ 或 ~business~，~code~ 和 ~message~ 为非空字符串，客户端按 ~code~ 处理并显示 ~message~。
+所有 HTTP 错误统一返回 ~api_version~、HTTP 数字 ~status~ 和 ~error{source,code,message}~；~source~ 只能是 ~services~、~emacs~ 或 ~business~，~code~ 和 ~message~ 为非空字符串，客户端按 ~code~ 处理并显示 ~message~ 。
 
 #+begin_src json
 {"api_version":"1","status":409,"error":{"source":"business","code":"capture-busy","message":"Emacs 中已有未完成捕获，请先保存或取消。"}}
@@ -50,6 +51,7 @@ services/
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
     │   ├── network/        本地身份、中转注册、配置处理与状态发布
+    │   ├── password/       pass 目录配置、条目查询与只读解密
     │   ├── status/         状态结构元数据、编译期目录、Rust 发布与 HTTP 查询
 │   ├── notification/   系统通知发送、跳转封装和回执状态
     │   └── health/         健康状态路由
@@ -90,6 +92,8 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 | GET | ~/emacs/receiver/notification/{id}~ | 系统通知状态查询的兼容入口 |
 | POST | ~/emacs/receiver/notification/{id}/receipt~ | 系统通知回执的兼容入口 |
 | GET | ~/emacs/buffers~ | 查询当前 Emacs buffer 列表 |
+| GET | ~/password/entries~ | 查询密码条目，可选 query 按路径过滤 |
+| GET | ~/password/entries/{*file}~ | 按相对 .gpg 路径读取单条密码原文 |
 
 * 配置中心
 
@@ -240,6 +244,88 @@ control-center:
 
 注册期间状态查询立即返回，不等待注册完成。连接建立后，网络模块监听 iroh 的连接变化并继续发布；切换配置失败但保留旧连接时，状态继续反映旧连接。状态数据不包含令牌或私钥；令牌不进入日志、通知或状态接口。
 
+* 密码管理模块
+
+** browserpass 源码分析与职责边界
+
+本次分析的上游版本为 [[https://github.com/browserpass/browserpass-extension/tree/dcdd297b4bd4a2df53c59185d8a7888e2332113b][browserpass-extension dcdd297]] 和
+[[https://github.com/browserpass/browserpass-native/tree/7c62896ca318cf44fcab5d041a93525119e69a5d][browserpass-native 7c62896]]。
+通信协议见 [[https://github.com/browserpass/browserpass-native/blob/7c62896ca318cf44fcab5d041a93525119e69a5d/PROTOCOL.md][PROTOCOL.md]]；实现入口分别为插件的
+[[https://github.com/browserpass/browserpass-extension/blob/dcdd297b4bd4a2df53c59185d8a7888e2332113b/src/background.js][src/background.js]] 中的 ~getFullSettings~ 、 ~hostAction~ 、 ~parseFields~ ，以及 native 的
+[[https://github.com/browserpass/browserpass-native/blob/7c62896ca318cf44fcab5d041a93525119e69a5d/request/process.go][request/process.go]]、~request/list.go~、~request/fetch.go~ 和 ~request/configure.go~ 。
+
+| 上游 action | native 的职责 | 本服务的对应能力 |
+|-------------+---------------+------------------|
+| ~configure~ | 检查密码库、返回版本、默认库路径和各库的 .browserpass.json 原文 | 通过现有配置中心管理单一本地库，通过 /healthz 和 /discover 查询服务及能力；不读取 .browserpass.json |
+| ~list~ | 列出每个库的相对 .gpg 文件路径，不解密 | GET /password/entries，通过 pass ls 获取列表 |
+| ~fetch~ | 按 storeId 与相对文件路径调用 GPG，返回完整 contents | GET /password/entries/{*file}，通过 pass show 获取完整 contents |
+| ~tree~ | 列出目录，供新增或编辑条目选择保存位置 | 查询流程不需要，未实现 |
+| ~save~ 、 ~delete~ | 加密写入、删除文件及清理空目录 | 未实现 |
+| ~echo~ | 原样返回请求中的 echoResponse，供通信诊断 | 使用现有健康接口，未实现此 action |
+
+~src/helpers/base.js~ 中的 ~prepareLogins~ 、 ~pathToInfo~ 和 ~filterSortLogins~ 在插件端完成域名匹配、过滤和排序。
+~background.js~ 的 ~parseFields~ 在取回原文后解析 ~secret/password/pass~ 、 ~login/username/user~ 、 ~url~ 、 ~otp/totp~ 等字段；没有显式密码字段时使用首个非空行，没有用户名时使用配置或条目名。
+OTP 参数解析和 TOTP 计算、剪贴板、最近使用记录、页面填充及自动提交也属于插件端。服务只需提供路径列表和原始内容，无须复制这些浏览器逻辑。
+
+原版插件通过 ~chrome.runtime.sendNativeMessage~ 调用 ~com.github.browserpass.native~ ，请求使用 ~action/settings~ ，响应使用 ~status/version/data~ ；native 消息还有四字节长度前缀。本服务采用项目现有的 HTTP JSON 版本和统一错误模型，并非 browserpass Native Messaging host，原版插件不能直接连接。后续浏览器接入需要修改通信适配层或增加独立桥接，目前均未实现。插件还会根据 native 的整数版本 ~>= 3001000~ 自动开放编辑能力，不能把 services 版本冒充该版本并宣称支持写入。
+
+** 配置与执行
+
+模块标识为 ~password~ ，~GET /meta/password~ 返回以下配置元数据，用户值由通用配置接口保存到 ~~/.assistant/config.yml~ ：
+
+| 键 | 类型 | 默认行为 |
+|----+------+----------|
+| ~store_dir~ | ~file_path~ ，目录 | 无默认值，必须显式指定绝对路径；不展开 ~ 和环境变量 |
+| ~pass_path~ | ~executable~ | 默认查找 pass，先搜索服务 PATH，再搜索 /opt/homebrew/bin 和 /usr/local/bin；允许显式覆盖 |
+
+配置通过 ~PasswordConfig~ 在每次查询时读取，下次调用即生效。目录在查询时规范化并检查存在性和目录类型；不创建密码库，不执行 ~pass init~ ，不回退到进程环境中的 ~PASSWORD_STORE_DIR~ 或默认用户密码库。
+
+所有数据查询由 ~pass~ 命令完成，服务不直接读取密文内容或调用 ~gpg~ ：
+
+- 列表固定执行 ~pass ls~ ，以 ~LC_ALL=C~ 固定 ASCII 树枝，去除 ANSI 颜色后恢复相对路径。兼容标准 ~pass 1.7.x~ 的 tree 输出；不支持的输出返回 ~invalid-pass-response~ 。仅以文件元数据确认 .gpg 普通文件及库内路径，列表不解密。
+- 单条固定执行 ~pass show -- <去掉末尾 .gpg 的相对路径>~ ，不添加 clip、qrcode 或扩展命令，不改变原文中的换行和字段。
+- 子进程显式设置 ~PASSWORD_STORE_DIR~ ，禁用用户 pass 扩展，关闭标准输入；参数独立传递，不经过 shell。服务 PATH 额外补入 pass 所在目录，供 pass 查找 GPG、tree 等依赖。
+- pass 调用限时 30 秒，取消等待时终止直接子进程。解密依赖本机已配置的 GPG agent 和 pinentry；服务不接收 GPG 口令、不管理私钥。
+
+密码和解密结果不持久化、不进入日志、通知、状态中心或发现元数据；pass/GPG 的原始标准错误和失败时的标准输出不回显到 HTTP，失败只提供稳定错误码、中文说明和退出码。密码接口的成功和错误响应均带 ~Cache-Control: no-store~ ，不启用 CORS，沿用服务的 loopback 监听边界。
+
+** 查询接口
+
+~GET /password/entries~ 返回排序、去重后的相对 ~.gpg~ 路径。可选 ~query~ 按完整路径进行不区分大小写的字面子串过滤，不作为 shell、正则或 pass 参数执行；省略或空字符串表示列出全部。空库、没有匹配项均返回空数组，不读取任何条目明文。
+
+#+begin_src json
+{"api_version":"1","files":["example.com/alice.gpg","work/example.org.gpg"]}
+#+end_src
+
+~GET /password/entries/{*file}~ 读取单个条目，~file~ 是包含目录的相对 ~.gpg~ 路径，不需要请求体。例如：
+
+#+begin_src http
+GET /password/entries/example.com/alice.gpg
+#+end_src
+
+#+begin_src json
+{"api_version":"1","file":"example.com/alice.gpg","contents":"示例密码\nlogin: alice\nurl: https://example.com\n"}
+#+end_src
+
+~file~ 是列表返回的相对路径，保留 ~.gpg~ 后缀。调用方按 URL 路径规则编码中文、空格、~#~、~?~ 和 ~%~ 等字符，目录分隔符可保留；服务端解码后检查路径。拒绝绝对路径、空路径分量、~.~ / ~..~ / 隐藏路径、反斜杠、控制字符，以及实际目标在库外的符号链接。列表同样排除这些条目。不存在或并非普通文件的目标返回 404；名称以 ~-~ 开头的普通条目仍可查询，由固定 ~show --~ 防止选项注入。
+
+当前密码业务接口只提供 GET 查询；POST、PUT、PATCH 和 DELETE 请求返回 405 ~method-not-allowed~ ，沿用统一 JSON 错误外壳及禁止缓存响应头。请求不能指定其他库目录、程序、命令或新增内容；模块不提供密码新增、修改、删除、剪贴板或 OTP 接口。模块配置仍由现有通用配置中心维护。
+
+错误采用统一的 ~api_version/status/error{source,code,message}~ 外壳：
+
+| HTTP | code | source | 含义 |
+|------+------+--------+------|
+| 400 | ~invalid-request~ | ~business~ | 无效查询参数、未知参数或错误类型 |
+| 400 | ~invalid-password-path~ | ~business~ | 条目路径不符合约定或实际目标越出密码库 |
+| 404 | ~password-entry-not-found~ | ~business~ | 条目不存在或不是普通文件 |
+| 405 | ~method-not-allowed~ | ~services~ | 密码业务接口不接受该 HTTP 方法 |
+| 503 | ~password-not-configured~ | ~business~ | 未配置密码库，或未找到 pass 程序 |
+| 503 | ~password-store-unavailable~ | ~business~ | 密码库不可访问 |
+| 502 | ~pass-unavailable~ | ~services~ | 无法启动 pass |
+| 502 | ~pass-command-failed~ | ~services~ | pass 非零退出或被信号终止，包括 GPG 解密失败 |
+| 502 | ~invalid-pass-response~ | ~services~ | pass 列表格式不受支持或内容不是 UTF-8 |
+| 504 | ~pass-timeout~ | ~services~ | pass 查询超过 30 秒 |
+
 * 状态中心
 
 ~modules/status~ 统一保存外部发布的模块/数据项数据，并提供 Rust 发布接口与版本为 ~1~ 的 HTTP 只读查询。该模块只处理名称校验、内存存储和序列化，具体值及更新时机由发布方负责；不读取配置、不查询 Emacs 或网络，不为查询启动业务程序。~Services~ 创建唯一 ~Arc<StatusService>~ ，业务发布方通过依赖注入共用这一实例。
@@ -296,9 +382,9 @@ Lisp 求值与 buffer 列表查询传入 ~--alternate-editor=~ 和 ~--eval~ 。s
 
 ~POST /emacs/capture/full~ 是 Chrome 插件使用的唯一服务入口。services 只接收浏览器
 已经转换好的 Org 文本，不连接 Emacs HTTP 服务、不下载网页，也不执行正文中的 Lisp。
-请求字段为 ~title~、~url~、~captured_at~ 和 ~body~；标题不能含换行，来源必须是绝对
+请求字段为 ~title~、~url~、~captured_at~ 和 ~body~ ；标题不能含换行，来源必须是绝对
 HTTP(S) URL，时间使用 UTC RFC 3339 的 ~Z~ 后缀，正文按 UTF-8 字节限制为 16 MiB。
-未知字段、格式错误和超限请求返回 HTTP 400 ~invalid-request~，不会调用 Emacs。
+未知字段、格式错误和超限请求返回 HTTP 400 ~invalid-request~ ，不会调用 Emacs。
 
 #+begin_src json
 {
@@ -310,17 +396,17 @@ HTTP(S) URL，时间使用 UTC RFC 3339 的 ~Z~ 后缀，正文按 UTF-8 字节�
 #+end_src
 
 services 使用现有 Emacs gateway 调用固定的
-=loki-assistant-capture-full=，并要求目标 Emacs 已加载
-=loki-assistant-capture=。成功建立捕获缓冲区返回 HTTP 202：
+=loki-assistant-capture-full= ，并要求目标 Emacs 已加载
+=loki-assistant-capture= 。成功建立捕获缓冲区返回 HTTP 202：
 
 #+begin_src json
 {"api_version":"1","status":"pending","url":"https://example.com/article/1"}
 #+end_src
 
-同一来源已有已保存文档时返回 HTTP 200 ~existing~，同时激活原节点；不覆盖或追加正文。
-同一来源正在捕获时复用原捕获缓冲区并返回 ~pending~；其他来源存在未完成捕获时返回
-HTTP 409 ~capture-busy~，第一版不排队。202 只表示捕获缓冲区已打开，不表示文件已经
-保存；用户需要在 Emacs 中使用 =C-c C-c= 或 =C-c C-k=。
+同一来源已有已保存文档时返回 HTTP 200 ~existing~ ，同时激活原节点；不覆盖或追加正文。
+同一来源正在捕获时复用原捕获缓冲区并返回 ~pending~ ；其他来源存在未完成捕获时返回
+HTTP 409 ~capture-busy~ ，第一版不排队。202 只表示捕获缓冲区已打开，不表示文件已经
+保存；用户需要在 Emacs 中使用 =C-c C-c= 或 =C-c C-k= 。
 
 #+begin_src json
 {
@@ -332,11 +418,11 @@ HTTP 409 ~capture-busy~，第一版不排队。202 只表示捕获缓冲区已�
 #+end_src
 
 Emacs 端由 =emacs/loki-assistant-capture.el= 提供
-=loki-assistant-capture-full=。它使用自有的
-=loki-assistant-capture-templates=（结构兼容 =org-roam-capture-templates=）作为单次
+=loki-assistant-capture-full= 。它使用自有的
+=loki-assistant-capture-templates= （结构兼容 =org-roam-capture-templates= ）作为单次
 =org-roam-capture= 调用的模板，不要求用户预先把模板写入 org-roam 全局变量，也不改变
 手动 =org-roam-capture= 的模板列表。Emacs 配置中的 =f= 模板以 =org-roam-directory= 为
-根目录，使用时间戳和 slug 生成文件名，把来源写入 =ROAM_REFS=，保存后显式更新 org-roam
+根目录，使用时间戳和 slug 生成文件名，把来源写入 =ROAM_REFS= ，保存后显式更新 org-roam
 索引。
 正文按字面插入，不能通过页面内容执行模板或 Lisp 表达式。
 
@@ -345,7 +431,7 @@ Emacs 端由 =emacs/loki-assistant-capture.el= 提供
 插件源码后重新加载。Chrome 插件使用 loopback host permission；普通网页不获得该接口的
 跨域写入能力。Emacs 未加载 capture 模块、没有图形 frame、gateway 不可用或超时，分别
 返回 ~capture-not-installed~、~emacs-ui-unavailable~、~emacs-unavailable~ 或
-~emacs-timeout~，客户端显示服务端中文说明。
+~emacs-timeout~ ，客户端显示服务端中文说明。
 
 ** Emacs 主动状态上报
 

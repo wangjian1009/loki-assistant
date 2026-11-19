@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、状态中心、系统通知模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。services 自身由 Homebrew services 管理，菜单栏应用只展示服务状态，提供设置、日志与业务入口；托盘登录启动仍由 services 的控制中心模块在配置提交时管理用户级 LaunchAgent。
+当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、状态中心、系统通知模块、密码管理模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。services 自身由 Homebrew services 管理，菜单栏应用只展示服务状态，提供设置、日志与业务入口；托盘登录启动仍由 services 的控制中心模块在配置提交时管理用户级 LaunchAgent。
 
 服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
@@ -115,6 +115,28 @@ control-center:
 
 ~GET /status~ 读取全部状态，~GET /status/emacs/buffers~ 读取 Emacs 发布的关注 buffer，~GET /status/network/my~ 读取网络模块发布的本机连接状态。单项响应包含 ~api_version~ 、 ~module_id~ 、 ~key~ 、 ~value~ 和 ~updated_at~ 。数据只保存在内存，重启后由发布方重新上报。完整协议见 [[file:../docs/control-center-services.org::*状态中心][状态中心]]。
 
+* 密码查询
+
+~password~ 模块通过 ~pass ls~ 查询条目，通过 ~pass show~ 读取单条密码原文，仅提供查询能力。先安装标准 ~pass 1.7.x~ 及其 GPG、tree 等依赖，并配置可用的 GPG agent 和 pinentry；模块不初始化密码库或管理私钥。
+
+在现有 Emacs 服务配置界面的“密码管理”模块中设置“本地 pass 目录”，使用绝对路径，不展开 ~ 和环境变量。~pass_path~ 默认从服务 PATH 和 Homebrew 常用目录发现，也可指定可执行文件。没有显式设置目录时返回 ~password-not-configured~ ，不会自动访问用户的默认密码库。
+
+也可通过通用配置接口设置并查询，以下地址仅为默认监听地址示例，客户端仍应从 ~~/.assistant/service~ 获取实际地址：
+
+#+begin_src sh
+curl -X PUT http://127.0.0.1:47321/data/password/store_dir \
+  -H 'Content-Type: application/json' \
+  -d '"/absolute/path/to/password-store"'
+
+curl 'http://127.0.0.1:47321/password/entries?query=example.com'
+
+curl http://127.0.0.1:47321/password/entries/example.com/alice.gpg
+#+end_src
+
+密码业务接口只提供 GET 查询。列表返回相对 ~.gpg~ 文件路径，不解密；单条读取使用 ~GET /password/entries/{*file}~ ，不需要请求体，返回完整 ~contents~ ，保留字段和换行，供调用方解析。文件名中的中文、空格及 URL 保留字符需按路径规则编码。POST、PUT、PATCH 和 DELETE 返回 405。配置变更从下一次查询生效。每次 pass 调用最多等待 30 秒，响应禁止缓存；失败不回显 GPG 原始输出。
+
+browserpass 源码分析、服务职责和完整接口见 [[file:../docs/control-center-services.org::*密码管理模块][密码管理模块协议]]。目前提供项目自身的 HTTP API，原版 browserpass 使用 Native Messaging，仍需另行适配才能接入。
+
 * Emacs
 
 Emacs 的 Rust 配置入口为 ~modules/emacs/config.rs~ 中的 ~EmacsConfig~ ，构造时注入 ~Arc<ConfigService>~ 。每个配置项有独立读取方法；~emacsclient_path()~ 和 ~socket_name()~ 在每次使用时读取生效值及来源，不缓存连接配置。配置元数据通过静态方法和 ~#[loki_config]~ 注册，与 API 元数据使用相同的编译期发现方式。
@@ -139,8 +161,8 @@ curl -X POST http://127.0.0.1:47321/emacs/receiver/notification \
   -d '{"title":"任务完成","app":"emacs","buffer":"*scratch*"}'
 #+end_src
 
-Chrome 全文捕获使用固定的 ~POST /emacs/capture/full~。services 接收浏览器已经转换好的
-Org 文本，再通过 gateway 调用 Emacs 的 ~loki-assistant-capture-full~；Emacs 不启动独立
+Chrome 全文捕获使用固定的 ~POST /emacs/capture/full~ 。services 接收浏览器已经转换好的
+Org 文本，再通过 gateway 调用 Emacs 的 ~loki-assistant-capture-full~ ；Emacs 不启动独立
 HTTP 服务。请求字段和捕获状态见
 [[file:../docs/control-center-services.org::*浏览器全文捕获][浏览器全文捕获接口]]。
 
