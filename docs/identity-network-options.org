@@ -121,7 +121,7 @@ Reticulum 的 identity、destination hash 和传播节点概念很有吸引力�
 
 这些是选型验证的历史结果。固定测试身份、预设对端、验证 CLI、手机 Rust/NAPI 验证库和脚本已清理，不再提供运行入口。原验证产物属于忽略的本地构建记录，不作为正式运行依赖。
 
-当前 services 的 ~modules/network~ 使用随机生成且持久化的本地身份，按配置注册 relay，处理配置变化并通过通知模块报告结果；实现边界见 [[file:control-center-services.org::*网络模块][网络模块]]。手机仅保留执行中心入口。设备配对、正式业务消息、安全存储迁移、密钥轮换与手机后台网络仍需后续实现。
+当前 services 的 ~modules/network~ 使用随机生成且持久化的本地身份，按配置注册 relay，处理配置变化并通过通知模块报告结果；已增加 Emacs 设备管理、services 二维码 PNG 邀请、iroh 绑定握手和设备关系持久化，实现边界见 [[file:control-center-services.org::*网络模块][网络模块]]。手机仅保留执行中心入口，尚未接入扫码客户端。正式业务消息、安全存储迁移、密钥轮换与手机后台网络仍需后续实现。
 
 * 来源
 

@@ -26,6 +26,17 @@
 
 (autoload 'loki-assistant-config "loki-assistant-config"
   "打开 services 配置管理界面。" t)
+(autoload 'loki-assistant-devices "loki-assistant-devices"
+  "打开已绑定设备管理界面。" t)
+
+(defvar loki-assistant-command-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "c") #'loki-assistant-config)
+    (define-key map (kbd "d") #'loki-assistant-devices)
+    map)
+  "Loki Assistant 命令的前缀键映射，由用户配置绑定入口键。")
+
+(define-key loki-assistant-command-map (kbd "d") #'loki-assistant-devices)
 
 (defcustom loki-assistant-service-file "~/.assistant/service"
   "services 地址信息文件；每次请求重新读取。"

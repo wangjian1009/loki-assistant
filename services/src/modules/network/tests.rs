@@ -31,9 +31,9 @@ use crate::{
 };
 
 #[derive(Debug, Default)]
-struct Launcher {
+pub(super) struct Launcher {
     messages: Mutex<Vec<NotificationContent>>,
-    fail: AtomicBool,
+    pub(super) fail: AtomicBool,
 }
 
 impl NotificationLauncher for Launcher {
@@ -68,10 +68,10 @@ impl RelaySession for Session {
 }
 
 #[derive(Debug, Default)]
-struct Registrar {
+pub(super) struct Registrar {
     calls: Mutex<Vec<(String, String, String)>>,
     sessions: Mutex<Vec<Arc<Session>>>,
-    fail: AtomicBool,
+    pub(super) fail: AtomicBool,
     hang: AtomicBool,
     resume: tokio::sync::Notify,
     failure_message: Mutex<Option<String>>,
@@ -106,14 +106,14 @@ impl RelayRegistrar for Registrar {
     }
 }
 
-struct Fixture {
-    root: PathBuf,
-    registrar: Arc<Registrar>,
-    launcher: Arc<Launcher>,
-    status: Arc<StatusService>,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) registrar: Arc<Registrar>,
+    pub(super) launcher: Arc<Launcher>,
+    pub(super) status: Arc<StatusService>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!("loki-network-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         Self {
@@ -123,10 +123,10 @@ impl Fixture {
             status: Arc::default(),
         }
     }
-    fn store(&self) -> IdentityStore {
+    pub(super) fn store(&self) -> IdentityStore {
         IdentityStore::new(self.root.join("identity.json"))
     }
-    fn service(&self) -> Arc<NetworkService> {
+    pub(super) fn service(&self) -> Arc<NetworkService> {
         Arc::new(NetworkService::new(
             Ok(self.store()),
             self.registrar.clone(),
@@ -138,7 +138,7 @@ impl Fixture {
             Duration::from_millis(30),
         ))
     }
-    fn config(&self, service: Arc<NetworkService>) -> Arc<ConfigService> {
+    pub(super) fn config(&self, service: Arc<NetworkService>) -> Arc<ConfigService> {
         Arc::new(
             ConfigService::load(self.root.join("config.yml"))
                 .unwrap()

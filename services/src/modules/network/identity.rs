@@ -22,6 +22,10 @@ struct StoredIdentity {
 }
 
 impl IdentityStore {
+    pub(super) fn peers_path(&self) -> PathBuf {
+        self.path.with_file_name("peers.json")
+    }
+
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }

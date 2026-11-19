@@ -7,6 +7,9 @@ use super::protocol::ConnectionStatus;
 pub type RelayFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
 pub trait RelaySession: fmt::Debug + Send + Sync {
+    fn endpoint(&self) -> Option<Endpoint> {
+        None
+    }
     fn status(&self) -> ConnectionStatus;
     fn status_changed(&self, _current: ConnectionStatus) -> RelayFuture<'_, ConnectionStatus> {
         Box::pin(std::future::pending())
@@ -44,6 +47,9 @@ impl IrohRelayRegistrar {
 struct IrohSession(Endpoint);
 
 impl RelaySession for IrohSession {
+    fn endpoint(&self) -> Option<Endpoint> {
+        Some(self.0.clone())
+    }
     fn status(&self) -> ConnectionStatus {
         if self.0.is_closed() {
             return ConnectionStatus::Disconnected;
@@ -115,6 +121,7 @@ impl RelayRegistrar for IrohRelayRegistrar {
             relays = relays.with_auth_token(token.clone());
             let endpoint = Endpoint::builder(presets::Minimal)
                 .secret_key(identity)
+                .alpns(vec![super::protocol::PAIRING_ALPN.to_vec()])
                 .relay_mode(RelayMode::Custom(relays))
                 .clear_ip_transports()
                 .bind()

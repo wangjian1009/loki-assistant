@@ -86,6 +86,7 @@ impl Services {
             .merge(self.config.router())
             .merge(self.notification.router())
             .merge(self.status.router())
+            .merge(self.network.router())
             .merge(self.emacs.router())
             .merge(self.password.router())
     }

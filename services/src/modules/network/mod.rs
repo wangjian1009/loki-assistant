@@ -1,7 +1,11 @@
 mod config;
 mod identity;
+mod pairing;
+mod peers;
 pub mod protocol;
+mod qr_code;
 mod relay;
+mod routes;
 mod service;
 mod status;
 
@@ -9,6 +13,8 @@ pub use identity::IdentityStore;
 pub use relay::{IrohRelayRegistrar, RelayRegistrar, RelaySession};
 pub use service::NetworkService;
 
+#[cfg(test)]
+mod pairing_tests;
 #[cfg(test)]
 mod tests;
 
@@ -18,6 +24,6 @@ use crate::modules::discover::registry::ModuleRegistration;
 static NETWORK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "network",
     name: "网络",
-    description: "管理本地网络身份与中转注册。",
+    description: "管理本地网络身份、中转注册和扫码设备绑定。",
     version: env!("CARGO_PKG_VERSION"),
 };

@@ -12,7 +12,7 @@ BREW ?= brew
 OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
-.PHONY: emacs-load emacs-test emacs-config chrome-build chrome-test export-icons
+.PHONY: emacs-load emacs-test emacs-config emacs-devices chrome-build chrome-test export-icons
 .PHONY: relay-image
 
 .PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
@@ -27,6 +27,7 @@ help:
 	  'make test            执行 Mac XCTest、services Rust 和 Chrome 插件测试' \
 	  'make test-mac        构建并执行 Mac XCTest' \
 	  'make emacs-config    打开 Emacs 服务配置管理界面' \
+	  'make emacs-devices   打开 Emacs 已绑定设备管理界面' \
 	  'make chrome-build    构建 Chrome 插件' \
 	  'make chrome-test     构建并执行 Chrome 插件测试' \
 	  'make export-icons    从公共 SVG 母版导出 macOS、HarmonyOS 和 Chrome 图标' \
@@ -57,16 +58,23 @@ help:
 	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR TEST_BUILD_DIR CMAKE CTEST CARGO BREW OPEN EMACSCLIENT DEVECO_HOME HDC_TARGET'
 
 emacs-load:
-	"$(EMACSCLIENT)" --eval "(progn \
+	"$(EMACSCLIENT)" --eval "(let ((command-map (and (boundp 'loki-assistant-command-map) loki-assistant-command-map))) \
 	  (add-to-list 'load-path \"$(PROJECT_ROOT)/emacs\") \
-	  (dolist (feature '(loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
+	  (dolist (feature '(loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
+	  (when command-map (setq loki-assistant-command-map command-map)) \
 	  (require 'loki-assistant) \
-	  (require 'loki-assistant-config))"
+	  (require 'loki-assistant-config) \
+	  (require 'loki-assistant-devices))"
 
 emacs-config: emacs-load
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (loki-assistant-config) \
+	  t)"
+
+emacs-devices: emacs-load
+	"$(EMACSCLIENT)" --eval "(progn \
+	  (loki-assistant-devices) \
 	  t)"
 
 emacs-test: emacs-load
@@ -77,8 +85,9 @@ emacs-test: emacs-load
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-capture-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-devices-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-monitor-tests.el\" nil t) \
-	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-capture-test-\"))) \
+	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-devices-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-capture-test-\"))) \
 	              (edna-stats \
 	               (when (require 'org-edna nil t) \
 	                 (load \"$(PROJECT_ROOT)/emacs/loki-assistant-edna-tests.el\" nil t) \

@@ -7,6 +7,7 @@ use tokio::{
 
 use super::{
     identity::IdentityStore,
+    pairing::PairingService,
     protocol::ConnectionStatus,
     relay::{RelayRegistrar, RelaySession},
 };
@@ -82,9 +83,140 @@ pub struct NetworkService {
     registration_timeout: Duration,
     status: Arc<StatusService>,
     connection_changed: Notify,
+    pairing_changed: Notify,
+    pairings: Arc<PairingService>,
 }
 
 impl NetworkService {
+    pub fn router(self: &Arc<Self>) -> axum::Router {
+        super::routes::router(self.clone())
+    }
+
+    pub async fn create_pairing(
+        &self,
+    ) -> Result<super::protocol::CreatePairingResponse, super::protocol::NetworkError> {
+        use super::protocol::NetworkError;
+        let state = self.state.lock().await;
+        let active = state
+            .active
+            .as_ref()
+            .filter(|active| {
+                state.pending.is_none() && active.session.status() == ConnectionStatus::Connected
+            })
+            .ok_or(NetworkError::NotReady)?;
+        self.pairings
+            .create(
+                active.endpoint_id.clone(),
+                active.settings.url.clone(),
+                active.settings.token.clone(),
+            )
+            .await
+    }
+
+    pub async fn pairing(
+        &self,
+        id: &str,
+        cancel: bool,
+    ) -> Result<super::protocol::PairingResponse, super::protocol::NetworkError> {
+        self.pairings.query(id, cancel).await
+    }
+
+    pub async fn peers(&self) -> Result<Vec<super::protocol::Peer>, super::protocol::NetworkError> {
+        self.pairings.list().await
+    }
+
+    pub async fn remove_peer(
+        &self,
+        id: iroh::EndpointId,
+    ) -> Result<(), super::protocol::NetworkError> {
+        self.pairings.remove(id).await
+    }
+
+    /// 与 monitor 一样由进程入口显式调度；每条连接只处理一次绑定请求。
+    pub async fn receive_pairings(self: Arc<Self>) {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            let changed = self.pairing_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let session = self
+                .state
+                .lock()
+                .await
+                .active
+                .as_ref()
+                .map(|active| active.session.clone());
+            let endpoint = session.as_ref().and_then(|session| session.endpoint());
+            tokio::select! {
+                _ = &mut changed => {},
+                _ = tasks.join_next(), if !tasks.is_empty() => {},
+                incoming = async { endpoint.as_ref().unwrap().accept().await }, if endpoint.is_some() && tasks.len() < 32 => {
+                    if let Some(incoming) = incoming {
+                        let service = self.clone();
+                        let session = session.unwrap();
+                        tasks.spawn(async move {
+                            let connection = match tokio::time::timeout(Duration::from_secs(10), incoming).await {
+                                Ok(Ok(connection)) => connection,
+                                _ => return,
+                            };
+                            service.pairings.track(connection.clone()).await;
+                            let _ = tokio::time::timeout(Duration::from_secs(15), service.handle_pairing(&session, &connection)).await;
+                            service.pairings.untrack(connection.stable_id()).await;
+                            connection.close(0u32.into(), b"finished");
+                        });
+                    } else {
+                        changed.await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_pairing(
+        &self,
+        session: &Arc<dyn RelaySession>,
+        connection: &iroh::endpoint::Connection,
+    ) -> Result<(), ()> {
+        use super::protocol::{BindRequest, NetworkError};
+        let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| ())?;
+        let result = match recv.read_to_end(16_384).await {
+            Ok(data) => match serde_json::from_slice::<BindRequest>(&data) {
+                Ok(request) => {
+                    let state = self.state.lock().await;
+                    if state.pending.is_some()
+                        || !state
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(&active.session, session))
+                    {
+                        Err(NetworkError::NotReady)
+                    } else {
+                        self.pairings.bind(connection.remote_id(), request).await
+                    }
+                }
+                Err(_) => Err(NetworkError::InvalidRequest),
+            },
+            Err(_) => Err(NetworkError::InvalidRequest),
+        };
+        let response = match result {
+            Ok(response) => serde_json::to_vec(&response).map_err(|_| ())?,
+            Err(error) => serde_json::to_vec(&crate::http::error::ApiErrorResponse {
+                api_version: super::protocol::API_VERSION.to_owned(),
+                status: error.status(),
+                error: crate::http::error::ApiError {
+                    source: crate::http::error::ErrorSource::Business,
+                    code: error.code().to_owned(),
+                    message: error.to_string(),
+                },
+            })
+            .map_err(|_| ())?,
+        };
+        send.write_all(&response).await.map_err(|_| ())?;
+        send.finish().map_err(|_| ())?;
+        let _ = send.stopped().await;
+        Ok(())
+    }
+
     pub fn new(
         identity: Result<IdentityStore, String>,
         registrar: Arc<dyn RelayRegistrar>,
@@ -99,6 +231,10 @@ impl NetworkService {
                 serde_json::json!({"status": ConnectionStatus::Offline}),
             )
             .expect("固定状态路径有效");
+        let peers_path = identity
+            .as_ref()
+            .map(IdentityStore::peers_path)
+            .map_err(Clone::clone);
         Self {
             identity,
             registrar,
@@ -107,6 +243,8 @@ impl NetworkService {
             registration_timeout,
             status,
             connection_changed: Notify::new(),
+            pairing_changed: Notify::new(),
+            pairings: Arc::new(PairingService::new(peers_path)),
         }
     }
 
@@ -247,9 +385,11 @@ impl NetworkService {
 
     async fn finish(&self, state: &mut State) {
         if let Some(pending) = state.pending.take() {
+            self.pairings.invalidate().await;
             let old = std::mem::replace(&mut state.active, pending.candidate);
             self.restore_active_phase(state, ConnectionStatus::Offline);
             self.connection_changed.notify_one();
+            self.pairing_changed.notify_one();
             if let Some(old) = old {
                 if let Err(error) = old.session.close().await {
                     eprintln!("关闭原中转连接失败：{error}");
@@ -342,8 +482,10 @@ impl NetworkService {
 
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
+        self.pairings.invalidate().await;
         self.publish_phase(&mut state, ConnectionStatus::Disconnected);
         self.connection_changed.notify_one();
+        self.pairing_changed.notify_one();
         if let Some(pending) = state.pending.take() {
             if let Some(candidate) = pending.candidate {
                 let _ = candidate.session.close().await;

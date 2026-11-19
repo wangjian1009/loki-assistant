@@ -8,6 +8,10 @@
 
 `modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
+扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个本机邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 安全读写 `~/.assistant/peers.json`。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
+
+二维码由 `qr_code.rs` 在阻塞工作线程中生成 PNG，经创建响应的 `qr_code_png_base64` 返回；仅保留令牌摘要，不缓存图片或原始令牌。图片编码失败须保留原邀请。设备管理界面属于 Emacs，托盘不提供绑定入口；服务端测试实际解码生成图片并比较完整 payload。
+
 `modules/service/` 在服务组合时向共享 `StatusService` 发布 `service`，当前包含本次 services 进程的 `start_at`（Unix 秒）；该状态只保存在内存，重启后重新发布。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
@@ -56,9 +60,14 @@ src/
     │   ├── config.rs    中转地址和令牌元数据
     │   ├── protocol.rs  网络连接状态值
     │   ├── identity.rs  ~/.assistant/identity.json 安全读写与随机身份生成
+    │   ├── pairing.rs   绑定邀请、单次消费和设备授权事务
+    │   ├── peers.rs     ~/.assistant/peers.json 安全读写
+    │   ├── qr_code.rs   绑定 JSON 二维码的 PNG 与 Base64 编码
+    │   ├── routes.rs    本机绑定邀请与设备管理 HTTP
     │   ├── relay.rs     可注入的中转注册器与 iroh 连接
     │   ├── service.rs   配置处理、启动注册、连接切换与通知
-    │   └── tests.rs     身份、事务、通知与随机端口 relay 测试
+    │   ├── tests.rs     身份、事务、通知与随机端口 relay 测试
+    │   └── pairing_tests.rs  并发绑定、重试、过期、HTTP 与真实握手测试
     ├── control_center/
     │   ├── mod.rs       控制中心模块描述和导出
     │   ├── config.rs    登录启动配置元数据

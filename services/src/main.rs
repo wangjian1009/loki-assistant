@@ -33,6 +33,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         network.monitor().await;
     });
+    let network_pairings = tokio::spawn(services.network.clone().receive_pairings());
 
     eprintln!(
         "loki-services listening on http://{} (health: /healthz)",
@@ -46,7 +47,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         _ = terminate.recv() => Ok(())
     };
     network_start.abort();
+    network_pairings.abort();
     let _ = network_start.await;
+    let _ = network_pairings.await;
     services.network.shutdown().await;
     service_pfile.remove_if_owner()?;
     result?;

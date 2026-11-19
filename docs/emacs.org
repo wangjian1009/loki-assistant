@@ -11,7 +11,25 @@
 (require 'loki-assistant)
 #+end_src
 
+包内的 ~loki-assistant-command-map~ 统一提供命令快捷键，~c~ 打开服务配置管理界面，~d~ 打开设备管理。入口键由个人配置指定，例如：
+
+#+begin_src emacs-lisp
+(global-set-key (kbd "C-x a") loki-assistant-command-map)
+#+end_src
+
+配置后使用 ~C-x a c~ 打开配置界面，~C-x a d~ 打开设备管理。
+
 每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
+
+* 设备管理
+
+~M-x loki-assistant-devices~ 打开 ~*Loki Assistant Devices*~ buffer；默认只显示当前绑定设备的名称、身份与绑定时间，以及“新增设备”入口。不在托盘中提供设备绑定功能，托盘的其他功能保留。
+
+点击“新增设备”或按 ~a~ 后，在当前 buffer 中展开二维码、目标电脑身份、到期时间和绑定状态。services 创建五分钟有效的单次邀请并生成 PNG，Emacs 直接展示返回的 ~qr_code_png_base64~ ，不自行编码二维码，不显示或保存原始令牌。显示图片需要支持 PNG 的 Emacs 图形界面；中继未连接时显示服务端原因。
+
+只有展开的邀请处于等待状态且 buffer 可见时，每两秒查询一次进度。完成后自动更新设备列表并移除二维码，显示绑定结果；过期或失败后可“重新生成”。“收起”停止查询并取消未完成邀请；关闭 buffer 也会清理邀请与计时器，迟到响应不会恢复旧界面。短暂切换到其他 buffer 不发送后台进度请求，服务端有效期仍继续计算。
+
+按 ~g~ 刷新已绑定设备列表，不替换当前邀请；按 ~q~ 关闭界面。设备旁的“解除绑定”在确认后调用 services，失败时保留原设备并展示原因。列表表示绑定关系，不代表设备在线。入口已注册到 ~loki-assistant-command-map~ 的 ~d~ 键，开发操作使用根目录 ~make emacs-devices~ ；HTTP 字段与传输协议见 [[file:control-center-services.org::*扫码绑定][扫码绑定协议]]。HarmonyOS 扫码客户端尚未接入。
 
 * Emacs 状态主动上报
 
