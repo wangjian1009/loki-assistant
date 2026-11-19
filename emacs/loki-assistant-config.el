@@ -73,28 +73,45 @@
   (not (equal (widget-value (loki-assistant-config--entry-field entry))
               (loki-assistant-config--entry-baseline entry))))
 
+(defun loki-assistant-config--set-widget-text (widget text &optional face)
+  "设置 WIDGET 的 TEXT，并为其内容应用 FACE。
+`item' widget 通过 `princ' 重绘值，会丢失字符串上的文本属性，因此
+这里在 widget 重绘完成后直接给内容区域加 face。"
+  (when widget
+    (widget-value-set widget text)
+    (let ((from (widget-get widget :from))
+          (to (widget-get widget :to)))
+      (when (and (markerp from) (markerp to))
+        (with-silent-modifications
+          (remove-text-properties from to '(face nil))
+          (when face
+            (add-text-properties from to (list 'face face))))))))
+
 (defun loki-assistant-config--status (entry)
   "重绘 ENTRY 的执行过程、结果和配置来源。"
-  (widget-value-set
-   (loki-assistant-config--entry-status entry)
-   (cond
-    ((loki-assistant-config--entry-busy entry)
-     (propertize
-      (format "%s（已等待 %d 秒）"
-              (if (eq (loki-assistant-config--entry-busy entry) 'validating)
-                  "正在校验…" "正在执行并保存，请稍候…")
-              (max 0 (floor (- (float-time) (loki-assistant-config--entry-started-at entry)))))
-      'face 'warning))
-    ((loki-assistant-config--entry-error entry)
-     (propertize (loki-assistant-config--entry-error entry) 'face 'error))
-    ((loki-assistant-config--entry-result entry)
-     (propertize (loki-assistant-config--entry-result entry) 'face 'success))
-    ((loki-assistant-config--dirty-p entry)
-     (propertize "已修改，尚未保存" 'face 'custom-modified))
-    ((equal (loki-assistant-config--entry-source entry) "default")
-     (propertize "默认值" 'face 'shadow))
-    ((equal (loki-assistant-config--entry-source entry) "user") "用户设置，已保存")
-    (t "未设置"))))
+  (let (text face)
+    (cond
+     ((loki-assistant-config--entry-busy entry)
+      (setq text
+            (format "%s（已等待 %d 秒）"
+                    (if (eq (loki-assistant-config--entry-busy entry) 'validating)
+                        "正在校验…" "正在执行并保存，请稍候…")
+                    (max 0 (floor (- (float-time)
+                                     (loki-assistant-config--entry-started-at entry)))))
+            face 'warning))
+     ((loki-assistant-config--entry-error entry)
+      (setq text (loki-assistant-config--entry-error entry) face 'error))
+     ((loki-assistant-config--entry-result entry)
+      (setq text (loki-assistant-config--entry-result entry) face 'success))
+     ((loki-assistant-config--dirty-p entry)
+      (setq text "已修改，尚未保存" face 'custom-modified))
+     ((equal (loki-assistant-config--entry-source entry) "default")
+      (setq text "默认值" face 'shadow))
+     ((equal (loki-assistant-config--entry-source entry) "user")
+      (setq text "用户设置，已保存"))
+     (t (setq text "未设置")))
+    (loki-assistant-config--set-widget-text
+     (loki-assistant-config--entry-status entry) text face)))
 
 (defun loki-assistant-config--edited (entry)
   "ENTRY 发生编辑时清除上次结果，保留执行中和结果未知状态。"
@@ -273,8 +290,8 @@
   (widget-insert "\n\n")
   (setq loki-assistant-config--message (widget-create 'item :format "%v\n\n" "就绪"))
   (cond
-   (error-text (widget-value-set loki-assistant-config--message
-                                (propertize error-text 'face 'error)))
+   (error-text (loki-assistant-config--set-widget-text
+                loki-assistant-config--message error-text 'error))
    ((null modules) (widget-insert "没有可编辑的配置模块。\n"))
    (t
     (dolist (module modules)
@@ -419,9 +436,9 @@
              (unless (loki-assistant-config--busy-p)
                (loki-assistant-config--stop-wait-timer)
                (unless loki-assistant-config--saving-all
-                 (widget-value-set loki-assistant-config--message
-                                   (propertize (format "%s：%s" name text)
-                                               'face (if success 'success 'error)))))
+                 (loki-assistant-config--set-widget-text
+                  loki-assistant-config--message (format "%s：%s" name text)
+                  (if success 'success 'error))))
              (loki-assistant-config--sync-controls)
              (message "%s：%s" name text)
              (when callback (funcall callback success))))
@@ -516,14 +533,13 @@
            (cond
             ((not success)
              (setq loki-assistant-config--saving-all nil)
-             (widget-value-set
+             (loki-assistant-config--set-widget-text
               loki-assistant-config--message
-              (propertize
-               (format "保存已停止（已完成 %d/%d 项）：%s：%s；此前成功项已保存，其余输入保留。"
-                       loki-assistant-config--batch-done loki-assistant-config--batch-total
-                       (alist-get 'name (loki-assistant-config--entry-item current))
-                       (loki-assistant-config--entry-error current))
-               'face 'error))
+              (format "保存已停止（已完成 %d/%d 项）：%s：%s；此前成功项已保存，其余输入保留。"
+                      loki-assistant-config--batch-done loki-assistant-config--batch-total
+                      (alist-get 'name (loki-assistant-config--entry-item current))
+                      (loki-assistant-config--entry-error current))
+              'error)
              (loki-assistant-config--sync-controls))
             (pending
              (setq current (pop pending))
