@@ -96,7 +96,7 @@ impl NetworkService {
             .publish(
                 "network",
                 "my",
-                serde_json::json!({"status": ConnectionStatus::Disconnected}),
+                serde_json::json!({"status": ConnectionStatus::Offline}),
             )
             .expect("固定状态路径有效");
         Self {
@@ -189,7 +189,7 @@ impl NetworkService {
                     if settings.configured() {
                         ConnectionStatus::Failed
                     } else {
-                        ConnectionStatus::Disconnected
+                        ConnectionStatus::Offline
                     },
                 );
                 return Err(error);
@@ -248,7 +248,7 @@ impl NetworkService {
     async fn finish(&self, state: &mut State) {
         if let Some(pending) = state.pending.take() {
             let old = std::mem::replace(&mut state.active, pending.candidate);
-            self.restore_active_phase(state, ConnectionStatus::Disconnected);
+            self.restore_active_phase(state, ConnectionStatus::Offline);
             self.connection_changed.notify_one();
             if let Some(old) = old {
                 if let Err(error) = old.session.close().await {

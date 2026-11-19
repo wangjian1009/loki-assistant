@@ -4,6 +4,7 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionStatus {
     #[default]
+    Offline,
     Disconnected,
     Connected,
     Failed,

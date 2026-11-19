@@ -17,6 +17,7 @@ set(LOKI_APP_SOURCES
     Sources/App/LokiAssistantApp.swift
     Sources/App/CenterLog.swift
     Sources/App/IdleSleepController.swift
+    Sources/App/MenuStatusDot.swift
     Sources/App/ServiceStatusModel.swift
     Sources/App/ServiceSettingsClient.swift
     Sources/App/EmacsReportedStatus.swift
@@ -72,6 +73,7 @@ if(BUILD_TESTING)
     find_package(XCTest REQUIRED)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
         Tests/ServiceStatusTests.swift
+        Tests/MenuStatusDotTests.swift
         Tests/ServiceSettingsTests.swift
         Tests/EmacsReportedStatusTests.swift
         Tests/CenterLogTests.swift

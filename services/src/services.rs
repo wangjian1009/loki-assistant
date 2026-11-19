@@ -5,7 +5,7 @@ use axum::Router;
 use crate::{
     modules::{
         config, control_center, discover, emacs, health, network,
-        notification::NotificationService, password, status::StatusService,
+        notification::NotificationService, password, service, status::StatusService,
     },
     runtime::RuntimeState,
 };
@@ -16,6 +16,7 @@ pub struct Services {
     pub health: health::Module,
     pub discover: discover::Module,
     pub config: config::Module,
+    pub service: service::Module,
     pub notification: Arc<NotificationService>,
     pub status: Arc<StatusService>,
     pub emacs: emacs::Module,
@@ -42,6 +43,7 @@ impl Services {
         let discover = discover::Module::new();
         let notification = Arc::new(NotificationService::new());
         let status = Arc::new(StatusService::new());
+        let service = service::Module::new(Arc::clone(&status));
         let identity = config::service::ConfigService::storage_path()
             .map(|path| network::IdentityStore::new(path.with_file_name("identity.json")))
             .map_err(|error| error.to_string());
@@ -66,6 +68,7 @@ impl Services {
 
         Self {
             health,
+            service,
             discover,
             config,
             notification,
@@ -105,7 +108,17 @@ mod tests {
         // 网络构造和 Emacs 业务发布必须写到组合根持有的同一个实例。
         assert_eq!(
             services.status.value("network", "my").unwrap().value["status"],
-            "disconnected"
+            "offline"
+        );
+        assert!(
+            services
+                .status
+                .value("service", "start_at")
+                .unwrap()
+                .value
+                .as_u64()
+                .unwrap()
+                > 0
         );
         let buffers = json!([{"name":"共享状态测试", "mode":"agent-shell-mode", "directory":"/tmp/", "file":null, "modified":false}]);
         services

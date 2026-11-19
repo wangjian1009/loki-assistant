@@ -14,10 +14,27 @@ pub struct StatusResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct StatusModuleResponse {
+    pub api_version: String,
+    pub module_id: String,
+    pub value: BTreeMap<String, Value>,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct StatusValueResponse {
     pub api_version: String,
     pub module_id: String,
     pub key: String,
+    pub value: Value,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StatusPathResponse {
+    pub api_version: String,
+    pub module_id: String,
+    pub path: String,
     pub value: Value,
     pub updated_at: u64,
 }

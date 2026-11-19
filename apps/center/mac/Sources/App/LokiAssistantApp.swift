@@ -80,7 +80,9 @@ struct LokiAssistantApp: App {
     }()
 
     init() {
-        let reportedStatus = EmacsReportedStatusModel(logger: .shared)
+        let model = ServiceStatusModel()
+        _status = State(initialValue: model)
+        let reportedStatus = EmacsReportedStatusModel(status: model, logger: .shared)
         _reportedStatus = State(initialValue: reportedStatus)
         _idleSleep = State(initialValue: IdleSleepController())
         menuTrackingObserver = MenuTrackingObserver(status: reportedStatus)
@@ -89,13 +91,10 @@ struct LokiAssistantApp: App {
             || NSClassFromString("XCTestCase") != nil
         if isTesting {
             instanceLock = nil
-            _status = State(initialValue: ServiceStatusModel())
             return
         }
         let instanceLock = CenterInstanceLock()
         self.instanceLock = instanceLock
-        let model = ServiceStatusModel()
-        _status = State(initialValue: model)
         if instanceLock == nil {
             let existing = NSRunningApplication.runningApplications(
                 withBundleIdentifier: Bundle.main.bundleIdentifier ?? "cc.loki-assistant.center"
@@ -104,19 +103,12 @@ struct LokiAssistantApp: App {
             DispatchQueue.main.async {
                 NSApplication.shared.terminate(nil)
             }
-        } else {
-            model.startMonitoring()
         }
     }
 
     var body: some Scene {
         MenuBarExtra {
             DashboardView(status: status, reportedStatus: reportedStatus, idleSleep: idleSleep)
-                .onAppear {
-                    Task {
-                        await status.refresh()
-                    }
-                }
         } label: {
             Image(nsImage: idleSleep.isEnabled ? Self.menuBarSleepIcon : Self.menuBarIcon)
             .accessibilityLabel(idleSleep.isEnabled ? "Loki的助理，已阻止空闲休眠" : "Loki的助理")

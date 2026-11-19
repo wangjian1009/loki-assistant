@@ -98,7 +98,7 @@ struct EmacsReportedStatusClient: Sendable {
     }
 
     func fetchBuffers(operation: CenterLogOperation? = nil) async throws -> EmacsBufferStatus {
-        let endpoint = try await endpoint(operation: operation)
+        let endpoint = try discover()
         let request = URLRequest(url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/status"),
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         let result = try JSONDecoder().decode(EmacsBufferStatus.self, from: await send(request, operation: operation))
@@ -110,6 +110,11 @@ struct EmacsReportedStatusClient: Sendable {
             throw EmacsReportedStatusError.failed("Emacs buffer 状态响应无效")
         }
         return result
+    }
+
+    @MainActor
+    func makeStatusModel() -> ServiceStatusModel {
+        ServiceStatusModel(discover: discover, transport: transport)
     }
 
     func activate(_ buffer: MonitoredEmacsBuffer, operation: CenterLogOperation? = nil) async throws {
@@ -146,12 +151,14 @@ final class EmacsReportedStatusModel {
     private(set) var activating = false
     var activationError: String?
     @ObservationIgnored private let client: EmacsReportedStatusClient
+    @ObservationIgnored private let status: ServiceStatusModel
     @ObservationIgnored private let logger: CenterLog?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var menuOpen = false
 
-    init(client: EmacsReportedStatusClient = .init(), logger: CenterLog? = nil) {
+    init(client: EmacsReportedStatusClient = .init(), status: ServiceStatusModel? = nil, logger: CenterLog? = nil) {
+        self.status = status ?? client.makeStatusModel()
         self.client = client
         self.logger = logger
     }
@@ -164,9 +171,7 @@ final class EmacsReportedStatusModel {
     }
 
     func menuTrackingDidBegin() {
-        menuOpen = true
-        guard !loading else { return }
-        refresh(operation: logger?.start("打开托盘菜单"))
+        menuDidOpen()
     }
 
     func menuDidClose() {
@@ -186,9 +191,16 @@ final class EmacsReportedStatusModel {
         generation += 1
         let current = generation
         loading = true
-        refreshTask = Task { [weak self, client, logger] in
+        refreshTask = Task { [weak self, status, logger] in
             do {
-                let snapshot = try await client.fetchBuffers(operation: operation)
+                await status.refresh(operation: operation)
+                try Task.checkCancellation()
+                guard let snapshot = status.snapshot else {
+                    if case let .unavailable(message) = status.status {
+                        throw EmacsReportedStatusError.failed(message)
+                    }
+                    throw NotificationReceiptError.serviceUnavailable
+                }
                 try Task.checkCancellation()
                 guard let self else {
                     if let operation { logger?.finish(operation, result: "cancelled") }

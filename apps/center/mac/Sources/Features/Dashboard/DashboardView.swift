@@ -130,13 +130,13 @@ struct DashboardView: View {
     @ViewBuilder
     private var statusSummary: some View {
         switch status.status {
-        case let .healthy(health):
+        case let .healthy(version):
             Label {
                 if let startedAt = status.startedAt {
-                    Text("\(health.version) · 启动于 \(startedAt.formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))")
+                    Text("\(version) · \(networkStatusLabel) · 启动于 \(startedAt.formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))")
                         .monospacedDigit()
                 } else {
-                    Text(health.version)
+                    Text("\(version) · \(networkStatusLabel)")
                 }
             } icon: {
                 statusDot
@@ -161,21 +161,18 @@ struct DashboardView: View {
     }
 
     private var statusDot: some View {
-        Image(systemName: "circle.fill")
-            .font(.system(size: 9))
-            .foregroundStyle(statusColor)
+        Image(nsImage: MenuStatusDot.image(for: status.indicator))
+            .renderingMode(.original)
     }
 
-    private var statusColor: Color {
-        switch status.status {
-        case .healthy:
-            .green
-        case .unknown:
-            .gray
-        case .stopped:
-            .gray
-        case .unavailable:
-            .gray
+    private var networkStatusLabel: String {
+        switch status.networkStatus {
+        case "connected": "中继已连接"
+        case "connecting": "中继连接中"
+        case "failed": "中继连接失败"
+        case "offline": "offline"
+        case "disconnected": "中继未连接"
+        default: "网络状态未知"
         }
     }
 

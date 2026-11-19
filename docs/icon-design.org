@@ -27,6 +27,12 @@ Chrome 插件使用专用彩色母版，L 与气泡放大 45% 并上移居中，
 - [[file:../chrome-plugin/extension/icons/icon-128.png][Chrome 插件 128 × 128 PNG]]
 - [[file:../resources/icons/loki-assistant-chrome-v1.svg][Chrome 插件专用 SVG 母版]]
 
+* 菜单状态圆点
+
+顶部菜单栏图标保持单色 template 渲染，状态颜色仅用于展开菜单后的第一项圆点。圆点由 ~MenuStatusDot~ 生成带透明背景的 9/18 像素原色图像，设置 ~isTemplate = false~ ，避免原生菜单对 SF Symbol 的模板重着色。
+
+服务停止或不可达时圆点为红色；注册失败、断开或连接中为黄色；注册成功或未配置的 ~offline~ 为绿色。状态仅在打开菜单时读取一次完整 ~/status~ 快照，不启动后台轮询。
+
 * 制作与检查
 
 原生 SVG 绘制，通过 ~rsvg-convert~ 导出 PNG，使用 ~iconutil~ 生成包含 16、32、128、256、512 pt 及各自 @2x 版本的 ICNS。未使用 AI 生图工具。

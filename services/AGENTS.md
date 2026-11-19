@@ -8,6 +8,8 @@
 
 `modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
+`modules/service/` 在服务组合时向共享 `StatusService` 发布 `service`，当前包含本次 services 进程的 `start_at`（Unix 秒）；该状态只保存在内存，重启后重新发布。
+
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
 `modules/password/` 维护本地 `store_dir`、`pass_path` 配置和只读查询协议。业务 HTTP 仅提供 `GET /password/entries` 和 `GET /password/entries/{*file}`，单条文件标识由路径传递，不接受 JSON 查询请求体。条目列表通过 `pass ls` 获取，解密通过固定的 `pass show --` 获取，不直接读取条目内容或调用 GPG；文件系统只用于目录、普通文件和路径边界检查。命令执行经本模块可注入的 `CommandRunner`，不复用 Emacs gateway。HTTP 不接收程序、库目录或任意命令参数，不提供密码写入操作；明文与 pass/GPG 原始错误不进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身，不读取真实密码库。
@@ -62,6 +64,10 @@ src/
     │   ├── config.rs    登录启动配置元数据
     │   ├── service.rs   提交前 LaunchAgent 同步与落盘失败撤销
     │   └── tests.rs     注入 launchctl 替身的提交与失败测试
+    ├── service/
+    │   ├── mod.rs       服务自身状态模块入口和发现元数据
+    │   ├── service.rs   本机启动时间发布
+    │   └── status.rs    service 状态结构声明
     ├── emacs/
     │   ├── mod.rs       Emacs 模块入口、依赖注入和发现元数据
     │   ├── config.rs    EmacsConfig、配置项读取方法与静态配置元数据

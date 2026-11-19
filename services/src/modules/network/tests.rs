@@ -546,7 +546,7 @@ async fn incomplete_settings_are_saved_without_registration_on_startup_or_update
             .await
             .unwrap();
         assert!(fixture.registrar.calls.lock().unwrap().is_empty());
-        assert_eq!(fixture.phase(), "disconnected");
+        assert_eq!(fixture.phase(), "offline");
         assert_eq!(fixture.titles(), ["已生成本地身份"]);
     }
 }
@@ -599,7 +599,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
             .replace("network", "relay_token", json!(""))
             .await
             .unwrap();
-        assert_eq!(fixture.phase(), "disconnected");
+        assert_eq!(fixture.phase(), "offline");
         assert_eq!(fixture.registrar.calls.lock().unwrap().len(), 2);
         assert!(
             fixture.registrar.sessions.lock().unwrap()[1]

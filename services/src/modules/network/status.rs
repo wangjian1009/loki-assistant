@@ -9,9 +9,14 @@ use loki_services_macros::loki_status;
 fn network_status_metadata() -> StatusModuleMetadata {
     let choices = [
         (
+            ConnectionStatus::Offline,
+            "未配置",
+            "中转地址或令牌未配置完整，不注册中转。",
+        ),
+        (
             ConnectionStatus::Disconnected,
             "未连接",
-            "地址或令牌未配置完整，或服务已关闭。",
+            "已配置连接断开，或服务已关闭。",
         ),
         (
             ConnectionStatus::Connected,

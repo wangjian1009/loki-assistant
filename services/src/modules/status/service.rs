@@ -5,7 +5,10 @@ use std::{
 };
 
 use super::model::StatusModuleMetadata;
-use super::protocol::{API_VERSION, StatusResponse, StatusValueResponse, StatusValues};
+use super::protocol::{
+    API_VERSION, StatusModuleResponse, StatusPathResponse, StatusResponse, StatusValueResponse,
+    StatusValues,
+};
 use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +77,68 @@ impl StatusService {
             api_version: API_VERSION.to_owned(),
             module_id: module_id.to_owned(),
             key: key.to_owned(),
+            value: value.clone(),
+            updated_at: state.timestamps[&(module_id.to_owned(), key.to_owned())],
+        })
+    }
+
+    pub fn module_value(&self, module_id: &str) -> Result<StatusModuleResponse, StatusError> {
+        Self::valid_name(module_id)?;
+        let state = self.snapshot.read().expect("状态锁不应中毒");
+        let values = state
+            .values
+            .get(module_id)
+            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
+        let updated_at = values
+            .keys()
+            .map(|key| state.timestamps[&(module_id.to_owned(), key.clone())])
+            .max()
+            .expect("已发布模块至少包含一个状态项");
+        Ok(StatusModuleResponse {
+            api_version: API_VERSION.to_owned(),
+            module_id: module_id.to_owned(),
+            value: values.clone(),
+            updated_at,
+        })
+    }
+
+    pub fn path_value(
+        &self,
+        module_id: &str,
+        key: &str,
+        path: &str,
+    ) -> Result<StatusPathResponse, StatusError> {
+        Self::valid_name(module_id)?;
+        Self::valid_name(key)?;
+        let segments: Vec<_> = path.split('/').collect();
+        if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+            return Err(StatusError::InvalidName);
+        }
+        for segment in &segments {
+            Self::valid_name(segment)?;
+        }
+        let state = self.snapshot.read().expect("状态锁不应中毒");
+        let root = state
+            .values
+            .get(module_id)
+            .and_then(|values| values.get(key))
+            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), key.to_owned()))?;
+        let mut value = root;
+        for segment in &segments {
+            value = match value {
+                Value::Object(object) => object.get(*segment),
+                Value::Array(array) => segment
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| array.get(index)),
+                _ => None,
+            }
+            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), format!("{key}/{path}")))?;
+        }
+        Ok(StatusPathResponse {
+            api_version: API_VERSION.to_owned(),
+            module_id: module_id.to_owned(),
+            path: format!("{key}/{path}"),
             value: value.clone(),
             updated_at: state.timestamps[&(module_id.to_owned(), key.to_owned())],
         })

@@ -70,7 +70,7 @@ final class EmacsReportedStatusTests: XCTestCase {
         try await client.activate(XCTUnwrap(snapshot.bufferGroups.first?.buffers.first))
         let paths = await transport.paths
         let query = await transport.query
-        XCTAssertEqual(paths, ["/healthz", "/status", "/healthz", "/emacs/activate"])
+        XCTAssertEqual(paths, ["/status", "/healthz", "/emacs/activate"])
         XCTAssertEqual(query, "中文会话")
     }
 
@@ -135,7 +135,7 @@ final class EmacsReportedStatusTests: XCTestCase {
         XCTAssertEqual(model.bufferGroups.first?.buffers.count, 1)
         model.refresh()
         let closedPaths = await transport.paths
-        XCTAssertEqual(closedPaths.count, 2)
+        XCTAssertEqual(closedPaths, ["/status"])
         await transport.setFailing()
         model.menuDidOpen()
         try await waitUntil { model.refreshError != nil }
@@ -157,6 +157,40 @@ final class EmacsReportedStatusTests: XCTestCase {
         try await waitUntil { model.hasSnapshot }
         XCTAssertEqual(model.bufferGroups.first?.buffers.count, 1)
         XCTAssertNil(model.refreshError)
+        model.menuDidClose()
+    }
+
+    @MainActor
+    func testMenuOpenFetchesOneSnapshotForServiceNetworkAndBuffers() async throws {
+        let transport = StatusTestTransport()
+        await transport.setStatusBody(#"""
+        {"api_version":"1","updated_at":201,"status":{
+          "service":{"start_at":200},
+          "network":{"my":{"status":"connected"}},
+          "emacs":{"buffers":[{"name":"同一快照","mode":"agent-shell-mode","directory":"/tmp/","modified":false}]}
+        }}
+        """#)
+        let status = Self.client(transport).makeStatusModel()
+        let model = EmacsReportedStatusModel(client: Self.client(transport), status: status)
+        XCTAssertNil(status.lastUpdated)
+        let initialPaths = await transport.paths
+        XCTAssertTrue(initialPaths.isEmpty)
+        model.menuTrackingDidBegin()
+        model.menuDidOpen()
+        try await waitUntil { model.hasSnapshot }
+        model.menuTrackingDidBegin()
+        model.menuDidOpen()
+        XCTAssertEqual(status.startedAt, Date(timeIntervalSince1970: 200))
+        XCTAssertEqual(status.networkStatus, "connected")
+        XCTAssertEqual(status.indicator, .green)
+        XCTAssertEqual(model.bufferGroups.first?.buffers.first?.name, "同一快照")
+        let paths = await transport.paths
+        XCTAssertEqual(paths, ["/status"])
+        model.menuDidClose()
+        model.menuTrackingDidBegin()
+        try await waitUntil { await transport.paths.count == 2 && !model.loading }
+        let reopenedPaths = await transport.paths
+        XCTAssertEqual(reopenedPaths, ["/status", "/status"])
         model.menuDidClose()
     }
 }

@@ -28,11 +28,57 @@ struct ServiceEndpoint: Codable, Equatable, Sendable {
     }
 }
 
+struct SelfServiceStatusModule: Decodable, Equatable, Sendable {
+    let startedAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case startedAt = "start_at"
+    }
+}
+
+struct NetworkStatusValue: Decodable, Equatable, Sendable {
+    let status: String
+}
+
+struct NetworkStatusModule: Decodable, Equatable, Sendable {
+    let my: NetworkStatusValue?
+}
+
+struct ServiceStatusModules: Decodable, Equatable, Sendable {
+    let service: SelfServiceStatusModule?
+    let network: NetworkStatusModule?
+}
+
+struct ServiceStatusSnapshot: Decodable, Equatable, Sendable {
+    let apiVersion: String
+    let status: ServiceStatusModules
+    let updatedAt: UInt64?
+    let bufferGroups: [EmacsBufferGroup]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        apiVersion = try container.decode(String.self, forKey: .apiVersion)
+        status = try container.decode(ServiceStatusModules.self, forKey: .status)
+        updatedAt = try container.decodeIfPresent(UInt64.self, forKey: .updatedAt)
+        bufferGroups = try EmacsBufferStatus(from: decoder).bufferGroups
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case apiVersion = "api_version"
+        case status
+        case updatedAt = "updated_at"
+    }
+}
+
 enum ServiceStatus: Equatable, Sendable {
     case unknown
-    case healthy(HealthResponse)
+    case healthy(String)
     case stopped
     case unavailable(String)
+}
+
+enum ServiceIndicator: Hashable {
+    case red, yellow, green
 }
 
 @MainActor
@@ -44,7 +90,20 @@ final class ServiceStatusModel {
     private(set) var status: ServiceStatus = .unknown
     private(set) var lastUpdated: Date?
     private(set) var startedAt: Date?
-    @ObservationIgnored private var monitoringTask: Task<Void, Never>?
+    private(set) var networkStatus: String?
+    private(set) var snapshot: ServiceStatusSnapshot?
+
+    var indicator: ServiceIndicator {
+        switch status {
+        case .stopped, .unavailable: .red
+        case .unknown: .yellow
+        case .healthy:
+            switch networkStatus {
+            case "offline", "connected": .green
+            default: .yellow
+            }
+        }
+    }
     @ObservationIgnored private let discover: Discover
     @ObservationIgnored private let transport: Transport
 
@@ -56,41 +115,55 @@ final class ServiceStatusModel {
         self.transport = transport
     }
 
-    func startMonitoring() {
-        guard monitoringTask == nil else { return }
-        monitoringTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
-    }
-
-    func refresh() async {
+    func refresh(operation: CenterLogOperation? = nil) async {
         do {
             // 与通知回执共用文件锁和 pfile 发现，不依赖任何服务管理器的任务名。
             let endpoint = try discover()
             let request = URLRequest(
-                url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/healthz"),
+                url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/status"),
                 cachePolicy: .reloadIgnoringLocalCacheData,
                 timeoutInterval: 5
             )
-            let (data, response) = try await transport(request)
+            let (data, response): (Data, URLResponse)
+            do {
+                (data, response) = try await transport(request)
+            } catch {
+                operation?.call("GET /status", result: "failure", details: ["error": error.localizedDescription])
+                throw error
+            }
+            try Task.checkCancellation()
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            operation?.call("GET /status", result: statusCode == 200 ? "success" : "failure", details: ["http_status": "\(statusCode)"])
+            if statusCode != 200,
+               let message = (try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data))?.error.message {
+                throw NSError(domain: "LokiAssistant.Status", code: statusCode, userInfo: [NSLocalizedDescriptionKey: message])
+            }
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }
-            let health = try JSONDecoder().decode(HealthResponse.self, from: data)
-            guard health.service == "loki-services", health.status == "ok" else {
+            let snapshot = try JSONDecoder().decode(ServiceStatusSnapshot.self, from: data)
+            guard snapshot.apiVersion == "1" else {
                 throw URLError(.cannotParseResponse)
             }
-            status = .healthy(health)
-            startedAt = Date(timeIntervalSince1970: TimeInterval(endpoint.startedAt))
+            status = .healthy(endpoint.version)
+            self.snapshot = snapshot
+            startedAt = snapshot.status.service.map {
+                Date(timeIntervalSince1970: TimeInterval($0.startedAt))
+            }
+            networkStatus = snapshot.status.network?.my?.status
+        } catch is CancellationError {
+            return
         } catch NotificationReceiptError.serviceUnavailable {
             status = .stopped
             startedAt = nil
+            networkStatus = nil
+            snapshot = nil
         } catch {
+            guard !Task.isCancelled else { return }
             status = .unavailable(error.localizedDescription)
             startedAt = nil
+            networkStatus = nil
+            snapshot = nil
         }
         lastUpdated = Date()
     }

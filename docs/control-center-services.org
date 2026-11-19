@@ -19,6 +19,7 @@
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/network~ | 本地身份持久化、中转注册和结果通知 | 已实现 |
+| ~modules/service~ | 发布本机 services 进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
@@ -85,7 +86,9 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 | POST | ~/emacs/capture/full~ | 接收浏览器生成的 Org 全文并进入 Loki Assistant 捕获 |
 | GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
 | GET | ~/status~ | 读取全部模块发布的状态 |
-| GET | ~/status/{module_id}/{key}~ | 读取指定状态数据项 |
+| GET | ~/status/{module_id}~ | 读取模块完整状态对象 |
+| GET | ~/status/{module_id}/{key}~ | 读取指定状态项 object 或 array |
+| GET | ~/status/{module_id}/{key}/{*path}~ | 按层级读取指定状态字段 |
 | POST | ~/emacs/activate~ | 显示 Emacs 或通过 buffer 查询参数定位目标 |
 | POST | ~/emacs/receiver/status~ | 接收 Emacs 业务状态并通过 Rust 接口发布 |
 | POST | ~/emacs/receiver/notification~ | 接收 Emacs 通知上报，默认展示 macOS 系统通知 |
@@ -229,7 +232,7 @@ control-center:
 
 ** 本机网络状态
 
-网络模块向共享状态中心发布 ~network/my~ ，通过 ~GET /status/network/my~ 读取，其 ~value~ 目前只包含 ~status~ ：
+网络模块向共享状态中心发布 ~network/my~ ，通过 ~GET /status/network/my~ 读取完整状态项；读取连接字段使用 ~GET /status/network/my/status~ ，返回当前连接状态：
 
 #+begin_src json
 {"api_version":"1","module_id":"network","key":"my","value":{"status":"disconnected"},"updated_at":1794890558}
@@ -237,7 +240,8 @@ control-center:
 
 | status | 含义 |
 |--------+------|
-| ~disconnected~ | 未连接，地址或令牌未配置完整，或服务正在关闭 |
+| ~offline~ | 地址或令牌未配置完整，不注册中转 |
+| ~disconnected~ | 已配置连接断开，或服务正在关闭 |
 | ~connecting~ | 正在注册或等待连接 |
 | ~connected~ | 连接成功 |
 | ~failed~ | 连接失败且没有保留的可用连接 |
@@ -330,13 +334,29 @@ GET /password/entries/example.com/alice.gpg
 
 ~modules/status~ 统一保存外部发布的模块/数据项数据，并提供 Rust 发布接口与版本为 ~1~ 的 HTTP 只读查询。该模块只处理名称校验、内存存储和序列化，具体值及更新时机由发布方负责；不读取配置、不查询 Emacs 或网络，不为查询启动业务程序。~Services~ 创建唯一 ~Arc<StatusService>~ ，业务发布方通过依赖注入共用这一实例。
 
+** 服务自身运行状态
+
+~service~ 模块只表示当前 services 进程自身，不使用节点层。服务组装时发布 Unix 秒整数 ~start_at~，~GET /status~ 返回的数据包含：
+
+#+begin_src json
+{"api_version":"1","status":{"service":{"start_at":1795074000},"network":{"my":{"status":"connected"}}},"updated_at":1795074000}
+#+end_src
+
+~GET /status/service~ 返回整个服务自身状态对象：
+
+#+begin_src json
+{"api_version":"1","module_id":"service","value":{"start_at":1795074000},"updated_at":1795074000}
+#+end_src
+
+启动时间是响应字段，不把 ~start_at~ 附加在服务详情查询路径中。网络模块允许多个节点，保留 ~network/{节点}/status~ 层级，当前本机节点为 ~my~。两者的数据均由统一 ~GET /status~ 快照提供，托盘每次打开菜单时只读取一次该快照，不为启动时间另发字段请求。
+
 ** 状态结构声明
 
-状态定义采用与配置元数据相同的编译期注册方式：业务模块在自己的 ~status.rs~ 中用 ~#[loki_status]~ 修饰无参数、无泛型的同步函数，返回 ~StatusModuleMetadata~ 。过程宏通过 ~linkme~ 注册到 ~STATUS_MODULES~ ，不在运行时注册，也不需要创建业务实例。当前 Emacs 声明 ~buffers~ 和 ~runtime~ ，网络模块声明 ~my~ 。
+状态定义采用与配置元数据相同的编译期注册方式：业务模块在自己的 ~status.rs~ 中用 ~#[loki_status]~ 修饰无参数、无泛型的同步函数，返回 ~StatusModuleMetadata~ 。过程宏通过 ~linkme~ 注册到 ~STATUS_MODULES~ ，不在运行时注册，也不需要创建业务实例。当前服务自身状态模块声明 ~start_at~，Emacs 声明 ~buffers~ 和 ~runtime~ ，网络模块声明 ~my~ 。
 
-~GET /stats/meta~ 返回 ~api_version~ 和完整 ~modules~ 列表；模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 和递归 ~schema~ ，数据路径为 ~/status/{模块 id}/{状态项 key}~ 。
+~GET /stats/meta~ 返回 ~api_version~ 和完整 ~modules~ 列表；模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 和递归 ~schema~ ，数据路径为 ~/status/{模块 id}/{状态项 key}~；嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~。当前包含 ~service~、~emacs/buffers~、~emacs/runtime~ 和 ~network/my~ ，其中读取本次 services 启动时间使用 ~GET /status/service~ 。
 
-~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未连接、连接成功、连接失败和连接中的四个值及说明。
+~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未配置、未连接、连接成功、连接失败和连接中的五个值及说明。
 
 元数据与运行时值分开维护：尚未发布数据时仍返回完整声明，查询元数据不改变状态和更新时间，也不返回运行时字段值、身份或令牌。声明用于结构发现及外部 HTTP 上报校验；外部发布的数据项必须已经声明。Rust 内部直接发布继续使用通用 JSON 值。HTTP 元数据接口保持只读。
 
@@ -356,7 +376,7 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 {"api_version":"1","status":400,"error":{"source":"business","code":"invalid-request","message":"请求无效：状态数据无效：emacs/buffers[0].modified：必须是 boolean"}}
 #+end_src
 
-~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回 ~module_id~ 、 ~key~ 、 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ ，未发布时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
+~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回完整状态项；~GET /status/{module_id}/{key}/{*path}~ 返回 ~module_id~、层级 ~path~、字段 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ 。字段路径按 URL 层级编码，不使用点号；未发布或字段不存在时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
 
 模块名和键不能为空、不能包含 ~/~ 、不能为 ~.~ 或 ~..~ ；空批量发布或名称无效返回 ~StatusError~ ，整批不修改；HTTP 查询名称无效返回 400 ~invalid-request~ 。Rust 发布接口为 ~StatusService::publish~ 与 ~publish_many~ ，读取接口为 ~value~ 和 ~snapshot~ 。发布后的数据只保留在内存，重启后由各发布方重新设置，不写入 YAML。旧 Emacs 状态路由已迁移到本模块。
 

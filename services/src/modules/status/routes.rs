@@ -1,6 +1,9 @@
 use super::{
     StatusService,
-    protocol::{API_VERSION, StatusMetaResponse, StatusResponse, StatusValueResponse},
+    protocol::{
+        API_VERSION, StatusMetaResponse, StatusModuleResponse, StatusPathResponse, StatusResponse,
+        StatusValueResponse,
+    },
     service::StatusError,
 };
 use crate::http::error::{ErrorSource, response};
@@ -18,6 +21,8 @@ pub fn router(service: Arc<StatusService>) -> Router {
     Router::new()
         .route("/stats/meta", get(metadata))
         .route("/status", get(snapshot))
+        .route("/status/{module_id}", get(module_value))
+        .route("/status/{module_id}/{key}/{*path}", get(path_value))
         .route("/status/{module_id}/{key}", get(value))
         .with_state(service)
 }
@@ -51,6 +56,24 @@ async fn snapshot(State(service): State<Arc<StatusService>>) -> Json<StatusRespo
 
 #[loki_api(
     module = "status",
+    id = "module-value",
+    method = "GET",
+    path = "/status/{module_id}",
+    summary = "读取模块完整状态",
+    description = "返回指定模块的完整状态对象及最后更新时间；service 对象直接包含 start_at，不增加节点层级。"
+)]
+async fn module_value(
+    State(service): State<Arc<StatusService>>,
+    Path(module): Path<String>,
+) -> Result<Json<StatusModuleResponse>, Response> {
+    service
+        .module_value(&module)
+        .map(Json)
+        .map_err(error_response)
+}
+
+#[loki_api(
+    module = "status",
     id = "value",
     method = "GET",
     path = "/status/{module_id}/{key}",
@@ -63,6 +86,24 @@ async fn value(
 ) -> Result<Json<StatusValueResponse>, Response> {
     service
         .value(&module, &key)
+        .map(Json)
+        .map_err(error_response)
+}
+
+#[loki_api(
+    module = "status",
+    id = "path-value",
+    method = "GET",
+    path = "/status/{module_id}/{key}/{*path}",
+    summary = "读取层级状态字段",
+    description = "按 module/key/field/path 层级读取 object 或 array 中的字段，避免在状态接口路径和响应约定中使用点号。"
+)]
+async fn path_value(
+    State(service): State<Arc<StatusService>>,
+    Path((module, key, path)): Path<(String, String, String)>,
+) -> Result<Json<StatusPathResponse>, Response> {
+    service
+        .path_value(&module, &key, &path)
         .map(Json)
         .map_err(error_response)
 }

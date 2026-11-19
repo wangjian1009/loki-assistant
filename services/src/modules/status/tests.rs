@@ -50,6 +50,15 @@ async fn rust_publishers_preserve_json_values_and_http_reads_the_shared_snapshot
     assert_eq!(value["module_id"], "tools");
     let (_, value) = request(service.clone(), "GET", "/status/tools/enabled", Value::Null).await;
     assert_eq!(value["value"], false);
+    let (_, value) = request(
+        service.clone(),
+        "GET",
+        "/status/emacs/runtime/pid",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(value["path"], "runtime/pid");
+    assert_eq!(value["value"], 123);
     let (_, read) = request(service, "GET", "/status", Value::Null).await;
     assert_eq!(read, serde_json::to_value(posted).unwrap());
 }
@@ -146,7 +155,11 @@ async fn status_module_is_discoverable_and_old_emacs_status_routes_are_removed()
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
-    for path in ["/discover/modules/status", "/status/network/my"] {
+    for path in [
+        "/discover/modules/status",
+        "/status/network/my",
+        "/status/network/my/status",
+    ] {
         let response = app
             .clone()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -157,7 +170,7 @@ async fn status_module_is_discoverable_and_old_emacs_status_routes_are_removed()
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         if path.starts_with("/discover") {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 3);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 5);
             assert!(
                 body["apis"]
                     .as_array()
@@ -165,10 +178,38 @@ async fn status_module_is_discoverable_and_old_emacs_status_routes_are_removed()
                     .iter()
                     .all(|api| api["method"] == "GET")
             );
+        } else if path.ends_with("/status") {
+            assert_eq!(body["path"], "my/status");
+            assert_eq!(body["value"], "offline");
         } else {
-            assert_eq!(body["value"]["status"], "disconnected");
+            assert_eq!(body["value"]["status"], "offline");
         }
     }
+}
+
+#[tokio::test]
+async fn service_state_has_no_node_layer_and_module_query_returns_all_fields() {
+    let services = Arc::new(crate::Services::build());
+    let status = Arc::clone(&services.status);
+    let snapshot = status.snapshot();
+    let start_at = snapshot.status["service"]["start_at"].as_u64().unwrap();
+    assert!(start_at > 0);
+    assert_eq!(snapshot.status["service"].len(), 1);
+    let (code, body) = request(Arc::clone(&status), "GET", "/status/service", Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["module_id"], "service");
+    assert_eq!(body["value"], json!({"start_at": start_at}));
+    assert!(body["updated_at"].as_u64().unwrap() >= start_at);
+    let (code, _) = request(
+        Arc::clone(&status),
+        "GET",
+        "/status/service/my",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    let (code, _) = request(status, "GET", "/status/device", Value::Null).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
 }
 
 #[test]
@@ -204,7 +245,7 @@ async fn metadata_is_complete_before_publication_and_contains_no_runtime_values(
             .iter()
             .map(|module| module["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["emacs", "network"]
+        ["emacs", "network", "service"]
     );
     assert!(service.snapshot().status.is_empty());
     assert_eq!(service.snapshot().updated_at, None);
@@ -273,6 +314,7 @@ async fn metadata_describes_buffer_fields_runtime_and_all_network_states() {
         .map(|choice| choice["value"].clone())
         .collect();
     let expected: Vec<Value> = [
+        ConnectionStatus::Offline,
         ConnectionStatus::Disconnected,
         ConnectionStatus::Connected,
         ConnectionStatus::Failed,
@@ -287,6 +329,17 @@ async fn metadata_describes_buffer_fields_runtime_and_all_network_states() {
             .iter()
             .all(|choice| !choice["label"].as_str().unwrap().is_empty())
     );
+    let service_module = modules
+        .iter()
+        .find(|module| module["id"] == "service")
+        .unwrap();
+    let service_item = service_module["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["key"] == "start_at")
+        .unwrap();
+    assert_eq!(service_item["schema"]["data_type"], "integer");
 }
 
 #[test]
@@ -312,7 +365,13 @@ fn external_validation_checks_primitive_types_optional_fields_and_nullable_value
     )
     .unwrap();
     let service = StatusService::new();
-    for state in ["disconnected", "connected", "failed", "connecting"] {
+    for state in [
+        "offline",
+        "disconnected",
+        "connected",
+        "failed",
+        "connecting",
+    ] {
         service
             .publish_many_validated(
                 serde_json::from_value(json!({"network":{"my":{"status":state}}})).unwrap(),

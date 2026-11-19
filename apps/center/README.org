@@ -2,9 +2,9 @@
 
 * 当前状态
 
-当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本和启动时间；启动时间来自服务发现文件的 ~started_at~ ，不逐秒更新运行时长。services 不可达时显示不可用状态。
+当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本、网络连接状态和启动时间；启动时间与网络连接状态来自每次打开菜单时读取的完整 ~GET /status~ 快照，其中启动时间读取 ~service~ 数据中的 ~start_at~ ，不逐秒更新运行时长。services 不可达时显示不可用状态。
 
-应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，通过 loopback HTTP 请求 ~GET /healthz~ 获取版本。应用后台每 5 秒轮询一次，菜单再次打开时立即查询；服务未运行时显示灰色“未运行”。托盘只显示服务状态，services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。不包含 Emacs 会话、语音输入或其他旧版功能。
+每次打开菜单时，应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，只请求一次 ~GET /status~。同一完整快照用于刷新启动时间、网络连接状态和 buffer 列表；启动时、菜单关闭时和菜单保持打开时均不定时轮询。顶部图标保持单色，只有菜单第一项圆点着色：服务未运行或不可达为红色，注册失败、断开或连接中为黄色，注册成功和未配置的 ~offline~ 为绿色。services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。
 
 菜单中的“阻止空闲休眠”开关使用 macOS 的 ~PreventUserIdleSystemSleep~ activity。开启后阻止系统因空闲自动休眠，关闭后立即释放 activity；开关状态保存到用户默认设置并在应用下次启动时恢复。该开关不阻止用户主动睡眠、合盖或锁屏。
 
@@ -22,7 +22,7 @@
 
 * 应用图标
 
-应用显示名称为“Loki的助理”，采用已确认的“对话中的 L”图标：深绿底板、薄荷色字母 L 与回应气泡。SVG 母版与设计预览统一放在仓库根目录 ~resources/icons/~ ，由根目录 ~scripts/export-icons.py~ 同时生成 macOS 与 HarmonyOS 图标。Mac 应用的完整 PNG iconset、ICNS、1024 像素 PNG 及菜单栏 20/40 像素透明图标位于 ~mac/Resources/AppIcon/~ 。菜单栏使用单色 template 图标，自动适配浅色与深色外观；设计说明与导出文件见 [[file:../../docs/icon-design.org][图标设计]]。
+应用显示名称为“Loki的助理”，采用已确认的“对话中的 L”图标：深绿底板、薄荷色字母 L 与回应气泡。SVG 母版与设计预览统一放在仓库根目录 ~resources/icons/~ ，由根目录 ~scripts/export-icons.py~ 同时生成 macOS 与 HarmonyOS 图标。Mac 应用的完整 PNG iconset、ICNS、1024 像素 PNG 及菜单栏 20/40 像素透明图标位于 ~mac/Resources/AppIcon/~ 。顶部菜单栏保持单色 template 渲染并保留休眠月牙标记；红、黄、绿仅用于展开菜单后的第一项状态圆点；设计说明与导出文件见 [[file:../../docs/icon-design.org][图标设计]]。
 
 修改 SVG 母版后，在仓库根目录执行：
 
