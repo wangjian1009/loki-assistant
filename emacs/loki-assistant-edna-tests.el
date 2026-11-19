@@ -54,6 +54,80 @@
       (should-error (org-todo "DONE"))
       (should (equal source (buffer-string))))))
 
+(ert-deftest loki-assistant-edna-test-spawn-six-months-from-each-completion ()
+  (let ((rule "self loki-spawn-next!(today \"+6m\")"))
+    (loki-assistant-edna-test-with-org
+        (concat "* TODO 复查\nSCHEDULED: <2020-01-01 Wed 09:00-10:00>\n"
+                ":PROPERTIES:\n:TRIGGER: " rule "\n:END:\n")
+      (let ((fixed-time (encode-time 0 34 12 19 11 2026)))
+        (cl-letf (((symbol-function 'org-current-time) (lambda (&rest _) fixed-time)))
+          (org-todo "DONE")))
+      (goto-char (point-min))
+      (should (equal (org-get-todo-state) "DONE"))
+      (should (equal (org-entry-get nil "SCHEDULED") "<2020-01-01 Wed 09:00-10:00>"))
+      (org-next-visible-heading 1)
+      (should (equal (org-get-todo-state) "TODO"))
+      (should (equal (org-entry-get nil "SCHEDULED") "<2027-05-19 Wed 09:00-10:00>"))
+      (should (equal (org-entry-get nil "CREATED") "[2026-11-19 Thu 12:34]"))
+      (should (equal (org-entry-get nil "TRIGGER") rule))
+      ;; 第二次延期完成时，仍以本次完成日为基准。
+      (let ((fixed-time (encode-time 0 0 15 22 5 2027)))
+        (cl-letf (((symbol-function 'org-current-time) (lambda (&rest _) fixed-time)))
+          (org-todo "DONE")))
+      (goto-char (point-max))
+      (org-back-to-heading t)
+      (should (equal (org-entry-get nil "SCHEDULED") "<2027-11-22 Mon 09:00-10:00>"))
+      (should (equal (org-entry-get nil "TRIGGER") rule)))))
+
+(ert-deftest loki-assistant-edna-test-spawn-months-without-schedule-clamps-month-end ()
+  (dolist (case '((2026 11 19 "+6m" "2027-05-19 Wed")
+                  (2026 8 31 "+6m" "2027-02-28 Sun")
+                  (2023 8 31 "+6m" "2024-02-29 Thu")
+                  (2024 2 29 "+12m" "2025-02-28 Fri")
+                  (2026 1 31 "+1m" "2026-02-28 Sat")))
+    (loki-assistant-edna-test-with-org
+        (format "* TODO 复查\n:PROPERTIES:\n:TRIGGER: self loki-spawn-next!(today %S)\n:END:\n"
+                (nth 3 case))
+      (let ((fixed-time (encode-time 0 30 23 (nth 2 case) (nth 1 case) (car case))))
+        (cl-letf (((symbol-function 'org-current-time) (lambda (&rest _) fixed-time)))
+          (org-todo "DONE")))
+      (goto-char (point-min))
+      (org-next-visible-heading 1)
+      (should (equal (org-entry-get nil "SCHEDULED") (format "<%s>" (nth 4 case)))))))
+
+(ert-deftest loki-assistant-edna-test-spawn-months-source-and-target-bases ()
+  (dolist (base '(source target))
+    (loki-assistant-edna-test-with-org
+        "* TODO 来源\nSCHEDULED: <2026-08-31 Mon 08:00>\n* TODO 目标\nSCHEDULED: <2026-11-19 Thu 09:00>\n"
+      (let ((source (point-marker)))
+        (org-next-visible-heading 1)
+        (org-edna-action/loki-spawn-next! source base "+6m")
+        (org-next-visible-heading 1)
+        (should (equal (org-entry-get nil "SCHEDULED")
+                       (if (eq base 'source) "<2027-02-28 Sun 08:00>"
+                         "<2027-05-19 Wed 09:00>")))))))
+
+(ert-deftest loki-assistant-edna-test-invalid-month-rules-roll-back-completion ()
+  (dolist (rule '("loki-spawn-next!(today \"+0m\")"
+                  "loki-spawn-next!(today \"-6m\")"
+                  "loki-spawn-next!(today \"+1.5m\")"
+                  "loki-spawn-next!(today \"+6m\" mon)"
+                  "loki-spawn-next!(today \"+6m\" \"+1m\")"
+                  "loki-spawn-next!(today \"+999999m\")"
+                  "loki-spawn-next!(source \"+6m\")"
+                  "loki-scheduled-next!(today \"+6m\")"
+                  "loki-deadline-next!(today \"+6m\")"))
+    (let ((source (format "* TODO 复查\n:PROPERTIES:\n:TRIGGER: self %s\n:END:\n" rule)))
+      (loki-assistant-edna-test-with-org source
+        (should-error (org-todo "DONE"))
+        (should (equal source (buffer-string)))))))
+
+(ert-deftest loki-assistant-edna-test-month-spawn-later-error-rolls-back-completion ()
+  (let ((source "* TODO 复查\n:PROPERTIES:\n:TRIGGER: self loki-spawn-next!(today \"+6m\") loki-scheduled-next!(source mon)\n:END:\n"))
+    (loki-assistant-edna-test-with-org source
+      (should-error (org-todo "DONE"))
+      (should (equal source (buffer-string))))))
+
 (ert-deftest loki-assistant-edna-test-legacy-successor-property-does-not-affect-creation ()
   (loki-assistant-edna-test-with-org
       "* TODO Task 1\nSCHEDULED: <2026-11-13 Fri>\n:PROPERTIES:\n:LOKI_NEXT_ID: missing\n:TRIGGER: self loki-spawn-next!(source mon wed fri)\n:END:\n"

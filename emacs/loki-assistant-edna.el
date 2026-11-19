@@ -36,23 +36,33 @@
           (error "Loki 不能修改冲突节点"))
         (setq more (org-up-heading-safe))))))
 
-(defun loki-assistant-edna-check-rule (base weekdays)
-  "校验日期基准 BASE 与非空星期集合 WEEKDAYS。"
+(defun loki-assistant-edna-month-interval (rule)
+  "当 RULE 为单个正月数间隔时返回月数，否则返回 nil。"
+  (when (and (= (length rule) 1)
+             (stringp (car rule))
+             (string-match "\\`[+]\\([1-9][0-9]*\\)m\\'" (car rule)))
+    (string-to-number (match-string 1 (car rule)))))
+
+(defun loki-assistant-edna-check-rule (base rule &optional allow-months)
+  "校验日期基准 BASE 与星期集合 RULE；ALLOW-MONTHS 允许正月数间隔。"
   (setq loki-assistant-edna-action-seen t)
   (unless (memq base '(source target today))
     (error "Loki 日期基准必须为 source、target 或 today"))
-  (unless (and weekdays
-               (cl-every (lambda (day) (memq day '(mon tue wed thu fri sat sun)))
-                         weekdays))
-    (error "Loki 星期必须为 mon 至 sun 的小写符号，且集合不能为空")))
+  (unless (or (and rule
+                   (cl-every (lambda (day) (memq day '(mon tue wed thu fri sat sun)))
+                             rule))
+              (and allow-months (loki-assistant-edna-month-interval rule)))
+    (error (if allow-months
+               "Loki 排程必须为非空星期集合或单个正月数间隔（如 \"+6m\"）"
+             "Loki 星期必须为 mon 至 sun 的小写符号，且集合不能为空"))))
 
 (defun loki-assistant-edna-clock (stamp)
   "读取 STAMP 中的时刻或同日时刻范围。"
   (when (and stamp (string-match "[0-9]\\{2\\}:[0-9]\\{2\\}\\(?:-[0-9]\\{2\\}:[0-9]\\{2\\}\\)?" stamp))
     (match-string 0 stamp)))
 
-(defun loki-assistant-edna-next-stamp (last-entry base weekdays property)
-  "按 BASE 和 WEEKDAYS 计算 PROPERTY 的下一个纯日期时刻。"
+(defun loki-assistant-edna-next-stamp (last-entry base rule property)
+  "按 BASE 和 RULE 计算 PROPERTY 的下一个纯日期时刻。"
   (unless (and (markerp last-entry)
                (eq (marker-buffer last-entry) (current-buffer)))
     (error "Loki 动作只支持当前文件"))
@@ -64,15 +74,22 @@
                  (unless raw (error "Loki 日期基准没有对应规划时间戳"))
                  (org-time-string-to-time raw)))
          (decoded (decode-time time))
-         (day (1+ (calendar-absolute-from-gregorian
-                   (list (nth 4 decoded) (nth 3 decoded) (nth 5 decoded)))))
-         (date (calendar-gregorian-from-absolute day))
-         (allowed (mapcar (lambda (weekday) (cl-position weekday '(sun mon tue wed thu fri sat)))
-                          weekdays)))
+         (date (list (nth 4 decoded) (nth 3 decoded) (nth 5 decoded)))
+         (months (loki-assistant-edna-month-interval rule)))
     ;; 自然日与时刻分开计算，避免沿用旧 UTC offset 而跨越或重复夏令时边界的日期。
-    (while (not (memq (calendar-day-of-week date) allowed))
-      (setq day (1+ day)
-            date (calendar-gregorian-from-absolute day)))
+    (if months
+        (let* ((month-index (+ (1- (car date)) months))
+               (year (+ (nth 2 date) (/ month-index 12)))
+               (month (1+ (% month-index 12))))
+          ;; 月末不存在同号日期时，取目标月的最后一天。
+          (setq date (list month (min (nth 1 date) (calendar-last-day-of-month month year)) year)))
+      (let* ((day (1+ (calendar-absolute-from-gregorian date)))
+             (allowed (mapcar (lambda (weekday) (cl-position weekday '(sun mon tue wed thu fri sat)))
+                              rule)))
+        (setq date (calendar-gregorian-from-absolute day))
+        (while (not (memq (calendar-day-of-week date) allowed))
+          (setq day (1+ day)
+                date (calendar-gregorian-from-absolute day)))))
     (unless (<= 1 (nth 2 date) 9999)
       (error "Loki 日期超出有效范围"))
     (format "<%04d-%02d-%02d %s%s>"
@@ -136,9 +153,10 @@
         (aset result index (1+ (aref result index)))
         result))))
 
-(defun org-edna-action/loki-spawn-next! (last-entry &optional base &rest weekdays)
-  "在目标子树后新建后继，递增标题末尾数字；每次执行都创建新任务。"
-  (loki-assistant-edna-check-rule base weekdays)
+(defun org-edna-action/loki-spawn-next! (last-entry &optional base &rest rule)
+  "在目标子树后新建后继，递增标题末尾数字，按 BASE 和 RULE 排程。
+RULE 支持非空星期集合或单个正月数间隔（如 \"+6m\"）。"
+  (loki-assistant-edna-check-rule base rule t)
   (loki-assistant-edna-check-node)
   (unless (and (markerp last-entry)
                (eq (marker-buffer last-entry) (current-buffer)))
@@ -149,7 +167,7 @@
       (widen)
       (org-back-to-heading t)
       (atomic-change-group
-        (let* ((stamp (loki-assistant-edna-next-stamp last-entry base weekdays "SCHEDULED"))
+        (let* ((stamp (loki-assistant-edna-next-stamp last-entry base rule "SCHEDULED"))
                (level (org-outline-level))
                (title (loki-assistant-edna-next-title (org-get-heading t t t)))
                (priority (org-element-property :priority (org-element-at-point)))

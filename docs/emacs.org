@@ -57,11 +57,11 @@
 * 浏览器全文捕获
 
 加载 ~loki-assistant~ 后，若 ~org-roam~ 已加载会自动加载
-~loki-assistant-capture~；services 也会在处理
+~loki-assistant-capture~ ；services 也会在处理
 ~POST /emacs/capture/full~ 时通过 gateway 要求加载该模块。该模块不启动 HTTP 服务，
 Chrome 只连接 services 的固定 loopback 地址。
 
-入口函数为 ~loki-assistant-capture-full~，接收 services 转交的 JSON 字符串，使用
+入口函数为 ~loki-assistant-capture-full~ ，接收 services 转交的 JSON 字符串，使用
 浏览器已经转换好的标题、来源 URL、抓取时间和 Org 正文建立捕获缓冲区。正文按字面插入，
 不执行其中的模板或 Lisp 表达式。用户在 Emacs 中使用 =C-c C-c= 保存，或 =C-c C-k= 取消。
 
@@ -290,7 +290,27 @@ SCHEDULED: <2026-11-20 Fri 13:00>
 
 新节点继承相同触发器，继续完成会生成 ~游泳 @ 2026-11 @ 4~ ，计划为 ~<2026-11-23 Mon 13:00>~ 。原节点标题和已有关闭日志保持不变。重新打开第 2 项再完成，会再次从第 2 项生成一个新的第 3 项；已有第 3、4 项保持原样，编号不扫描兄弟任务的最大值。
 
-相关 ERT 检查已纳入 ~make emacs-test~ ，覆盖星期推进、时刻范围、夏令时、25 项已有任务链、末项结束、原生 Edna 动作、重复完成创建、游泳任务尾号递增及失败回滚。星期排程、标题与事务设计参见 Org Tasks 项目的 ~docs/core/TRIGGER触发器设计.org~ 。
+*** 完成后间隔 6 个月
+
+Emacs 的 ~loki-spawn-next!~ 还支持 ~BASE "+Nm"~ ，其中 ~N~ 为正整数。要以实际完成当天为基准，使用 ~today~ ：
+
+#+begin_src org
+** TODO 高尿酸血症检查
+SCHEDULED: <2027-05-06 Thu>
+:PROPERTIES:
+:TRIGGER: self loki-spawn-next!(today "+6m")
+:END:
+#+end_src
+
+标记为 ~DONE~ 时立即创建新的同级待办，把 ~SCHEDULED~ 设为完成当天往后 6 个自然月。例如在 ~2027-05-08~ 完成，新任务安排在 ~2027-11-08~ 。新任务继承同一触发器，下一次仍从实际完成日计算；原任务保留完成记录。
+
+月末不存在同号日期时取目标月最后一天，例如 ~2026-08-31~ 加 6 个月得到 ~2027-02-28~ ，~2023-08-31~ 加 6 个月得到 ~2024-02-29~ 。原计划有时刻或同日时刻范围时继续保留；没有 ~SCHEDULED~ 也可使用 ~today~ 。
+
+若要从原计划日期推算，可改成 ~self loki-spawn-next!(source "+6m")~ ；~target~ 使用目标任务的原计划日期。月数间隔只用于 ~loki-spawn-next!~ ，不能与星期集合混用；此新增语法尚未同步到 Org Tasks Core。
+
+*** 验证与兼容
+
+相关 ERT 检查已纳入 ~make emacs-test~ ，覆盖星期推进、时刻范围、夏令时、25 项已有任务链、末项结束、原生 Edna 动作、重复完成创建、游泳任务尾号递增、完成后按月排程、月末与闰年及失败回滚。星期排程、标题与事务设计参见 Org Tasks 项目的 ~docs/core/TRIGGER触发器设计.org~ 。
 
 旧笔记中已有的 ~LOKI_NEXT_ID~ 属性已不参与处理，可以直接删除；它的值无论是否有效都不影响新后继的创建。
 
