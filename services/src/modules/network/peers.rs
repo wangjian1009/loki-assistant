@@ -8,20 +8,42 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::protocol::{NetworkError, Peer};
+use super::protocol::{BindingToken, DeviceType, NetworkError, Peer};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StoredPeer {
+    #[serde(default)]
+    pub device_type: DeviceType,
+    pub endpoint_id: String,
+    pub name: String,
+    pub bound_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_token: Option<BindingToken>,
+}
+impl StoredPeer {
+    pub fn public(&self) -> Peer {
+        Peer {
+            device_type: self.device_type,
+            endpoint_id: self.endpoint_id.clone(),
+            name: self.name.clone(),
+            bound_at: self.bound_at,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredPeers {
     version: u32,
-    peers: Vec<Peer>,
+    peers: Vec<StoredPeer>,
 }
 
 pub(super) fn valid_name(name: &str) -> bool {
     !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
 }
 
-pub(super) fn load(path: &Path) -> Result<BTreeMap<String, Peer>, NetworkError> {
+pub(super) fn load(path: &Path) -> Result<BTreeMap<String, StoredPeer>, NetworkError> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -60,6 +82,13 @@ pub(super) fn load(path: &Path) -> Result<BTreeMap<String, Peer>, NetworkError> 
             .map_err(|_| NetworkError::Storage)?;
         if id.to_string() != peer.endpoint_id
             || !valid_name(&peer.name)
+            || peer.binding_token.as_ref().is_some_and(|token| {
+                token.0.len() != 64
+                    || !token
+                        .0
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
             || peer.bound_at == 0
             || peers.insert(peer.endpoint_id.clone(), peer).is_some()
         {
@@ -69,7 +98,7 @@ pub(super) fn load(path: &Path) -> Result<BTreeMap<String, Peer>, NetworkError> 
     Ok(peers)
 }
 
-pub(super) fn save(path: PathBuf, peers: Vec<Peer>) -> Result<(), NetworkError> {
+pub(super) fn save(path: PathBuf, peers: Vec<StoredPeer>) -> Result<(), NetworkError> {
     let parent = path.parent().ok_or(NetworkError::Storage)?;
     DirBuilder::new()
         .recursive(true)

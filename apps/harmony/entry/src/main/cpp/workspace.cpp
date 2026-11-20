@@ -6,7 +6,8 @@
 extern "C" void* loki_workspace_open(const char*, char**);
 extern "C" char* loki_workspace_execute(const void*, const char*, const char*);
 extern "C" void loki_workspace_free(void*);
-extern "C" void loki_devices_free(char*);
+extern "C" void loki_workspace_begin_stop(const void*);
+extern "C" void loki_workspace_string_free(char*);
 
 struct WorkspaceHandle {
     void* value = nullptr;
@@ -62,7 +63,7 @@ static napi_value Queue(napi_env env, WorkspaceWork* work) {
                 napi_create_string_utf8(env, work->result ? work->result : "{\"ok\":false,\"error\":\"工作空间任务未完成\"}", NAPI_AUTO_LENGTH, &value);
                 napi_resolve_deferred(env, work->deferred, value);
             }
-            loki_devices_free(work->result); loki_devices_free(work->error);
+            loki_workspace_string_free(work->result); loki_workspace_string_free(work->error);
             napi_delete_async_work(env, work->work); delete work;
         }, work, &work->work);
     if (status == napi_ok) status = napi_queue_async_work(env, work->work);
@@ -95,14 +96,28 @@ static napi_value Execute(napi_env env, napi_callback_info info) {
         delete work; napi_throw_type_error(env, nullptr, "工作空间参数无效"); return nullptr;
     }
     work->workspace = *static_cast<std::shared_ptr<WorkspaceHandle>*>(reference);
+    if (work->operation == "stop") loki_workspace_begin_stop(work->workspace->value);
     return Queue(env, work);
+}
+// 取消只写入信号，不占用异步工作线程，也不等待网络。
+static napi_value Cancel(napi_env env, napi_callback_info info) {
+    size_t count = 2; napi_value args[2]; void* reference = nullptr; std::string operation;
+    if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != 2 ||
+        napi_get_value_external(env, args[0], &reference) != napi_ok || !reference || !ReadString(env, args[1], operation)) {
+        napi_throw_type_error(env, nullptr, "取消请求参数无效"); return nullptr;
+    }
+    auto workspace = *static_cast<std::shared_ptr<WorkspaceHandle>*>(reference);
+    char* result = loki_workspace_execute(workspace->value, "cancel", operation.c_str());
+    loki_workspace_string_free(result);
+    napi_value value; napi_get_undefined(env, &value); return value;
 }
 static napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor properties[] = {
         {"open", nullptr, Open, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"execute", nullptr, Execute, nullptr, nullptr, nullptr, napi_default, nullptr}
+        {"execute", nullptr, Execute, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"cancel", nullptr, Cancel, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
-    napi_define_properties(env, exports, 2, properties); return exports;
+    napi_define_properties(env, exports, 3, properties); return exports;
 }
-static napi_module module = {1, 0, nullptr, Init, "lokidevices", nullptr, {0}};
-extern "C" __attribute__((constructor)) void RegisterLokiDevices() { napi_module_register(&module); }
+static napi_module module = {1, 0, nullptr, Init, "lokiworkspace", nullptr, {0}};
+extern "C" __attribute__((constructor)) void RegisterLokiWorkspace() { napi_module_register(&module); }

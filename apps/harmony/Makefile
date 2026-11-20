@@ -44,6 +44,7 @@ run:
 	$(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME)
 
 test:
+	"$(NODE)" scripts/test-application.cjs "$(DEVECO_HOME)"
 	cargo fmt --manifest-path entry/src/main/rust/Cargo.toml --check
 	cargo test --locked --manifest-path entry/src/main/rust/Cargo.toml
 
@@ -67,7 +68,7 @@ help:
 	  'make deps     检查 SDK 并安装 HarmonyOS 工程依赖' \
 	  'make check-sdk 检查 HarmonyOS SDK 安装' \
 	  'make build    构建 Debug HAP，使用 OrgTasksDebug 调试签名' \
-	  'make test     检查并测试手机设备管理 Rust 模块' \
+	  'make test     检查并测试手机应用层与 Rust 网络模块' \
 	  'make install  安装到已连接的 HarmonyOS 设备' \
 	  'make run      启动手机应用' \
 	  'make deploy   检查真机，构建、安装并启动' \

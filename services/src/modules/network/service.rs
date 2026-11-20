@@ -85,7 +85,7 @@ pub struct NetworkService {
     status: Arc<StatusService>,
     connection_changed: Notify,
     pairing_changed: Notify,
-    pairings: Arc<PairingService>,
+    pub(super) pairings: Arc<PairingService>,
 }
 
 impl NetworkService {
@@ -133,7 +133,7 @@ impl NetworkService {
         self.pairings.remove(id).await
     }
 
-    /// 由进程入口显式调度；每条连接只处理一次绑定或设备状态请求。
+    /// 由进程入口显式调度，分发绑定、设备状态及复用的业务连接。
     pub async fn receive_pairings(self: Arc<Self>) {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -200,19 +200,26 @@ impl NetworkService {
                         {
                             Err(NetworkError::NotReady)
                         } else {
-                            self.pairings.list().await.and_then(|peers| {
-                                let peer = peers
-                                    .iter()
-                                    .find(|peer| {
-                                        peer.endpoint_id == connection.remote_id().to_string()
-                                    })
-                                    .ok_or(NetworkError::PeerNotBound)?;
-                                Ok(serde_json::json!({
-                                    "api_version": "1", "type": "device.status",
-                                    "endpoint_id": local_id.to_string(),
-                                    "status": "online", "bound_at": peer.bound_at,
-                                }))
-                            })
+                            match self
+                                .pairings
+                                .authenticate(connection.remote_id(), &request.binding_token)
+                                .await
+                            {
+                                Err(error) => Err(error),
+                                Ok(()) => self.pairings.list().await.and_then(|peers| {
+                                    let peer = peers
+                                        .iter()
+                                        .find(|peer| {
+                                            peer.endpoint_id == connection.remote_id().to_string()
+                                        })
+                                        .ok_or(NetworkError::PeerNotBound)?;
+                                    Ok(serde_json::json!({
+                                        "api_version": "1", "type": "device.status",
+                                        "endpoint_id": local_id.to_string(),
+                                        "status": "online", "bound_at": peer.bound_at,
+                                    }))
+                                }),
+                            }
                         }
                     }
                     _ => Err(NetworkError::InvalidRequest),
@@ -301,8 +308,14 @@ impl NetworkService {
             .into_iter()
             .find(|peer| peer.endpoint_id == id.to_string())
             .ok_or(NetworkError::PeerNotBound)?;
+        let name = self
+            .status
+            .value("service", "name")
+            .ok()
+            .and_then(|v| v.value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "Loki 电脑".into());
         Ok(
-            serde_json::json!({"api_version":"1","endpoint_id":active.endpoint_id,"status":"online","bound_at":peer.bound_at}),
+            serde_json::json!({"api_version":"1","endpoint_id":active.endpoint_id,"status":"online","bound_at":peer.bound_at,"name":name,"device_type":"computer"}),
         )
     }
 

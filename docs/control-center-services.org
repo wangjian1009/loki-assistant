@@ -19,7 +19,7 @@
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
-| ~modules/service~ | 发布本机 services 进程启动时间 | 已实现 |
+| ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
@@ -295,7 +295,7 @@ services 将 ~qr_payload~ 编码为 UTF-8 JSON，用 M 级纠错生成二维码�
   "pairing_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "completed",
   "expires_at": 1795104300,
-  "peer": {"endpoint_id": "<手机 Endpoint ID>", "name": "我的手机", "bound_at": 1795104100}
+  "peer": {"endpoint_id": "<手机 Endpoint ID>", "name": "我的手机", "device_type": "mobile", "bound_at": 1795104100}
 }
 #+end_src
 
@@ -317,37 +317,40 @@ Emacs 打开管理页面仅调用 ~GET /network/peers~ ，不创建邀请。点�
   "type": "pairing.bind",
   "pairing_id": "550e8400-e29b-41d4-a716-446655440000",
   "pairing_token": "<二维码中的一次性令牌>",
-  "device_name": "我的手机"
+  "device_name": "我的手机",
+  "device_type": "mobile"
 }
 #+end_src
 
-请求不接受未知字段。~device_name~ 必须包含非空白内容，不含控制字符，UTF-8 编码最多 128 字节，保存时去除两端空白。手机 Endpoint ID 仅从 iroh 已认证连接读取，不接受消息自行声明；本机不能绑定自己。校验邀请、令牌与有效期后，在同一事务中保存设备、更新邀请为 ~completed~ 并返回：
+请求不接受未知字段。~device_type~ 为 ~computer~ 或 ~mobile~ ，当前手机上报 ~mobile~ ，旧记录缺省按 ~mobile~ 读取；类型仅用于展示。~device_name~ 必须包含非空白内容，不含控制字符，UTF-8 编码最多 128 字节，保存时去除两端空白。手机 Endpoint ID 仅从 iroh 已认证连接读取，不接受消息自行声明；本机不能绑定自己。校验邀请、令牌与有效期后，在同一事务中保存设备、更新邀请为 ~completed~ 并返回：
 
 #+begin_src json
-{"api_version":"1","type":"pairing.bound","endpoint_id":"<services Endpoint ID>","bound_at":1795104100}
+{"api_version":"1","type":"pairing.bound","endpoint_id":"<services Endpoint ID>","bound_at":1795104100,"binding_token":"<64 个小写十六进制字符>"}
 #+end_src
+
+电脑生成随机 256 bit ~binding_token~ ，与已认证手机身份一起持久化，成功后通过绑定响应交给手机。只有绑定接口允许不携带此凭据；其他远程请求必须同时验证 Endpoint ID、当前授权记录与 token。凭据不能由名称、类型、时间或客户端布尔值替代。重新绑定签发新凭据，旧凭据立即失效；解绑删除凭据。
 
 绑定设备持久化成功后才消费邀请。并发绑定只有一个设备成功；同一已认证手机使用相同邀请和令牌重试，返回原成功结果，不重新绑定或修改时间；其他设备使用已消费的邀请返回冲突。持久化失败不消费邀请。接受的持久化事务由独立任务完成，不因请求断开而中断磁盘提交与内存更新。
 
 *** 已绑定设备
 
-~GET /network/peers~ 返回 ~{"api_version":"1","peers":[...]}~ ，每个设备包含 ~endpoint_id~ 、 ~name~ 和 ~bound_at~ ，按 Endpoint ID 排序。列表表示授权关系，不表示设备在线。
+~GET /network/peers~ 返回 ~{"api_version":"1","peers":[...]}~ ，每个设备包含 ~endpoint_id~ 、 ~name~ 、 ~device_type~ 和 ~bound_at~ ，按 Endpoint ID 排序。列表表示授权关系，不表示设备在线。
 
 ~DELETE /network/peers/{endpoint_id}~ 先持久化删除，再关闭该设备当前被跟踪的连接，并取消该设备已经消费的邀请，防止旧请求恢复绑定。成功返回 ~{"api_version":"1","endpoint_id":"...","removed":true}~ ；设备不存在返回 404 ~peer-not-found~ 。解除绑定不撤销共享中继令牌，持有新邀请的设备可以再次绑定。设备状态 ALPN 查询同一份绑定关系并纳入连接撤销；后续业务协议同样必须遵守此边界。
 
-设备记录独立保存在 ~~/.assistant/peers.json~ ，包含 ~version: 1~ 和 ~peers~ 数组，最多 256 个设备。文件使用 ~0600~ 权限，通过同目录临时文件、文件同步和原子 rename 更新；目录创建权限为 ~0700~ 。读取拒绝符号链接、非普通文件、超过 1 MiB、重复身份或无效结构，损坏记录报错且不自动覆盖。重启会恢复绑定关系，不恢复邀请。
+设备记录独立保存在 ~~/.assistant/peers.json~ ，包含 ~version: 1~ 和 ~peers~ 数组，最多 256 个设备。文件使用 ~0600~ 权限，通过同目录临时文件、文件同步和原子 rename 更新；目录创建权限为 ~0700~ 。读取拒绝符号链接、非普通文件、超过 1 MiB、重复身份或无效结构，损坏记录报错且不自动覆盖。重启会恢复绑定关系和每个手机的 ~binding_token~ ，不恢复邀请。设备列表及邀请查询不返回该凭据；Debug 隐藏原文。旧授权记录无凭据时须重新扫码，不能用身份本身 跳过凭据验证。
 
 *** 电脑状态查询与手机持久化
 
-新手机已将状态检查切换为通用通道的 ~GET /network/session~ ，下述 ~device-status/1~ 握手保留供旧客户端兼容。
+新手机已将状态检查切换为通用通道的 ~GET /network/session~ ，下述 ~device-status/1~ 仍保留，但也必须携带绑定凭据；旧版无凭据客户端须升级重新绑定。
 
 手机使用同一随机身份、中继地址和访问令牌，按 ~loki-assistant/device-status/1~ 建立完整认证的 QUIC 连接；stream 的 FIN 分帧、16 KiB 上限、连接跟踪与服务端超时沿用绑定握手。每条连接只处理一次状态请求，不接受 0-RTT。请求严格拒绝未知字段：
 
 #+begin_src json
-{"api_version":"1","type":"device.status"}
+{"api_version":"1","type":"device.status","binding_token":"<绑定后签发的凭据>"}
 #+end_src
 
-services 每次从当前绑定关系验证已认证的远端 Endpoint ID，未绑定或已解绑返回 403 ~peer-not-bound~ ；配置切换期间或会话已失效返回 503 ~network-not-ready~ 。成功返回：
+services 每次从当前绑定关系验证已认证的远端 Endpoint ID 和绑定凭据，缺少或无效凭据返回 403 ~invalid-binding-token~ ；未绑定或已解绑返回 403 ~peer-not-bound~ ；配置切换期间或会话已失效返回 503 ~network-not-ready~ 。成功返回：
 
 #+begin_src json
 {"api_version":"1","type":"device.status","endpoint_id":"<services Endpoint ID>","status":"online","bound_at":1795104100}
@@ -355,29 +358,33 @@ services 每次从当前绑定关系验证已认证的远端 Endpoint ID，未�
 
 ~online~ 表示此次请求时电脑服务可用，不承诺持续在线。手机校验返回版本、类型、身份和绑定时间；连接失败显示“暂时无法连接”，不推断为解绑。前台每轮检查结束后间隔 20 秒刷新，支持手动刷新，后台停止安排轮询；页面重新进入时先显示等待检查，随后读取当前状态。此兼容状态请求只返回本机在线与绑定时间；通用 HTTP 请求使用下节的 services/1。
 
-手机将随机私钥、自己的 Endpoint ID 与最多 64 台电脑的身份、中继凭据、绑定时间保存在应用私有目录的 ~devices.json~ ，使用 ~version: 1~ 、~0600~ 权限、文件同步与原子替换；拒绝符号链接、超过 1 MiB、重复电脑身份及损坏记录，不自动重置身份。手机 Workspace 创建并持有唯一 Network，设备模块通过构造函数接收该实例；Network 只连接选中的一台电脑并复用连接。~selected_endpoint_id~ 是可选存储字段，旧文件只有一台电脑时自动选中，多台时要求用户明确选择。
+手机 ArkTS Application 负责最多 64 台电脑的列表、目标选择、名称和完整配置持久化；Rust Workspace 只持有本机身份、唯一 Network 和通用私有存储适配，不提供 devices 管理模块。应用保存 ~endpoint_id/relay_url/relay_token/binding~ ，下次读取后重新设置到 Network，首次请求时复用随机身份与绑定凭据恢复连接。~binding~ 是 ~unbound~ 或携带 ~credential{token,bound_at}~ 的 ~bound~ Union；没有凭据不能构造有效已绑定状态。
 
-发出绑定请求前先持久化待确认电脑及邀请；电脑成功提交但手机丢失响应时，刷新通过状态请求恢复绑定时间并清除一次性邀请。电脑尚未绑定且邀请仍有效时，刷新重试绑定；失效时提示重新扫码。成功确认后只保留后续状态连接需要的中继凭据；私钥、邀请和中继令牌不向 ArkTS 导出，也不进入 UI 或日志。重新扫描同一电脑更新其连接信息，不重复增加设备。
+数据沿用应用私有目录的 ~devices.json~ 、版本 1、~0600~ 权限、文件同步与原子替换。Rust 验证私钥及本机身份；应用验证电脑记录、重复身份和选择。只有一台时自动选中，多台未选择时由用户明确指定；Network 不管理列表或自动选择目标。旧数据保留本机身份，但缺少协议凭据的电脑需要重新扫码。
+
+发送绑定前应用先保存待确认记录和邀请；响应丢失后，邀请有效时通过同一绑定接口幂等重试取得原凭据，不开放无凭据查询或恢复接口。邀请过期或丢失时提示重新扫码。成功后删除一次性邀请，保存完整凭据；手机私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。
+
+手机名称可以在手机设置页修改，后续绑定上报新名称；services 不提供名称修改接口。电脑 services 根据 hostname 生成名称，发布 ~service/name~ 和 ~service/device_type~ 监控字段；手机通过认证状态查询获取并缓存电脑的 ~name~ 与 ~device_type: computer~ 。手机绑定记录上报 ~device_type: mobile~ ；名称和类型不参与权限判断。
 
 *** 通用 services 请求通道
 
 手机 Network.request 使用 ~loki-assistant/services/1~ ALPN；使用完整认证的 QUIC，不使用 0-RTT。同一连接复用，每个请求独占双向 stream，请求和响应各以 FIN 结束 UTF-8 JSON。请求不指定 service，目标来自 Network 预设的唯一绑定。
 
 #+begin_src json
-{"api_version":"1","request_id":"550e8400-e29b-41d4-a716-446655440000","method":"GET","path":"/network/session","query":[]}
+{"api_version":"1","request_id":"550e8400-e29b-41d4-a716-446655440000","binding_token":"<当前 Service 的绑定凭据>","method":"GET","path":"/network/session","query":[]}
 #+end_src
 
 query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体时省略 body；显式 JSON null 使用 ~"body":null~ ，服务端保留区别。拒绝未知外壳字段、非法方法、路径或版本；路径必须是以单个 ~/~ 开始的相对资源路径，不接受 scheme、host、query、fragment 或反斜杠。动态路径与 query 由网络适配器按 HTTP 语义编码。
 
 #+begin_src json
-{"api_version":"1","request_id":"550e8400-e29b-41d4-a716-446655440000","status":200,"body":{"api_version":"1","endpoint_id":"<电脑 Endpoint ID>","status":"online","bound_at":1795104100}}
+{"api_version":"1","request_id":"550e8400-e29b-41d4-a716-446655440000","status":200,"body":{"api_version":"1","endpoint_id":"<电脑 Endpoint ID>","status":"online","bound_at":1795104100,"name":"工作电脑","device_type":"computer"}}
 #+end_src
 
 响应保留 HTTP 状态码和业务 JSON，204 的 body 为 null；失败 body 使用现有版本化错误格式，两层 status 一致。客户端校验版本、请求 ID、状态、错误外壳与 DTO。请求 ID 只关联结果，不提供去重或幂等性。
 
-电脑 network 模块统一完成通用请求到 HTTP request 的转换，通过进程内 Axum Router 调用现有 handler；业务模块不另写远程分发逻辑。Services 组合根调用 ~attach_remote~ 注入共享业务路由工厂，仅持有 Weak 引用。每次请求都校验当前会话和已认证手机的绑定记录，解绑关闭被跟踪连接及其 stream。
+电脑 network 模块统一完成通用请求到 HTTP request 的转换，通过进程内 Axum Router 调用现有 handler；业务模块不另写远程分发逻辑。Services 组合根调用 ~attach_remote~ 注入共享业务路由工厂，仅持有 Weak 引用。每次请求都校验当前会话、已认证手机的绑定记录以及 ~binding_token~ ，凭据使用常量时间比较，解绑关闭被跟踪连接及其 stream。
 
-~#[loki_api]~ 新增 ~access~ 属性：默认 ~local~ ，显式 ~paired~ 才允许远程调用，discover 同时返回 access。访问检查用 Axum 路由模板匹配 method/path，不使用字符串前缀。当前只开放 ~GET /network/session~ ，返回当前电脑身份、online 和认证手机的 bound_at；本机 HTTP 缺少认证上下文时返回 401 ~peer-authentication-required~ ，不接受伪造 header 或查询字段。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
+~#[loki_api]~ 新增 ~access~ 属性：默认 ~local~ ，显式 ~paired~ 才允许远程调用，discover 同时返回 access。访问检查用 Axum 路由模板匹配 method/path，不使用字符串前缀。当前只开放 ~GET /network/session~ ，返回当前电脑身份、online、认证手机的 bound_at，以及电脑 name 和 device_type；本机 HTTP 缺少认证上下文时返回 401 ~peer-authentication-required~ ，不接受伪造 header 或查询字段。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
 
 请求最大 1 MiB，响应最大 4 MiB；每个手机最多 8 个正在执行请求，服务总上限 64，超限返回 429。服务端 stream 处理上限 30 秒；手机请求默认 10 秒，允许 1 至 30 秒，覆盖连接、发送与读取。手机显式取消 reset 当前 stream，超时和取消不保证已经执行的写操作回滚。网络层不自动重发请求。
 
@@ -389,6 +396,7 @@ query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体
 |--------+------+------|
 | 400 | ~invalid-request~ | 无效参数、消息、设备名称、版本或本机自绑定 |
 | 403 | ~invalid-pairing-token~ | 绑定令牌不匹配 |
+| 403 | ~invalid-binding-token~ | 缺少绑定凭据、凭据不匹配或已失效 |
 | 403 | ~peer-not-bound~ | 状态查询的已认证手机未绑定或已被解绑 |
 | 404 | ~pairing-not-found~ | 邀请不存在或重启后丢失 |
 | 404 | ~peer-not-found~ | 已绑定设备不存在 |
@@ -491,16 +499,16 @@ GET /password/entries/example.com/alice.gpg
 
 ** 服务自身运行状态
 
-~service~ 模块只表示当前 services 进程自身，不使用节点层。服务组装时发布 Unix 秒整数 ~start_at~，~GET /status~ 返回的数据包含：
+~service~ 模块只表示当前 services 进程自身，不使用节点层。服务组装时发布 Unix 秒整数 ~start_at~ 、只读显示名称 ~name~ 和设备类型 ~device_type: computer~，~GET /status~ 返回的数据包含：
 
 #+begin_src json
-{"api_version":"1","status":{"service":{"start_at":1795074000},"network":{"my":{"status":"connected"}}},"updated_at":1795074000}
+{"api_version":"1","status":{"service":{"start_at":1795074000,"name":"工作电脑","device_type":"computer"},"network":{"my":{"status":"connected"}}},"updated_at":1795074000}
 #+end_src
 
 ~GET /status/service~ 返回整个服务自身状态对象：
 
 #+begin_src json
-{"api_version":"1","module_id":"service","value":{"start_at":1795074000},"updated_at":1795074000}
+{"api_version":"1","module_id":"service","value":{"start_at":1795074000,"name":"工作电脑","device_type":"computer"},"updated_at":1795074000}
 #+end_src
 
 启动时间是响应字段，不把 ~start_at~ 附加在服务详情查询路径中。网络模块允许多个节点，保留 ~network/{节点}/status~ 层级，当前本机节点为 ~my~。两者的数据均由统一 ~GET /status~ 快照提供，托盘每次打开菜单时只读取一次该快照，不为启动时间另发字段请求。

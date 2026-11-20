@@ -44,7 +44,7 @@ curl http://127.0.0.1:47321/meta/config
 curl http://127.0.0.1:47321/data/config
 #+end_src
 
-服务只监听 loopback，不提供跨设备访问。新增业务接口前，先在规划文档中确认模块职责和协议归属。
+HTTP listener 只监听 loopback；已绑定设备通过认证的 iroh 通道调用显式开放的 API，每次请求验证 Endpoint ID 和绑定后签发的 token。新增业务接口前，先在规划文档中确认模块职责和协议归属。
 
 * 云端中继安装与管理
 

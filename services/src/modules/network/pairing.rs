@@ -11,10 +11,10 @@ use subtle::ConstantTimeEq;
 use tokio::{sync::Mutex, time::Instant};
 
 use super::{
-    peers,
+    peers::{self, StoredPeer},
     protocol::{
-        API_VERSION, BindRequest, BoundResponse, CreatePairingResponse, NetworkError, PAIRING_ALPN,
-        PairingResponse, PairingStatus, Peer, QrPayload,
+        API_VERSION, BindRequest, BindingToken, BoundResponse, CreatePairingResponse, NetworkError,
+        PAIRING_ALPN, PairingResponse, PairingStatus, Peer, QrPayload,
     },
 };
 
@@ -29,6 +29,7 @@ struct Invitation {
     expires_at: u64,
     deadline: Instant,
     peer: Option<Peer>,
+    binding_token: Option<BindingToken>,
 }
 
 impl Invitation {
@@ -54,7 +55,7 @@ impl Invitation {
 #[derive(Debug, Default)]
 struct State {
     invitations: VecDeque<Invitation>,
-    peers: Option<BTreeMap<String, Peer>>,
+    peers: Option<BTreeMap<String, StoredPeer>>,
     connections: BTreeMap<usize, Connection>,
 }
 
@@ -136,6 +137,7 @@ impl PairingService {
             expires_at,
             deadline: Instant::now() + INVITATION_LIFETIME,
             peer: None,
+            binding_token: None,
         });
         while state.invitations.len() > 128 {
             state.invitations.pop_front();
@@ -180,7 +182,13 @@ impl PairingService {
     pub async fn list(&self) -> Result<Vec<Peer>, NetworkError> {
         let mut state = self.state.lock().await;
         self.load(&mut state).await?;
-        Ok(state.peers.as_ref().unwrap().values().cloned().collect())
+        Ok(state
+            .peers
+            .as_ref()
+            .unwrap()
+            .values()
+            .map(StoredPeer::public)
+            .collect())
     }
 
     // 独立任务持有提交，避免请求取消发生在磁盘提交与内存更新之间。
@@ -217,7 +225,7 @@ impl PairingService {
         .map_err(|_| NetworkError::Storage)?
     }
 
-    async fn save(&self, peers: &BTreeMap<String, Peer>) -> Result<(), NetworkError> {
+    async fn save(&self, peers: &BTreeMap<String, StoredPeer>) -> Result<(), NetworkError> {
         let path = self
             .path
             .as_ref()
@@ -252,8 +260,8 @@ impl PairingService {
                 .iter()
                 .position(|item| item.id == request.pairing_id)
                 .ok_or(NetworkError::PairingNotFound)?;
-            let invitation = &mut state.invitations[index];
-            invitation.expire();
+            state.invitations[index].expire();
+            let invitation = &state.invitations[index];
             let hash: [u8; 32] = Sha256::digest(request.pairing_token.as_bytes()).into();
             if !bool::from(invitation.token_hash.ct_eq(&hash)) {
                 return Err(NetworkError::InvalidToken);
@@ -271,6 +279,10 @@ impl PairingService {
                         kind: "pairing.bound".to_owned(),
                         endpoint_id: invitation.endpoint_id.clone(),
                         bound_at: peer.bound_at,
+                        binding_token: invitation
+                            .binding_token
+                            .clone()
+                            .ok_or(NetworkError::InvalidBindingToken)?,
                     });
                 }
                 PairingStatus::Pending => {}
@@ -278,7 +290,15 @@ impl PairingService {
             if invitation.endpoint_id == remote.to_string() {
                 return Err(NetworkError::InvalidRequest);
             }
-            let peer = Peer {
+            let peer = StoredPeer {
+                device_type: request.device_type,
+                binding_token: Some(BindingToken(
+                    SecretKey::generate()
+                        .to_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                )),
                 endpoint_id: remote.to_string(),
                 name: request.device_name.trim().to_owned(),
                 bound_at: now(),
@@ -292,16 +312,37 @@ impl PairingService {
             state.peers = Some(peers);
             let invitation = &mut state.invitations[index];
             invitation.status = PairingStatus::Completed;
-            invitation.peer = Some(peer.clone());
+            invitation.peer = Some(peer.public());
+            invitation.binding_token = peer.binding_token.clone();
             Ok(BoundResponse {
                 api_version: API_VERSION.to_owned(),
                 kind: "pairing.bound".to_owned(),
                 endpoint_id: invitation.endpoint_id.clone(),
                 bound_at: peer.bound_at,
+                binding_token: peer.binding_token.unwrap(),
             })
         })
         .await
         .map_err(|_| NetworkError::Storage)?
+    }
+
+    pub async fn authenticate(&self, remote: EndpointId, token: &str) -> Result<(), NetworkError> {
+        let mut state = self.state.lock().await;
+        self.load(&mut state).await?;
+        let peer = state
+            .peers
+            .as_ref()
+            .unwrap()
+            .get(&remote.to_string())
+            .ok_or(NetworkError::PeerNotBound)?;
+        let expected = peer
+            .binding_token
+            .as_ref()
+            .ok_or(NetworkError::InvalidBindingToken)?;
+        if token.len() != 64 || !bool::from(expected.0.as_bytes().ct_eq(token.as_bytes())) {
+            return Err(NetworkError::InvalidBindingToken);
+        }
+        Ok(())
     }
 
     pub async fn track(&self, connection: Connection) {

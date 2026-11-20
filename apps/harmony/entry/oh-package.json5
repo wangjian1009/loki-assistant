@@ -6,6 +6,6 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "liblokidevices.so": "file:./src/main/cpp/types/liblokidevices"
+    "liblokiworkspace.so": "file:./src/main/cpp/types/liblokiworkspace"
   }
 }

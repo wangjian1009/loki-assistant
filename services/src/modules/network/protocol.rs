@@ -8,6 +8,8 @@ pub const SERVICES_ALPN: &[u8] = b"loki-assistant/services/1";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceStatusRequest {
+    #[serde(default)]
+    pub binding_token: String,
     pub api_version: String,
     #[serde(rename = "type")]
     pub kind: String,
@@ -22,12 +24,32 @@ pub enum PairingStatus {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceType {
+    Computer,
+    #[default]
+    Mobile,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
+    #[serde(default)]
+    pub device_type: DeviceType,
     pub endpoint_id: String,
     pub name: String,
     pub bound_at: u64,
+}
+
+/// 绑定成功后签发的通信凭据；Debug 始终隐藏内容。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct BindingToken(pub String);
+impl std::fmt::Debug for BindingToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,6 +85,8 @@ pub struct PairingResponse {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindRequest {
+    #[serde(default)]
+    pub device_type: DeviceType,
     pub api_version: String,
     #[serde(rename = "type")]
     pub kind: String,
@@ -73,6 +97,7 @@ pub struct BindRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BoundResponse {
+    pub binding_token: BindingToken,
     pub api_version: String,
     #[serde(rename = "type")]
     pub kind: String,
@@ -102,6 +127,8 @@ pub enum NetworkError {
     PeerNotFound,
     #[error("此手机尚未绑定或已被电脑解除绑定，请重新扫码")]
     PeerNotBound,
+    #[error("绑定凭据无效或已失效，请重新扫码绑定")]
+    InvalidBindingToken,
     #[error("设备记录无法读取或保存，请检查 ~/.assistant/peers.json")]
     Storage,
     #[error("绑定信息无法生成二维码，请检查中继地址和令牌长度")]
@@ -113,7 +140,7 @@ impl NetworkError {
         match self {
             Self::InvalidRequest => 400,
             Self::InvalidToken => 403,
-            Self::PeerNotBound => 403,
+            Self::PeerNotBound | Self::InvalidBindingToken => 403,
             Self::PairingNotFound | Self::PeerNotFound => 404,
             Self::Consumed | Self::Completed => 409,
             Self::Expired | Self::Cancelled => 410,
@@ -135,6 +162,7 @@ impl NetworkError {
             Self::Completed => "pairing-completed",
             Self::PeerNotFound => "peer-not-found",
             Self::PeerNotBound => "peer-not-bound",
+            Self::InvalidBindingToken => "invalid-binding-token",
             Self::Storage => "peer-storage-error",
             Self::QrCode => "pairing-qr-code-error",
         }

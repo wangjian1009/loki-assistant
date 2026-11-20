@@ -8,7 +8,7 @@ Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的�
 
 services 提供本机 loopback HTTP 服务、服务发现、配置数据、系统通知、Emacs gateway 和 macOS LaunchAgent 管理。Mac 菜单栏应用展示 services 状态并承接系统通知，点击后回调 services 执行对应业务跳转。
 
-services 的网络模块自动生成并保存本地身份，按 ~network.relay_url~ 和 ~network.relay_token~ 注册中转，并通过通知模块报告结果。Emacs 提供设备管理和新增绑定入口，services 已实现二维码 PNG 生成、单次邀请、iroh 绑定握手和设备关系持久化，协议见 [[file:docs/control-center-services.org::*扫码绑定][扫码绑定]]。状态中心统一提供各模块的 Rust 发布接口与 HTTP 只读查询。~apps/harmony/~ 使用 HarmonyOS Stage 模式与 ArkTS，首页提供设备管理、扫码绑定与电脑状态查询，通过 Rust Workspace 注入的唯一 Network 访问电脑 HTTP 接口；辅助能力、跨设备同步与后台常驻尚未实现。
+services 的网络模块自动生成并保存本地身份，按 ~network.relay_url~ 和 ~network.relay_token~ 注册中转，并通过通知模块报告结果。Emacs 提供设备管理和新增绑定入口，services 已实现二维码 PNG 生成、单次邀请、iroh 绑定握手和设备关系持久化，协议见 [[file:docs/control-center-services.org::*扫码绑定][扫码绑定]]。状态中心统一提供各模块的 Rust 发布接口与 HTTP 只读查询。~apps/harmony/~ 使用 HarmonyOS Stage 模式与 ArkTS，首页提供设备管理、扫码绑定与电脑状态查询，由应用层管理多台电脑、保存协议签发的绑定凭据，通过唯一 Network 恢复选中电脑并查询名称与设备类型；辅助能力、跨设备同步与后台常驻尚未实现。
 
 ~emacs/~ 中的 ~loki-assistant~ Emacs Lisp 包提供服务配置管理、异步 services HTTP 请求、通知发送和浏览器全文捕获，支持目标 buffer、标题、正文、应用标识和处理器选择；失败时返回明确错误。Chrome 插件通过 services 的固定 loopback 接口提交页面内容，Emacs 不启动独立 HTTP 服务。
 
@@ -112,7 +112,7 @@ make emacs-test
 | make emacs-test | 通过 emacsclient 执行 Emacs ERT 测试 |
 | make harmony-deps | 检查 SDK 并安装 HarmonyOS 工程依赖 |
 | make harmony-check-sdk | 检查 HarmonyOS SDK 安装 |
-| make harmony-test | 检查并测试 HarmonyOS 设备管理 Rust 模块 |
+| make harmony-test | 检查并测试 HarmonyOS 应用层与 Rust 网络模块 |
 | make harmony-build | 检查 SDK、安装依赖，构建并使用 OrgTasksDebug 签名 |
 | make harmony-install | 构建并安装 HarmonyOS 手机应用 |
 | make harmony-run | 启动 HarmonyOS 手机应用 |

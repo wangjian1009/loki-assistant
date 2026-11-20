@@ -48,7 +48,7 @@ help:
 	  'make harmony-deps    检查 SDK 并安装 HarmonyOS 工程依赖' \
 	  'make harmony-check-sdk 检查 HarmonyOS SDK 安装' \
 	  'make harmony-build   构建 HarmonyOS 手机应用并使用 OrgTasksDebug 签名' \
-	  'make harmony-test    检查并测试 HarmonyOS 设备管理 Rust 模块' \
+	  'make harmony-test    检查并测试 HarmonyOS 应用层与 Rust 网络模块' \
 	  'make harmony-install 构建并安装 HarmonyOS 手机应用' \
 	  'make harmony-run     启动 HarmonyOS 手机应用' \
 	  'make harmony-deploy  同 make deploy，检查真机后构建、安装并启动' \

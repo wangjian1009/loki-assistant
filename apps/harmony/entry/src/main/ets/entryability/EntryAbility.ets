@@ -1,12 +1,14 @@
 import { UIAbility } from '@kit.AbilityKit'
+import { deviceInfo } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
+import { Application } from '../app/Application'
 import { Workspace } from '../workspace/Workspace'
 
 export default class EntryAbility extends UIAbility {
-  private workspace?: Workspace
+  private application?: Application
 
   onDestroy(): void {
-    this.workspace?.stop().catch(() => {})
+    this.application?.stop().catch(() => {})
   }
 
   onForeground(): void {
@@ -18,8 +20,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    this.workspace = new Workspace(this.context.filesDir)
-    AppStorage.setOrCreate('lokiWorkspace', this.workspace)
+    this.application = new Application(new Workspace(this.context.filesDir), deviceInfo.marketName || 'HarmonyOS 手机')
+    AppStorage.setOrCreate('lokiApplication', this.application)
     windowStage.loadContent('pages/Index', (error) => {
       if (error.code !== 0) {
         console.error(`加载主页面失败: ${JSON.stringify(error)}`)

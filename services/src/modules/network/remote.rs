@@ -157,6 +157,8 @@ fn present_body<'de, D: serde::Deserializer<'de>>(
 struct WireRequest {
     api_version: String,
     request_id: String,
+    #[serde(default)]
+    binding_token: String,
     method: String,
     path: String,
     #[serde(default)]
@@ -232,6 +234,18 @@ impl NetworkService {
     ) -> Response {
         if let Err(reason) = self
             .authenticated_peer(session, connection.remote_id())
+            .await
+        {
+            return api_error(
+                StatusCode::from_u16(reason.status()).unwrap(),
+                ErrorSource::Business,
+                reason.code(),
+                reason.to_string(),
+            );
+        }
+        if let Err(reason) = self
+            .pairings
+            .authenticate(connection.remote_id(), &request.binding_token)
             .await
         {
             return api_error(

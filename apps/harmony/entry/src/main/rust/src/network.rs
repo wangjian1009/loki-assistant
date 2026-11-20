@@ -19,99 +19,85 @@ use uuid::Uuid;
 pub(crate) const PAIR_ALPN: &[u8] = b"loki-assistant/pair/1";
 const SERVICES_ALPN: &[u8] = b"loki-assistant/services/1";
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorKind {
-    ServiceNotConfigured,
-    ServiceChanged,
-    Closed,
-    Transport,
-    Timeout,
-    Cancelled,
-    Protocol,
-    Api,
-    InvalidRequest,
+pub use crate::error::*;
+use crate::pairing::Invitation;
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(try_from = "CredentialData")]
+pub struct BindingCredential {
+    token: String,
+    bound_at: u64,
 }
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    NotSent,
-    Rejected,
-    Unknown,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialData {
+    token: String,
+    bound_at: u64,
 }
-#[derive(Clone, Debug, Serialize)]
-pub struct NetworkError {
-    pub kind: ErrorKind,
-    pub code: String,
-    pub message: String,
-    pub request_id: Option<String>,
-    pub outcome: Outcome,
-    pub status: Option<u16>,
-    pub source: Option<String>,
-}
-impl NetworkError {
-    pub(crate) fn new(kind: ErrorKind) -> Self {
-        let (code, message) = match kind {
-            ErrorKind::ServiceNotConfigured => ("service-not-configured", "尚未设置绑定的电脑服务"),
-            ErrorKind::ServiceChanged => ("service-changed", "绑定的电脑服务已切换"),
-            ErrorKind::Closed => ("network-closed", "网络模块已关闭"),
-            ErrorKind::Transport => (
-                "unreachable",
-                "暂时无法连接电脑，请确认电脑服务和网络已开启",
-            ),
-            ErrorKind::Timeout => ("request-timeout", "请求超时，请检查电脑服务和网络"),
-            ErrorKind::Cancelled => ("request-cancelled", "请求已取消"),
-            ErrorKind::Protocol => (
-                "invalid-service-response",
-                "电脑服务协议不兼容或响应无效，请更新电脑服务",
-            ),
-            ErrorKind::InvalidRequest => ("invalid-request", "请求参数无效"),
-            ErrorKind::Api => ("service-error", "电脑服务暂时无法处理请求"),
-        };
-        Self {
-            kind,
-            code: code.into(),
-            message: message.into(),
-            request_id: None,
-            outcome: Outcome::NotSent,
-            status: None,
-            source: None,
-        }
-    }
-    pub(crate) fn api(value: &Value, status: u16) -> Result<Self, Self> {
-        let e = &value["error"];
-        let source = e["source"]
-            .as_str()
-            .filter(|s| matches!(*s, "services" | "emacs" | "business"))
-            .ok_or_else(|| Self::new(ErrorKind::Protocol))?;
-        let code = e["code"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| Self::new(ErrorKind::Protocol))?;
-        let message = e["message"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| Self::new(ErrorKind::Protocol))?;
-        if value["api_version"] != "1" || value["status"].as_u64() != Some(status as u64) {
-            return Err(Self::new(ErrorKind::Protocol));
+impl TryFrom<CredentialData> for BindingCredential {
+    type Error = &'static str;
+    fn try_from(value: CredentialData) -> Result<Self, Self::Error> {
+        if value.token.len() != 64
+            || !value
+                .token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || value.bound_at == 0
+        {
+            return Err("绑定凭据格式无效");
         }
         Ok(Self {
-            kind: ErrorKind::Api,
-            code: code.into(),
-            message: message.into(),
-            request_id: None,
-            outcome: Outcome::Rejected,
-            status: Some(status),
-            source: Some(source.into()),
+            token: value.token,
+            bound_at: value.bound_at,
         })
     }
 }
-impl std::fmt::Display for NetworkError {
+impl std::fmt::Debug for BindingCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.debug_struct("BindingCredential")
+            .field("token", &"[REDACTED]")
+            .field("bound_at", &self.bound_at)
+            .finish()
     }
 }
-impl std::error::Error for NetworkError {}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", try_from = "BindingData")]
+pub enum BindingState {
+    #[default]
+    Unbound,
+    Bound {
+        credential: BindingCredential,
+    },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingData {
+    status: String,
+    credential: Option<BindingCredential>,
+}
+impl TryFrom<BindingData> for BindingState {
+    type Error = &'static str;
+    fn try_from(data: BindingData) -> Result<Self, Self::Error> {
+        match (data.status.as_str(), data.credential) {
+            ("unbound", None) => Ok(Self::Unbound),
+            ("bound", Some(credential)) => Ok(Self::Bound { credential }),
+            _ => Err("绑定状态与协议凭据不一致"),
+        }
+    }
+}
+#[derive(Clone, Serialize)]
+pub struct ServiceState {
+    pub endpoint_id: String,
+    pub relay_url: String,
+    pub relay_token: String,
+    pub binding: BindingState,
+    pub generation: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Binding {
+    pub endpoint_id: String,
+    pub credential: BindingCredential,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +141,7 @@ pub struct ServiceResponse<T> {
     pub generation: u64,
 }
 
-/// 由外部绑定模块构造；凭据均为私有字段，不实现 Debug 或 Serialize。
+/// 应用设置的唯一电脑服务；凭据不进入状态快照或错误。
 pub struct Service {
     identity: SecretKey,
     id: EndpointId,
@@ -164,6 +150,7 @@ pub struct Service {
     endpoint: AsyncMutex<Option<Endpoint>>,
     connection: AsyncMutex<Option<Connection>>,
     closed: AtomicBool,
+    binding: Mutex<BindingState>,
 }
 impl Service {
     pub fn new(
@@ -171,9 +158,9 @@ impl Service {
         id: EndpointId,
         relay_url: String,
         relay_token: String,
-    ) -> Result<Self, NetworkError> {
-        if identity.public() == id || !crate::storage::valid_relay(&relay_url, &relay_token) {
-            return Err(NetworkError::new(ErrorKind::InvalidRequest));
+    ) -> Result<Self, ResponsError> {
+        if identity.public() == id || !crate::pairing::valid_relay(&relay_url, &relay_token) {
+            return Err(ResponsError::from(InvalidRequestReason::InvalidService));
         }
         Ok(Self {
             identity,
@@ -183,7 +170,15 @@ impl Service {
             endpoint: AsyncMutex::new(None),
             connection: AsyncMutex::new(None),
             closed: AtomicBool::new(false),
+            binding: Mutex::new(BindingState::Unbound),
         })
+    }
+    pub fn with_binding(self, binding: BindingState) -> Self {
+        *self.binding.lock().unwrap() = binding;
+        self
+    }
+    pub fn binding(&self) -> BindingState {
+        self.binding.lock().unwrap().clone()
     }
     pub fn endpoint_id(&self) -> EndpointId {
         self.id
@@ -193,11 +188,12 @@ impl Service {
             && self.identity.public() == other.identity.public()
             && self.relay_url == other.relay_url
             && self.relay_token == other.relay_token
+            && self.binding() == other.binding()
     }
-    async fn endpoint(&self) -> Result<Endpoint, NetworkError> {
+    async fn endpoint(&self) -> Result<Endpoint, ResponsError> {
         let mut guard = self.endpoint.lock().await;
         if self.closed.load(Ordering::SeqCst) {
-            return Err(NetworkError::new(ErrorKind::ServiceChanged));
+            return Err(ResponsError::from(CancelledReason::ServiceChanged));
         }
         if let Some(endpoint) = guard.as_ref() {
             return Ok(endpoint.clone());
@@ -205,7 +201,7 @@ impl Service {
         let relay: iroh::RelayUrl = self
             .relay_url
             .parse()
-            .map_err(|_| NetworkError::new(ErrorKind::InvalidRequest))?;
+            .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidService))?;
         let relays: RelayMap = [relay].into_iter().collect();
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(self.identity.clone())
@@ -215,23 +211,23 @@ impl Service {
             ))
             .bind()
             .await
-            .map_err(|_| NetworkError::new(ErrorKind::Transport))?;
+            .map_err(|_| ResponsError::from(NetworkReason::ConnectFailed))?;
         *guard = Some(endpoint.clone());
         Ok(endpoint)
     }
-    async fn connect(&self, alpn: &[u8]) -> Result<Connection, NetworkError> {
+    async fn connect(&self, alpn: &[u8]) -> Result<Connection, ResponsError> {
         let endpoint = self.endpoint().await?;
         let remote = EndpointAddr::new(self.id).with_relay_url(
             self.relay_url
                 .parse()
-                .map_err(|_| NetworkError::new(ErrorKind::InvalidRequest))?,
+                .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidService))?,
         );
         tokio::time::timeout(Duration::from_secs(10), endpoint.connect(remote, alpn))
             .await
-            .map_err(|_| NetworkError::new(ErrorKind::Timeout))?
-            .map_err(|_| NetworkError::new(ErrorKind::Transport))
+            .map_err(|_| ResponsError::from(NetworkReason::ConnectTimeout))?
+            .map_err(|_| ResponsError::from(NetworkReason::ConnectFailed))
     }
-    async fn connection(&self) -> Result<Connection, NetworkError> {
+    async fn connection(&self) -> Result<Connection, ResponsError> {
         let mut guard = self.connection.lock().await;
         if let Some(connection) = guard.as_ref().filter(|c| c.close_reason().is_none()) {
             return Ok(connection.clone());
@@ -245,69 +241,116 @@ impl Service {
         request: &ServiceRequest,
         id: Uuid,
         sent: &AtomicBool,
-    ) -> Result<(StatusCode, Value), NetworkError> {
-        let mut body = json!({"api_version":"1","request_id":id.to_string(),"method":request.method.as_str(),"path":request.path,"query":request.query});
+    ) -> Result<(StatusCode, Value), ResponsError> {
+        let binding = self.binding();
+        let BindingState::Bound { credential } = binding else {
+            return Err(NotBoundReason::BindingRequired.into());
+        };
+        let mut body = json!({"binding_token":credential.token,"api_version":"1","request_id":id.to_string(),"method":request.method.as_str(),"path":request.path,"query":request.query});
         if let Some(value) = &request.body {
             body["body"] = value.clone();
         }
         let bytes = serde_json::to_vec(&body).unwrap();
         if bytes.len() > 1_048_576 {
-            return Err(NetworkError::new(ErrorKind::InvalidRequest));
+            return Err(InvalidRequestReason::RequestTooLarge.into());
         }
         let connection = self.connection().await?;
         let (mut send, mut recv) = connection
             .open_bi()
             .await
-            .map_err(|_| NetworkError::new(ErrorKind::Transport))?;
+            .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
         sent.store(true, Ordering::SeqCst);
         send.write_all(&bytes)
             .await
-            .map_err(|_| NetworkError::new(ErrorKind::Transport))?;
+            .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
         send.finish()
-            .map_err(|_| NetworkError::new(ErrorKind::Transport))?;
+            .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
         let bytes = recv
             .read_to_end(4_194_304)
             .await
-            .map_err(|_| NetworkError::new(ErrorKind::Transport))?;
-        let reply: Value =
-            serde_json::from_slice(&bytes).map_err(|_| NetworkError::new(ErrorKind::Protocol))?;
+            .map_err(|error| match error {
+                iroh::endpoint::ReadToEndError::TooLong => {
+                    ResponsError::from(NetworkReason::ResponseTooLarge)
+                }
+                _ => ResponsError::from(NetworkReason::ReceiveFailed),
+            })?;
+        let reply: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
         if reply["api_version"] != "1"
             || reply["request_id"] != id.to_string()
             || reply.get("body").is_none()
         {
-            return Err(NetworkError::new(ErrorKind::Protocol));
+            return Err(NetworkReason::InvalidResponse.into());
         }
         let status = reply["status"]
             .as_u64()
             .and_then(|s| u16::try_from(s).ok())
             .and_then(|s| StatusCode::from_u16(s).ok())
             .filter(|s| s.is_success() || s.is_client_error() || s.is_server_error())
-            .ok_or_else(|| NetworkError::new(ErrorKind::Protocol))?;
+            .ok_or_else(|| ResponsError::from(NetworkReason::InvalidResponse))?;
         if !status.is_success() {
-            return Err(NetworkError::api(&reply["body"], status.as_u16())?);
+            return Err(ResponsError::api(&reply["body"], status.as_u16())?);
         }
         if status == StatusCode::NO_CONTENT && !reply["body"].is_null() {
-            return Err(NetworkError::new(ErrorKind::Protocol));
+            return Err(NetworkReason::InvalidResponse.into());
         }
         Ok((status, reply["body"].clone()))
     }
-    pub(crate) async fn pair(
+    async fn pair(
         &self,
-        invitation: &crate::storage::Invitation,
-    ) -> Result<Value, NetworkError> {
-        let result = tokio::time::timeout(Duration::from_secs(20), async {
-            let connection = self.connect(PAIR_ALPN).await?;
-            let (mut send, mut recv) = connection.open_bi().await.map_err(|_| NetworkError::new(ErrorKind::Transport))?;
-            let request = json!({"api_version":"1","type":"pairing.bind","pairing_id":invitation.pairing_id,"pairing_token":invitation.pairing_token,"device_name":"HarmonyOS 手机"});
-            send.write_all(&serde_json::to_vec(&request).unwrap()).await.map_err(|_| NetworkError::new(ErrorKind::Transport))?;
-            send.finish().map_err(|_| NetworkError::new(ErrorKind::Transport))?;
-            let bytes = recv.read_to_end(16_384).await.map_err(|_| NetworkError::new(ErrorKind::Transport))?;
-            let reply: Value = serde_json::from_slice(&bytes).map_err(|_| NetworkError::new(ErrorKind::Protocol))?;
-            connection.close(0u32.into(), b"finished");
-            if let Some(status) = reply["status"].as_u64() { return Err(NetworkError::api(&reply, status as u16)?); }
-            if reply["api_version"] != "1" || reply["type"] != "pairing.bound" || reply["endpoint_id"] != self.id.to_string() || reply["bound_at"].as_u64().is_none() { return Err(NetworkError::new(ErrorKind::Protocol)); }
-            Ok(reply)
-        }).await.map_err(|_| NetworkError::new(ErrorKind::Timeout))?;
+        invitation: &Invitation,
+        device_name: &str,
+        sent: &AtomicBool,
+    ) -> Result<Binding, ResponsError> {
+        if invitation.endpoint_id != self.id.to_string()
+            || invitation.relay_url != self.relay_url
+            || invitation.relay_token != self.relay_token
+        {
+            return Err(InvalidRequestReason::InvitationTargetMismatch.into());
+        }
+        let connection = self.connect(PAIR_ALPN).await?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
+        let request = json!({"api_version":"1","type":"pairing.bind","pairing_id":invitation.pairing_id,"pairing_token":invitation.pairing_token,"device_name":device_name,"device_type":"mobile"});
+        sent.store(true, Ordering::SeqCst);
+        send.write_all(&serde_json::to_vec(&request).unwrap())
+            .await
+            .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
+        send.finish()
+            .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
+        let result = async {
+            let bytes = recv
+                .read_to_end(16_384)
+                .await
+                .map_err(|_| ResponsError::from(NetworkReason::ReceiveFailed))?;
+            let reply: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
+            if let Some(status) = reply["status"].as_u64() {
+                let status = u16::try_from(status)
+                    .ok()
+                    .filter(|s| (400..600).contains(s))
+                    .ok_or_else(|| ResponsError::from(NetworkReason::InvalidResponse))?;
+                return Err(ResponsError::api(&reply, status)?);
+            }
+            if reply["api_version"] != "1"
+                || reply["type"] != "pairing.bound"
+                || reply["endpoint_id"] != self.id.to_string()
+            {
+                return Err(NetworkReason::InvalidResponse.into());
+            }
+            let credential: BindingCredential = serde_json::from_value(
+                json!({"token":reply["binding_token"],"bound_at":reply["bound_at"]}),
+            )
+            .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
+            Ok(Binding {
+                endpoint_id: self.id.to_string(),
+                credential,
+            })
+        }
+        .await;
+        connection.close(0u32.into(), b"finished");
         result
     }
     async fn close(&self) {
@@ -371,10 +414,10 @@ impl Network {
             }),
         }
     }
-    pub fn set_service(&self, service: Service) -> Result<(), NetworkError> {
+    pub fn set_service(&self, service: Service) -> Result<(), ResponsError> {
         let mut state = self.inner.state.lock().unwrap();
         if state.closed {
-            return Err(NetworkError::new(ErrorKind::Closed));
+            return Err(ResponsError::from(CancelledReason::NetworkClosed));
         }
         if state
             .service
@@ -408,18 +451,6 @@ impl Network {
     pub fn generation(&self) -> u64 {
         self.inner.state.lock().unwrap().generation
     }
-    pub(crate) async fn selected_service(&self) -> Result<Arc<Service>, NetworkError> {
-        self.retire().await;
-        let service = {
-            let state = self.inner.state.lock().unwrap();
-            if state.closed {
-                return Err(NetworkError::new(ErrorKind::Closed));
-            }
-            state.service.clone()
-        };
-        service.ok_or_else(|| NetworkError::new(ErrorKind::ServiceNotConfigured))
-    }
-
     fn schedule_retirement(&self) {
         let network = self.clone();
         self.inner.runtime.spawn(async move {
@@ -434,6 +465,53 @@ impl Network {
             service.close().await;
         }
     }
+    pub fn service(&self) -> Option<ServiceState> {
+        let state = self.inner.state.lock().unwrap();
+        state.service.as_ref().map(|service| ServiceState {
+            endpoint_id: service.id.to_string(),
+            relay_url: service.relay_url.clone(),
+            relay_token: service.relay_token.clone(),
+            binding: service.binding(),
+            generation: state.generation,
+        })
+    }
+    pub fn bind<OnSuccess, OnError>(
+        &self,
+        payload: &str,
+        device_name: &str,
+        on_success: OnSuccess,
+        on_error: OnError,
+    ) -> RequestHandle
+    where
+        OnSuccess: FnOnce(ServiceResponse<Binding>) + Send + 'static,
+        OnError: FnOnce(ResponsError) + Send + 'static,
+    {
+        let invitation = Invitation::parse(payload);
+        let device_name = device_name.to_owned();
+        self.execute(
+            true,
+            RequestOptions {
+                timeout: Duration::from_secs(20),
+            },
+            move |service, _, sent| async move {
+                if device_name.trim().is_empty()
+                    || device_name.len() > 128
+                    || device_name.chars().any(char::is_control)
+                {
+                    return Err(InvalidRequestReason::InvalidDeviceName.into());
+                }
+                let binding = service
+                    .pair(&invitation?, device_name.trim(), &sent)
+                    .await?;
+                let state = BindingState::Bound {
+                    credential: binding.credential.clone(),
+                };
+                Ok((StatusCode::OK, binding, Some(state)))
+            },
+            on_success,
+            on_error,
+        )
+    }
     pub fn request<T, OnSuccess, OnError>(
         &self,
         request: ServiceRequest,
@@ -444,7 +522,44 @@ impl Network {
     where
         T: DeserializeOwned + Send + 'static,
         OnSuccess: FnOnce(ServiceResponse<T>) + Send + 'static,
-        OnError: FnOnce(NetworkError) + Send + 'static,
+        OnError: FnOnce(ResponsError) + Send + 'static,
+    {
+        self.execute(
+            false,
+            options,
+            move |service, id, sent| async move {
+                if !request.path.starts_with('/')
+                    || request.path.starts_with("//")
+                    || request.path.contains(['?', '#', '\\'])
+                    || request.path.chars().any(char::is_control)
+                {
+                    return Err(InvalidRequestReason::InvalidPath.into());
+                }
+                let (status, value) = service.exchange(&request, id, &sent).await?;
+                let data = serde_json::from_value(value)
+                    .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
+                Ok((status, data, None))
+            },
+            on_success,
+            on_error,
+        )
+    }
+    fn execute<T, Operation, Future, OnSuccess, OnError>(
+        &self,
+        allow_unbound: bool,
+        options: RequestOptions,
+        operation: Operation,
+        on_success: OnSuccess,
+        on_error: OnError,
+    ) -> RequestHandle
+    where
+        T: Send + 'static,
+        Operation: FnOnce(Arc<Service>, Uuid, Arc<AtomicBool>) -> Future + Send + 'static,
+        Future: std::future::Future<
+                Output = Result<(StatusCode, T, Option<BindingState>), ResponsError>,
+            > + Send,
+        OnSuccess: FnOnce(ServiceResponse<T>) + Send + 'static,
+        OnError: FnOnce(ResponsError) + Send + 'static,
     {
         let id = Uuid::new_v4();
         let (cancel, mut cancelled) = watch::channel(false);
@@ -458,60 +573,110 @@ impl Network {
                 self.inner.changed.subscribe(),
             )
         };
-        // Workspace 已释放运行时后，外部仍可能持有 Arc<Network>。
-        // 此时直接交付关闭错误，避免把回调提交到已经停止的执行器。
         if closed {
             self.inner.state.lock().unwrap().requests.remove(&id);
-            let mut error = NetworkError::new(ErrorKind::Closed);
-            error.request_id = Some(id.to_string());
+            let mut error = ResponsError::from(CancelledReason::NetworkClosed);
+            error.set_context(Some(id.to_string()), Outcome::NotSent);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_error(error)));
             self.inner.done.notify_waiters();
             return RequestHandle { cancel };
         }
         let network = self.clone();
         self.inner.runtime.spawn(async move {
-            let sent = AtomicBool::new(false);
-            let mut result = if *cancelled.borrow() { Err(NetworkError::new(ErrorKind::Cancelled)) }
-                else if closed { Err(NetworkError::new(ErrorKind::Closed)) }
-                else if service.is_none() { Err(NetworkError::new(ErrorKind::ServiceNotConfigured)) }
-                else if !request.path.starts_with('/') || request.path.starts_with("//") || request.path.contains(['?', '#', '\\']) || request.path.chars().any(char::is_control) || !(Duration::from_secs(1)..=Duration::from_secs(30)).contains(&options.timeout) {
-                    Err(NetworkError::new(ErrorKind::InvalidRequest))
+            let sent = Arc::new(AtomicBool::new(false));
+            let mut result = if *cancelled.borrow() {
+                Err(CancelledReason::UserRequested.into())
+            } else if let Some(service) = service.as_ref() {
+                if !allow_unbound && matches!(service.binding(), BindingState::Unbound) {
+                    Err(NotBoundReason::BindingRequired.into())
+                } else if !(Duration::from_secs(1)..=Duration::from_secs(30))
+                    .contains(&options.timeout)
+                {
+                    Err(InvalidRequestReason::InvalidTimeout.into())
                 } else {
-                    tokio::select! { biased;
-                        _ = async { if !*cancelled.borrow() { let _ = cancelled.changed().await; } } => Err(NetworkError::new(ErrorKind::Cancelled)),
-                        _ = async { if *changed.borrow() == generation { let _ = changed.changed().await; } } => Err(NetworkError::new(if network.inner.state.lock().unwrap().closed { ErrorKind::Closed } else { ErrorKind::ServiceChanged })),
+                    tokio::select! {
+                        biased;
+                        _ = async {
+                            if !*cancelled.borrow() { let _ = cancelled.changed().await; }
+                        } => Err(CancelledReason::UserRequested.into()),
+                        _ = async {
+                            if *changed.borrow() == generation { let _ = changed.changed().await; }
+                        } => {
+                            let reason = if network.inner.state.lock().unwrap().closed {
+                                CancelledReason::NetworkClosed
+                            } else { CancelledReason::ServiceChanged };
+                            Err(reason.into())
+                        },
                         result = tokio::time::timeout(options.timeout, async {
-                            network.selected_service().await?;
-                            let (status, value) = service.unwrap().exchange(&request, id, &sent).await?;
-                            let data = serde_json::from_value(value).map_err(|_| NetworkError::new(ErrorKind::Protocol))?;
-                            Ok(ServiceResponse {request_id: id, status, data, generation})
-                        }) => result.unwrap_or_else(|_| Err(NetworkError::new(ErrorKind::Timeout))),
+                            network.retire().await;
+                            operation(service.clone(), id, sent.clone()).await
+                        }) => result.unwrap_or_else(|_| Err(NetworkReason::RequestTimeout.into())),
                     }
+                }
+            } else {
+                Err(NotConfiguredReason::ServiceNotSet.into())
+            };
+            if *cancelled.borrow() {
+                result = Err(CancelledReason::UserRequested.into());
+            }
+            {
+                let state = network.inner.state.lock().unwrap();
+                if state.generation != generation {
+                    let reason = if state.closed {
+                        CancelledReason::NetworkClosed
+                    } else {
+                        CancelledReason::ServiceChanged
+                    };
+                    result = Err(reason.into());
+                } else if let Some(service) = service {
+                    if let Ok((_, _, Some(binding))) = &result {
+                        *service.binding.lock().unwrap() = binding.clone();
+                    } else if matches!(&result, Err(ResponsError::NotBound(_))) {
+                        *service.binding.lock().unwrap() = BindingState::Unbound;
+                    }
+                }
+            }
+            if let Err(error) = &mut result {
+                let outcome = if sent.load(Ordering::SeqCst) && error.outcome() != Outcome::Rejected
+                {
+                    Outcome::Unknown
+                } else {
+                    error.outcome()
                 };
-            if *cancelled.borrow() { result = Err(NetworkError::new(ErrorKind::Cancelled)); }
-            else if result.is_ok() && network.generation() != generation { result = Err(NetworkError::new(ErrorKind::ServiceChanged)); }
-            if let Err(error) = &mut result { error.request_id = Some(id.to_string()); if sent.load(Ordering::SeqCst) && error.outcome != Outcome::Rejected { error.outcome = Outcome::Unknown; } }
-            // 回调允许再次调用 Network；不在持有实例锁时执行用户代码。
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match result { Ok(response) => on_success(response), Err(error) => on_error(error) }));
+                error.set_context(Some(id.to_string()), outcome);
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match result {
+                Ok((status, data, _)) => on_success(ServiceResponse {
+                    request_id: id,
+                    status,
+                    data,
+                    generation,
+                }),
+                Err(error) => on_error(error),
+            }));
             network.inner.state.lock().unwrap().requests.remove(&id);
             network.inner.done.notify_waiters();
         });
         RequestHandle { cancel }
     }
-    pub async fn shutdown(&self) {
-        {
-            let mut state = self.inner.state.lock().unwrap();
-            state.closed = true;
-            // 主动唤醒每个请求，让调用者收到取消回调，而非等待连接超时。
-            for cancel in state.requests.values() {
-                cancel.send_replace(true);
-            }
-            state.generation += 1;
-            if let Some(service) = state.service.take() {
-                state.retired.push(service);
-            }
-            self.inner.changed.send_replace(state.generation);
+    /// 同步发出关闭信号，避免原生工作线程被请求占满时无法启动取消。
+    pub fn begin_shutdown(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.closed {
+            return;
         }
+        state.closed = true;
+        for cancel in state.requests.values() {
+            cancel.send_replace(true);
+        }
+        state.generation += 1;
+        if let Some(service) = state.service.take() {
+            state.retired.push(service);
+        }
+        self.inner.changed.send_replace(state.generation);
+    }
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
         self.retire().await;
         loop {
             let done = self.inner.done.notified();

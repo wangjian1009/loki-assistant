@@ -1,8 +1,8 @@
 import { common } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
+import { window } from '@kit.ArkUI'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
-import { ComputerDevice, DeviceManager } from '../devices/DeviceManager'
-import { Workspace } from '../workspace/Workspace'
+import { Application, ComputerDevice } from '../app/Application'
 
 @Entry
 @Component
@@ -14,7 +14,8 @@ struct Index {
   @State private progress: string = ''
   @State private errorMessage: string = ''
   @State private notice: string = ''
-  private manager?: DeviceManager
+  @State private currentIndex: number = 0
+  private application?: Application
   private timer: number = -1
   private visible: boolean = false
 
@@ -28,7 +29,8 @@ struct Index {
 
   onPageShow(): void {
     this.visible = true
-    this.manager = AppStorage.get<Workspace>('lokiWorkspace')?.devices
+    this.setSystemColors()
+    this.application = AppStorage.get<Application>('lokiApplication')
     this.loadDevices()
   }
 
@@ -40,6 +42,21 @@ struct Index {
   aboutToDisappear(): void {
     this.visible = false
     this.stopTimer()
+  }
+
+  private setSystemColors(): void {
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext
+    window.getLastWindow(context).then((mainWindow) => {
+      mainWindow.setWindowSystemBarProperties({
+        statusBarColor: '#2C2C2B', statusBarContentColor: '#E7E7E4',
+        navigationBarColor: '#2C2C2B', navigationBarContentColor: '#AEAEAA'
+      }).catch(() => {})
+    }).catch(() => {})
+  }
+
+  private syncCurrentDevice(): void {
+    const activeIndex = this.computers.findIndex((computer: ComputerDevice) => computer.active)
+    this.currentIndex = activeIndex >= 0 ? activeIndex : Math.min(this.currentIndex, Math.max(0, this.computers.length - 1))
   }
 
   private stopTimer(): void {
@@ -57,11 +74,12 @@ struct Index {
   }
 
   private async loadDevices(): Promise<void> {
-    if (this.working || !this.manager) { return }
+    if (this.working || !this.application) { return }
     this.working = true
     this.progress = '正在读取设备'
     try {
-      this.computers = await this.manager.list()
+      this.computers = await this.application.list()
+      this.syncCurrentDevice()
       this.loaded = true
       this.errorMessage = ''
     } catch (error) {
@@ -74,12 +92,13 @@ struct Index {
   }
 
   private async refreshDevices(): Promise<void> {
-    if (this.working || !this.manager || !this.visible || !this.foreground) { return }
+    if (this.working || !this.application || !this.visible || !this.foreground) { return }
     this.stopTimer()
     this.working = true
     this.progress = '正在检查电脑状态'
     try {
-      this.computers = await this.manager.refresh()
+      this.computers = await this.application.refresh()
+      this.syncCurrentDevice()
       this.errorMessage = ''
     } catch (error) {
       this.errorMessage = (error as Error).message
@@ -91,7 +110,7 @@ struct Index {
   }
 
   private async addDevice(): Promise<void> {
-    if (this.working || !this.manager) { return }
+    if (this.working || !this.application) { return }
     this.stopTimer()
     this.working = true
     this.errorMessage = ''
@@ -105,7 +124,7 @@ struct Index {
       })
       scanned = true
       this.progress = '正在绑定电脑'
-      await this.manager.bind(result.originalValue)
+      await this.application.bind(result.originalValue)
       this.notice = '电脑绑定成功'
     } catch (error) {
       if (!scanned) {
@@ -119,7 +138,8 @@ struct Index {
     } finally {
       // 响应丢失时也读取预先保存的记录，允许刷新确认绑定结果。
       try {
-        this.computers = await this.manager.list()
+        this.computers = await this.application.list()
+        this.syncCurrentDevice()
         this.loaded = true
       } catch (error) {
         this.errorMessage = (error as Error).message
@@ -131,16 +151,40 @@ struct Index {
     if (this.notice !== '' && this.visible) { await this.refreshDevices() }
   }
 
-  private async selectDevice(endpointId: string): Promise<void> {
-    if (this.working || !this.manager) { return }
+  private openSettings(): void {
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/Settings' }).catch(() => {
+      this.errorMessage = '无法打开设置，请重试'
+    })
+  }
+
+  private async removeDevice(endpointId: string): Promise<void> {
+    if (this.working || !this.application) { return }
+    this.stopTimer()
     this.working = true
+    this.progress = '正在删除设备'
     try {
-      await this.manager.select(endpointId)
-      this.computers = await this.manager.list()
+      await this.application.remove(endpointId)
+      this.computers = await this.application.list()
+      this.syncCurrentDevice()
+      this.notice = '设备已删除，请重新扫码添加'
+      this.errorMessage = ''
+    } catch (error) { this.errorMessage = (error as Error).message }
+    finally { this.working = false; this.progress = ''; this.scheduleRefresh() }
+  }
+
+  private async selectDevice(endpointId: string): Promise<void> {
+    if (this.working || !this.application) { return }
+    this.working = true
+    this.progress = '正在连接电脑'
+    this.notice = ''
+    try {
+      await this.application.select(endpointId)
+      this.computers = await this.application.list()
+      this.syncCurrentDevice()
       this.errorMessage = ''
     } catch (error) {
       this.errorMessage = (error as Error).message
-    } finally { this.working = false }
+    } finally { this.working = false; this.progress = ''; this.syncCurrentDevice() }
     await this.refreshDevices()
   }
 
@@ -155,93 +199,176 @@ struct Index {
     }
   }
 
+  private statusColor(computer: ComputerDevice): string {
+    if (computer.status === 'online') { return '#A8CBA0' }
+    if (computer.status === 'unbound') { return '#F2A7A2' }
+    if (computer.status === 'pending') { return '#D8BE87' }
+    return '#AEAEAA'
+  }
+
+  private async changeDevice(index: number): Promise<void> {
+    if (this.working || index < 0 || index >= this.computers.length) { return }
+    this.currentIndex = index
+    const computer = this.computers[index]
+    if (!computer.active) { await this.selectDevice(computer.endpoint_id) }
+  }
+
+  private checkedTime(computer: ComputerDevice): string {
+    return computer.checked_at > 0 ? new Date(computer.checked_at * 1000).toLocaleTimeString() : '尚未检查'
+  }
+
   @Builder
-  private deviceCard(computer: ComputerDevice) {
-    Column({ space: 12 }) {
-      Row({ space: 12 }) {
-        Image($r('sys.media.ohos_ic_public_device_matebook')).width(36).height(36).fillColor('#176443')
-        Column({ space: 4 }) {
-          Text(computer.bound_at === null ? '待绑定电脑' : computer.name)
-            .fontSize(18).fontWeight(FontWeight.Medium)
-          Text(this.statusText(computer)).fontSize(14)
-            .fontColor(computer.status === 'online' ? '#176443' : '#6B7280')
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Circle().width(9).height(9).fill(computer.status === 'online' ? '#29976B' : '#A6ADB7')
-      }
+  private sectionTitle(title: string) {
+    Text(title).fontSize(14).fontColor('#AEAEAA').width('100%')
+      .padding({ left: 14, top: 26, bottom: 16 })
+  }
+
+  @Builder
+  private monitorRow(label: string, value: string, color: string) {
+    Row({ space: 16 }) {
+      Text(label).fontSize(16).fontColor('#E7E7E4').layoutWeight(1)
+      Text(value).fontSize(14).fontColor(color).maxLines(2)
+        .textAlign(TextAlign.End).constraintSize({ maxWidth: '62%' })
+    }.width('100%').constraintSize({ minHeight: 58 }).padding({ left: 18, right: 18, top: 12, bottom: 12 })
+  }
+
+  @Builder
+  private deviceHeader(computer: ComputerDevice) {
+    Row({ space: 16 }) {
+      Image($r('sys.media.ohos_ic_public_device_matebook')).width(36).height(36).fillColor('#BCA5E5')
+      Column({ space: 8 }) {
+        Text(computer.name).fontSize(21).fontWeight(FontWeight.Medium).fontColor('#E7E7E4')
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+        Row({ space: 8 }) {
+          Text(computer.device_type === 'computer' ? '电脑' : '移动端').fontSize(13).fontColor('#AEAEAA')
+          Text('·').fontSize(13).fontColor('#777C75')
+          Circle().width(6).height(6).fill(this.statusColor(computer))
+          Text(this.statusText(computer)).fontSize(13).fontColor(this.statusColor(computer))
+        }
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+    }.width('100%').height(102).padding({ left: 20, right: 20 })
+      .backgroundColor('#333633').borderRadius(18)
+  }
+
+  @Builder
+  private devicePage(computer: ComputerDevice) {
+    Column() {
+      // 设备概览固定在页顶；后续监控项统一加入下方滚动区域。
+      this.deviceHeader(computer)
       if (!computer.active) {
-        Button('使用此电脑').enabled(!this.working).onClick(() => { this.selectDevice(computer.endpoint_id) })
+        Button('使用此电脑', { type: ButtonType.Capsule }).fontSize(14).fontColor('#BCA5E5')
+          .backgroundColor('#3D3748').height(40).margin({ top: 12 })
+          .enabled(!this.working).onClick(() => { this.selectDevice(computer.endpoint_id) })
       }
-      Text(computer.detail).fontSize(14).fontColor('#6B7280').width('100%')
-      Text(`设备标识  ${computer.endpoint_id.slice(0, 12)}…${computer.endpoint_id.slice(-8)}`)
-        .fontSize(12).fontColor('#8A919D').width('100%')
-      if (computer.bound_at !== null) {
-        Text(`绑定于 ${new Date(computer.bound_at * 1000).toLocaleString()}`)
-          .fontSize(12).fontColor('#8A919D').width('100%')
-      }
-      if (computer.checked_at > 0) {
-        Text(`检查于 ${new Date(computer.checked_at * 1000).toLocaleTimeString()}`)
-          .fontSize(12).fontColor('#8A919D').width('100%')
-      }
-    }
-    .padding(20).width('100%').alignItems(HorizontalAlign.Start)
-    .backgroundColor(Color.White).borderRadius(20)
+      Scroll() {
+        Column() {
+          this.sectionTitle('运行状态')
+          Column() {
+            this.monitorRow('连接状态', this.statusText(computer), this.statusColor(computer))
+            Divider().color('#444643').strokeWidth(0.5)
+            this.monitorRow('最近检查', this.checkedTime(computer), '#AEAEAA')
+          }.width('100%').backgroundColor('#333633').borderRadius(18).clip(true)
+          Text(computer.detail).fontSize(13).fontColor(computer.status === 'unbound' ? '#F2A7A2' : '#8F938D')
+            .width('100%').padding({ left: 14, right: 14, top: 12 }).lineHeight(21)
+
+          if (computer.status === 'unbound') {
+            Button('删除设备', { type: ButtonType.Capsule }).fontSize(15).fontColor('#F2A7A2')
+              .backgroundColor('#493837').height(44).width('100%').margin({ top: 16 })
+              .enabled(!this.working).onClick(() => { this.removeDevice(computer.endpoint_id) })
+          }
+          this.sectionTitle('设备信息')
+          Column() {
+            this.monitorRow('设备类型', computer.device_type === 'computer' ? '电脑' : '移动端', '#AEAEAA')
+            Divider().color('#444643').strokeWidth(0.5)
+            this.monitorRow('设备标识', `${computer.endpoint_id.slice(0, 12)}…${computer.endpoint_id.slice(-8)}`, '#AEAEAA')
+            if (computer.bound_at !== null) {
+              Divider().color('#444643').strokeWidth(0.5)
+              this.monitorRow('绑定时间', new Date(computer.bound_at * 1000).toLocaleString(), '#AEAEAA')
+            }
+          }.width('100%').backgroundColor('#333633').borderRadius(18).clip(true)
+        }.width('100%').padding({ bottom: 40 }).alignItems(HorizontalAlign.Start)
+      }.width('100%').layoutWeight(1).align(Alignment.Top).scrollBar(BarState.Auto).scrollBarColor('#656862').scrollBarWidth(3)
+    }.width('100%').height('100%').padding({ left: 18, right: 18 })
+  }
+
+  @Builder
+  private emptyDevices() {
+    Column({ space: 20 }) {
+      Image($r('sys.media.ohos_ic_public_device_matebook')).width(64).height(64).fillColor('#BCA5E5')
+      Text('还没有绑定电脑').fontSize(21).fontWeight(FontWeight.Medium).fontColor('#E7E7E4')
+      Text('在电脑上新增设备，\n扫描二维码，让手机与电脑连接。')
+        .fontSize(14).fontColor('#AEAEAA').textAlign(TextAlign.Center).lineHeight(24)
+      Button('增加设备 · 扫码绑定', { type: ButtonType.Capsule })
+        .fontSize(15).fontWeight(FontWeight.Medium).fontColor('#292331').backgroundColor('#BCA5E5')
+        .height(46).padding({ left: 24, right: 24 }).margin({ top: 8 })
+        .enabled(!this.working).onClick(() => { this.addDevice() })
+    }.width('100%').padding({ left: 24, right: 24, top: 44, bottom: 44 })
+      .backgroundColor('#333633').borderRadius(18)
   }
 
   build() {
-    Scroll() {
-      Column({ space: 20 }) {
-        Column({ space: 8 }) {
-          Text('Loki 执行中心').fontSize(30).fontWeight(FontWeight.Bold).fontColor('#182D25')
-          Text('连接电脑，让手机与电脑协同工作').fontSize(15).fontColor('#6B7280')
-        }.width('100%').alignItems(HorizontalAlign.Start).margin({ top: 24, bottom: 12 })
+    Column() {
+      Row({ space: 12 }) {
+        Image($r('sys.media.ohos_ic_public_device_matebook')).width(28).height(28).fillColor('#BCA5E5')
+        Text('设备').fontSize(28).fontWeight(FontWeight.Medium).fontColor('#E7E7E4').layoutWeight(1)
+        Button('设置', { type: ButtonType.Normal }).fontSize(15).fontColor('#AEAEAA')
+          .backgroundColor(Color.Transparent).padding({ left: 12, right: 0 })
+          .enabled(!this.working).onClick(() => { this.openSettings() })
+      }.width('100%').height(92).padding({ left: 20, right: 24 })
+      Divider().color('#414240').strokeWidth(0.5)
 
-        Row() {
-          Text('设备管理').fontSize(22).fontWeight(FontWeight.Bold).layoutWeight(1)
-          if (this.computers.length > 0) {
-            Button('刷新', { type: ButtonType.Normal }).fontColor('#176443')
-              .backgroundColor(Color.Transparent).enabled(!this.working)
-              .onClick(() => { this.refreshDevices() })
-            Button('＋ 增加', { type: ButtonType.Capsule }).fontSize(14).fontColor(Color.White)
-              .backgroundColor('#176443').enabled(!this.working).onClick(() => { this.addDevice() })
+      Row({ space: 10 }) {
+        Text('我的设备').fontSize(14).fontColor('#AEAEAA')
+        if (this.computers.length > 0) {
+          Text(`${this.currentIndex + 1} / ${this.computers.length}`).fontSize(12).fontColor('#8F938D')
+        }
+        Blank()
+        if (this.computers.length > 0) {
+          Button('刷新', { type: ButtonType.Normal }).fontSize(14).fontColor('#AEAEAA')
+            .backgroundColor(Color.Transparent).enabled(!this.working).onClick(() => { this.refreshDevices() })
+          Button('添加设备', { type: ButtonType.Capsule }).fontSize(14)
+            .fontColor('#BCA5E5').backgroundColor('#3D3748').height(36)
+            .enabled(!this.working).onClick(() => { this.addDevice() })
+        }
+      }.height(72).width('100%').padding({ left: 32, right: 18 })
+
+      if (this.errorMessage !== '') {
+        Row({ space: 12 }) {
+          Text(this.errorMessage).fontSize(13).fontColor('#F2A7A2').layoutWeight(1)
+          if (!this.loaded) {
+            Button('重新读取').fontSize(13).fontColor('#F2A7A2').backgroundColor(Color.Transparent)
+              .enabled(!this.working).onClick(() => { this.loadDevices() })
           }
-        }.width('100%')
+        }.width('100%').padding({ left: 24, right: 24, bottom: 14 })
+      }
+      if (this.notice !== '') {
+        Text(this.notice).fontSize(13).fontColor('#B5CFAE').width('100%')
+          .padding({ left: 32, right: 24, bottom: 14 })
+      }
+      if (this.working) {
+        Row({ space: 10 }) {
+          LoadingProgress().width(16).height(16).color('#BCA5E5')
+          Text(this.progress).fontSize(13).fontColor('#AEAEAA')
+        }.width('100%').padding({ left: 32, right: 24, bottom: 14 })
+      }
 
-        if (this.errorMessage !== '') {
-          Column({ space: 8 }) {
-            Text(this.errorMessage).fontSize(14).fontColor('#AB3838').width('100%')
-            if (!this.loaded) {
-              Button('重新读取').onClick(() => { this.loadDevices() }).enabled(!this.working)
-            }
-          }.padding(16).width('100%').backgroundColor('#FFF0EE').borderRadius(14)
+      if (this.loaded && this.computers.length === 0) {
+        Column() { this.emptyDevices() }
+          .width('100%').layoutWeight(1).padding({ left: 18, right: 18 }).alignItems(HorizontalAlign.Start)
+      } else if (this.computers.length > 0) {
+        if (this.computers.length > 1) {
+          Text('左右滑动切换设备').fontSize(12).fontColor('#8F938D')
+            .width('100%').padding({ left: 32, bottom: 12 })
         }
-        if (this.notice !== '') {
-          Text(this.notice).fontSize(14).fontColor('#176443').width('100%')
-        }
-        if (this.working) {
-          Row({ space: 10 }) {
-            LoadingProgress().width(20).height(20).color('#176443')
-            Text(this.progress).fontSize(14).fontColor('#6B7280')
-          }.width('100%')
-        }
-
-        if (this.loaded && this.computers.length === 0) {
-          Column({ space: 16 }) {
-            Image($r('sys.media.ohos_ic_public_device_matebook')).width(64).height(64).fillColor('#83A594')
-            Text('还没有绑定电脑').fontSize(20).fontWeight(FontWeight.Medium).fontColor('#182D25')
-            Text('在电脑的设备管理中点击“新增设备”，\n再扫描二维码完成绑定。')
-              .fontSize(14).fontColor('#6B7280').textAlign(TextAlign.Center).lineHeight(22)
-            Button('增加设备 · 扫码绑定', { type: ButtonType.Capsule })
-              .fontColor(Color.White).backgroundColor('#176443').padding({ left: 24, right: 24 })
-              .height(48).enabled(!this.working).onClick(() => { this.addDevice() })
-          }
-          .width('100%').padding({ top: 44, bottom: 44, left: 20, right: 20 })
-          .backgroundColor(Color.White).borderRadius(24)
-        } else {
+        Swiper() {
+          // 显示数据变化时重建设备页，避免沿用旧的连接状态。
           ForEach(this.computers, (computer: ComputerDevice) => {
-            this.deviceCard(computer)
-          }, (computer: ComputerDevice) => computer.endpoint_id)
-        }
-      }.padding(24).width('100%').alignItems(HorizontalAlign.Start)
-    }.width('100%').height('100%').backgroundColor('#F3F6F4').align(Alignment.Top)
+            this.devicePage(computer)
+          }, (computer: ComputerDevice) => JSON.stringify(computer))
+        }.width('100%').layoutWeight(1).index(this.currentIndex).loop(false).indicator(false)
+          .disableSwipe(this.working).onChange((index: number) => { this.changeDevice(index) })
+      } else { Blank() }
+    }.width('100%').height('100%').backgroundColor('#2C2C2B')
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
   }
 }

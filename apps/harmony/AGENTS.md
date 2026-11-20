@@ -5,13 +5,16 @@
 ## 约定
 
 - `entry/src/main/ets/entryability/EntryAbility.ets` 是应用入口 Ability。
-- `entry/src/main/ets/pages/Index.ets` 是首页设备管理入口；`ets/devices/DeviceManager.ets` 封装异步 NAPI 调用，使用 Scan Kit 系统扫码界面，不配置固定电脑或预设中继。
-- `entry/src/main/rust/` 维护正式设备绑定客户端、随机身份和电脑记录；`cpp/devices.cpp` 仅提供异步 NAPI 桥接。身份和中继凭据只保存在应用私有目录的 `devices.json`，权限为 `0600`，损坏禁止覆盖，不向 ArkTS 或日志导出。
-- Rust `Workspace` 是应用组合根，持有 Tokio runtime 与一个 `Arc<Network>`，在构造 `DeviceManager` 时注入同一实例。`Network` 只管理外部预设的唯一 `Service`，通用请求使用实例 `request()`，不传目标；未设置 service 时通过错误回调报告。不得按 NAPI 请求重建 Workspace、通过静态变量查找 Network 或让业务模块自行创建它。
-- `Workspace.stop()` 先禁止业务新操作，再调用 `Network.shutdown()` 主动通过 `Cancelled` 错误回调取消未完成请求，等待回调与设备业务收尾。NAPI stop 在收尾后关闭 runtime；对象释放也执行兜底关闭。停止须幂等，停止后不得隐式重新打开。
-- `network.rs` 提供通用 HTTP 语义请求与 iroh 连接；`workspace.rs` 组合模块；`devices.rs` 负责绑定业务；`storage.rs` 保持私有存储。NAPI 持有 Workspace 的引用，EntryAbility 管理 ArkTS Workspace，页面消费其设备模块。
-- 扫码按 `loki-assistant/pair/1` 绑定；前台通过 `Network.request(GET /network/session)` 和 `loki-assistant/services/1` 查询选中电脑。历史多条记录只选择一台接入 Network，未选中的不轮询。已绑定不等于在线，重新进入页面先显示待检查；绑定请求发送前保存待确认记录，响应丢失由后续查询恢复。后台不继续安排轮询，不提供独立后台服务。
-- `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` target 和 DevEco NDK 生成 ARM64 库，供 Hvigor 打包；`make test` 检查手机 Rust 模块，services 的真实 relay 测试同时调用手机客户端入口。
+- `entry/src/main/ets/pages/Index.ets` 是深色设备入口，使用 Scan Kit 扫码；多设备使用 Swiper 单页展示，左右滑动同步选择唯一 Network 目标，设备概览固定、监控区域独立滚动；`pages/Settings.ets` 是设置页，负责手机名称编辑，首页仅保留设置入口；`ets/app/Application.ets` 在应用层管理电脑列表、手机名称、目标选择、待确认绑定与完整配置持久化，不保留独立 devices 管理模块。
+- Rust `Workspace` 创建 Tokio runtime 与唯一 `Arc<Network>`，不从应用数据中自动选择目标。`storage.rs` 只解释本机随机身份，其余 JSON 由应用层解释，沿用私有 `devices.json`、`0600` 权限与原子替换；损坏禁止覆盖，私钥不向 ArkTS 导出。
+- `Network` 只设置一个 `Service`，直接提供 `bind()`、`service()` 和异步 `request()`。业务保存返回的完整 `endpoint_id/relay_url/relay_token/binding`，下次读取后重新设置恢复连接。不得按请求重建 Workspace、查找全局 Network 或维护多个 Network 目标。
+- `BindingState` 使用 `Unbound` / `Bound { credential }` 数据 Union，凭据由电脑绑定接口签发并用于每次业务请求，不能以业务布尔值或绑定时间代替。只有绑定接口允许不携带凭据；状态查询也必须验证身份和 token。
+- `ResponsError` 是直接返回的数据 Union，分为未设置、未绑定、网络、取消、Services 和参数错误，各分支分别定义 reason。ArkTS 请求采用成功/错误回调，直接返回 Union，不包装成 Error 类。
+- `network.rs` 提供单目标通信与绑定；`pairing.rs` 校验邀请；`error.rs` 定义错误；`workspace.rs` 提供实例分发和生命周期；`cpp/workspace.cpp` 只提供 NAPI 桥接。完整配置供业务存储，凭据不进入 UI、错误、监控或日志，Rust Debug 隐藏凭据。
+- `Workspace.stop()` 先同步通知网络关闭，再等待未完成请求取消回调并释放 runtime；NAPI 取消和停止信号不等待异步工作线程。停止须幂等，停止后不隐式重新打开。
+- 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。电脑状态通过 `request(GET /network/session)` 查询，包含只读 name 和 `device_type: computer`；名称和类型只用于展示，手机为固定 mobile、services 为固定 computer，UI 不提供设备类型编辑；services 不提供名称修改接口。
+- 只轮询当前选中电脑，前台每轮完成后间隔 20 秒刷新；后台停止安排轮询。绑定前保存待确认邀请，响应丢失时在邀请有效期内通过绑定接口重试取得凭据；不使用无凭据状态查询恢复。旧记录缺少凭据时保留身份并重新扫码。已解绑设备提示删除后重新扫码添加，删除入口只清除应用层记录；删除当前设备时清除 Network 目标，保存失败保留原记录。
+- `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。
 - `bundleName` 为 `cc.loki.assistant.mobile`。
 - 应用、Ability 和启动窗口图标统一引用 `$media:app_icon`；`AppScope/resources/base/media/app_icon.png` 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
 - 使用 DevEco Studio 内置 Hvigor 构建；常用操作统一维护在本目录 `Makefile` 和根目录 `Makefile` 中。

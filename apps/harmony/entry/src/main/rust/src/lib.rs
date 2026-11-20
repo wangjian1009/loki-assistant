@@ -1,5 +1,6 @@
-pub mod devices;
+pub mod error;
 pub mod network;
+pub mod pairing;
 mod storage;
 mod workspace;
 pub use workspace::{Workspace, WorkspaceOptions};
@@ -66,6 +67,14 @@ pub unsafe extern "C" fn loki_workspace_execute(
     CString::new(value.to_string()).unwrap().into_raw()
 }
 /// # Safety
+/// workspace 必须为本库创建且尚未释放的对象。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn loki_workspace_begin_stop(workspace: *const Workspace) {
+    if !workspace.is_null() {
+        unsafe { &*workspace }.begin_stop();
+    }
+}
+/// # Safety
 /// 仅接受本库返回且未释放的对象；不得与其他调用并发释放。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn loki_workspace_free(workspace: *mut Workspace) {
@@ -76,7 +85,7 @@ pub unsafe extern "C" fn loki_workspace_free(workspace: *mut Workspace) {
 /// # Safety
 /// 仅接受本库返回且未释放的字符串，或空指针。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn loki_devices_free(value: *mut c_char) {
+pub unsafe extern "C" fn loki_workspace_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
     }

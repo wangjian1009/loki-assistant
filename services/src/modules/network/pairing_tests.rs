@@ -27,6 +27,7 @@ fn request(id: &str, token: &str) -> BindRequest {
         pairing_id: id.to_owned(),
         pairing_token: token.to_owned(),
         device_name: "我的手机".to_owned(),
+        device_type: super::protocol::DeviceType::Mobile,
     }
 }
 
@@ -504,8 +505,54 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .await
         .unwrap();
     assert_eq!(response["type"], "pairing.bound");
-    let online = exchange_alpn(status_request.clone(), super::protocol::DEVICE_STATUS_ALPN).await;
+    assert_eq!(
+        exchange_alpn(status_request.clone(), super::protocol::DEVICE_STATUS_ALPN).await["error"]["code"],
+        "invalid-binding-token"
+    );
+    let mut authenticated_status: Value = serde_json::from_slice(&status_request).unwrap();
+    authenticated_status["binding_token"] = response["binding_token"].clone();
+    let online = exchange_alpn(
+        serde_json::to_vec(&authenticated_status).unwrap(),
+        super::protocol::DEVICE_STATUS_ALPN,
+    )
+    .await;
     assert_eq!(online["status"], "online");
+    assert_eq!(
+        service.peers().await.unwrap()[0].device_type,
+        super::protocol::DeviceType::Mobile
+    );
+    assert!(
+        !serde_json::to_string(&service.peers().await.unwrap())
+            .unwrap()
+            .contains(response["binding_token"].as_str().unwrap())
+    );
+    let mut raw = json!({"api_version":"1","request_id":uuid::Uuid::new_v4().to_string(),"method":"GET","path":"/network/session","query":[]});
+    assert_eq!(
+        exchange_alpn(
+            serde_json::to_vec(&raw).unwrap(),
+            super::protocol::SERVICES_ALPN
+        )
+        .await["body"]["error"]["code"],
+        "invalid-binding-token"
+    );
+    raw["binding_token"] = json!("0".repeat(64));
+    assert_eq!(
+        exchange_alpn(
+            serde_json::to_vec(&raw).unwrap(),
+            super::protocol::SERVICES_ALPN
+        )
+        .await["body"]["error"]["code"],
+        "invalid-binding-token"
+    );
+    raw["binding_token"] = response["binding_token"].clone();
+    let valid = exchange_alpn(
+        serde_json::to_vec(&raw).unwrap(),
+        super::protocol::SERVICES_ALPN,
+    )
+    .await;
+    assert_eq!(valid["status"], 200);
+    assert_eq!(valid["body"]["device_type"], "computer");
+    assert!(!valid["body"]["name"].as_str().unwrap().is_empty());
     assert_eq!(online["endpoint_id"], created.qr_payload.endpoint_id);
     let spoofed_status = serde_json::to_vec(&json!({
         "api_version": "1", "type": "device.status", "endpoint_id": phone_id.to_string(),
@@ -541,66 +588,98 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         "peer-not-bound"
     );
 
-    // 直接调用手机 NAPI 背后的同一入口，验证真实扫码 payload、身份恢复和双端解绑。
+    // 业务保存 Network 返回的完整配置，重建 Workspace 后显式设置恢复。
     let mobile_path = fixture.root.join("mobile");
     fs::create_dir(&mobile_path).unwrap();
-    let mobile = |operation: &'static str, payload: String| {
-        let directory = mobile_path.to_str().unwrap().to_owned();
-        async move {
-            tokio::task::spawn_blocking(move || {
-                loki_mobile_network::Workspace::open(loki_mobile_network::WorkspaceOptions::new(
-                    directory,
-                ))
-                .unwrap()
-                .execute(operation, &payload)
-            })
-            .await
+    let directory = mobile_path.clone();
+    let workspace = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            loki_mobile_network::Workspace::open(loki_mobile_network::WorkspaceOptions::new(
+                directory,
+            ))
             .unwrap()
-        }
-    };
+        })
+        .await
+        .unwrap(),
+    );
     let invitation = service.create_pairing().await.unwrap();
     let qr_payload = serde_json::to_string(&invitation.qr_payload).unwrap();
-    let bound = mobile("bind", qr_payload.clone()).await;
-    assert_eq!(bound["ok"], true, "{bound}");
-    let loaded = mobile("list", String::new()).await;
-    assert_eq!(loaded["devices"][0]["status"], "unknown");
-    let checked = mobile("refresh", String::new()).await;
-    assert_eq!(checked["devices"][0]["status"], "online", "{checked}");
-    assert!(
-        !checked
-            .to_string()
-            .contains(&invitation.qr_payload.relay_token)
-    );
-    let mobile_file = mobile_path.join("devices.json");
-    let mut saved: Value = serde_json::from_slice(&fs::read(&mobile_file).unwrap()).unwrap();
-    let mobile_id = saved["endpoint_id"].as_str().unwrap().to_owned();
-    // 模拟电脑提交成功后手机丢失响应：持久化待确认记录应由状态查询恢复。
-    saved["computers"][0]["pending"] = serde_json::from_str(&qr_payload).unwrap();
-    saved["computers"][0]["bound_at"] = Value::Null;
-    fs::write(&mobile_file, serde_json::to_vec(&saved).unwrap()).unwrap();
-    let recovered = mobile("refresh", String::new()).await;
-    assert_eq!(recovered["devices"][0]["status"], "online");
-    assert!(recovered["devices"][0]["bound_at"].as_u64().is_some());
-    let retry = mobile("bind", qr_payload).await;
-    assert_eq!(retry["ok"], true, "{retry}");
-    assert_eq!(service.peers().await.unwrap().len(), 1);
+    let config = json!({"endpoint_id":invitation.qr_payload.endpoint_id,"relay_url":invitation.qr_payload.relay_url,"relay_token":invitation.qr_payload.relay_token,"binding":{"status":"unbound"}});
     assert_eq!(
-        mobile("list", String::new()).await["devices"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+        mobile_execute(workspace.clone(), "set_service", config.to_string()).await["ok"],
+        true
     );
-    // 持久 Workspace 的同一个 Network 实例并发通过 iroh 进入实际 HTTP handler。
+    use loki_mobile_network::network::{
+        BindingState, QueryParameter, ResponsError, ServiceRequest,
+    };
+    assert!(matches!(
+        channel_request(workspace.network(), ServiceRequest::get("/network/session"))
+            .await
+            .unwrap_err(),
+        ResponsError::NotBound(_)
+    ));
+    let bind_payload = json!({"invitation":qr_payload,"device_name":"测试手机"}).to_string();
+    let bound = mobile_execute(workspace.clone(), "bind", bind_payload.clone()).await;
+    assert_eq!(bound["ok"], true, "绑定应成功");
+    let token = bound["body"]["credential"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let retry = mobile_execute(workspace.clone(), "bind", bind_payload).await;
+    assert_eq!(retry["body"]["credential"]["token"], token);
+    let info = serde_json::to_value(workspace.network().service().unwrap()).unwrap();
+    let config = json!({"endpoint_id":info["endpoint_id"],"relay_url":info["relay_url"],"relay_token":info["relay_token"],"binding":info["binding"]});
+    assert_eq!(
+        mobile_execute(
+            workspace.clone(),
+            "save_state",
+            json!({"service":config}).to_string()
+        )
+        .await["ok"],
+        true
+    );
+    let phone_peer = service
+        .peers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|peer| peer.name == "测试手机")
+        .unwrap();
+    assert_eq!(phone_peer.device_type, super::protocol::DeviceType::Mobile);
+    let mobile_id = phone_peer.endpoint_id;
+    mobile_execute(workspace.clone(), "stop", String::new()).await;
+    drop(workspace);
     let directory = mobile_path.clone();
-    let workspace = tokio::task::spawn_blocking(move || {
-        loki_mobile_network::Workspace::open(loki_mobile_network::WorkspaceOptions::new(directory))
+    let workspace = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            loki_mobile_network::Workspace::open(loki_mobile_network::WorkspaceOptions::new(
+                directory,
+            ))
             .unwrap()
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap(),
+    );
+    assert!(!workspace.network().has_service());
+    let saved = mobile_execute(workspace.clone(), "load_state", String::new()).await;
+    assert_eq!(
+        mobile_execute(
+            workspace.clone(),
+            "set_service",
+            saved["state"]["service"].to_string()
+        )
+        .await["ok"],
+        true
+    );
     let network = workspace.network();
-    use loki_mobile_network::network::{QueryParameter, ServiceRequest};
+    // 同一身份与绑定凭据重新连接，无需新邀请；完整配置由应用保存。
+    let restored = channel_request(network.clone(), ServiceRequest::get("/network/session"))
+        .await
+        .unwrap();
+    assert_eq!(restored.data["status"], "online");
+    assert_eq!(restored.data["device_type"], "computer");
+    assert!(!restored.data["name"].as_str().unwrap().is_empty());
+    assert!(!restored.data.to_string().contains(&token));
     let mut request = ServiceRequest::get("/network-test/echo/phone%20test");
     request.method = axum::http::Method::POST;
     request.query = vec![
@@ -659,43 +738,32 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         assert_eq!(response.data["status"], "online");
         assert!(ids.insert(response.request_id));
     }
-    assert_eq!(
-        channel_request(network.clone(), ServiceRequest::get("/network/peers"))
-            .await
-            .unwrap_err()
-            .code,
-        "remote-api-forbidden"
+    let forbidden = channel_request(network.clone(), ServiceRequest::get("/network/peers"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(forbidden,ResponsError::Services(error) if error.code == "remote-api-forbidden")
     );
-    assert_eq!(
-        channel_request(network.clone(), ServiceRequest::get("/missing"))
-            .await
-            .unwrap_err()
-            .status,
-        Some(404)
-    );
+    let missing = channel_request(network.clone(), ServiceRequest::get("/missing"))
+        .await
+        .unwrap_err();
+    assert!(matches!(missing,ResponsError::Services(error) if error.status == 404));
     let mut wrong_method = ServiceRequest::get("/network/session");
     wrong_method.method = axum::http::Method::POST;
-    assert_eq!(
-        channel_request(network.clone(), wrong_method)
-            .await
-            .unwrap_err()
-            .status,
-        Some(405)
+    let error = channel_request(network.clone(), wrong_method)
+        .await
+        .unwrap_err();
+    assert!(matches!(error,ResponsError::Services(error) if error.status == 405));
+    let error = channel_request(network.clone(), ServiceRequest::get("/network-test/bad"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error,ResponsError::Services(error) if error.code == "invalid-service-response")
     );
-    assert_eq!(
-        channel_request(network.clone(), ServiceRequest::get("/network-test/bad"))
-            .await
-            .unwrap_err()
-            .code,
-        "invalid-service-response"
-    );
-    assert_eq!(
-        channel_request(network.clone(), ServiceRequest::get("/network-test/large"))
-            .await
-            .unwrap_err()
-            .code,
-        "response-too-large"
-    );
+    let error = channel_request(network.clone(), ServiceRequest::get("/network-test/large"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error,ResponsError::Services(error) if error.code == "response-too-large"));
     assert_eq!(
         http(service.router(), "GET", "/network/session").await.0,
         401
@@ -709,20 +777,22 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .await
         .unwrap_err();
     assert!(matches!(
-        denied.code.as_str(),
-        "peer-not-bound" | "unreachable"
+        denied,
+        ResponsError::NotBound(_) | ResponsError::Network(_)
+    ));
+    // 新连接仍携带旧凭据，电脑必须按身份拒绝；Network 清除无效绑定数据。
+    let denied = channel_request(network.clone(), ServiceRequest::get("/network/session"))
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, ResponsError::NotBound(_)));
+    assert!(matches!(
+        network.service().unwrap().binding,
+        BindingState::Unbound
     ));
     workspace.close().await;
-    let revoked = mobile("refresh", String::new()).await;
-    assert_eq!(revoked["devices"][0]["status"], "unbound", "{revoked}");
     receiver.abort();
     let _ = receiver.await;
     service.shutdown().await;
-    let unavailable = mobile("refresh", String::new()).await;
-    assert_eq!(
-        unavailable["devices"][0]["status"], "unreachable",
-        "{unavailable}"
-    );
     phone.close().await.unwrap();
     relay.shutdown().await.unwrap();
 }
@@ -780,7 +850,7 @@ async fn channel_request(
     request: loki_mobile_network::network::ServiceRequest,
 ) -> Result<
     loki_mobile_network::network::ServiceResponse<Value>,
-    loki_mobile_network::network::NetworkError,
+    loki_mobile_network::network::ResponsError,
 > {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let sender = Arc::new(std::sync::Mutex::new(Some(sender)));
@@ -800,4 +870,111 @@ async fn channel_request(
         },
     );
     receiver.await.unwrap()
+}
+
+async fn mobile_execute(
+    workspace: Arc<loki_mobile_network::Workspace>,
+    operation: &'static str,
+    payload: String,
+) -> Value {
+    tokio::task::spawn_blocking(move || workspace.execute(operation, &payload))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn binding_credentials_are_persistent_peer_scoped_and_revoked_on_rebinding() {
+    let fixture = Fixture::new();
+    let path = fixture.root.join("peers.json");
+    let manager = Arc::new(PairingService::new(Ok(path.clone())));
+    let server = SecretKey::generate().public().to_string();
+    let phone = SecretKey::generate().public();
+    let other = SecretKey::generate().public();
+    let invitation = manager
+        .create(
+            server.clone(),
+            "https://relay.example/".into(),
+            "relay".into(),
+        )
+        .await
+        .unwrap();
+    let bound = manager
+        .bind(
+            phone,
+            request(&invitation.pairing_id, &invitation.qr_payload.pairing_token),
+        )
+        .await
+        .unwrap();
+    let token = bound.binding_token.0.clone();
+    assert_eq!(token.len(), 64);
+    manager.authenticate(phone, &token).await.unwrap();
+    assert_eq!(
+        manager
+            .authenticate(other, &token)
+            .await
+            .unwrap_err()
+            .code(),
+        "peer-not-bound"
+    );
+    assert_eq!(
+        manager.authenticate(phone, "").await.unwrap_err().code(),
+        "invalid-binding-token"
+    );
+    assert_eq!(
+        manager
+            .authenticate(phone, &"0".repeat(64))
+            .await
+            .unwrap_err()
+            .code(),
+        "invalid-binding-token"
+    );
+    assert!(!format!("{bound:?}").contains(&token));
+    assert!(
+        !serde_json::to_string(&manager.list().await.unwrap())
+            .unwrap()
+            .contains(&token)
+    );
+    let restarted = PairingService::new(Ok(path));
+    restarted.authenticate(phone, &token).await.unwrap();
+    let next = manager
+        .create(server, "https://relay.example/".into(), "relay".into())
+        .await
+        .unwrap();
+    let rebound = manager
+        .bind(
+            phone,
+            request(&next.pairing_id, &next.qr_payload.pairing_token),
+        )
+        .await
+        .unwrap();
+    assert_ne!(rebound.binding_token.0, token);
+    assert_eq!(
+        manager
+            .authenticate(phone, &token)
+            .await
+            .unwrap_err()
+            .code(),
+        "invalid-binding-token"
+    );
+    manager
+        .authenticate(phone, &rebound.binding_token.0)
+        .await
+        .unwrap();
+    let original_retry = manager
+        .bind(
+            phone,
+            request(&invitation.pairing_id, &invitation.qr_payload.pairing_token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original_retry.binding_token.0, token);
+    manager.remove(phone).await.unwrap();
+    assert_eq!(
+        manager
+            .authenticate(phone, &rebound.binding_token.0)
+            .await
+            .unwrap_err()
+            .code(),
+        "peer-not-bound"
+    );
 }

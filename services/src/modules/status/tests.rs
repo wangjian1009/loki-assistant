@@ -194,11 +194,18 @@ async fn service_state_has_no_node_layer_and_module_query_returns_all_fields() {
     let snapshot = status.snapshot();
     let start_at = snapshot.status["service"]["start_at"].as_u64().unwrap();
     assert!(start_at > 0);
-    assert_eq!(snapshot.status["service"].len(), 1);
+    assert_eq!(snapshot.status["service"].len(), 3);
+    assert!(
+        !snapshot.status["service"]["name"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(snapshot.status["service"]["device_type"], "computer");
     let (code, body) = request(Arc::clone(&status), "GET", "/status/service", Value::Null).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(body["module_id"], "service");
-    assert_eq!(body["value"], json!({"start_at": start_at}));
+    assert_eq!(body["value"], json!(snapshot.status["service"]));
     assert!(body["updated_at"].as_u64().unwrap() >= start_at);
     let (code, _) = request(
         Arc::clone(&status),

@@ -2,19 +2,25 @@
 
 * 项目说明
 
-这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS，Rust/NAPI 提供 iroh 设备通信。首页提供设备管理：没有电脑时提示增加设备，点击后扫描电脑二维码绑定；绑定后展示电脑状态、设备标识、绑定时间与最近检查时间。手机辅助能力、跨设备同步与后台常驻仍在规划中。
+这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS，Rust/NAPI 提供 iroh 设备通信。首页提供设备管理：没有电脑时提示增加设备，点击后扫描电脑二维码绑定；绑定后展示电脑名称、设备类型、在线状态、绑定时间与最近检查时间。手机辅助能力、跨设备同步与后台常驻仍在规划中。
 
 应用、Ability 和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。根目录 ~make export-icons~ 将图标导出为 ~AppScope/resources/base/media/app_icon.png~ 的 1024 × 1024 PNG；构建直接使用仓库中的导出资源。设计与导出说明见 [[file:../../docs/icon-design.org][图标设计]]。
 
 * 设备管理
 
+点击首页右上角“设置”，可在设置页修改并保存手机名称，后续绑定时上报；手机类型为 ~mobile~ 。电脑 services 从 hostname 生成自己的只读显示名称，类型为 ~computer~ ；手机绑定后通过认证状态查询取得并展示名称和类型。名称只用于显示，不参与认证；services 不提供名称修改接口。
+
 先在电脑的 Emacs 设备管理界面点击“新增设备”，再在手机首页点击“增加设备 · 扫码绑定”；已有电脑时可用右上角“增加”继续扫码。系统扫码支持相机和相册，取消后返回首页；无效、过期或已取消的邀请会提示重新生成二维码。
 
-手机保存随机身份和绑定记录，重新启动后恢复电脑列表；每次连接一台电脑，其他记录可点击“使用此电脑”切换。切换会停止旧电脑请求，之后的通用请求只发给选中的电脑。电脑状态由实际认证请求确定，显示“在线”“暂时无法连接”“已解除绑定”或“绑定待确认”；应用前台每轮检查结束后间隔 20 秒刷新，也可点击“刷新”。后台停止安排轮询，重新进入页面重新检查，不把历史绑定记录当作当前在线。电脑需要运行支持设备状态协议的 services；中继配置变化后可重新扫码更新手机凭据。
+设备页采用深色分组样式，每页只显示一台电脑，左右滑动切换当前连接目标，顶部显示页码。设备名称、固定类型和连接状态保持在页顶，下方监控区域独立滚动，当前展示连接状态、最近检查和设备信息；后续监控项按实际能力增加。手机保存随机身份和绑定记录，重新启动后恢复上次选中的设备；多台历史设备未选择目标时，可点击“使用此电脑”明确选择。切换会停止旧电脑请求，之后的通用请求只发给选中的电脑。电脑状态由实际认证请求确定，显示“在线”“暂时无法连接”“已解除绑定”或“绑定待确认”；应用前台每轮检查结束后间隔 20 秒刷新，也可点击“刷新”。后台停止安排轮询，重新进入页面重新检查，不把历史绑定记录当作当前在线。电脑需要运行支持绑定凭据的 services；中继配置变化后可重新扫码更新手机凭据。
 
-绑定请求发送前先保存待确认记录，避免电脑已绑定但手机丢失响应时丢失关系；刷新会查询电脑并在邀请有效时重试。手机私钥、电脑中继信息与待确认邀请保存在应用私有目录的 ~devices.json~ ，使用 ~0600~ 权限和原子替换，不进入 UI 或日志；成功确认后删除一次性邀请凭据。协议见 [[file:../../docs/control-center-services.org::*扫码绑定][扫码绑定]]。
+电脑解除绑定或凭据失效后，设备卡片提示“请删除后重新扫码添加”，点击“删除设备”清除手机上的记录，再通过“增加设备”扫描新二维码。删除当前设备同时清除 Network 目标，不自动连接其他电脑；此操作不调用电脑端解除绑定接口。
 
-Rust Workspace 统一构造 Network 与设备模块，手机业务通过注入的 ~network.request()~ 使用 HTTP 方法、路径、query 和 JSON body，不传目标 service。电脑 network 模块将 iroh 请求转到现有 HTTP handler，状态查询已经使用 ~GET /network/session~ 。Network 未设置 service 时返回错误回调；Workspace 提供 stop 优雅停止：主动通知未完成请求取消，等待业务收尾并关闭网络，已保存的绑定不删除。接口、分发和生命周期见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
+绑定请求发送前先保存待确认记录；响应丢失后在邀请有效时通过同一绑定接口重试获取原凭据。只有绑定接口允许无凭据，状态查询必须同时验证身份和绑定 token。邀请失效时需重新扫码。手机私钥、电脑中继信息、协议签发的绑定凭据与待确认邀请保存在应用私有目录的 ~devices.json~ ，使用 ~0600~ 权限和原子替换，不进入 UI 或日志；成功确认后删除一次性邀请凭据。协议见 [[file:../../docs/control-center-services.org::*扫码绑定][扫码绑定]]。
+
+手机应用层 Application 管理多台电脑、名称、目标选择和持久化；Rust Workspace 只构造唯一 Network，不提供 devices 管理模块。Network 只持有当前一个 Service，绑定后可获取完整配置，由应用保存，下次启动重新设置到 Network 即可在请求时恢复连接。旧记录缺少新协议 token 时保留手机身份并提示重新扫码。
+
+~network.request()~ 接收 HTTP 方法、路径、query 和 JSON body，并通过异步成功/错误回调返回。错误直接使用 ~ResponsError~ Union，分别表示未设置、未绑定、网络失败、取消、Services 拒绝与参数错误；各分支独立定义原因。Workspace 停止时取消请求并等待回调，不删除已保存绑定。接口、分发与生命周期见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
 
 * 构建与运行
 
@@ -29,14 +35,14 @@ Rust Workspace 统一构造 Network 与设备模块，手机业务通过注入�
 make check-sdk   # 检查 SDK 安装
 make deps        # 检查 SDK 并安装工程依赖
 make build       # 构建 Debug HAP，使用 OrgTasksDebug 调试签名
-make test        # 检查并测试设备管理 Rust 模块
+make test        # 检查并测试应用层与 Rust 网络模块
 make devices     # 查看 hdc 设备
 make install     # 安装到已连接设备
 make run         # 启动手机应用
 make deploy      # 检查真机，构建、安装并启动
 #+end_src
 
-~make build~ 自动检查 SDK 目录及 ~sdk-pkg.json~ ，执行工程和 entry 模块的 OHPM 依赖安装，使用 Rust 和 DevEco NDK 编译设备通信库，再通过 Hvigor 的 ~default@PackingCheck~ 和 ~default@CollectDebugSymbol~ 打包。构建显式指定 ~module=entry@default~ 、 ~product=default~ 、 ~buildMode=debug~ 和 ~debuggable=true~ ，随后由 ~scripts/sign-hap.cjs~ 使用 ~signing/config.json~ 指定的材料独立签名，生成 ~entry/build/default/outputs/default/entry-default-signed.hap~ 。安装入口只使用已签名产物，真机还需已授权的 ~hdc~ 连接。根目录 ~make harmony-test~ 执行手机 Rust 检查；~make services-test~ 同时验证手机入口与 services 的真实 relay 握手。
+~make build~ 自动检查 SDK 目录及 ~sdk-pkg.json~ ，执行工程和 entry 模块的 OHPM 依赖安装，使用 Rust 和 DevEco NDK 编译设备通信库，再通过 Hvigor 的 ~default@PackingCheck~ 和 ~default@CollectDebugSymbol~ 打包。构建显式指定 ~module=entry@default~ 、 ~product=default~ 、 ~buildMode=debug~ 和 ~debuggable=true~ ，随后由 ~scripts/sign-hap.cjs~ 使用 ~signing/config.json~ 指定的材料独立签名，生成 ~entry/build/default/outputs/default/entry-default-signed.hap~ 。安装入口只使用已签名产物，真机还需已授权的 ~hdc~ 连接。根目录 ~make harmony-test~ 执行手机应用层测试与 Rust 检查；~make services-test~ 同时验证手机入口与 services 的真实 relay 握手。
 
 ~make install~ 和 ~make run~ 同样通过设备选择脚本自动选择唯一真机；也可用 ~HDC_TARGET=<设备 ID>~ 显式选择已连接的模拟器。根目录提供 ~make harmony-deps~ 和 ~make harmony-check-sdk~ 对应依赖安装与 SDK 检查。
 

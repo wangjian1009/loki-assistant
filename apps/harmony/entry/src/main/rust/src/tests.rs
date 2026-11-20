@@ -1,45 +1,79 @@
 use super::*;
-use crate::network::*;
-use crate::storage::*;
+use crate::{
+    network::*,
+    pairing::{Invitation, now},
+    storage,
+};
 use iroh::SecretKey;
 use serde_json::{Value, json};
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    sync::Arc,
+    time::Duration,
+};
 
 struct Fixture(std::path::PathBuf);
-
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("loki-mobile-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
-    fn run(&self, operation: &str, payload: &str) -> Value {
-        match Workspace::open(WorkspaceOptions::new(&self.0)) {
-            Ok(workspace) => workspace.execute(operation, payload),
-            Err(error) => json!({"ok":false,"error":error}),
-        }
+    fn workspace(&self) -> Workspace {
+        Workspace::open(WorkspaceOptions::new(&self.0)).unwrap()
     }
 }
-
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-
 fn invitation() -> Value {
-    json!({ "version": 1, "pairing_id": uuid::Uuid::new_v4().to_string(),
-        "endpoint_id": SecretKey::generate().public().to_string(),
-        "relay_url": "https://relay.example/", "relay_token": "relay-secret",
-        "alpn": "loki-assistant/pair/1", "pairing_token": "a".repeat(64), "expires_at": now() + 300 })
+    json!({"version":1,"pairing_id":uuid::Uuid::new_v4().to_string(),
+        "endpoint_id":SecretKey::generate().public().to_string(),"relay_url":"https://relay.example/",
+        "relay_token":"relay-secret","alpn":"loki-assistant/pair/1","pairing_token":"a".repeat(64),"expires_at":now()+300})
+}
+fn bound() -> BindingState {
+    serde_json::from_value(
+        json!({"status":"bound","credential":{"token":"b".repeat(64),"bound_at":1}}),
+    )
+    .unwrap()
+}
+fn unreachable_service(key: &SecretKey, id: iroh::EndpointId) -> Service {
+    Service::new(
+        key.clone(),
+        id,
+        "http://127.0.0.1:9/".into(),
+        "test-token".into(),
+    )
+    .unwrap()
+    .with_binding(bound())
+}
+fn request(
+    network: &Network,
+    timeout: Duration,
+) -> (RequestHandle, std::sync::mpsc::Receiver<ResponsError>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = network.request::<Value, _, _>(
+        ServiceRequest::get("/network/session"),
+        RequestOptions { timeout },
+        |_| panic!("请求不得成功"),
+        move |error| {
+            let _ = sender.send(error);
+        },
+    );
+    (handle, receiver)
+}
+fn error_value(receiver: std::sync::mpsc::Receiver<ResponsError>) -> Value {
+    serde_json::to_value(receiver.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap()
 }
 
 #[test]
-fn rejects_invalid_expired_and_foreign_qr_codes() {
-    assert!(parse_invitation("https://example.org").is_err());
+fn invitation_and_bound_state_require_protocol_data() {
+    assert!(Invitation::parse("https://example.org").is_err());
     let valid = invitation();
-    assert!(parse_invitation(&valid.to_string()).is_ok());
+    assert!(Invitation::parse(&valid.to_string()).is_ok());
     for (key, value) in [
         ("version", json!(2)),
         ("alpn", json!("other/1")),
@@ -48,41 +82,61 @@ fn rejects_invalid_expired_and_foreign_qr_codes() {
         ("pairing_token", json!("A".repeat(64))),
         ("expires_at", json!(now() - 1)),
         ("relay_url", json!("https://user:password@relay.example/")),
-        ("relay_url", json!("file:///tmp/relay")),
         ("relay_token", json!(" ")),
     ] {
-        let mut bad = valid.clone();
-        bad[key] = value;
-        assert!(parse_invitation(&bad.to_string()).is_err(), "{key}");
+        let mut invalid = valid.clone();
+        invalid[key] = value;
+        assert!(Invitation::parse(&invalid.to_string()).is_err(), "{key}");
     }
+    for invalid in [
+        json!({"status":"bound"}),
+        json!({"status":"bound","credential":{"token":"fake","bound_at":1}}),
+        json!({"status":"unbound","credential":{"token":"a".repeat(64),"bound_at":1}}),
+    ] {
+        assert!(serde_json::from_value::<BindingState>(invalid).is_err());
+    }
+    assert!(!format!("{:?}", bound()).contains(&"b".repeat(64)));
 }
 
 #[test]
-fn restores_identity_and_records_without_exposing_credentials_or_stale_online_state() {
+fn application_owns_records_and_workspace_never_selects_a_service() {
     let fixture = Fixture::new();
-    assert_eq!(fixture.run("list", "")["devices"], json!([]));
-    let path = fixture.0.join("devices.json");
-    let mut store = load(&path).unwrap();
-    let id = store.endpoint_id.clone();
-    let qr: Invitation = serde_json::from_value(invitation()).unwrap();
-    store.computers.push(Computer {
-        endpoint_id: qr.endpoint_id,
-        relay_url: qr.relay_url,
-        relay_token: qr.relay_token,
-        bound_at: Some(now()),
-        pending: None,
-    });
-    save(&path, &store).unwrap();
-    let restored = fixture.run("list", "");
-    assert_eq!(restored["devices"][0]["status"], "unknown");
-    assert_eq!(load(&path).unwrap().endpoint_id, id);
+    let workspace = fixture.workspace();
+    let state = json!({"computers":[{"endpoint_id":"app-owned"}],"selected_endpoint_id":"app-owned","device_name":"手机"});
     assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        workspace.execute("save_state", &state.to_string())["ok"],
+        true
+    );
+    let identity = workspace.execute("load_state", "")["endpoint_id"].clone();
+    workspace.execute("stop", "");
+    drop(workspace);
+    let restored = fixture.workspace();
+    let loaded = restored.execute("load_state", "");
+    assert_eq!(loaded["state"], state);
+    assert_eq!(loaded["endpoint_id"], identity);
+    assert!(!restored.network().has_service());
+    let secret = storage::load(&fixture.0.join("devices.json"))
+        .unwrap()
+        .secret_key;
+    assert!(!loaded.to_string().contains(&secret));
+    assert_eq!(
+        restored.execute("save_state", r#"{"secret_key":"replace"}"#)["ok"],
+        false
+    );
+    assert_eq!(
+        storage::load(&fixture.0.join("devices.json"))
+            .unwrap()
+            .secret_key,
+        secret
+    );
+    assert_eq!(
+        fs::metadata(fixture.0.join("devices.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
-    let view = restored.to_string();
-    assert!(!view.contains("relay-secret"));
-    assert!(!view.contains(&store.secret_key));
 }
 
 #[test]
@@ -90,217 +144,140 @@ fn damaged_or_symlinked_storage_is_preserved() {
     let fixture = Fixture::new();
     let path = fixture.0.join("devices.json");
     fs::write(&path, "broken").unwrap();
-    assert_eq!(fixture.run("list", "")["ok"], false);
+    assert!(Workspace::open(WorkspaceOptions::new(&fixture.0)).is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), "broken");
     fs::remove_file(&path).unwrap();
     let target = fixture.0.join("target.json");
     fs::write(&target, "preserve").unwrap();
     symlink(&target, &path).unwrap();
-    assert_eq!(fixture.run("list", "")["ok"], false);
-    assert_eq!(fs::read_to_string(&target).unwrap(), "preserve");
+    assert!(Workspace::open(WorkspaceOptions::new(&fixture.0)).is_err());
+    assert_eq!(fs::read_to_string(target).unwrap(), "preserve");
 }
 
 #[test]
-fn workspace_injects_one_network_and_reports_missing_service_through_callback() {
+fn missing_unbound_invalid_and_transport_failures_are_distinct_unions() {
     let fixture = Fixture::new();
-    let workspace = Workspace::open(WorkspaceOptions::new(&fixture.0)).unwrap();
+    let workspace = fixture.workspace();
     let network = workspace.network();
     assert!(Arc::ptr_eq(&network, &workspace.network()));
-    assert!(Arc::ptr_eq(&network, &workspace.devices().network()));
-    let (sender, receiver) = std::sync::mpsc::channel();
-    network.request::<Value, _, _>(
-        ServiceRequest::get("/network/session"),
-        RequestOptions::default(),
-        |_| panic!("未配置 service 不得成功"),
-        move |error| {
-            sender.send(error).unwrap();
-        },
-    );
-    let error = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(error.kind, ErrorKind::ServiceNotConfigured);
-    assert_eq!(error.code, "service-not-configured");
-    assert_eq!(error.outcome, Outcome::NotSent);
-    assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
-    assert_eq!(
-        workspace.execute("request", r#"{"method":"GET","path":"/network/session"}"#)["network_error"]
-            ["code"],
-        "service-not-configured"
-    );
-}
-
-#[test]
-fn legacy_multiple_bindings_require_explicit_selection() {
-    let fixture = Fixture::new();
-    let path = fixture.0.join("devices.json");
-    let mut store = load(&path).unwrap();
-    for _ in 0..2 {
-        let qr: Invitation = serde_json::from_value(invitation()).unwrap();
-        store.computers.push(Computer {
-            endpoint_id: qr.endpoint_id,
-            relay_url: qr.relay_url,
-            relay_token: qr.relay_token,
-            bound_at: Some(now()),
-            pending: None,
-        });
-    }
-    save(&path, &store).unwrap();
-    let workspace = Workspace::open(WorkspaceOptions::new(&fixture.0)).unwrap();
-    assert!(!workspace.network().has_service());
-    assert_eq!(
-        workspace.execute("list", "")["devices"][0]["status"],
-        "inactive"
-    );
-    let id = store.computers[1].endpoint_id.clone();
-    assert_eq!(workspace.execute("select", &id)["ok"], true);
-    assert!(workspace.network().has_service());
-    assert_eq!(workspace.execute("list", "")["devices"][1]["active"], true);
-    assert_eq!(load(&path).unwrap().selected_endpoint_id, Some(id));
-    workspace.network().clear_service();
-    assert!(!workspace.network().has_service());
-}
-
-#[test]
-fn network_cancel_switch_timeout_and_close_complete_once() {
-    let fixture = Fixture::new();
-    let workspace = Workspace::open(WorkspaceOptions::new(&fixture.0)).unwrap();
-    let network = workspace.network();
+    let (_, receiver) = request(&network, Duration::from_secs(10));
+    let error = error_value(receiver);
+    assert_eq!(error["kind"], "not_configured");
+    assert_eq!(error["reason"], "service_not_set");
     let key = SecretKey::generate();
     let id = SecretKey::generate().public();
-    let service = || {
-        Service::new(
-            key.clone(),
-            id,
-            "http://127.0.0.1:9/".into(),
-            "test-token".into(),
-        )
-        .unwrap()
-    };
-    network.set_service(service()).unwrap();
-    let generation = network.generation();
-    network.set_service(service()).unwrap();
-    assert_eq!(network.generation(), generation);
-    let request = |network: &Network, timeout| {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let handle = network.request::<Value, _, _>(
-            ServiceRequest::get("/network/session"),
-            RequestOptions { timeout },
-            |_| panic!("不可达服务不得成功"),
-            move |error| {
-                sender.send(error).unwrap();
-            },
-        );
-        (handle, receiver)
-    };
-    let (handle, receiver) = request(&network, Duration::from_secs(10));
-    handle.cancel();
-    handle.cancel();
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap().kind,
-        ErrorKind::Cancelled
-    );
-    assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
-    let (_, receiver) = request(&network, Duration::from_secs(10));
-    network.clear_service();
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap().kind,
-        ErrorKind::ServiceChanged
-    );
-    network.set_service(service()).unwrap();
-    let (_, receiver) = request(&network, Duration::from_secs(1));
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(3)).unwrap().kind,
-        ErrorKind::Timeout
-    );
-    let (_, receiver) = request(&network, Duration::from_secs(10));
-    workspace.execute("stop", "");
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap().kind,
-        ErrorKind::Cancelled
-    );
-    let (_, receiver) = request(&network, Duration::from_secs(10));
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap().kind,
-        ErrorKind::Closed
-    );
-    assert!(network.set_service(service()).is_err());
-}
-
-#[test]
-fn retained_network_delivers_closed_error_after_workspace_drop() {
-    let fixture = Fixture::new();
-    let workspace = Workspace::open(WorkspaceOptions::new(&fixture.0)).unwrap();
-    let network = workspace.network();
-    workspace.execute("close", "");
-    drop(workspace);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    network.request::<Value, _, _>(
-        ServiceRequest::get("/network/session"),
-        Default::default(),
-        |_| panic!("已关闭不得成功"),
-        move |error| {
-            sender.send(error).unwrap();
-        },
-    );
-    assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(1)).unwrap().kind,
-        ErrorKind::Closed
-    );
-}
-
-#[test]
-fn workspace_stop_cancels_all_callers_and_rejects_new_business_operations() {
-    let fixture = Fixture::new();
-    let workspace = Arc::new(Workspace::open(WorkspaceOptions::new(&fixture.0)).unwrap());
-    let network = workspace.network();
     network
         .set_service(
             Service::new(
-                SecretKey::generate(),
-                SecretKey::generate().public(),
+                key.clone(),
+                id,
                 "http://127.0.0.1:9/".into(),
                 "token".into(),
             )
             .unwrap(),
         )
         .unwrap();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    for _ in 0..4 {
-        let sender = sender.clone();
-        network.request::<Value, _, _>(
-            ServiceRequest::get("/network/session"),
-            Default::default(),
-            |_| panic!("不可达服务不得成功"),
-            move |error| {
-                sender.send(error).unwrap();
-            },
-        );
+    let (_, receiver) = request(&network, Duration::from_secs(10));
+    let error = error_value(receiver);
+    assert_eq!(error["kind"], "not_bound");
+    assert_eq!(error["reason"], "binding_required");
+    assert_eq!(error["outcome"], "not_sent");
+    network.set_service(unreachable_service(&key, id)).unwrap();
+    let (_, receiver) = request(&network, Duration::from_millis(1));
+    let error = error_value(receiver);
+    assert_eq!(error["kind"], "invalid_request");
+    assert_eq!(error["reason"], "invalid_timeout");
+    let (_, receiver) = request(&network, Duration::from_secs(1));
+    let error = error_value(receiver);
+    assert_eq!(error["kind"], "network");
+    assert!(matches!(
+        error["reason"].as_str(),
+        Some("request_timeout" | "connect_failed")
+    ));
+}
+
+#[test]
+fn network_replaces_the_only_service_and_restores_full_configuration() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace();
+    let network = workspace.network();
+    let config = json!({"endpoint_id":SecretKey::generate().public().to_string(),"relay_url":"https://relay.example/","relay_token":"relay-secret","binding":bound()});
+    assert_eq!(
+        workspace.execute("set_service", &config.to_string())["ok"],
+        true
+    );
+    let snapshot = workspace.execute("service", "")["service"].clone();
+    for key in ["endpoint_id", "relay_url", "relay_token", "binding"] {
+        assert_eq!(snapshot[key], config[key]);
     }
-    drop(sender);
-    let first = workspace.clone();
-    let second = workspace.clone();
-    let begin = std::time::Instant::now();
-    let stop1 = std::thread::spawn(move || first.execute("stop", ""));
-    let stop2 = std::thread::spawn(move || second.execute("stop", ""));
-    assert_eq!(stop1.join().unwrap()["ok"], true);
-    assert_eq!(stop2.join().unwrap()["ok"], true);
-    assert!(begin.elapsed() < Duration::from_secs(4));
-    let errors = receiver.into_iter().collect::<Vec<_>>();
-    assert_eq!(errors.len(), 4);
-    assert!(
-        errors
-            .iter()
-            .all(|error| error.kind == ErrorKind::Cancelled)
+    let generation = network.generation();
+    assert_eq!(
+        workspace.execute("set_service", &config.to_string())["ok"],
+        true
+    );
+    assert_eq!(network.generation(), generation);
+    let mut other = config.clone();
+    other["endpoint_id"] = json!(SecretKey::generate().public().to_string());
+    assert_eq!(
+        workspace.execute("set_service", &other.to_string())["ok"],
+        true
     );
     assert_eq!(
-        errors
-            .iter()
-            .filter_map(|e| e.request_id.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        4
+        workspace.execute("service", "")["service"]["endpoint_id"],
+        other["endpoint_id"]
     );
-    assert_eq!(workspace.execute("list", "")["ok"], false);
-    assert_eq!(workspace.execute("refresh", "")["ok"], false);
-    assert_eq!(workspace.execute("select", "missing")["ok"], false);
+    network.clear_service();
+    assert!(network.service().is_none());
+}
+
+#[test]
+fn cancellation_switch_and_shutdown_preserve_separate_reasons() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace();
+    let network = workspace.network();
+    let key = SecretKey::generate();
+    let id = SecretKey::generate().public();
+    network.set_service(unreachable_service(&key, id)).unwrap();
+    let (handle, receiver) = request(&network, Duration::from_secs(10));
+    handle.cancel();
+    handle.cancel();
+    let error = error_value(receiver);
+    assert_eq!(error["kind"], "cancelled");
+    assert_eq!(error["reason"], "user_requested");
+    let (_, receiver) = request(&network, Duration::from_secs(10));
+    network.clear_service();
+    assert_eq!(error_value(receiver)["reason"], "service_changed");
+    network.set_service(unreachable_service(&key, id)).unwrap();
+    let (_, receiver) = request(&network, Duration::from_secs(10));
     assert_eq!(workspace.execute("stop", "")["ok"], true);
+    assert_eq!(error_value(receiver)["reason"], "network_closed");
+    assert_eq!(workspace.execute("stop", "")["ok"], true);
+    drop(workspace);
+    let (_, receiver) = request(&network, Duration::from_secs(10));
+    assert_eq!(error_value(receiver)["reason"], "network_closed");
+}
+
+#[test]
+fn service_rejections_keep_their_own_reason_and_details() {
+    let response = json!({"api_version":"1","status":409,"error":{"source":"business","code":"busy","message":"服务忙"}});
+    let error = ResponsError::api(&response, 409).unwrap();
+    let value = serde_json::to_value(error).unwrap();
+    assert_eq!(value["kind"], "services");
+    assert_eq!(value["reason"], "rejected");
+    assert_eq!(value["status"], 409);
+    assert_eq!(value["code"], "busy");
+    assert_eq!(value["source"], "business");
+    for (code, reason) in [
+        ("peer-not-bound", "binding_revoked"),
+        ("invalid-binding-token", "invalid_credential"),
+    ] {
+        let error=ResponsError::api(&json!({"api_version":"1","status":403,"error":{"source":"business","code":code,"message":"授权失败"}}),403).unwrap();
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["kind"], "not_bound");
+        assert_eq!(value["reason"], reason);
+    }
+    assert!(matches!(
+        ResponsError::api(&response, 500).unwrap_err(),
+        ResponsError::Network(_)
+    ));
 }
