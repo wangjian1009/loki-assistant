@@ -6,7 +6,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Invitation {
     pub version: u32,
@@ -37,7 +37,7 @@ pub(crate) fn valid_relay(address: &str, token: &str) -> bool {
         && token.len() <= 4096
 }
 impl Invitation {
-    pub fn parse(payload: &str) -> Result<Self, ResponsError> {
+    pub fn decode(payload: &str) -> Result<Self, ResponsError> {
         let invalid = || ResponsError::from(InvalidRequestReason::InvalidInvitation);
         if payload.len() > 16_384 {
             return Err(invalid());
@@ -56,6 +56,10 @@ impl Invitation {
         {
             return Err(invalid());
         }
+        Ok(value)
+    }
+    pub fn parse(payload: &str) -> Result<Self, ResponsError> {
+        let value = Self::decode(payload)?;
         if value.expires_at <= now() {
             return Err(InvalidRequestReason::ExpiredInvitation.into());
         }

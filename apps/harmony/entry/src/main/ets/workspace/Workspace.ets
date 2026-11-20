@@ -23,19 +23,22 @@ interface NativeRequest extends ServiceRequest { operation_id: string }
 export interface QueryParameter { name: string; value: string }
 export interface BindingCredential { token: string; bound_at: number }
 export interface Unbound { status: 'unbound' }
+export interface BindingInProgress { status: 'binding' }
+export interface BindingFailed { status: 'failed'; error: ResponsError }
 export interface Bound { status: 'bound'; credential: BindingCredential }
-export type BindingState = Unbound | Bound
+export type BindingState = Unbound | BindingInProgress | BindingFailed | Bound
 export type DeviceType = 'computer' | 'mobile'
 export interface Service {
   endpoint_id: string
   relay_url: string
   relay_token: string
   binding: BindingState
+  auto_binding?: AutoBinding
 }
 export interface ServiceState extends Service {
   generation: number
 }
-export interface Binding { endpoint_id: string; credential: BindingCredential }
+export interface AutoBinding { invitation: Invitation; device_name: string }
 export interface Invitation {
   version: number
   pairing_id: string
@@ -46,7 +49,6 @@ export interface Invitation {
   pairing_token: string
   expires_at: number
 }
-interface BindRequest { invitation: string; device_name: string }
 interface InvitationResult { invitation: Invitation }
 interface StateResult { service: ServiceState | null }
 export interface ApplicationData { state: Object; endpoint_id: string }
@@ -71,10 +73,6 @@ export class Network {
   }
   async parseInvitation(payload: string): Promise<Invitation> {
     return (JSON.parse(await this.workspace.execute('parse_invitation', payload)) as InvitationResult).invitation
-  }
-  async bind(payload: string, deviceName: string): Promise<Binding> {
-    const request: BindRequest = { invitation: payload, device_name: deviceName }
-    return (JSON.parse(await this.workspace.execute('bind', JSON.stringify(request))) as ServiceResponse).body as Binding
   }
   request(request: ServiceRequest, onSuccess: (response: ServiceResponse) => void,
     onError: (error: ResponsError) => void): RequestHandle {

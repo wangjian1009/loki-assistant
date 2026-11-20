@@ -65,6 +65,10 @@ impl std::fmt::Debug for BindingCredential {
 pub enum BindingState {
     #[default]
     Unbound,
+    Binding,
+    Failed {
+        error: ResponsError,
+    },
     Bound {
         credential: BindingCredential,
     },
@@ -74,16 +78,27 @@ pub enum BindingState {
 struct BindingData {
     status: String,
     credential: Option<BindingCredential>,
+    error: Option<ResponsError>,
 }
 impl TryFrom<BindingData> for BindingState {
     type Error = &'static str;
     fn try_from(data: BindingData) -> Result<Self, Self::Error> {
-        match (data.status.as_str(), data.credential) {
-            ("unbound", None) => Ok(Self::Unbound),
-            ("bound", Some(credential)) => Ok(Self::Bound { credential }),
-            _ => Err("绑定状态与协议凭据不一致"),
+        match (data.status.as_str(), data.credential, data.error) {
+            ("unbound", None, None) => Ok(Self::Unbound),
+            ("binding", None, None) => Ok(Self::Binding),
+            ("failed", None, Some(error)) => Ok(Self::Failed { error }),
+            ("bound", Some(credential), None) => Ok(Self::Bound { credential }),
+            _ => Err("绑定状态与协议数据不一致"),
         }
     }
+}
+
+/// 仅自动绑定使用，成功或失败后均丢弃一次性邀请；不实现 Debug。
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoBinding {
+    pub invitation: Invitation,
+    pub device_name: String,
 }
 #[derive(Clone, Serialize)]
 pub struct ServiceState {
@@ -91,12 +106,14 @@ pub struct ServiceState {
     pub relay_url: String,
     pub relay_token: String,
     pub binding: BindingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_binding: Option<AutoBinding>,
     pub generation: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Binding {
-    pub endpoint_id: String,
-    pub credential: BindingCredential,
+struct Binding {
+    endpoint_id: String,
+    credential: BindingCredential,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +168,7 @@ pub struct Service {
     connection: AsyncMutex<Option<Connection>>,
     closed: AtomicBool,
     binding: Mutex<BindingState>,
+    auto_binding: Mutex<Option<AutoBinding>>,
 }
 impl Service {
     pub fn new(
@@ -171,10 +189,23 @@ impl Service {
             connection: AsyncMutex::new(None),
             closed: AtomicBool::new(false),
             binding: Mutex::new(BindingState::Unbound),
+            auto_binding: Mutex::new(None),
         })
     }
     pub fn with_binding(self, binding: BindingState) -> Self {
         *self.binding.lock().unwrap() = binding;
+        self
+    }
+    pub fn with_auto_binding(self, options: AutoBinding) -> Self {
+        // 已有票据或最终失败结果不因残留邀请数据而重新握手。
+        if matches!(
+            self.binding(),
+            BindingState::Bound { .. } | BindingState::Failed { .. }
+        ) {
+            return self;
+        }
+        *self.auto_binding.lock().unwrap() = Some(options);
+        *self.binding.lock().unwrap() = BindingState::Unbound;
         self
     }
     pub fn binding(&self) -> BindingState {
@@ -188,7 +219,12 @@ impl Service {
             && self.identity.public() == other.identity.public()
             && self.relay_url == other.relay_url
             && self.relay_token == other.relay_token
-            && self.binding() == other.binding()
+            && (self.binding() == other.binding()
+                || matches!(
+                    (self.binding(), other.binding()),
+                    (BindingState::Binding, BindingState::Unbound)
+                ))
+            && *self.auto_binding.lock().unwrap() == *other.auto_binding.lock().unwrap()
     }
     async fn endpoint(&self) -> Result<Endpoint, ResponsError> {
         let mut guard = self.endpoint.lock().await;
@@ -417,7 +453,7 @@ impl Network {
     pub fn set_service(&self, service: Service) -> Result<(), ResponsError> {
         let mut state = self.inner.state.lock().unwrap();
         if state.closed {
-            return Err(ResponsError::from(CancelledReason::NetworkClosed));
+            return Err(CancelledReason::NetworkClosed.into());
         }
         if state
             .service
@@ -426,14 +462,92 @@ impl Network {
         {
             return Ok(());
         }
-        if let Some(old) = state.service.replace(Arc::new(service)) {
+        let service = Arc::new(service);
+        let auto_bind = matches!(
+            service.binding(),
+            BindingState::Unbound | BindingState::Binding
+        );
+        if auto_bind {
+            *service.binding.lock().unwrap() = BindingState::Binding;
+        }
+        if let Some(old) = state.service.replace(service.clone()) {
             state.retired.push(old);
         }
         state.generation += 1;
         self.inner.changed.send_replace(state.generation);
+        if auto_bind {
+            // 在释放状态锁前登记任务，shutdown 必须等待这次绑定收尾。
+            let id = Uuid::new_v4();
+            let (cancel, cancelled) = watch::channel(false);
+            state.requests.insert(id, cancel);
+            let generation = state.generation;
+            let changed = self.inner.changed.subscribe();
+            let network = self.clone();
+            self.inner.runtime.spawn(async move {
+                network
+                    .auto_bind(service, id, generation, cancelled, changed)
+                    .await;
+            });
+        }
         drop(state);
         self.schedule_retirement();
         Ok(())
+    }
+
+    async fn auto_bind(
+        &self,
+        service: Arc<Service>,
+        id: Uuid,
+        generation: u64,
+        mut cancelled: watch::Receiver<bool>,
+        mut changed: watch::Receiver<u64>,
+    ) {
+        let sent = AtomicBool::new(false);
+        let operation = async {
+            self.retire().await;
+            let options = service
+                .auto_binding
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| ResponsError::from(InvalidRequestReason::InvalidInvitation))?;
+            let invitation =
+                Invitation::parse(&serde_json::to_string(&options.invitation).unwrap())?;
+            let name = options.device_name.trim();
+            if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                return Err(InvalidRequestReason::InvalidDeviceName.into());
+            }
+            service.pair(&invitation, name, &sent).await
+        };
+        let mut result = tokio::select! {
+            biased;
+            _ = async { if !*cancelled.borrow() { let _ = cancelled.changed().await; } } => Err(CancelledReason::NetworkClosed.into()),
+            _ = async { if *changed.borrow() == generation { let _ = changed.changed().await; } } => Err(CancelledReason::ServiceChanged.into()),
+            result = tokio::time::timeout(Duration::from_secs(20), operation) => result.unwrap_or_else(|_| Err(NetworkReason::RequestTimeout.into())),
+        };
+        if let Err(error) = &mut result {
+            let outcome = if sent.load(Ordering::SeqCst) && error.outcome() != Outcome::Rejected {
+                Outcome::Unknown
+            } else {
+                error.outcome()
+            };
+            error.set_context(Some(id.to_string()), outcome);
+        }
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            // 旧目标的成功、失败或取消都不能覆盖当前 Service。
+            if state.generation == generation && !state.closed {
+                *service.binding.lock().unwrap() = match result {
+                    Ok(binding) => BindingState::Bound {
+                        credential: binding.credential,
+                    },
+                    Err(error) => BindingState::Failed { error },
+                };
+                service.auto_binding.lock().unwrap().take();
+            }
+            state.requests.remove(&id);
+        }
+        self.inner.done.notify_waiters();
     }
     pub fn clear_service(&self) {
         let mut state = self.inner.state.lock().unwrap();
@@ -472,45 +586,9 @@ impl Network {
             relay_url: service.relay_url.clone(),
             relay_token: service.relay_token.clone(),
             binding: service.binding(),
+            auto_binding: service.auto_binding.lock().unwrap().clone(),
             generation: state.generation,
         })
-    }
-    pub fn bind<OnSuccess, OnError>(
-        &self,
-        payload: &str,
-        device_name: &str,
-        on_success: OnSuccess,
-        on_error: OnError,
-    ) -> RequestHandle
-    where
-        OnSuccess: FnOnce(ServiceResponse<Binding>) + Send + 'static,
-        OnError: FnOnce(ResponsError) + Send + 'static,
-    {
-        let invitation = Invitation::parse(payload);
-        let device_name = device_name.to_owned();
-        self.execute(
-            true,
-            RequestOptions {
-                timeout: Duration::from_secs(20),
-            },
-            move |service, _, sent| async move {
-                if device_name.trim().is_empty()
-                    || device_name.len() > 128
-                    || device_name.chars().any(char::is_control)
-                {
-                    return Err(InvalidRequestReason::InvalidDeviceName.into());
-                }
-                let binding = service
-                    .pair(&invitation?, device_name.trim(), &sent)
-                    .await?;
-                let state = BindingState::Bound {
-                    credential: binding.credential.clone(),
-                };
-                Ok((StatusCode::OK, binding, Some(state)))
-            },
-            on_success,
-            on_error,
-        )
     }
     pub fn request<T, OnSuccess, OnError>(
         &self,
@@ -525,7 +603,6 @@ impl Network {
         OnError: FnOnce(ResponsError) + Send + 'static,
     {
         self.execute(
-            false,
             options,
             move |service, id, sent| async move {
                 if !request.path.starts_with('/')
@@ -538,7 +615,7 @@ impl Network {
                 let (status, value) = service.exchange(&request, id, &sent).await?;
                 let data = serde_json::from_value(value)
                     .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
-                Ok((status, data, None))
+                Ok((status, data))
             },
             on_success,
             on_error,
@@ -546,7 +623,6 @@ impl Network {
     }
     fn execute<T, Operation, Future, OnSuccess, OnError>(
         &self,
-        allow_unbound: bool,
         options: RequestOptions,
         operation: Operation,
         on_success: OnSuccess,
@@ -555,9 +631,7 @@ impl Network {
     where
         T: Send + 'static,
         Operation: FnOnce(Arc<Service>, Uuid, Arc<AtomicBool>) -> Future + Send + 'static,
-        Future: std::future::Future<
-                Output = Result<(StatusCode, T, Option<BindingState>), ResponsError>,
-            > + Send,
+        Future: std::future::Future<Output = Result<(StatusCode, T), ResponsError>> + Send,
         OnSuccess: FnOnce(ServiceResponse<T>) + Send + 'static,
         OnError: FnOnce(ResponsError) + Send + 'static,
     {
@@ -587,7 +661,7 @@ impl Network {
             let mut result = if *cancelled.borrow() {
                 Err(CancelledReason::UserRequested.into())
             } else if let Some(service) = service.as_ref() {
-                if !allow_unbound && matches!(service.binding(), BindingState::Unbound) {
+                if !matches!(service.binding(), BindingState::Bound { .. }) {
                     Err(NotBoundReason::BindingRequired.into())
                 } else if !(Duration::from_secs(1)..=Duration::from_secs(30))
                     .contains(&options.timeout)
@@ -629,10 +703,13 @@ impl Network {
                     };
                     result = Err(reason.into());
                 } else if let Some(service) = service {
-                    if let Ok((_, _, Some(binding))) = &result {
-                        *service.binding.lock().unwrap() = binding.clone();
-                    } else if matches!(&result, Err(ResponsError::NotBound(_))) {
-                        *service.binding.lock().unwrap() = BindingState::Unbound;
+                    if let Err(error @ ResponsError::NotBound(_)) = &result {
+                        // 正在绑定时业务请求只是未就绪，不中断或覆盖自动绑定。
+                        if matches!(service.binding(), BindingState::Bound { .. }) {
+                            *service.binding.lock().unwrap() = BindingState::Failed {
+                                error: error.clone(),
+                            };
+                        }
                     }
                 }
             }
@@ -646,7 +723,7 @@ impl Network {
                 error.set_context(Some(id.to_string()), outcome);
             }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match result {
-                Ok((status, data, _)) => on_success(ServiceResponse {
+                Ok((status, data)) => on_success(ServiceResponse {
                     request_id: id,
                     status,
                     data,

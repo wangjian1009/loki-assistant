@@ -132,7 +132,7 @@ async fn invitations_expire_refresh_cancel_and_reject_wrong_tokens() {
             .await
             .unwrap_err()
             .code(),
-        "pairing-cancelled"
+        "pairing-expired"
     );
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(300)).await;
@@ -158,7 +158,7 @@ async fn invitations_expire_refresh_cancel_and_reject_wrong_tokens() {
 }
 
 #[tokio::test]
-async fn concurrent_binding_has_one_winner_and_retries_are_idempotent() {
+async fn concurrent_binding_consumes_invitation_and_later_attempts_expire() {
     let fixture = Fixture::new();
     let path = fixture.root.join("peers.json");
     let manager = Arc::new(PairingService::new(Ok(path.clone())));
@@ -181,10 +181,14 @@ async fn concurrent_binding_has_one_winner_and_retries_are_idempotent() {
     } else {
         a.unwrap_err()
     };
-    assert_eq!(loser.code(), "pairing-consumed");
+    assert_eq!(loser.code(), "pairing-expired");
     let progress = manager.query(&created.pairing_id, false).await.unwrap();
-    let retry = manager.bind(winner, bind()).await.unwrap();
-    assert_eq!(retry.bound_at, progress.peer.unwrap().bound_at);
+    assert_eq!(progress.status, PairingStatus::Completed);
+    assert_eq!(progress.peer.unwrap().endpoint_id, winner.to_string());
+    assert_eq!(
+        manager.bind(winner, bind()).await.unwrap_err().code(),
+        "pairing-expired"
+    );
     assert_eq!(
         manager
             .query(&created.pairing_id, true)
@@ -210,7 +214,7 @@ async fn concurrent_binding_has_one_winner_and_retries_are_idempotent() {
     assert!(manager.list().await.unwrap().is_empty());
     assert_eq!(
         manager.bind(winner, bind()).await.unwrap_err().code(),
-        "pairing-cancelled"
+        "pairing-expired"
     );
     assert_eq!(
         manager.remove(winner).await.unwrap_err().code(),
@@ -501,10 +505,13 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     .await
     .unwrap();
     assert_eq!(rejected["status"], 400);
-    let response = tokio::time::timeout(Duration::from_secs(10), exchange(good))
+    let response = tokio::time::timeout(Duration::from_secs(10), exchange(good.clone()))
         .await
         .unwrap();
     assert_eq!(response["type"], "pairing.bound");
+    let repeated = exchange(good).await;
+    assert_eq!(repeated["status"], 410);
+    assert_eq!(repeated["error"]["code"], "pairing-expired");
     assert_eq!(
         exchange_alpn(status_request.clone(), super::protocol::DEVICE_STATUS_ALPN).await["error"]["code"],
         "invalid-binding-token"
@@ -603,31 +610,58 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .unwrap(),
     );
     let invitation = service.create_pairing().await.unwrap();
-    let qr_payload = serde_json::to_string(&invitation.qr_payload).unwrap();
-    let config = json!({"endpoint_id":invitation.qr_payload.endpoint_id,"relay_url":invitation.qr_payload.relay_url,"relay_token":invitation.qr_payload.relay_token,"binding":{"status":"unbound"}});
-    assert_eq!(
-        mobile_execute(workspace.clone(), "set_service", config.to_string()).await["ok"],
-        true
-    );
     use loki_mobile_network::network::{
         BindingState, QueryParameter, ResponsError, ServiceRequest,
     };
+    let config = json!({"endpoint_id":invitation.qr_payload.endpoint_id,"relay_url":invitation.qr_payload.relay_url,"relay_token":invitation.qr_payload.relay_token,"binding":{"status":"unbound"},"auto_binding":{"invitation":invitation.qr_payload,"device_name":"测试手机"}});
+    let mut wrong = config.clone();
+    wrong["auto_binding"]["invitation"]["pairing_token"] = json!("0".repeat(64));
+    assert_eq!(
+        mobile_execute(workspace.clone(), "set_service", wrong.to_string()).await["ok"],
+        true
+    );
+    tokio::time::timeout(Duration::from_secs(10),async {
+        loop {
+            let info=workspace.network().service().unwrap();
+            if let BindingState::Failed{error}=info.binding {
+                assert!(matches!(error,ResponsError::Services(error) if error.code == "invalid-pairing-token"));
+                assert!(info.auto_binding.is_none());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
     assert!(matches!(
         channel_request(workspace.network(), ServiceRequest::get("/network/session"))
             .await
             .unwrap_err(),
         ResponsError::NotBound(_)
     ));
-    let bind_payload = json!({"invitation":qr_payload,"device_name":"测试手机"}).to_string();
-    let bound = mobile_execute(workspace.clone(), "bind", bind_payload.clone()).await;
-    assert_eq!(bound["ok"], true, "绑定应成功");
-    let token = bound["body"]["credential"]["token"]
+    assert_eq!(
+        mobile_execute(workspace.clone(), "set_service", config.to_string()).await["ok"],
+        true
+    );
+    let info = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let info = serde_json::to_value(workspace.network().service().unwrap()).unwrap();
+            if info["binding"]["status"] == "bound" {
+                break info;
+            }
+            assert_ne!(info["binding"]["status"], "failed", "自动绑定失败");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(info.get("auto_binding").is_none());
+    let token = info["binding"]["credential"]["token"]
         .as_str()
         .unwrap()
         .to_owned();
-    let retry = mobile_execute(workspace.clone(), "bind", bind_payload).await;
-    assert_eq!(retry["body"]["credential"]["token"], token);
-    let info = serde_json::to_value(workspace.network().service().unwrap()).unwrap();
+    assert_eq!(
+        mobile_execute(workspace.clone(), "bind", String::new()).await["ok"],
+        false
+    );
     let config = json!({"endpoint_id":info["endpoint_id"],"relay_url":info["relay_url"],"relay_token":info["relay_token"],"binding":info["binding"]});
     assert_eq!(
         mobile_execute(
@@ -787,7 +821,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     assert!(matches!(denied, ResponsError::NotBound(_)));
     assert!(matches!(
         network.service().unwrap().binding,
-        BindingState::Unbound
+        BindingState::Failed { .. }
     ));
     workspace.close().await;
     receiver.abort();
@@ -960,14 +994,17 @@ async fn binding_credentials_are_persistent_peer_scoped_and_revoked_on_rebinding
         .authenticate(phone, &rebound.binding_token.0)
         .await
         .unwrap();
-    let original_retry = manager
-        .bind(
-            phone,
-            request(&invitation.pairing_id, &invitation.qr_payload.pairing_token),
-        )
-        .await
-        .unwrap();
-    assert_eq!(original_retry.binding_token.0, token);
+    assert_eq!(
+        manager
+            .bind(
+                phone,
+                request(&invitation.pairing_id, &invitation.qr_payload.pairing_token)
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        "pairing-expired"
+    );
     manager.remove(phone).await.unwrap();
     assert_eq!(
         manager

@@ -1,7 +1,7 @@
 use crate::{
     network::{
-        BindingState, InvalidRequestReason, Network, NetworkReason, RequestHandle, RequestOptions,
-        ResponsError, Service, ServiceRequest, ServiceResponse,
+        AutoBinding, BindingState, InvalidRequestReason, Network, NetworkReason, RequestHandle,
+        RequestOptions, ResponsError, Service, ServiceRequest, ServiceResponse,
     },
     storage,
 };
@@ -133,6 +133,8 @@ impl Workspace {
                     relay_url: String,
                     relay_token: String,
                     binding: BindingState,
+                    #[serde(default)]
+                    auto_binding: Option<AutoBinding>,
                 }
                 let service = (|| -> Result<Service, ResponsError> {
                     let config: Configuration = serde_json::from_str(payload)
@@ -149,8 +151,13 @@ impl Workspace {
                         .endpoint_id
                         .parse()
                         .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidService))?;
-                    Ok(Service::new(key, id, config.relay_url, config.relay_token)?
-                        .with_binding(config.binding))
+                    let service = Service::new(key, id, config.relay_url, config.relay_token)?
+                        .with_binding(config.binding);
+                    Ok(if let Some(options) = config.auto_binding {
+                        service.with_auto_binding(options)
+                    } else {
+                        service
+                    })
                 })();
                 match service.and_then(|service| self.network.set_service(service)) {
                     Ok(()) => json!({"ok":true}),
@@ -162,33 +169,10 @@ impl Workspace {
                 json!({"ok":true})
             }
             "service" => json!({"ok":true,"service":self.network.service()}),
-            "parse_invitation" => match crate::pairing::Invitation::parse(payload) {
+            "parse_invitation" => match crate::pairing::Invitation::decode(payload) {
                 Ok(invitation) => json!({"ok":true,"invitation":invitation}),
                 Err(error) => failure(error),
             },
-            "bind" => {
-                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                let error_sender = sender.clone();
-                let success = move |value| {
-                    let _ = sender.send(Ok(value));
-                };
-                let error = move |value| {
-                    let _ = error_sender.send(Err(value));
-                };
-                #[derive(serde::Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct Bind {
-                    invitation: String,
-                    device_name: String,
-                }
-                let input = match serde_json::from_str::<Bind>(payload) {
-                    Ok(input) => input,
-                    Err(_) => return failure(InvalidRequestReason::InvalidInvitation.into()),
-                };
-                self.network
-                    .bind(&input.invitation, &input.device_name, success, error);
-                response(receiver)
-            }
             "request" => self.request_json(payload),
             "cancel" => {
                 let mut pending = self.pending.lock().unwrap();

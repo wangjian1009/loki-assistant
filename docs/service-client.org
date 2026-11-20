@@ -7,7 +7,7 @@
 | 对象 | 职责 |
 |------+------|
 | Rust ~Workspace~ | 创建 Tokio runtime 和一个 Network，持有本机随机身份及通用私有存储适配，不选择电脑 |
-| ~Network~ | 设置唯一 Service，查询当前绑定数据，执行绑定、认证请求、连接复用、超时和取消 |
+| ~Network~ | 设置唯一 Service，查询当前绑定数据和错误，自动绑定、认证请求、连接复用、超时和取消 |
 | ~Service~ | 当前电脑 Endpoint ID、中继配置以及携带协议凭据的绑定状态 |
 | ArkTS ~Application~ | 管理多台电脑、选择、名称、状态展示与完整配置持久化 |
 | ~HttpDispatcher~ | 电脑端将认证后的通用请求转为进程内 HTTP 调用 |
@@ -22,42 +22,53 @@
 #+begin_src rust
 let workspace = Workspace::open(WorkspaceOptions::new(private_directory))?;
 let network = workspace.network();
-let service = Service::new(identity, endpoint_id, relay_url, relay_token)?;
+let service = Service::new(identity, endpoint_id, relay_url, relay_token)?
+    .with_auto_binding(AutoBinding { invitation, device_name: "我的手机".into() });
 network.set_service(service)?;
-network.bind(&qr_payload, "我的手机", on_bound, on_error);
+// set_service 返回后，自动绑定由 Network 调度；读取 service() 获取状态和错误。
 #+end_src
 
-绑定接口直接属于 Network。二维码解析与邀请有效期检查由 ~Invitation::parse~ 提供；~bind~ 还检查邀请是否匹配当前 Service，并上报手机显示名称及 ~device_type: mobile~ 。只有绑定握手允许无绑定凭据；完整认证的 QUIC 身份和一次性邀请仍必须校验。
+Network 不提供公开的 ~bind~ 或确认接口；应用只添加 Service 配置。未绑定目标设置到 Network 时立即进入 ~binding~ 并异步执行内部握手，校验一次性邀请、当前目标与手机名称，上报固定 ~device_type: mobile~ 。同一目标的相同配置不会重复启动绑定；切换或关闭取消旧任务，旧结果不得覆盖新目标。
 
-电脑持久化绑定后签发随机 ~binding_token~ ，绑定结果包含电脑 Endpoint ID 和 ~credential~ 。绑定状态由协议数据表示：
+电脑生成二维码后将邀请加入有效队列，默认有效期 300 秒。超时主动丢弃队列数据；成功绑定并持久化授权后立即移出队列，队列中不存在的邀请（含已消费、过期和取消）返回 410 ~pairing-expired~ ，不重新发放 token。供本机 Emacs 查询的最近 128 条结果仅保留完成、过期、取消等元数据，不保留邀请摘要或绑定 token。
+
+自动绑定成功后，电脑签发随机 ~binding_token~ ，Network 将 Service 更新为携带 ~credential~ 的 ~bound~ 。失败保存在该 Service 的 ~binding.error~ 中，直接使用 ~ResponsError~ Union，供应用查询、保存和展示。
 
 #+begin_src typescript
 interface BindingCredential { token: string; bound_at: number }
 interface Unbound { status: 'unbound' }
+interface BindingInProgress { status: 'binding' }
+interface BindingFailed { status: 'failed'; error: ResponsError }
 interface Bound { status: 'bound'; credential: BindingCredential }
-type BindingState = Unbound | Bound
+type BindingState = Unbound | BindingInProgress | BindingFailed | Bound
+interface AutoBinding { invitation: Invitation; device_name: string }
 interface Service {
   endpoint_id: string
   relay_url: string
   relay_token: string
   binding: BindingState
+  auto_binding?: AutoBinding
 }
 #+end_src
 
-~bound~ 必须携带凭据，不能只设置布尔值或绑定时间。Network 每次业务请求自动附带此凭据；电脑同时校验当前绑定关系、已认证 Endpoint ID 和 token，不能用其他手机的凭据访问。凭据无效或绑定撤销后，Network 转为 ~unbound~ ，普通业务请求直接返回未绑定错误。
+只有内部绑定握手允许无绑定凭据；QUIC 身份和一次性邀请仍需验证。没有 token 时，所有业务请求都在本机拒绝，返回 ~not_bound/binding_required~ ；电脑对所有非绑定远程请求同时校验 Endpoint ID、当前授权和 token，包括状态查询。凭据无效或绑定被撤销后，Service 记录 ~failed~ 和对应错误。
 
-~network.service()~ 返回当前目标的完整配置与运行时代次，未设置时为 None / null；这是本地查询，不发送请求。业务负责读取、保存、下次启动时重新设置配置：
+~network.service()~ 是本地查询，返回完整配置、绑定状态、绑定错误与运行时代次，未设置时返回 None / null。业务获取并持久化成功配置，下次重新设置：
 
 #+begin_src typescript
 await workspace.network.setService(savedService)
 const current = await workspace.network.service()
-// 业务保存 current 的 endpoint_id、relay_url、relay_token、binding。
-// generation 仅用于当前进程内的响应关联，不作为持久化授权依据。
+// 保存 endpoint_id、relay_url、relay_token、binding，以及仍在绑定时的 auto_binding。
+// generation 仅用于当前进程关联，不作为授权依据。
 #+end_src
 
-设置配置本身不连接；首次请求按恢复的身份和凭据连接，无需新邀请。Network 不读写历史设备或绑定记录。相同配置复用连接；替换、清除或关闭使旧请求取消，不向新电脑自动重发。~clear_service~ 只清除当前运行时目标，不撤销电脑端授权。
+设置带有效凭据的目标不会重新扫码或绑定，首次业务请求时建立连接。设置未绑定目标自动绑定；绑定成功或失败后均清除一次性 ~auto_binding~ 数据。保存的失败状态恢复后继续展示错误，不自动重试；失败只能删除记录后扫描新二维码。不存在“绑定待确认”业务状态，也不在响应丢失时重试取得旧 token；邀请已消费时再次确认提示过期。
 
-应用在发出绑定请求前保存待确认邀请。响应丢失且邀请仍有效时，应用通过同一绑定接口重试取得原凭据；不开放无凭据的状态或恢复接口。邀请过期、电脑重启导致邀请丢失或旧记录缺少凭据时提示重新扫码，保留手机随机身份。已保存的有效完整配置仍可跨进程恢复。
+Network 不读写多设备列表；应用保留完整配置和随机手机身份。相同配置复用连接；替换、清除或关闭取消旧任务，业务请求不向新电脑自动重发。~clear_service~ 仅清除当前运行时目标，不撤销电脑端授权。
+
+* 界面状态
+
+设备页面仅展示四种状态：离线、绑定中、绑定失败、在线。~binding~ 对应绑定中，~failed~ 显示 Service 保存的具体错误，并提示“请删除此设备后重新扫码绑定”。~bound~ 仅表示持有绑定票据，在线必须由实际认证请求确定；网络失败显示离线，不删除有效票据。绑定中每轮结束后间隔 1 秒查询本地 Service，其他状态每轮结束后间隔 20 秒刷新，后台停止轮询。
 
 * 异步请求与取消
 
@@ -148,6 +159,6 @@ API 使用 ~#[loki_api(access = "paired")]~ 显式开放给绑定设备，默认
 
 ArkTS Application 管理最多 64 台电脑和 ~selected_endpoint_id~ ，只选择一台设置到 Network；未选中的不轮询。Workspace 的通用私有存储适配原样保存应用 JSON，不解释电脑列表。沿用 ~devices.json~ 、版本 1、随机身份和原子替换；私钥不向 ArkTS 导出，身份损坏禁止自动重置。旧数据缺少通信凭据时保持未绑定并重新扫码。
 
-已解绑设备在应用层提示删除后重新扫码添加，删除本地记录后可再次扫码。删除当前目标时清除 Network，删除其他记录不影响当前目标；磁盘提交失败保留原数据。
+绑定失败或授权失效时，应用提示删除后重新扫码绑定，删除本地记录后可再次扫码。删除当前目标时清除 Network，删除其他记录不影响当前目标；磁盘提交失败保留原数据。
 
-~make harmony-test~ 验证应用层恢复、待确认重试、名称、单目标选择与 Union 回调，并测试 Rust 身份存储、状态数据和取消。~make services-test~ 使用临时身份与真实本机 relay 验证凭据签发、重启恢复、逐请求认证、解绑、HTTP 参数与错误保真。
+~make harmony-test~ 验证应用层恢复、自动绑定与失败展示、名称、单目标选择与 Union 回调，并测试 Rust 身份存储、状态数据和取消。~make services-test~ 使用临时身份与真实本机 relay 验证凭据签发、重启恢复、一次性邀请消费与超时清理、逐请求认证、解绑、HTTP 参数与错误保真。

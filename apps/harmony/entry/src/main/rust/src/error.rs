@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     NotSent,
@@ -9,19 +9,19 @@ pub enum Outcome {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotConfiguredReason {
     ServiceNotSet,
 }
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotBoundReason {
     BindingRequired,
     BindingRevoked,
     InvalidCredential,
 }
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkReason {
     ConnectFailed,
@@ -32,19 +32,19 @@ pub enum NetworkReason {
     InvalidResponse,
     ResponseTooLarge,
 }
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelledReason {
     UserRequested,
     ServiceChanged,
     NetworkClosed,
 }
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServicesReason {
     Rejected,
 }
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InvalidRequestReason {
     InvalidMethod,
@@ -60,14 +60,14 @@ pub enum InvalidRequestReason {
     InvitationTargetMismatch,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Failure<R> {
     pub reason: R,
     pub message: String,
     pub request_id: Option<String>,
     pub outcome: Outcome,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServicesFailure {
     pub reason: ServicesReason,
     pub message: String,
@@ -79,7 +79,7 @@ pub struct ServicesFailure {
 }
 
 /// 各类失败分别定义原因，通过带 kind 标签的 Union 返回给调用者。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResponsError {
     NotConfigured(Failure<NotConfiguredReason>),

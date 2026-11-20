@@ -69,7 +69,7 @@ struct Index {
   private scheduleRefresh(): void {
     this.stopTimer()
     if (this.visible && this.foreground && this.computers.length > 0) {
-      this.timer = setTimeout(() => { this.refreshDevices() }, 20000)
+      this.timer = setTimeout(() => { this.refreshDevices() }, this.computers.some((computer: ComputerDevice) => computer.active && computer.status === 'binding') ? 1000 : 20000)
     }
   }
 
@@ -124,8 +124,8 @@ struct Index {
       })
       scanned = true
       this.progress = '正在绑定电脑'
-      await this.application.bind(result.originalValue)
-      this.notice = '电脑绑定成功'
+      await this.application.addService(result.originalValue)
+      this.notice = ''
     } catch (error) {
       if (!scanned) {
         const scanError = error as BusinessError
@@ -136,7 +136,7 @@ struct Index {
         this.errorMessage = (error as Error).message
       }
     } finally {
-      // 响应丢失时也读取预先保存的记录，允许刷新确认绑定结果。
+      // 重新读取 Network 持有的自动绑定状态和错误。
       try {
         this.computers = await this.application.list()
         this.syncCurrentDevice()
@@ -148,7 +148,7 @@ struct Index {
       this.progress = ''
       this.scheduleRefresh()
     }
-    if (this.notice !== '' && this.visible) { await this.refreshDevices() }
+    if (scanned && this.visible) { await this.refreshDevices() }
   }
 
   private openSettings(): void {
@@ -190,19 +190,17 @@ struct Index {
 
   private statusText(computer: ComputerDevice): string {
     switch (computer.status) {
-      case 'inactive': return '未选用'
       case 'online': return '在线'
-      case 'unreachable': return '暂时无法连接'
-      case 'unbound': return '已解除绑定'
-      case 'pending': return '绑定待确认'
-      default: return '等待检查'
+      case 'binding': return '绑定中'
+      case 'binding_failed': return '绑定失败'
+      default: return '离线'
     }
   }
 
   private statusColor(computer: ComputerDevice): string {
     if (computer.status === 'online') { return '#A8CBA0' }
-    if (computer.status === 'unbound') { return '#F2A7A2' }
-    if (computer.status === 'pending') { return '#D8BE87' }
+    if (computer.status === 'binding_failed') { return '#F2A7A2' }
+    if (computer.status === 'binding') { return '#D8BE87' }
     return '#AEAEAA'
   }
 
@@ -268,10 +266,10 @@ struct Index {
             Divider().color('#444643').strokeWidth(0.5)
             this.monitorRow('最近检查', this.checkedTime(computer), '#AEAEAA')
           }.width('100%').backgroundColor('#333633').borderRadius(18).clip(true)
-          Text(computer.detail).fontSize(13).fontColor(computer.status === 'unbound' ? '#F2A7A2' : '#8F938D')
+          Text(computer.detail).fontSize(13).fontColor(computer.status === 'binding_failed' ? '#F2A7A2' : '#8F938D')
             .width('100%').padding({ left: 14, right: 14, top: 12 }).lineHeight(21)
 
-          if (computer.status === 'unbound') {
+          if (computer.status === 'binding_failed') {
             Button('删除设备', { type: ButtonType.Capsule }).fontSize(15).fontColor('#F2A7A2')
               .backgroundColor('#493837').height(44).width('100%').margin({ top: 16 })
               .enabled(!this.working).onClick(() => { this.removeDevice(computer.endpoint_id) })

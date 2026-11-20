@@ -25,45 +25,50 @@ struct Invitation {
     id: String,
     token_hash: [u8; 32],
     endpoint_id: String,
-    status: PairingStatus,
     expires_at: u64,
     deadline: Instant,
-    peer: Option<Peer>,
-    binding_token: Option<BindingToken>,
-}
-
-impl Invitation {
-    fn expire(&mut self) {
-        if self.status == PairingStatus::Pending
-            && (Instant::now() >= self.deadline || now() >= self.expires_at)
-        {
-            self.status = PairingStatus::Expired;
-        }
-    }
-
-    fn response(&self) -> PairingResponse {
-        PairingResponse {
-            api_version: API_VERSION.to_owned(),
-            pairing_id: self.id.clone(),
-            status: self.status,
-            expires_at: self.expires_at,
-            peer: self.peer.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
 struct State {
     invitations: VecDeque<Invitation>,
+    // 只保留供本机查询的结果元数据；不保留邀请摘要或绑定 token。
+    results: VecDeque<PairingResponse>,
     peers: Option<BTreeMap<String, StoredPeer>>,
     connections: BTreeMap<usize, Connection>,
+}
+impl State {
+    fn finish(&mut self, invitation: Invitation, status: PairingStatus, peer: Option<Peer>) {
+        self.results.push_back(PairingResponse {
+            api_version: API_VERSION.to_owned(),
+            pairing_id: invitation.id,
+            status,
+            expires_at: invitation.expires_at,
+            peer,
+        });
+        while self.results.len() > 128 {
+            self.results.pop_front();
+        }
+    }
+    fn expire(&mut self) {
+        let mut index = 0;
+        while index < self.invitations.len() {
+            let invitation = &self.invitations[index];
+            if Instant::now() >= invitation.deadline || now() >= invitation.expires_at {
+                let invitation = self.invitations.remove(index).unwrap();
+                self.finish(invitation, PairingStatus::Expired, None);
+            } else {
+                index += 1;
+            }
+        }
+    }
 }
 
 /// 邀请仅驻留内存；设备保存成功后才提交消费结果。
 #[derive(Debug)]
 pub(super) struct PairingService {
     path: Result<PathBuf, String>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 }
 
 pub(super) fn now() -> u64 {
@@ -77,7 +82,7 @@ impl PairingService {
     pub fn new(path: Result<PathBuf, String>) -> Self {
         Self {
             path,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
         }
     }
 
@@ -123,25 +128,23 @@ impl PairingService {
             expires_at,
         };
         let qr_code_png_base64 = super::qr_code::render(&qr_payload).await?;
-        for invitation in &mut state.invitations {
-            invitation.expire();
-            if invitation.status == PairingStatus::Pending {
-                invitation.status = PairingStatus::Cancelled;
-            }
+        state.expire();
+        while let Some(invitation) = state.invitations.pop_front() {
+            state.finish(invitation, PairingStatus::Cancelled, None);
         }
         state.invitations.push_back(Invitation {
             id: id.clone(),
             token_hash: Sha256::digest(token.as_bytes()).into(),
             endpoint_id,
-            status: PairingStatus::Pending,
             expires_at,
             deadline: Instant::now() + INVITATION_LIFETIME,
-            peer: None,
-            binding_token: None,
         });
-        while state.invitations.len() > 128 {
-            state.invitations.pop_front();
-        }
+        let expiry_state = self.state.clone();
+        let deadline = state.invitations.back().unwrap().deadline;
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            expiry_state.lock().await.expire();
+        });
         Ok(CreatePairingResponse {
             api_version: API_VERSION.to_owned(),
             pairing_id: id,
@@ -153,29 +156,44 @@ impl PairingService {
 
     pub async fn query(&self, id: &str, cancel: bool) -> Result<PairingResponse, NetworkError> {
         let mut state = self.state.lock().await;
-        let invitation = state
-            .invitations
-            .iter_mut()
-            .find(|item| item.id == id)
-            .ok_or(NetworkError::PairingNotFound)?;
-        invitation.expire();
-        if cancel {
-            match invitation.status {
-                PairingStatus::Completed => return Err(NetworkError::Completed),
-                PairingStatus::Pending => invitation.status = PairingStatus::Cancelled,
-                _ => {}
+        state.expire();
+        if let Some(index) = state.invitations.iter().position(|item| item.id == id) {
+            if cancel {
+                let invitation = state.invitations.remove(index).unwrap();
+                state.finish(invitation, PairingStatus::Cancelled, None);
+            } else {
+                let invitation = &state.invitations[index];
+                return Ok(PairingResponse {
+                    api_version: API_VERSION.to_owned(),
+                    pairing_id: invitation.id.clone(),
+                    status: PairingStatus::Pending,
+                    expires_at: invitation.expires_at,
+                    peer: None,
+                });
             }
         }
-        Ok(invitation.response())
+        let result = state
+            .results
+            .iter()
+            .find(|item| item.pairing_id == id)
+            .ok_or(NetworkError::PairingNotFound)?;
+        if cancel && result.status == PairingStatus::Completed {
+            return Err(NetworkError::Completed);
+        }
+        Ok(PairingResponse {
+            api_version: result.api_version.clone(),
+            pairing_id: result.pairing_id.clone(),
+            status: result.status,
+            expires_at: result.expires_at,
+            peer: result.peer.clone(),
+        })
     }
 
     pub async fn invalidate(&self) {
         let mut state = self.state.lock().await;
-        for invitation in &mut state.invitations {
-            invitation.expire();
-            if invitation.status == PairingStatus::Pending {
-                invitation.status = PairingStatus::Cancelled;
-            }
+        state.expire();
+        while let Some(invitation) = state.invitations.pop_front() {
+            state.finish(invitation, PairingStatus::Cancelled, None);
         }
     }
 
@@ -202,14 +220,14 @@ impl PairingService {
             peers.remove(&id).ok_or(NetworkError::PeerNotFound)?;
             service.save(&peers).await?;
             state.peers = Some(peers);
-            for invitation in &mut state.invitations {
-                if invitation
+            for result in &mut state.results {
+                if result
                     .peer
                     .as_ref()
                     .is_some_and(|peer| peer.endpoint_id == id)
                 {
-                    invitation.status = PairingStatus::Cancelled;
-                    invitation.peer = None;
+                    result.status = PairingStatus::Cancelled;
+                    result.peer = None;
                 }
             }
             for connection in state
@@ -255,37 +273,16 @@ impl PairingService {
         tokio::spawn(async move {
             let mut state = service.state.lock().await;
             service.load(&mut state).await?;
+            state.expire();
             let index = state
                 .invitations
                 .iter()
                 .position(|item| item.id == request.pairing_id)
-                .ok_or(NetworkError::PairingNotFound)?;
-            state.invitations[index].expire();
+                .ok_or(NetworkError::Expired)?;
             let invitation = &state.invitations[index];
             let hash: [u8; 32] = Sha256::digest(request.pairing_token.as_bytes()).into();
             if !bool::from(invitation.token_hash.ct_eq(&hash)) {
                 return Err(NetworkError::InvalidToken);
-            }
-            match invitation.status {
-                PairingStatus::Expired => return Err(NetworkError::Expired),
-                PairingStatus::Cancelled => return Err(NetworkError::Cancelled),
-                PairingStatus::Completed => {
-                    let peer = invitation.peer.as_ref().unwrap();
-                    if peer.endpoint_id != remote.to_string() {
-                        return Err(NetworkError::Consumed);
-                    }
-                    return Ok(BoundResponse {
-                        api_version: API_VERSION.to_owned(),
-                        kind: "pairing.bound".to_owned(),
-                        endpoint_id: invitation.endpoint_id.clone(),
-                        bound_at: peer.bound_at,
-                        binding_token: invitation
-                            .binding_token
-                            .clone()
-                            .ok_or(NetworkError::InvalidBindingToken)?,
-                    });
-                }
-                PairingStatus::Pending => {}
             }
             if invitation.endpoint_id == remote.to_string() {
                 return Err(NetworkError::InvalidRequest);
@@ -310,14 +307,13 @@ impl PairingService {
             }
             service.save(&peers).await?;
             state.peers = Some(peers);
-            let invitation = &mut state.invitations[index];
-            invitation.status = PairingStatus::Completed;
-            invitation.peer = Some(peer.public());
-            invitation.binding_token = peer.binding_token.clone();
+            let invitation = state.invitations.remove(index).unwrap();
+            let endpoint_id = invitation.endpoint_id.clone();
+            state.finish(invitation, PairingStatus::Completed, Some(peer.public()));
             Ok(BoundResponse {
                 api_version: API_VERSION.to_owned(),
                 kind: "pairing.bound".to_owned(),
-                endpoint_id: invitation.endpoint_id.clone(),
+                endpoint_id,
                 bound_at: peer.bound_at,
                 binding_token: peer.binding_token.unwrap(),
             })
@@ -355,5 +351,35 @@ impl PairingService {
 
     pub async fn untrack(&self, id: usize) {
         self.state.lock().await.connections.remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn expired_invitation_is_removed_without_a_later_request() {
+        let path = std::env::temp_dir().join(format!("loki-expiry-{}.json", uuid::Uuid::new_v4()));
+        let manager = PairingService::new(Ok(path));
+        let created = manager
+            .create(
+                SecretKey::generate().public().to_string(),
+                "https://relay.example/".into(),
+                "test".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.state.lock().await.invitations.len(), 1);
+        tokio::time::advance(INVITATION_LIFETIME).await;
+        tokio::task::yield_now().await;
+        assert!(manager.state.lock().await.invitations.is_empty());
+        assert_eq!(
+            manager
+                .query(&created.pairing_id, false)
+                .await
+                .unwrap()
+                .status,
+            PairingStatus::Expired
+        );
     }
 }

@@ -281,3 +281,107 @@ fn service_rejections_keep_their_own_reason_and_details() {
         ResponsError::Network(_)
     ));
 }
+
+fn auto_service(key: &SecretKey, qr: &Value) -> Service {
+    Service::new(
+        key.clone(),
+        qr["endpoint_id"].as_str().unwrap().parse().unwrap(),
+        qr["relay_url"].as_str().unwrap().into(),
+        qr["relay_token"].as_str().unwrap().into(),
+    )
+    .unwrap()
+    .with_auto_binding(AutoBinding {
+        invitation: serde_json::from_value(qr.clone()).unwrap(),
+        device_name: "测试手机".into(),
+    })
+}
+fn settled(network: &Network) -> ServiceState {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let service = network.service().unwrap();
+        if !matches!(service.binding, BindingState::Binding) {
+            return service;
+        }
+        assert!(std::time::Instant::now() < deadline, "自动绑定未及时完成");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn setting_unbound_service_automatically_binds_and_retains_failure_for_ui() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace();
+    let network = workspace.network();
+    let key = SecretKey::generate();
+    let mut qr = invitation();
+    qr["expires_at"] = json!(now() - 1);
+    network.set_service(auto_service(&key, &qr)).unwrap();
+    let state = settled(&network);
+    assert!(
+        matches!(&state.binding, BindingState::Failed { error: ResponsError::InvalidRequest(failure) } if failure.reason == InvalidRequestReason::ExpiredInvitation)
+    );
+    assert!(state.auto_binding.is_none());
+    let view = serde_json::to_value(&state).unwrap();
+    assert_eq!(view["binding"]["error"]["reason"], "expired_invitation");
+    assert!(
+        !view
+            .to_string()
+            .contains(qr["pairing_token"].as_str().unwrap())
+    );
+    assert!(view["binding"]["error"]["request_id"].is_string());
+    assert_eq!(workspace.execute("bind", "")["ok"], false);
+    let (_, receiver) = request(&network, Duration::from_secs(1));
+    assert_eq!(error_value(receiver)["kind"], "not_bound");
+    assert_eq!(
+        serde_json::to_value(network.service().unwrap().binding).unwrap(),
+        view["binding"]
+    );
+    // 已记录的失败可序列化恢复；恢复失败不重新发送一次性邀请。
+    network
+        .set_service(
+            Service::new(
+                key,
+                state.endpoint_id.parse().unwrap(),
+                state.relay_url,
+                state.relay_token,
+            )
+            .unwrap()
+            .with_binding(state.binding),
+        )
+        .unwrap();
+    assert!(matches!(
+        network.service().unwrap().binding,
+        BindingState::Failed { .. }
+    ));
+}
+
+#[test]
+fn binding_in_progress_is_single_and_cancelled_on_switch_or_shutdown() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace();
+    let network = workspace.network();
+    let key = SecretKey::generate();
+    let mut qr = invitation();
+    qr["relay_url"] = json!("http://127.0.0.1:9/");
+    network.set_service(auto_service(&key, &qr)).unwrap();
+    assert!(matches!(
+        network.service().unwrap().binding,
+        BindingState::Binding
+    ));
+    let generation = network.generation();
+    network.set_service(auto_service(&key, &qr)).unwrap();
+    assert_eq!(network.generation(), generation);
+    let (_, receiver) = request(&network, Duration::from_secs(1));
+    assert_eq!(error_value(receiver)["kind"], "not_bound");
+    assert!(matches!(
+        network.service().unwrap().binding,
+        BindingState::Binding
+    ));
+    let other = SecretKey::generate().public();
+    network
+        .set_service(unreachable_service(&key, other))
+        .unwrap();
+    assert_eq!(network.service().unwrap().endpoint_id, other.to_string());
+    workspace.execute("stop", "");
+    assert!(network.service().is_none());
+}

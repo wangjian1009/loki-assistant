@@ -115,12 +115,8 @@ pub enum NetworkError {
     PairingNotFound,
     #[error("绑定邀请已过期，请刷新二维码")]
     Expired,
-    #[error("绑定邀请已取消，请刷新二维码")]
-    Cancelled,
     #[error("绑定令牌无效")]
     InvalidToken,
-    #[error("绑定邀请已被其他设备使用")]
-    Consumed,
     #[error("绑定已经完成，无法取消")]
     Completed,
     #[error("绑定设备不存在")]
@@ -142,8 +138,8 @@ impl NetworkError {
             Self::InvalidToken => 403,
             Self::PeerNotBound | Self::InvalidBindingToken => 403,
             Self::PairingNotFound | Self::PeerNotFound => 404,
-            Self::Consumed | Self::Completed => 409,
-            Self::Expired | Self::Cancelled => 410,
+            Self::Completed => 409,
+            Self::Expired => 410,
             Self::NotReady => 503,
             Self::Storage => 500,
             Self::QrCode => 422,
@@ -156,9 +152,7 @@ impl NetworkError {
             Self::NotReady => "network-not-ready",
             Self::PairingNotFound => "pairing-not-found",
             Self::Expired => "pairing-expired",
-            Self::Cancelled => "pairing-cancelled",
             Self::InvalidToken => "invalid-pairing-token",
-            Self::Consumed => "pairing-consumed",
             Self::Completed => "pairing-completed",
             Self::PeerNotFound => "peer-not-found",
             Self::PeerNotBound => "peer-not-bound",

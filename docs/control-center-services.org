@@ -285,7 +285,7 @@ Emacs 的 ~loki-assistant-devices~ 管理界面通过现有异步 HTTP 客户端
 
 services 将 ~qr_payload~ 编码为 UTF-8 JSON，用 M 级纠错生成二维码，添加四个 module 的白边并以六倍整数像素输出灰度 PNG。图片使用标准 Base64 编码，字段 ~qr_code_png_base64~ 不包含 data URI 前缀；客户端只负责解码展示。二维码仅在创建响应中返回，不保存在磁盘或邀请状态中。生成在阻塞工作线程中执行，失败返回 422 ~pairing-qr-code-error~ ，不替换原邀请。
 
-~pairing_id~ 是随机 UUID，~pairing_token~ 使用系统随机源生成 256 bit 随机值并编码为 64 个十六进制字符。服务端只保存其 SHA-256 摘要，采用常量时间比较。邀请有效期为 300 秒，同时保留一个 ~pending~ 邀请；创建成功时取消先前未完成邀请，保留最近 128 条邀请供状态查询。~expires_at~ 是 Unix 秒；服务端同时依据墙钟与单调时钟判断过期，不依赖手机时钟。
+~pairing_id~ 是随机 UUID，~pairing_token~ 使用系统随机源生成 256 bit 随机值并编码为 64 个十六进制字符。服务端只保存其 SHA-256 摘要，采用常量时间比较。邀请有效期为 300 秒，同时保留一个 ~pending~ 邀请；创建成功时取消先前未完成邀请，有效队列只保存可用邀请；超时定时丢弃。另保留最近 128 条结果元数据供本机状态查询，不保留已完成或已过期邀请的令牌摘要。~expires_at~ 是 Unix 秒；服务端同时依据墙钟与单调时钟判断过期，不依赖手机时钟。
 
 ~GET /network/pairings/{id}~ 返回 HTTP 200：
 
@@ -322,7 +322,7 @@ Emacs 打开管理页面仅调用 ~GET /network/peers~ ，不创建邀请。点�
 }
 #+end_src
 
-请求不接受未知字段。~device_type~ 为 ~computer~ 或 ~mobile~ ，当前手机上报 ~mobile~ ，旧记录缺省按 ~mobile~ 读取；类型仅用于展示。~device_name~ 必须包含非空白内容，不含控制字符，UTF-8 编码最多 128 字节，保存时去除两端空白。手机 Endpoint ID 仅从 iroh 已认证连接读取，不接受消息自行声明；本机不能绑定自己。校验邀请、令牌与有效期后，在同一事务中保存设备、更新邀请为 ~completed~ 并返回：
+请求不接受未知字段。~device_type~ 为 ~computer~ 或 ~mobile~ ，当前手机上报 ~mobile~ ，旧记录缺省按 ~mobile~ 读取；类型仅用于展示。~device_name~ 必须包含非空白内容，不含控制字符，UTF-8 编码最多 128 字节，保存时去除两端空白。手机 Endpoint ID 仅从 iroh 已认证连接读取，不接受消息自行声明；本机不能绑定自己。校验邀请、令牌与有效期后，在同一事务中保存设备、移出有效邀请队列并记录 ~completed~ 查询元数据，再返回：
 
 #+begin_src json
 {"api_version":"1","type":"pairing.bound","endpoint_id":"<services Endpoint ID>","bound_at":1795104100,"binding_token":"<64 个小写十六进制字符>"}
@@ -330,7 +330,7 @@ Emacs 打开管理页面仅调用 ~GET /network/peers~ ，不创建邀请。点�
 
 电脑生成随机 256 bit ~binding_token~ ，与已认证手机身份一起持久化，成功后通过绑定响应交给手机。只有绑定接口允许不携带此凭据；其他远程请求必须同时验证 Endpoint ID、当前授权记录与 token。凭据不能由名称、类型、时间或客户端布尔值替代。重新绑定签发新凭据，旧凭据立即失效；解绑删除凭据。
 
-绑定设备持久化成功后才消费邀请。并发绑定只有一个设备成功；同一已认证手机使用相同邀请和令牌重试，返回原成功结果，不重新绑定或修改时间；其他设备使用已消费的邀请返回冲突。持久化失败不消费邀请。接受的持久化事务由独立任务完成，不因请求断开而中断磁盘提交与内存更新。
+绑定设备持久化成功后才消费并移除邀请。并发绑定只有一个设备成功；任何手机再次提交已消费、已过期、已取消、重启后丢失或未知的邀请，均返回 410 ~pairing-expired~ ，不重发绑定 token。持久化失败不消费邀请。接受的持久化事务由独立任务完成，不因请求断开而中断磁盘提交与内存更新。
 
 *** 已绑定设备
 
@@ -358,11 +358,13 @@ services 每次从当前绑定关系验证已认证的远端 Endpoint ID 和绑�
 
 ~online~ 表示此次请求时电脑服务可用，不承诺持续在线。手机校验返回版本、类型、身份和绑定时间；连接失败显示“暂时无法连接”，不推断为解绑。前台每轮检查结束后间隔 20 秒刷新，支持手动刷新，后台停止安排轮询；页面重新进入时先显示等待检查，随后读取当前状态。此兼容状态请求只返回本机在线与绑定时间；通用 HTTP 请求使用下节的 services/1。
 
-手机 ArkTS Application 负责最多 64 台电脑的列表、目标选择、名称和完整配置持久化；Rust Workspace 只持有本机身份、唯一 Network 和通用私有存储适配，不提供 devices 管理模块。应用保存 ~endpoint_id/relay_url/relay_token/binding~ ，下次读取后重新设置到 Network，首次请求时复用随机身份与绑定凭据恢复连接。~binding~ 是 ~unbound~ 或携带 ~credential{token,bound_at}~ 的 ~bound~ Union；没有凭据不能构造有效已绑定状态。
+手机 ArkTS Application 负责最多 64 台电脑的列表、目标选择、名称和完整配置持久化；Rust Workspace 只持有本机身份、唯一 Network 和通用私有存储适配，不提供 devices 管理模块。应用保存 ~endpoint_id/relay_url/relay_token/binding~ ，下次读取后重新设置到 Network，首次请求时复用随机身份与绑定凭据恢复连接。~binding~ 是 ~unbound~ 、~binding~ 、携带 ~error~ 的 ~failed~ 或携带 ~credential{token,bound_at}~ 的 ~bound~ Union；没有凭据不能构造有效已绑定状态。
 
 数据沿用应用私有目录的 ~devices.json~ 、版本 1、~0600~ 权限、文件同步与原子替换。Rust 验证私钥及本机身份；应用验证电脑记录、重复身份和选择。只有一台时自动选中，多台未选择时由用户明确指定；Network 不管理列表或自动选择目标。旧数据保留本机身份，但缺少协议凭据的电脑需要重新扫码。
 
-发送绑定前应用先保存待确认记录和邀请；响应丢失后，邀请有效时通过同一绑定接口幂等重试取得原凭据，不开放无凭据查询或恢复接口。邀请过期或丢失时提示重新扫码。成功后删除一次性邀请，保存完整凭据；手机私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。
+应用只将扫码得到的 Service 配置和 ~auto_binding{invitation,device_name}~ 设置到 Network；Network 自动异步绑定，不提供公开的绑定或确认方法。绑定中和失败状态均保存在 Service，失败的 ~error~ 是 ResponsError Union，界面可读取详细原因。绑定成功或失败后清除一次性邀请，业务保存最新完整配置。
+
+不保留待确认状态或响应丢失后的重试恢复流程。手机界面仅展示“离线、绑定中、绑定失败、在线”；绑定失败提示删除后重新扫码绑定。失败状态可持久化恢复，后续不自动重试旧邀请；绑定中每轮结束后 1 秒读取状态，其他情况 20 秒刷新。私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。
 
 手机名称可以在手机设置页修改，后续绑定上报新名称；services 不提供名称修改接口。电脑 services 根据 hostname 生成名称，发布 ~service/name~ 和 ~service/device_type~ 监控字段；手机通过认证状态查询获取并缓存电脑的 ~name~ 与 ~device_type: computer~ 。手机绑定记录上报 ~device_type: mobile~ ；名称和类型不参与权限判断。
 
@@ -398,13 +400,11 @@ query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体
 | 403 | ~invalid-pairing-token~ | 绑定令牌不匹配 |
 | 403 | ~invalid-binding-token~ | 缺少绑定凭据、凭据不匹配或已失效 |
 | 403 | ~peer-not-bound~ | 状态查询的已认证手机未绑定或已被解绑 |
-| 404 | ~pairing-not-found~ | 邀请不存在或重启后丢失 |
+| 404 | ~pairing-not-found~ | 本机查询的邀请结果不存在或重启后丢失 |
 | 404 | ~peer-not-found~ | 已绑定设备不存在 |
 | 405 | ~method-not-allowed~ | 不支持的 HTTP 方法，source 为 services |
-| 409 | ~pairing-consumed~ | 邀请已由其他设备消费 |
 | 409 | ~pairing-completed~ | 无法通过取消邀请解除已完成的绑定 |
-| 410 | ~pairing-expired~ | 握手使用已过期邀请 |
-| 410 | ~pairing-cancelled~ | 握手使用已取消邀请 |
+| 410 | ~pairing-expired~ | 握手邀请已消费、过期、取消、重启后丢失或不存在 |
 | 422 | ~pairing-qr-code-error~ | 绑定数据过长或二维码 PNG 编码失败 |
 | 500 | ~peer-storage-error~ | 设备记录无法读取、保存或超过容量 |
 | 503 | ~network-not-ready~ | 中继未就绪或正在切换配置 |

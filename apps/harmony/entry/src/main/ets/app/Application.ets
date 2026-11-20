@@ -1,5 +1,5 @@
-import { BindingState, DeviceType, Invitation, Service, ServiceResponse, Workspace } from '../workspace/Workspace'
-import { NetworkFailure, ResponsError, responsError } from '../workspace/ResponsError'
+import { AutoBinding, BindingState, DeviceType, Service, ServiceResponse, Workspace } from '../workspace/Workspace'
+import { NetworkFailure, ResponsError } from '../workspace/ResponsError'
 
 export interface ComputerDevice {
   endpoint_id: string
@@ -10,21 +10,20 @@ export interface ComputerDevice {
   detail: string
   checked_at: number
   active: boolean
+  binding_error?: ResponsError
 }
 interface ComputerRecord extends Service {
   name: string
   device_type: DeviceType
-  pending: Invitation | null
 }
 interface StoredComputer {
   endpoint_id: string
   relay_url: string
   relay_token: string
   binding?: BindingState
+  auto_binding?: AutoBinding
   name?: string
   device_type?: DeviceType
-  pending?: Invitation | null
-  bound_at?: number | null
 }
 interface StoredState { computers?: StoredComputer[]; selected_endpoint_id?: string | null; device_name?: string }
 interface ApplicationState { computers: ComputerRecord[]; selected_endpoint_id: string | null; device_name: string }
@@ -38,13 +37,13 @@ interface ComputerSession {
 }
 function now(): number { return Math.floor(Date.now() / 1000) }
 function copy(state: ApplicationState): ApplicationState { return JSON.parse(JSON.stringify(state)) as ApplicationState }
-const UNBOUND_DETAIL: string = '此设备已解除绑定，请删除后重新扫码添加。'
 function validName(name: string): boolean {
-  // UTF-8 长度最终由 Network / services 校验，应用限制输入并拒绝控制字符。
-  return typeof name === 'string' && name.trim().length > 0 && encodeURIComponent(name).replace(/%[0-9A-F]{2}/g, 'x').length <= 128 && !/[\x00-\x1f\x7f]/.test(name)
+  return typeof name === 'string' && name.trim().length > 0 &&
+    encodeURIComponent(name).replace(/%[0-9A-F]{2}/g, 'x').length <= 128 && !/[\x00-\x1f\x7f]/.test(name)
 }
+const BINDING_FAILED_DETAIL: string = '请删除此设备后重新扫码绑定。'
 
-// 应用负责历史设备、名称、选择和持久化；Network 只接收当前唯一 Service。
+// 应用保存多设备配置；自动绑定、协议状态和绑定错误均由 Network 持有。
 export class Application {
   readonly workspace: Workspace
   private state: ApplicationState
@@ -83,27 +82,21 @@ export class Application {
         ids.includes(computer.endpoint_id) || !this.validRelay(computer.relay_url, computer.relay_token)) {
         throw new Error('电脑记录已损坏')
       }
-      // 旧版本只有 bound_at，缺少协议凭据，必须保持未绑定并重新扫码。
       const binding: BindingState = computer.binding === undefined ? { status: 'unbound' } : computer.binding
       if (!binding) { throw new Error('绑定状态已损坏') }
       if (binding.status === 'bound') {
         if (!binding.credential || !/^[0-9a-f]{64}$/.test(binding.credential.token) ||
           !Number.isSafeInteger(binding.credential.bound_at) || binding.credential.bound_at <= 0) { throw new Error('绑定凭据已损坏') }
-      } else if (binding.status !== 'unbound') { throw new Error('绑定状态已损坏') }
-      if (computer.bound_at !== undefined && computer.bound_at !== null &&
-        (!Number.isSafeInteger(computer.bound_at) || computer.bound_at <= 0)) { throw new Error('旧绑定记录已损坏') }
-      if (computer.pending && (computer.pending.endpoint_id !== computer.endpoint_id ||
-        computer.pending.relay_url !== computer.relay_url || computer.pending.relay_token !== computer.relay_token ||
-        !/^([0-9a-f]{8}-)([0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(computer.pending.pairing_id) ||
-        computer.pending.version !== 1 || computer.pending.alpn !== 'loki-assistant/pair/1' ||
-        !/^[0-9a-f]{64}$/.test(computer.pending.pairing_token) ||
-        !Number.isSafeInteger(computer.pending.expires_at) || computer.pending.expires_at <= 0)) { throw new Error('待确认绑定记录已损坏') }
-      const name = computer.name ?? '已绑定电脑'
+      } else if (binding.status === 'failed') {
+        if (!binding.error || typeof binding.error.kind !== 'string' || typeof binding.error.reason !== 'string' ||
+          typeof binding.error.message !== 'string') { throw new Error('绑定错误信息已损坏') }
+      } else if (binding.status !== 'unbound' && binding.status !== 'binding') { throw new Error('绑定状态已损坏') }
+      const name = computer.name ?? '电脑'
       const deviceType = computer.device_type ?? 'computer'
       if (!validName(name) || (deviceType !== 'computer' && deviceType !== 'mobile')) { throw new Error('设备展示信息已损坏') }
       state.computers.push({
         endpoint_id: computer.endpoint_id, relay_url: computer.relay_url, relay_token: computer.relay_token,
-        binding: binding, pending: computer.pending ?? null, name: name, device_type: deviceType
+        binding: binding, auto_binding: computer.auto_binding, name: name, device_type: deviceType
       })
       ids.push(computer.endpoint_id)
     }
@@ -122,7 +115,7 @@ export class Application {
   private service(computer: ComputerRecord): Service {
     return {
       endpoint_id: computer.endpoint_id, relay_url: computer.relay_url,
-      relay_token: computer.relay_token, binding: computer.binding
+      relay_token: computer.relay_token, binding: computer.binding, auto_binding: computer.auto_binding
     }
   }
   private async save(state: ApplicationState): Promise<void> {
@@ -132,17 +125,21 @@ export class Application {
   private views(): ComputerDevice[] {
     return this.state.computers.map((computer: ComputerRecord): ComputerDevice => {
       const active = computer.endpoint_id === this.state.selected_endpoint_id
-      const unbound = computer.binding.status === 'unbound' && !computer.pending
+      const failed = computer.binding.status === 'failed'
+      const bindingError = computer.binding.status === 'failed' ? computer.binding.error : undefined
       return {
         endpoint_id: computer.endpoint_id, name: computer.name, device_type: computer.device_type,
         bound_at: computer.binding.status === 'bound' ? computer.binding.credential.bound_at : null,
-        status: !active ? 'inactive' : computer.pending ? 'pending' : computer.binding.status === 'unbound' ? 'unbound' : 'unknown',
-        detail: unbound ? UNBOUND_DETAIL : active ? '等待检查电脑状态' : '选择此电脑后检查状态',
-        checked_at: 0, active: active
+        status: failed ? 'binding_failed' : active && computer.binding.status === 'binding' ? 'binding' : 'offline',
+        detail: failed ? `${bindingError?.message}；${BINDING_FAILED_DETAIL}` : active && computer.binding.status === 'binding' ?
+          '正在与电脑建立绑定' : active ? '等待检查电脑状态' : '左右滑动到此设备以连接',
+        checked_at: 0, active: active, binding_error: bindingError
       }
     })
   }
-  list(): Promise<ComputerDevice[]> { return this.run(async () => this.views()) }
+  list(): Promise<ComputerDevice[]> {
+    return this.run(async () => { await this.captureService(); return this.views() })
+  }
   deviceName(): Promise<string> { return this.run(async () => this.state.device_name) }
   setDeviceName(name: string): Promise<void> {
     return this.run(async () => {
@@ -154,62 +151,67 @@ export class Application {
   }
   select(endpointId: string): Promise<void> {
     return this.run(async () => {
-      const state = copy(this.state)
-      const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === endpointId)
+      if (!this.state.computers.some((item: ComputerRecord) => item.endpoint_id === endpointId)) { throw new Error('电脑记录不存在') }
+      // 切换前先保存旧目标的自动绑定结果，避免成功凭据遗留在运行时。
+      await this.captureService()
+      const latest = copy(this.state)
+      latest.selected_endpoint_id = endpointId
+      const computer = latest.computers.find((item: ComputerRecord) => item.endpoint_id === endpointId)
       if (!computer) { throw new Error('电脑记录不存在') }
-      // 保存成功后才切换 Network，磁盘失败保留原目标。
-      state.selected_endpoint_id = endpointId
-      await this.save(state)
+      await this.save(latest)
       await this.workspace.network.setService(this.service(computer))
+      await this.captureService()
     })
   }
   remove(endpointId: string): Promise<void> {
     return this.run(async () => {
+      await this.captureService()
       const state = copy(this.state)
       const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === endpointId)
       if (!computer) { throw new Error('电脑记录不存在') }
-      if (computer.binding.status !== 'unbound' || computer.pending) {
-        throw new Error('请先在电脑端解除绑定后再删除设备')
+      if (computer.binding.status === 'bound' || computer.binding.status === 'binding') {
+        throw new Error('请先解除绑定或等待绑定结束后再删除设备')
       }
       const active = state.selected_endpoint_id === endpointId
       state.computers = state.computers.filter((item: ComputerRecord) => item.endpoint_id !== endpointId)
       if (active) { state.selected_endpoint_id = null }
-      // 持久化成功后再清除当前目标，保存失败时保留记录与连接选择。
       await this.save(state)
       if (active) { await this.workspace.network.clearService() }
     })
   }
-  bind(payload: string): Promise<void> {
+  addService(payload: string): Promise<void> {
     return this.run(async () => {
       const invitation = await this.workspace.network.parseInvitation(payload)
       if (invitation.endpoint_id === this.endpointId) { throw new Error('不能绑定手机自身') }
+      await this.captureService()
       const state = copy(this.state)
-      const index = state.computers.findIndex((item: ComputerRecord) => item.endpoint_id === invitation.endpoint_id)
-      if (index < 0 && state.computers.length >= 64) { throw new Error('最多可保存 64 台电脑') }
-      const old = index < 0 ? undefined : state.computers[index]
-      const binding: BindingState = { status: 'unbound' }
+      if (state.computers.some((item: ComputerRecord) => item.endpoint_id === invitation.endpoint_id)) {
+        throw new Error('此电脑已在设备列表中，请删除后重新扫码添加')
+      }
+      if (state.computers.length >= 64) { throw new Error('最多可保存 64 台电脑') }
       const computer: ComputerRecord = {
         endpoint_id: invitation.endpoint_id, relay_url: invitation.relay_url, relay_token: invitation.relay_token,
-        binding: old?.binding ?? binding, pending: invitation,
-        name: old?.name ?? '待绑定电脑', device_type: old?.device_type ?? 'computer'
+        binding: { status: 'unbound' }, auto_binding: { invitation: invitation, device_name: state.device_name },
+        name: '电脑', device_type: 'computer'
       }
-      if (index < 0) { state.computers.push(computer) } else { state.computers[index] = computer }
+      state.computers.push(computer)
       state.selected_endpoint_id = computer.endpoint_id
       await this.save(state)
+      // 添加目标即触发自动绑定，应用不调用独立绑定接口。
       await this.workspace.network.setService(this.service(computer))
-      await this.workspace.network.bind(payload, state.device_name)
       await this.captureService()
     })
   }
   private async captureService(): Promise<void> {
     const service = await this.workspace.network.service()
-    if (!service || service.endpoint_id !== this.state.selected_endpoint_id) { throw new Error('电脑服务已切换') }
+    if (!service) { return }
+    if (service.endpoint_id !== this.state.selected_endpoint_id) { throw new Error('电脑服务已切换') }
     const state = copy(this.state)
     const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === service.endpoint_id)
     if (!computer) { throw new Error('电脑记录不存在') }
     computer.binding = service.binding
-    if (service.binding.status === 'bound') { computer.pending = null }
-    await this.save(state)
+    computer.auto_binding = service.auto_binding
+    if (JSON.stringify(state) !== JSON.stringify(this.state)) { await this.save(state) }
   }
   private session(): Promise<ComputerSession> {
     return new Promise((resolve, reject) => {
@@ -229,43 +231,32 @@ export class Application {
   }
   refresh(): Promise<ComputerDevice[]> {
     return this.run(async () => {
+      await this.captureService()
       const selected = this.state.computers.find((item: ComputerRecord) => item.endpoint_id === this.state.selected_endpoint_id)
-      if (!selected) { return this.views() }
+      if (!selected || selected.binding.status !== 'bound') { return this.views() }
       let session: ComputerSession
       try { session = await this.session() } catch (error) {
-        const failure = responsError(error)
-        if (failure.kind !== 'not_bound' || !selected.pending || selected.pending.expires_at <= now()) {
-          return this.failedRefresh(selected, failure)
-        }
-        try { await this.workspace.network.bind(JSON.stringify(selected.pending), this.state.device_name) }
-        catch (error) { return this.failedRefresh(selected, responsError(error)) }
         await this.captureService()
-        try { session = await this.session() }
-        catch (error) { return this.failedRefresh(selected, responsError(error)) }
+        const failure = error as ResponsError
+        const views = this.views()
+        return views.map((view: ComputerDevice): ComputerDevice => {
+          if (view.active) {
+            if (view.status !== 'binding_failed') { view.status = 'offline'; view.detail = failure.message }
+            view.checked_at = now()
+          }
+          return view
+        })
       }
       const state = copy(this.state)
-      const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === session?.endpoint_id)
+      const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === session.endpoint_id)
       if (!computer) { throw new Error('电脑服务已切换') }
       computer.name = session.name
       computer.device_type = session.device_type
       await this.save(state)
-      return this.currentView('online', '电脑服务可用')
-    })
-  }
-  private async failedRefresh(selected: ComputerRecord, failure: ResponsError): Promise<ComputerDevice[]> {
-    if (failure.kind === 'not_bound') {
-      const state = copy(this.state)
-      const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === selected.endpoint_id)
-      if (computer) { computer.binding = { status: 'unbound' }; await this.save(state) }
-    }
-    const unbound = failure.kind === 'not_bound' && !selected.pending
-    return this.currentView(selected.pending ? 'pending' : unbound ? 'unbound' : 'unreachable',
-      unbound ? UNBOUND_DETAIL : failure.message)
-  }
-  private currentView(status: string, detail: string): ComputerDevice[] {
-    return this.views().map((view: ComputerDevice): ComputerDevice => {
-      if (view.active) { view.status = status; view.detail = detail; view.checked_at = now() }
-      return view
+      return this.views().map((view: ComputerDevice): ComputerDevice => {
+        if (view.active) { view.status = 'online'; view.detail = '电脑服务可用'; view.checked_at = now() }
+        return view
+      })
     })
   }
   async stop(): Promise<void> {
