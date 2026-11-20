@@ -444,7 +444,10 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         weak.upgrade().map(|service| {
             service
                 .router()
-                .route("/network-test/echo/{id}", axum::routing::post(echo_channel))
+                .route(
+                    "/network-test/echo/{id}",
+                    axum::routing::post(echo_channel).get(query_channel),
+                )
                 .route("/network-test/bad", axum::routing::get(bad_channel))
                 .route("/network-test/large", axum::routing::get(large_channel))
         })
@@ -714,6 +717,37 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     assert_eq!(restored.data["device_type"], "computer");
     assert!(!restored.data["name"].as_str().unwrap().is_empty());
     assert!(!restored.data.to_string().contains(&token));
+    let debug_address = workspace.start_http_server(0, |_, _, _| false).unwrap();
+    let (status, body) = mobile_http(debug_address, "/service/network/session").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, restored.data);
+    let (status, body) = mobile_http(
+        debug_address,
+        "/service/network-test/echo/phone%20test?text=%E4%B8%AD+%26+%2B&text=second",
+    )
+    .await;
+    assert_eq!(status, 202);
+    assert_eq!(body["id"], "phone test");
+    let query = body["query"].as_str().unwrap();
+    assert_eq!(
+        url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>(),
+        [
+            ("text".into(), "中 & +".into()),
+            ("text".into(), "second".into())
+        ]
+    );
+    let (status, body) = mobile_http(debug_address, "/service/network/peers").await;
+    assert_eq!(status, 403);
+    assert_eq!(body["kind"], "services");
+    assert_eq!(body["code"], "remote-api-forbidden");
+    let (status, body) = mobile_http(debug_address, "/service/missing").await;
+    assert_eq!(status, 404);
+    assert_eq!(body["status"], 404);
+    assert_eq!(
+        mobile_execute(workspace.clone(), "stop_http", String::new()).await["ok"],
+        true
+    );
+    assert!(tokio::net::TcpStream::connect(debug_address).await.is_err());
     let mut request = ServiceRequest::get("/network-test/echo/phone%20test");
     request.method = axum::http::Method::POST;
     request.query = vec![
@@ -855,6 +889,22 @@ async fn echo_channel(
 
 #[loki_services_macros::loki_api(
     module = "network-test",
+    id = "query",
+    method = "GET",
+    path = "/network-test/echo/{id}",
+    access = "paired",
+    summary = "测试手机 HTTP 查询",
+    description = "仅测试时编译，验证路径和重复查询参数。"
+)]
+async fn query_channel(
+    id: axum::extract::Path<String>,
+    query: axum::extract::RawQuery,
+) -> impl axum::response::IntoResponse {
+    echo_channel(id, query, axum::body::Bytes::new()).await
+}
+
+#[loki_services_macros::loki_api(
+    module = "network-test",
     id = "bad",
     method = "GET",
     path = "/network-test/bad",
@@ -914,6 +964,24 @@ async fn mobile_execute(
     tokio::task::spawn_blocking(move || workspace.execute(operation, &payload))
         .await
         .unwrap()
+}
+
+async fn mobile_http(address: std::net::SocketAddr, path: &str) -> (u16, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    connection.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    connection.read_to_string(&mut response).await.unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    let status = headers
+        .split_ascii_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    (status, serde_json::from_str(body).unwrap())
 }
 
 #[tokio::test]

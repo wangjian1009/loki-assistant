@@ -74,11 +74,62 @@ function fixture(initial = {}) {
   }
   const { Workspace } = load(path.join(etsRoot, 'workspace/Workspace.ets'));
   const { Application } = load(path.join(etsRoot, 'app/Application.ets'));
-  return { control, create() { const workspace = new Workspace('/private'); return { workspace, app: new Application(workspace) }; } };
+  return { control, load, create() { const workspace = new Workspace('/private'); return { workspace, app: new Application(workspace) }; } };
 }
 function request(network) {
   return new Promise(resolve => network.request({ method: 'GET', path: '/network/session' }, () => assert.fail('请求不得成功'), resolve));
 }
+
+test('冷启动只加载末级页面，多级返回按需加载父页并复用原生导航栈', async () => {
+  const { load } = fixture();
+  const { NavigatorManager, NavigationResult, PageName, launchPath, parseNavigationPath } =
+    load(path.join(etsRoot, 'app/NavigatorManager.ets'));
+  const navigator = new NavigatorManager();
+  const operations = [];
+  const router = {
+    pushUrl: async ({ url }) => { operations.push(['push', url]); },
+    replaceUrl: async ({ url }) => { operations.push(['replace', url]); },
+    back: () => { operations.push(['back']); }
+  };
+  const stage = {
+    loadContent: async url => { operations.push(['load', url]); },
+    getMainWindowSync: () => ({ getUIContext: () => ({ getRouter: () => router }) })
+  };
+  assert.equal(launchPath({ parameters: { page: 'Index,Unknown' } }, false), undefined);
+  assert.equal(launchPath({ parameters: { page: 'Index,' } }, false), undefined);
+  const debugWant = { parameters: { httpApiEnabled: true, httpApiPage: 'Index,Settings' } };
+  const settingsPath = { pages: [{ url: PageName.Index }, { url: PageName.Settings }] };
+  assert.equal(launchPath(debugWant, false), undefined);
+  assert.deepEqual(launchPath(debugWant, true), settingsPath);
+  navigator.openFromWant(launchPath({ parameters: { page: 'Index,Settings,Index' } }, false));
+  await navigator.attach(stage);
+  assert.deepEqual(operations, [['load', 'pages/Index']]);
+  assert.deepEqual(navigator.snapshot(), { pages: [...settingsPath.pages, { url: PageName.Index }] });
+
+  const home = parseNavigationPath('{"pages":[{"url":"Index"}]}');
+  assert.equal(parseNavigationPath('{"pages":[{"url":"pages/Index"}]}'), undefined);
+  assert.equal(navigator.canGoBack(), true);
+  assert.equal(await navigator.back(), NavigationResult.Ok);
+  assert.deepEqual(navigator.snapshot(), settingsPath);
+  const stopWatching = navigator.watchLeaveGuard(() => false);
+  assert.equal(await navigator.setPath(home), NavigationResult.Busy);
+  stopWatching();
+  assert.equal(await navigator.back(), NavigationResult.Ok);
+  assert.equal(navigator.canGoBack(), false);
+  assert.equal(await navigator.openPage(PageName.Settings), NavigationResult.Ok);
+  assert.equal(await navigator.back(), NavigationResult.Ok);
+  assert.deepEqual(operations, [
+    ['load', 'pages/Index'], ['replace', 'pages/Settings'], ['replace', 'pages/Index'],
+    ['push', 'pages/Settings'], ['back']
+  ]);
+  assert.deepEqual(navigator.snapshot(), home);
+
+  const replacement = parseNavigationPath('{"pages":[{"url":"Settings"},{"url":"Index"},{"url":"Settings"}]}');
+  assert.equal(await navigator.setPath(replacement), NavigationResult.Ok);
+  assert.equal(await navigator.setPath(settingsPath), NavigationResult.Ok);
+  assert.deepEqual(navigator.snapshot(), settingsPath);
+  assert.deepEqual(operations.slice(5), [['replace', 'pages/Settings']]);
+});
 
 test('应用保存多台电脑，Network 只恢复选中的一个目标', async () => {
   const fixtureState = fixture(); let { app, workspace } = fixtureState.create();

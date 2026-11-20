@@ -3,6 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { Application, ComputerDevice } from '../app/Application'
+import { NavigatorManager, NavigationResult, PageName } from '../app/NavigatorManager'
 
 @Entry
 @Component
@@ -37,6 +38,13 @@ struct Index {
   onPageHide(): void {
     this.visible = false
     this.stopTimer()
+  }
+
+  onBackPress(): boolean {
+    const navigator = AppStorage.get<NavigatorManager>('lokiNavigator')
+    if (!navigator || !navigator.canGoBack()) return false
+    navigator.back()
+    return true
   }
 
   aboutToDisappear(): void {
@@ -151,10 +159,12 @@ struct Index {
     if (scanned && this.visible) { await this.refreshDevices() }
   }
 
-  private openSettings(): void {
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/Settings' }).catch(() => {
+  private async openSettings(): Promise<void> {
+    const navigator = AppStorage.get<NavigatorManager>('lokiNavigator')
+    const result = await navigator?.openPage(PageName.Settings)
+    if (result !== NavigationResult.Ok && result !== NavigationResult.Busy) {
       this.errorMessage = '无法打开设置，请重试'
-    })
+    }
   }
 
   private async removeDevice(endpointId: string): Promise<void> {

@@ -1388,6 +1388,9 @@ name = "loki-mobile-network"
 version = "0.1.0"
 dependencies = [
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "libc",
  "serde",

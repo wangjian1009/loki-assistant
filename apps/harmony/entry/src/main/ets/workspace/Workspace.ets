@@ -1,4 +1,4 @@
-import native, { WorkspaceHandle } from 'liblokiworkspace.so'
+import native, { HttpHandler, WorkspaceHandle } from 'liblokiworkspace.so'
 import { InvalidRequestError, ResponsError, responsError } from './ResponsError'
 
 interface WorkspaceResult {
@@ -132,19 +132,33 @@ export class Workspace {
       }
       return Promise.reject(error)
     }
+    const handle = await this.open()
+    return this.checkResult(await native.execute(handle, operation, payload))
+  }
+  private async open(): Promise<WorkspaceHandle> {
     if (!this.handle) { this.handle = native.open(this.directory) }
-    let handle: WorkspaceHandle
-    try { handle = await this.handle } catch (error) {
-      this.handle = undefined
-      return Promise.reject(error)
+    const opening = this.handle
+    try { return await opening } catch (error) {
+      if (this.handle === opening) this.handle = undefined
+      throw error as Error
     }
-    const text = await native.execute(handle, operation, payload)
+  }
+  private async checkResult(text: string): Promise<string> {
     const result = JSON.parse(text) as WorkspaceResult
     if (!result.ok) {
       if (result.respons_error) { return Promise.reject(result.respons_error) }
       throw new Error(result.error ?? '工作空间暂时不可用')
     }
     return text
+  }
+  async startHttpServer(handler: HttpHandler): Promise<void> {
+    if (this.stopped) throw new Error('工作空间已停止')
+    const handle = await this.open()
+    if (this.stopped) throw new Error('工作空间已停止')
+    await this.checkResult(await native.startHttpServer(handle, handler))
+  }
+  async stopHttpServer(): Promise<void> {
+    if (this.handle && !this.stopped) await this.execute('stop_http')
   }
   async cancelRequest(operationId: string): Promise<void> {
     if (this.handle && !this.stopped) { native.cancel(await this.handle, operationId) }

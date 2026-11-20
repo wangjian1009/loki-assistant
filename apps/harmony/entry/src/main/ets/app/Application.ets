@@ -137,6 +137,9 @@ export class Application {
       }
     })
   }
+  prepare(): Promise<void> {
+    return this.run(async (): Promise<void> => {})
+  }
   list(): Promise<ComputerDevice[]> {
     return this.run(async () => { await this.captureService(); return this.views() })
   }

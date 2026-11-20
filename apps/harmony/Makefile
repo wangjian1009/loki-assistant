@@ -11,6 +11,9 @@ OHPM := $(DEVECO_HOME)/tools/ohpm/bin/ohpm
 HDC := $(DEVECO_HOME)/sdk/default/openharmony/toolchains/hdc
 NODE := $(NODE_HOME)/bin/node
 HDC_TARGET ?=
+PAGE ?=
+HTTP_API_ENABLED ?=
+export PAGE HTTP_API_ENABLED
 HDC_DEVICE = device_target="$$(sh scripts/select-hdc-target.sh "$(HDC)" "$(HDC_TARGET)")" && "$(HDC)" -t "$$device_target"
 BUNDLE_NAME := cc.loki.assistant.mobile
 ABILITY_NAME := EntryAbility
@@ -41,7 +44,19 @@ install: build
 	$(HDC_DEVICE) install -r "$(HAP_FILE)"
 
 run:
-	$(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME)
+	@set --; \
+	  if [ -n "$$PAGE" ]; then \
+	    printf '%s\n' "$$PAGE" | grep -Eq '^(Index|Settings)(,(Index|Settings))*$$' || { \
+	      echo 'PAGE 可指定 Index、Settings 或逗号分隔的页面路径，例如 Index,Settings' >&2; exit 1; \
+	    }; \
+	    set -- "$$@" --ps page "$$PAGE"; \
+	  fi; \
+	  case "$$HTTP_API_ENABLED" in \
+	    '') ;; \
+	    true|false) set -- "$$@" --pb httpApiEnabled "$$HTTP_API_ENABLED" ;; \
+	    *) echo 'HTTP_API_ENABLED 可指定 true 或 false' >&2; exit 1 ;; \
+	  esac; \
+	  $(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME) "$$@"
 
 test:
 	"$(NODE)" scripts/test-application.cjs "$(DEVECO_HOME)"
@@ -70,7 +85,8 @@ help:
 	  'make build    构建 Debug HAP，使用 OrgTasksDebug 调试签名' \
 	  'make test     检查并测试手机应用层与 Rust 网络模块' \
 	  'make install  安装到已连接的 HarmonyOS 设备' \
-	  'make run      启动手机应用' \
+	  'make run      启动手机应用，可指定 PAGE=Settings 或 PAGE=Index,Settings' \
+	  'HTTP_API_ENABLED=true/false 可开启或关闭当前 Debug 会话的 HTTP 服务' \
 	  'make deploy   检查真机，构建、安装并启动' \
 	  'make devices  查看 hdc 设备' \
 	  'make clean    清理构建产物' \

@@ -1,6 +1,7 @@
 import { bundleManager, common } from '@kit.AbilityKit'
 import { window } from '@kit.ArkUI'
 import { Application } from '../app/Application'
+import { NavigatorManager, NavigationResult } from '../app/NavigatorManager'
 
 @Entry
 @Component
@@ -15,13 +16,43 @@ struct Settings {
   @State private editError: string = ''
   @State private notice: string = ''
   private application?: Application
+  private stopWatching?: () => void
 
   onPageShow(): void {
     this.setSystemColors()
     this.application = AppStorage.get<Application>('lokiApplication')
+    this.stopWatching?.()
+    this.stopWatching = AppStorage.get<NavigatorManager>('lokiNavigator')
+      ?.watchLeaveGuard((): boolean => !this.editing)
     this.loadSettings()
     bundleManager.getBundleInfoForSelf(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT)
       .then((info) => { this.version = info.versionName }).catch(() => {})
+  }
+
+  onPageHide(): void {
+    this.stopWatching?.()
+    this.stopWatching = undefined
+  }
+
+  aboutToDisappear(): void {
+    this.onPageHide()
+  }
+
+  onBackPress(): boolean {
+    this.goBack()
+    return true
+  }
+
+  private async goBack(): Promise<void> {
+    if (this.editing) {
+      if (!this.working) this.editing = false
+      return
+    }
+    const result = await AppStorage.get<NavigatorManager>('lokiNavigator')?.back()
+    if (result !== NavigationResult.Ok && result !== NavigationResult.Busy) {
+      try { this.getUIContext().getPromptAction().showToast({ message: '无法返回上一页，请重试' }) }
+      catch (error) { console.error('无法显示返回失败提示') }
+    }
   }
 
   private setSystemColors(): void {
@@ -111,7 +142,7 @@ struct Settings {
         Text('设置').fontSize(28).fontWeight(FontWeight.Medium).fontColor('#E7E7E4').layoutWeight(1)
         Button('返回', { type: ButtonType.Normal }).fontSize(15).fontColor('#AEAEAA')
           .backgroundColor(Color.Transparent).padding({ left: 12, right: 0 })
-          .onClick(() => { this.getUIContext().getRouter().back() })
+          .onClick(() => { this.goBack() })
       }.width('100%').height(92).padding({ left: 20, right: 24 })
       Divider().color('#414240').strokeWidth(0.5)
 
@@ -165,7 +196,8 @@ struct Settings {
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
       .bindSheet($$this.editing, this.nameEditor(), {
         height: SheetSize.MEDIUM, backgroundColor: '#333633',
-        showClose: false
+        showClose: false,
+        onDisappear: (): void => { this.editing = false }
       })
   }
 }

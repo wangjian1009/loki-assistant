@@ -50,6 +50,34 @@ make deploy      # 检查真机，构建、安装并启动
 
 ~make deploy~ 在构建前检查真机，自动选中唯一已连接的真机；多台真机时通过 ~HDC_TARGET=<设备 ID>~ 指定。模拟器、离线或未授权设备不能作为部署目标。确认设备后依次完成构建签名、安装和启动，任一步失败即停止；并行执行 make 时也保持此顺序。根目录的 ~make deploy~ 和 ~make harmony-deploy~ 均调用此入口。
 
+* 启动页面与导航测试
+
+~make run PAGE=Settings~ 直接以设置页启动应用。根目录使用 ~make harmony-run PAGE=Settings~ 。Ability 从 ~Want.parameters.page~ 读取 ~Index~ 、 ~Settings~ 或用逗号分隔的页面路径。路径按从根到末级的顺序传入，例如 ~make run PAGE=Index,Settings~ 。导航管理器保存完整路径，只加载末级页面，按系统返回或设置页的返回按钮时再加载上一级。单独打开设置页后返回首页。冷启动未指定有效路径时进入首页。应用已经运行时可用同一个参数设置路径，缺省、无效值或正在编辑手机名称时保留当前页面。
+
+Debug 构建可通过 ~Want.parameters.httpApiEnabled~ 临时启停 Rust Workspace 的 HTTP 服务，监听设备的 ~127.0.0.1:8787~ 。普通启动默认关闭，Workspace 停止时关闭监听和在途请求。可与 ~page~ 一起传入，也支持参考实现中的 ~httpApiPage~ ，其值只在显式开启调试服务时读取。
+
+以下命令在本目录运行，使用 ~make devices~ 查找设备并设置 ~TEST_DEVICE~ 。
+
+#+begin_src sh
+HDC_BIN=/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc
+make run HDC_TARGET="$TEST_DEVICE" PAGE=Index,Settings HTTP_API_ENABLED=true
+"$HDC_BIN" -t "$TEST_DEVICE" fport tcp:18787 tcp:8787
+
+curl --fail-with-body http://127.0.0.1:18787/api/v1/ui/navigation
+curl --fail-with-body -X PUT http://127.0.0.1:18787/api/v1/ui/navigation \
+  -H 'Content-Type: application/json' \
+  -d '{"pages":[{"url":"Index"},{"url":"Settings"}]}'
+
+curl --fail-with-body http://127.0.0.1:18787/service/network/session
+
+make run HDC_TARGET="$TEST_DEVICE" HTTP_API_ENABLED=false
+"$HDC_BIN" -t "$TEST_DEVICE" fport rm tcp:18787 tcp:8787
+#+end_src
+
+GET 返回从根到当前页的完整 ~pages~ 。PUT 接收相同结构并设置页面路径，每一项的 ~url~ 填写页面名称。与启动参数一样，PUT 只加载末级页面。窗口未就绪返回 HTTP 503，跳转进行中或设置页正在编辑名称时 PUT 返回 HTTP 409，无效页面路径返回 HTTP 400。
+
+~GET /service/network/session~ 去掉 ~/service~ 前缀后，通过当前 Network 向选中的电脑发起 ~GET /network/session~ 。其他查询路径按同一规则映射，保留查询参数的顺序和重复项。电脑按已有绑定和接口访问范围处理请求。成功时使用电脑返回的 HTTP 状态码和 JSON 响应体，失败时返回 ~ResponsError~ JSON。电脑拒绝保留其状态码，未选择电脑或请求已取消返回 503，未绑定返回 403，网络超时返回 504，其他通信错误返回 502。协议见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
+
 * 调试签名
 
 项目复用 ~OrgTasksDebug~ 调试证书，配套的 ~LokiAssistantDebug~ Profile 绑定包名 ~cc.loki.assistant.mobile~ 和后台登记的手机，有效期至 2027-10-11。此配置用于调试构建。

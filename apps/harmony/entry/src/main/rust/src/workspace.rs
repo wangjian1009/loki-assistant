@@ -1,4 +1,5 @@
 use crate::{
+    http_server::HttpServer,
     network::{
         AutoBinding, BindingState, InvalidRequestReason, Network, NetworkReason, RequestHandle,
         RequestOptions, ResponsError, Service, ServiceRequest, ServiceResponse,
@@ -7,6 +8,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -40,6 +42,7 @@ pub struct Workspace {
     stopping: AtomicBool,
     stop_gate: tokio::sync::Mutex<()>,
     stop_executor: Mutex<()>,
+    http: Mutex<Option<HttpServer>>,
 }
 impl Workspace {
     /// 初始化只读取本机存储，不连接预设服务器；统一持有执行环境。
@@ -64,19 +67,57 @@ impl Workspace {
             stopping: AtomicBool::new(false),
             stop_gate: tokio::sync::Mutex::new(()),
             stop_executor: Mutex::new(()),
+            http: Mutex::new(None),
         })
     }
     pub fn network(&self) -> Arc<Network> {
         self.network.clone()
     }
+    /// 使用当前工作空间的 Network 监听设备回环地址，端口 0 由系统分配。
+    pub fn start_http_server(
+        &self,
+        port: u16,
+        dispatch: impl Fn(u64, &str, &str) -> bool + Send + Sync + 'static,
+    ) -> Result<SocketAddr, String> {
+        let _guard = self.stop_executor.lock().unwrap();
+        let mut server = self.http.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err("工作空间已停止".into());
+        }
+        if let Some(active) = server.as_ref().filter(|server| server.is_running()) {
+            return Ok(active.address);
+        }
+        let started = HttpServer::start(&self.executor, self.network(), port, Box::new(dispatch))
+            .map_err(|error| format!("无法启动调试 HTTP 服务：{error}"))?;
+        let address = started.address;
+        *server = Some(started);
+        Ok(address)
+    }
+
+    pub(crate) fn respond_http(&self, id: u64, status: u16, body: &str) {
+        if let Some(server) = self.http.lock().unwrap().as_ref() {
+            server.respond(id, status, body);
+        }
+    }
+
+    async fn stop_http_server(&self) {
+        let server = self.http.lock().unwrap().take();
+        if let Some(server) = server {
+            server.stop().await;
+        }
+    }
     /// 停止新操作并主动取消当前目标的所有请求。
     pub fn begin_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.network.begin_shutdown();
+        if let Some(server) = self.http.lock().unwrap().as_mut() {
+            server.begin_stop();
+        }
     }
     pub async fn stop(&self) {
         let _stop = self.stop_gate.lock().await;
         self.begin_stop();
+        self.stop_http_server().await;
         self.network.shutdown().await;
     }
     pub async fn close(&self) {
@@ -92,6 +133,13 @@ impl Workspace {
                 if let Some(runtime) = runtime {
                     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
                 }
+            }
+            return json!({"ok":true});
+        }
+        if operation == "stop_http" {
+            let _guard = self.stop_executor.lock().unwrap();
+            if self.runtime.lock().unwrap().is_some() {
+                self.executor.block_on(self.stop_http_server());
             }
             return json!({"ok":true});
         }
@@ -284,6 +332,7 @@ fn response<T: serde::Serialize>(
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
+        self.http.get_mut().unwrap().take();
         if let Some(runtime) = self.runtime.get_mut().unwrap().take() {
             let network = self.network.clone();
             // 不在 Tokio 执行线程中阻塞销毁运行时。
