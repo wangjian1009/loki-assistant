@@ -121,7 +121,11 @@ impl RelayRegistrar for IrohRelayRegistrar {
             relays = relays.with_auth_token(token.clone());
             let endpoint = Endpoint::builder(presets::Minimal)
                 .secret_key(identity)
-                .alpns(vec![super::protocol::PAIRING_ALPN.to_vec()])
+                .alpns(vec![
+                    super::protocol::PAIRING_ALPN.to_vec(),
+                    super::protocol::DEVICE_STATUS_ALPN.to_vec(),
+                    super::protocol::SERVICES_ALPN.to_vec(),
+                ])
                 .relay_mode(RelayMode::Custom(relays))
                 .clear_ip_transports()
                 .bind()

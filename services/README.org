@@ -109,7 +109,13 @@ control-center:
 
 Emacs 的设备管理界面默认只显示已绑定设备；点击“新增设备”后，通过 ~POST /network/pairings~ 创建五分钟有效的邀请，services 生成包含电脑 Endpoint ID、中继地址、中继访问令牌和一次性绑定凭据的二维码 PNG，以 ~qr_code_png_base64~ 返回，Emacs 在当前 buffer 中展开图片与有效期。手机按 ~loki-assistant/pair/1~ ALPN 连接现有 Endpoint，使用自己生成的身份提交绑定；services 验证后将设备保存到权限为 ~0600~ 的 ~~/.assistant/peers.json~ ，并消费邀请。同一设备重试幂等，刷新、取消、过期或中继配置成功切换都会使未完成的旧邀请失效。
 
-~GET /network/pairings/{id}~ 查询进度，~DELETE /network/pairings/{id}~ 取消邀请，~GET /network/peers~ 列出设备，~DELETE /network/peers/{endpoint_id}~ 解除绑定。HTTP 仅限本机，查询不返回令牌，所有绑定响应禁止缓存。当前已实现 Emacs 设备管理、services PNG 生成及本机随机端口 relay 握手测试，HarmonyOS 扫码入口和后续跨设备业务尚未接入；完整字段、传输和错误见 [[file:../docs/control-center-services.org::*扫码绑定][扫码绑定协议]]。
+~GET /network/pairings/{id}~ 查询进度，~DELETE /network/pairings/{id}~ 取消邀请，~GET /network/peers~ 列出设备，~DELETE /network/peers/{endpoint_id}~ 解除绑定。HTTP 仅限本机，查询不返回令牌，所有绑定响应禁止缓存。HarmonyOS 首页已接入扫码绑定和电脑状态查询，后者通过同一 Endpoint 的 ~loki-assistant/services/1~ 通用通道调用 ~GET /network/session~ ，旧 ~device-status/1~ 保留兼容，仅向已绑定手机返回在线状态；解绑后拒绝状态查询。测试通过本机随机端口 relay 调用实际手机客户端入口，覆盖绑定、响应丢失恢复和解绑。后续跨设备业务仍在规划；完整字段、传输和错误见 [[file:../docs/control-center-services.org::*扫码绑定][扫码绑定协议]]。
+
+* 手机通用请求
+
+手机 Workspace 持有唯一 Network，预先设置一台已绑定电脑，业务使用实例 ~network.request()~ 传递 HTTP 方法、路径、query 与 JSON body。电脑 network 模块内置 HttpDispatcher，将请求转换为进程内 HTTP 调用；已有业务 handler 无需处理 iroh 或另写分发逻辑。HTTP 服务继续仅监听 loopback。
+
+~#[loki_api]~ 的 ~access~ 默认 local，显式 paired 才允许远程调用；首期开放 ~GET /network/session~ 。每条请求重新验证已认证手机和绑定记录；解绑关闭连接并拒绝后续请求。客户端保留 HTTP 状态与结构化错误，支持超时和取消，不自动重试。实例接口见 [[file:../docs/service-client.org][Workspace 与 Network 接口]]。
 
 * 状态发布与查询
 

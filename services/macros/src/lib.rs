@@ -59,6 +59,7 @@ pub fn loki_status(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct ApiArguments {
+    access: LitStr,
     module: LitStr,
     id: LitStr,
     method: LitStr,
@@ -75,6 +76,7 @@ impl Parse for ApiArguments {
         let mut path = None;
         let mut summary = None;
         let mut description = None;
+        let mut access = None;
 
         while !input.is_empty() {
             let name: syn::Ident = input.parse()?;
@@ -87,6 +89,15 @@ impl Parse for ApiArguments {
                 "path" => path = Some(value),
                 "summary" => summary = Some(value),
                 "description" => description = Some(value),
+                "access" => {
+                    if !matches!(value.value().as_str(), "local" | "paired") {
+                        return Err(syn::Error::new(
+                            value.span(),
+                            "access 只能为 local 或 paired",
+                        ));
+                    }
+                    access = Some(value);
+                }
                 _ => return Err(syn::Error::new(name.span(), "未知的 loki_api 参数")),
             }
             if input.peek(Token![,]) {
@@ -95,6 +106,7 @@ impl Parse for ApiArguments {
         }
 
         Ok(Self {
+            access: access.unwrap_or_else(|| LitStr::new("local", input.span())),
             module: module.ok_or_else(|| syn::Error::new(input.span(), "缺少 module"))?,
             id: id.ok_or_else(|| syn::Error::new(input.span(), "缺少 id"))?,
             method: method.ok_or_else(|| syn::Error::new(input.span(), "缺少 method"))?,
@@ -113,6 +125,7 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function_name = &function.sig.ident;
     let registration_name = format_ident!("__LOKI_API_{}", function_name);
     let ApiArguments {
+        access,
         module,
         id,
         method,
@@ -148,6 +161,7 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
         static #registration_name: ::loki_services::modules::discover::registry::ApiDescriptor =
             ::loki_services::modules::discover::registry::ApiDescriptor {
                 module_id: #module,
+                access: #access,
                 id: #id,
                 method: #method,
                 path: #path,

@@ -2,6 +2,16 @@ use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: &str = "1";
 pub const PAIRING_ALPN: &[u8] = b"loki-assistant/pair/1";
+pub const DEVICE_STATUS_ALPN: &[u8] = b"loki-assistant/device-status/1";
+pub const SERVICES_ALPN: &[u8] = b"loki-assistant/services/1";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceStatusRequest {
+    pub api_version: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +100,8 @@ pub enum NetworkError {
     Completed,
     #[error("绑定设备不存在")]
     PeerNotFound,
+    #[error("此手机尚未绑定或已被电脑解除绑定，请重新扫码")]
+    PeerNotBound,
     #[error("设备记录无法读取或保存，请检查 ~/.assistant/peers.json")]
     Storage,
     #[error("绑定信息无法生成二维码，请检查中继地址和令牌长度")]
@@ -101,6 +113,7 @@ impl NetworkError {
         match self {
             Self::InvalidRequest => 400,
             Self::InvalidToken => 403,
+            Self::PeerNotBound => 403,
             Self::PairingNotFound | Self::PeerNotFound => 404,
             Self::Consumed | Self::Completed => 409,
             Self::Expired | Self::Cancelled => 410,
@@ -121,6 +134,7 @@ impl NetworkError {
             Self::Consumed => "pairing-consumed",
             Self::Completed => "pairing-completed",
             Self::PeerNotFound => "peer-not-found",
+            Self::PeerNotBound => "peer-not-bound",
             Self::Storage => "peer-storage-error",
             Self::QrCode => "pairing-qr-code-error",
         }

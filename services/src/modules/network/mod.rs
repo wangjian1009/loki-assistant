@@ -5,6 +5,7 @@ mod peers;
 pub mod protocol;
 mod qr_code;
 mod relay;
+pub mod remote;
 mod routes;
 mod service;
 mod status;

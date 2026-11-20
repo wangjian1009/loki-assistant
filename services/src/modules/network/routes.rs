@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{
         DefaultBodyLimit, Path, State,
@@ -23,6 +23,7 @@ use crate::http::error::{ErrorSource, response as api_error};
 
 pub(super) fn router(service: Arc<NetworkService>) -> Router {
     Router::new()
+        .route("/network/session", get(session))
         .route("/network/pairings", post(create))
         .route("/network/pairings/{id}", get(query).delete(cancel))
         .route("/network/peers", get(peers))
@@ -48,6 +49,33 @@ async fn no_store(mut response: Response) -> Response {
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[loki_api(
+    module = "network",
+    id = "session",
+    method = "GET",
+    path = "/network/session",
+    access = "paired",
+    summary = "查询已认证服务会话",
+    description = "向已绑定手机返回当前电脑身份、在线状态与绑定时间，认证身份由 iroh 分发器注入。"
+)]
+async fn session(
+    State(service): State<Arc<NetworkService>>,
+    peer: Option<Extension<super::remote::AuthenticatedPeer>>,
+) -> Response {
+    let Some(Extension(peer)) = peer else {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            ErrorSource::Services,
+            "peer-authentication-required",
+            "此接口需要已认证的远端身份",
+        );
+    };
+    match service.peer_session(peer.0).await {
+        Ok(value) => Json(value).into_response(),
+        Err(reason) => error(reason),
+    }
 }
 
 fn error(error: NetworkError) -> Response {

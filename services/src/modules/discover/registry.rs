@@ -12,6 +12,7 @@ pub struct ModuleRegistration {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ApiDescriptor {
+    pub access: &'static str,
     pub module_id: &'static str,
     pub id: &'static str,
     pub method: &'static str,
@@ -52,6 +53,7 @@ pub fn metadata() -> Vec<ModuleMetadata> {
         if let Some(module) = modules.iter_mut().find(|module| module.id == api.module_id) {
             module.apis.push(
                 ApiMetadata::new(api.id, api.method, api.path, api.summary, api.description)
+                    .with_access(api.access)
                     .with_parameters(
                         api.parameters
                             .iter()

@@ -362,7 +362,7 @@ async fn http_lifecycle_uses_committed_settings_and_never_returns_tokens_in_quer
 }
 
 #[tokio::test]
-async fn services_mounts_all_five_network_apis_without_exposing_credentials() {
+async fn services_mounts_network_apis_and_access_without_exposing_credentials() {
     let services = Arc::new(crate::Services::build());
     let app = services.router(Arc::new(crate::runtime::RuntimeState::new(
         services.clone(),
@@ -380,7 +380,17 @@ async fn services_mounts_all_five_network_apis_without_exposing_credentials() {
     assert_eq!(response.status(), 200);
     let metadata: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65_536).await.unwrap()).unwrap();
-    assert_eq!(metadata["apis"].as_array().unwrap().len(), 5);
+    assert_eq!(metadata["apis"].as_array().unwrap().len(), 6);
+    for api in metadata["apis"].as_array().unwrap() {
+        assert_eq!(
+            api["access"],
+            if api["id"] == "session" {
+                "paired"
+            } else {
+                "local"
+            }
+        );
+    }
     assert!(!metadata.to_string().contains("relay_token"));
     assert_eq!(http(app, "POST", "/network/pairings").await.0, 503);
 }
@@ -424,6 +434,16 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         fixture.status.clone(),
         Duration::from_secs(10),
     ));
+    let weak = Arc::downgrade(&service);
+    service.set_remote_dispatcher(Arc::new(super::remote::HttpDispatcher::new(move || {
+        weak.upgrade().map(|service| {
+            service
+                .router()
+                .route("/network-test/echo/{id}", axum::routing::post(echo_channel))
+                .route("/network-test/bad", axum::routing::get(bad_channel))
+                .route("/network-test/large", axum::routing::get(large_channel))
+        })
+    })));
     let receiver = tokio::spawn(service.clone().receive_pairings());
     let config = fixture.config(service.clone());
     config
@@ -444,11 +464,11 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     let endpoint = phone.endpoint().unwrap();
     let remote = EndpointAddr::new(created.qr_payload.endpoint_id.parse().unwrap())
         .with_relay_url(address.parse().unwrap());
-    let exchange = |body: Vec<u8>| {
+    let exchange_alpn = |body: Vec<u8>, alpn: &'static [u8]| {
         let endpoint = endpoint.clone();
         let remote = remote.clone();
         async move {
-            let connection = endpoint.connect(remote, PAIRING_ALPN).await.unwrap();
+            let connection = endpoint.connect(remote, alpn).await.unwrap();
             let (mut send, mut recv) = connection.open_bi().await.unwrap();
             send.write_all(&body).await.unwrap();
             send.finish().unwrap();
@@ -456,6 +476,11 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
             serde_json::from_slice::<Value>(&data).unwrap()
         }
     };
+    let exchange = |body| exchange_alpn(body, PAIRING_ALPN);
+    let status_request =
+        serde_json::to_vec(&json!({ "api_version": "1", "type": "device.status" })).unwrap();
+    let unbound = exchange_alpn(status_request.clone(), super::protocol::DEVICE_STATUS_ALPN).await;
+    assert_eq!(unbound["error"]["code"], "peer-not-bound");
     let bad = serde_json::to_vec(&request(&created.pairing_id, &"0".repeat(64))).unwrap();
     let rejected = tokio::time::timeout(Duration::from_secs(10), exchange(bad))
         .await
@@ -479,6 +504,17 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .await
         .unwrap();
     assert_eq!(response["type"], "pairing.bound");
+    let online = exchange_alpn(status_request.clone(), super::protocol::DEVICE_STATUS_ALPN).await;
+    assert_eq!(online["status"], "online");
+    assert_eq!(online["endpoint_id"], created.qr_payload.endpoint_id);
+    let spoofed_status = serde_json::to_vec(&json!({
+        "api_version": "1", "type": "device.status", "endpoint_id": phone_id.to_string(),
+    }))
+    .unwrap();
+    assert_eq!(
+        exchange_alpn(spoofed_status, super::protocol::DEVICE_STATUS_ALPN).await["status"],
+        400
+    );
     assert_eq!(
         service.peers().await.unwrap()[0].endpoint_id,
         phone_id.to_string()
@@ -500,9 +536,268 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     assert_eq!(status, 200);
     assert_eq!(removed["removed"], true);
     assert!(service.peers().await.unwrap().is_empty());
+    assert_eq!(
+        exchange_alpn(status_request, super::protocol::DEVICE_STATUS_ALPN).await["error"]["code"],
+        "peer-not-bound"
+    );
+
+    // 直接调用手机 NAPI 背后的同一入口，验证真实扫码 payload、身份恢复和双端解绑。
+    let mobile_path = fixture.root.join("mobile");
+    fs::create_dir(&mobile_path).unwrap();
+    let mobile = |operation: &'static str, payload: String| {
+        let directory = mobile_path.to_str().unwrap().to_owned();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                loki_mobile_network::Workspace::open(loki_mobile_network::WorkspaceOptions::new(
+                    directory,
+                ))
+                .unwrap()
+                .execute(operation, &payload)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let invitation = service.create_pairing().await.unwrap();
+    let qr_payload = serde_json::to_string(&invitation.qr_payload).unwrap();
+    let bound = mobile("bind", qr_payload.clone()).await;
+    assert_eq!(bound["ok"], true, "{bound}");
+    let loaded = mobile("list", String::new()).await;
+    assert_eq!(loaded["devices"][0]["status"], "unknown");
+    let checked = mobile("refresh", String::new()).await;
+    assert_eq!(checked["devices"][0]["status"], "online", "{checked}");
+    assert!(
+        !checked
+            .to_string()
+            .contains(&invitation.qr_payload.relay_token)
+    );
+    let mobile_file = mobile_path.join("devices.json");
+    let mut saved: Value = serde_json::from_slice(&fs::read(&mobile_file).unwrap()).unwrap();
+    let mobile_id = saved["endpoint_id"].as_str().unwrap().to_owned();
+    // 模拟电脑提交成功后手机丢失响应：持久化待确认记录应由状态查询恢复。
+    saved["computers"][0]["pending"] = serde_json::from_str(&qr_payload).unwrap();
+    saved["computers"][0]["bound_at"] = Value::Null;
+    fs::write(&mobile_file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let recovered = mobile("refresh", String::new()).await;
+    assert_eq!(recovered["devices"][0]["status"], "online");
+    assert!(recovered["devices"][0]["bound_at"].as_u64().is_some());
+    let retry = mobile("bind", qr_payload).await;
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(service.peers().await.unwrap().len(), 1);
+    assert_eq!(
+        mobile("list", String::new()).await["devices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // 持久 Workspace 的同一个 Network 实例并发通过 iroh 进入实际 HTTP handler。
+    let directory = mobile_path.clone();
+    let workspace = tokio::task::spawn_blocking(move || {
+        loki_mobile_network::Workspace::open(loki_mobile_network::WorkspaceOptions::new(directory))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let network = workspace.network();
+    use loki_mobile_network::network::{QueryParameter, ServiceRequest};
+    let mut request = ServiceRequest::get("/network-test/echo/phone%20test");
+    request.method = axum::http::Method::POST;
+    request.query = vec![
+        QueryParameter {
+            name: "text".into(),
+            value: "中文 & +".into(),
+        },
+        QueryParameter {
+            name: "text".into(),
+            value: "second".into(),
+        },
+    ];
+    request.body = Some(json!({"value":"手机请求"}));
+    let echoed = channel_request(network.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(echoed.status, 202);
+    assert_eq!(echoed.data["id"], "phone test");
+    let query = echoed.data["query"].as_str().unwrap();
+    assert_eq!(
+        url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>()[0].1,
+        "中文 & +"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(echoed.data["body"].as_str().unwrap()).unwrap(),
+        json!({"value":"手机请求"})
+    );
+    request.body = None;
+    assert_eq!(
+        channel_request(network.clone(), request.clone())
+            .await
+            .unwrap()
+            .data["body"],
+        ""
+    );
+    request.body = Some(Value::Null);
+    assert_eq!(
+        channel_request(network.clone(), request)
+            .await
+            .unwrap()
+            .data["body"],
+        "null"
+    );
+    let mut calls = tokio::task::JoinSet::new();
+    for _ in 0..6 {
+        let network = network.clone();
+        calls.spawn(async move {
+            channel_request(network, ServiceRequest::get("/network/session"))
+                .await
+                .unwrap()
+        });
+    }
+    let mut ids = std::collections::HashSet::new();
+    while let Some(response) = calls.join_next().await {
+        let response = response.unwrap();
+        assert_eq!(response.data["status"], "online");
+        assert!(ids.insert(response.request_id));
+    }
+    assert_eq!(
+        channel_request(network.clone(), ServiceRequest::get("/network/peers"))
+            .await
+            .unwrap_err()
+            .code,
+        "remote-api-forbidden"
+    );
+    assert_eq!(
+        channel_request(network.clone(), ServiceRequest::get("/missing"))
+            .await
+            .unwrap_err()
+            .status,
+        Some(404)
+    );
+    let mut wrong_method = ServiceRequest::get("/network/session");
+    wrong_method.method = axum::http::Method::POST;
+    assert_eq!(
+        channel_request(network.clone(), wrong_method)
+            .await
+            .unwrap_err()
+            .status,
+        Some(405)
+    );
+    assert_eq!(
+        channel_request(network.clone(), ServiceRequest::get("/network-test/bad"))
+            .await
+            .unwrap_err()
+            .code,
+        "invalid-service-response"
+    );
+    assert_eq!(
+        channel_request(network.clone(), ServiceRequest::get("/network-test/large"))
+            .await
+            .unwrap_err()
+            .code,
+        "response-too-large"
+    );
+    assert_eq!(
+        http(service.router(), "GET", "/network/session").await.0,
+        401
+    );
+    // 在保持连接的情况下解绑，后续请求不得继续进入业务路由。
+    service
+        .remove_peer(mobile_id.parse().unwrap())
+        .await
+        .unwrap();
+    let denied = channel_request(network.clone(), ServiceRequest::get("/network/session"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied.code.as_str(),
+        "peer-not-bound" | "unreachable"
+    ));
+    workspace.close().await;
+    let revoked = mobile("refresh", String::new()).await;
+    assert_eq!(revoked["devices"][0]["status"], "unbound", "{revoked}");
     receiver.abort();
     let _ = receiver.await;
     service.shutdown().await;
+    let unavailable = mobile("refresh", String::new()).await;
+    assert_eq!(
+        unavailable["devices"][0]["status"], "unreachable",
+        "{unavailable}"
+    );
     phone.close().await.unwrap();
     relay.shutdown().await.unwrap();
+}
+
+#[loki_services_macros::loki_api(
+    module = "network-test",
+    id = "echo",
+    method = "POST",
+    path = "/network-test/echo/{id}",
+    access = "paired",
+    summary = "测试通用 HTTP 通道",
+    description = "仅测试时编译，验证路径、查询与请求体透传。"
+)]
+async fn echo_channel(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    query: axum::extract::RawQuery,
+    body: axum::body::Bytes,
+) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::ACCEPTED,
+        axum::Json(
+            json!({"id":id,"query":query.0,"body":String::from_utf8(body.to_vec()).unwrap()}),
+        ),
+    )
+}
+
+#[loki_services_macros::loki_api(
+    module = "network-test",
+    id = "bad",
+    method = "GET",
+    path = "/network-test/bad",
+    access = "paired",
+    summary = "测试无效响应",
+    description = "仅测试时编译。"
+)]
+async fn bad_channel() -> &'static str {
+    "not json"
+}
+
+#[loki_services_macros::loki_api(
+    module = "network-test",
+    id = "large",
+    method = "GET",
+    path = "/network-test/large",
+    access = "paired",
+    summary = "测试超限响应",
+    description = "仅测试时编译。"
+)]
+async fn large_channel() -> axum::Json<Value> {
+    axum::Json(json!({"data":"x".repeat(4_200_000)}))
+}
+
+async fn channel_request(
+    network: Arc<loki_mobile_network::network::Network>,
+    request: loki_mobile_network::network::ServiceRequest,
+) -> Result<
+    loki_mobile_network::network::ServiceResponse<Value>,
+    loki_mobile_network::network::NetworkError,
+> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let sender = Arc::new(std::sync::Mutex::new(Some(sender)));
+    let error_sender = sender.clone();
+    network.request(
+        request,
+        Default::default(),
+        move |response| {
+            if let Some(sender) = sender.lock().unwrap().take() {
+                let _ = sender.send(Ok(response));
+            }
+        },
+        move |error| {
+            if let Some(sender) = error_sender.lock().unwrap().take() {
+                let _ = sender.send(Err(error));
+            }
+        },
+    );
+    receiver.await.unwrap()
 }

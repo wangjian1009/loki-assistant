@@ -76,6 +76,7 @@ struct State {
 /// 持有当前中转连接；新地址完成注册并落盘后才替换原连接。
 #[derive(Debug)]
 pub struct NetworkService {
+    pub(super) remote: super::remote::Gateway,
     identity: Result<IdentityStore, String>,
     registrar: Arc<dyn RelayRegistrar>,
     notification: Arc<NotificationService>,
@@ -132,7 +133,7 @@ impl NetworkService {
         self.pairings.remove(id).await
     }
 
-    /// 与 monitor 一样由进程入口显式调度；每条连接只处理一次绑定请求。
+    /// 由进程入口显式调度；每条连接只处理一次绑定或设备状态请求。
     pub async fn receive_pairings(self: Arc<Self>) {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -160,7 +161,11 @@ impl NetworkService {
                                 _ => return,
                             };
                             service.pairings.track(connection.clone()).await;
-                            let _ = tokio::time::timeout(Duration::from_secs(15), service.handle_pairing(&session, &connection)).await;
+                            if connection.alpn() == super::protocol::SERVICES_ALPN {
+                                service.clone().handle_remote(&session, &connection).await;
+                            } else {
+                                let _ = tokio::time::timeout(Duration::from_secs(15), service.handle_pairing(&session, &connection)).await;
+                            }
                             service.pairings.untrack(connection.stable_id()).await;
                             connection.close(0u32.into(), b"finished");
                         });
@@ -177,9 +182,42 @@ impl NetworkService {
         session: &Arc<dyn RelaySession>,
         connection: &iroh::endpoint::Connection,
     ) -> Result<(), ()> {
-        use super::protocol::{BindRequest, NetworkError};
+        use super::protocol::{BindRequest, DEVICE_STATUS_ALPN, DeviceStatusRequest, NetworkError};
+        let local_id = session.endpoint().ok_or(())?.id();
         let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| ())?;
         let result = match recv.read_to_end(16_384).await {
+            Ok(data) if connection.alpn() == DEVICE_STATUS_ALPN => {
+                match serde_json::from_slice::<DeviceStatusRequest>(&data) {
+                    Ok(request)
+                        if request.api_version == "1" && request.kind == "device.status" =>
+                    {
+                        let state = self.state.lock().await;
+                        if state.pending.is_some()
+                            || !state
+                                .active
+                                .as_ref()
+                                .is_some_and(|active| Arc::ptr_eq(&active.session, session))
+                        {
+                            Err(NetworkError::NotReady)
+                        } else {
+                            self.pairings.list().await.and_then(|peers| {
+                                let peer = peers
+                                    .iter()
+                                    .find(|peer| {
+                                        peer.endpoint_id == connection.remote_id().to_string()
+                                    })
+                                    .ok_or(NetworkError::PeerNotBound)?;
+                                Ok(serde_json::json!({
+                                    "api_version": "1", "type": "device.status",
+                                    "endpoint_id": local_id.to_string(),
+                                    "status": "online", "bound_at": peer.bound_at,
+                                }))
+                            })
+                        }
+                    }
+                    _ => Err(NetworkError::InvalidRequest),
+                }
+            }
             Ok(data) => match serde_json::from_slice::<BindRequest>(&data) {
                 Ok(request) => {
                     let state = self.state.lock().await;
@@ -191,7 +229,12 @@ impl NetworkService {
                     {
                         Err(NetworkError::NotReady)
                     } else {
-                        self.pairings.bind(connection.remote_id(), request).await
+                        self.pairings
+                            .bind(connection.remote_id(), request)
+                            .await
+                            .map(|response| {
+                                serde_json::to_value(response).expect("绑定响应可序列化")
+                            })
                     }
                 }
                 Err(_) => Err(NetworkError::InvalidRequest),
@@ -217,6 +260,52 @@ impl NetworkService {
         Ok(())
     }
 
+    pub(super) async fn authenticated_peer(
+        &self,
+        session: &Arc<dyn RelaySession>,
+        id: iroh::EndpointId,
+    ) -> Result<super::protocol::Peer, super::protocol::NetworkError> {
+        use super::protocol::NetworkError;
+        let state = self.state.lock().await;
+        if state.pending.is_some()
+            || !state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.session, session))
+        {
+            return Err(NetworkError::NotReady);
+        }
+        self.pairings
+            .list()
+            .await?
+            .into_iter()
+            .find(|peer| peer.endpoint_id == id.to_string())
+            .ok_or(NetworkError::PeerNotBound)
+    }
+
+    pub(super) async fn peer_session(
+        &self,
+        id: iroh::EndpointId,
+    ) -> Result<serde_json::Value, super::protocol::NetworkError> {
+        use super::protocol::NetworkError;
+        let state = self.state.lock().await;
+        let active = state
+            .active
+            .as_ref()
+            .filter(|_| state.pending.is_none())
+            .ok_or(NetworkError::NotReady)?;
+        let peer = self
+            .pairings
+            .list()
+            .await?
+            .into_iter()
+            .find(|peer| peer.endpoint_id == id.to_string())
+            .ok_or(NetworkError::PeerNotBound)?;
+        Ok(
+            serde_json::json!({"api_version":"1","endpoint_id":active.endpoint_id,"status":"online","bound_at":peer.bound_at}),
+        )
+    }
+
     pub fn new(
         identity: Result<IdentityStore, String>,
         registrar: Arc<dyn RelayRegistrar>,
@@ -236,6 +325,7 @@ impl NetworkService {
             .map(IdentityStore::peers_path)
             .map_err(Clone::clone);
         Self {
+            remote: super::remote::Gateway::new(),
             identity,
             registrar,
             notification,

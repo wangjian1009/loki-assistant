@@ -32,6 +32,7 @@ pub struct ModuleSummary {
 /// 模块对外提供的一个 HTTP API 描述。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ApiMetadata {
+    pub access: String,
     pub id: String,
     pub method: String,
     pub path: String,
@@ -49,6 +50,7 @@ impl ApiMetadata {
 
     pub fn new(id: &str, method: &str, path: &str, summary: &str, description: &str) -> Self {
         Self {
+            access: "local".to_owned(),
             id: id.to_owned(),
             method: method.to_owned(),
             path: path.to_owned(),
@@ -62,6 +64,11 @@ impl ApiMetadata {
 
     pub fn with_response(mut self, response: DataMetadata) -> Self {
         self.response = Some(response);
+        self
+    }
+
+    pub fn with_access(mut self, access: &str) -> Self {
+        self.access = access.to_owned();
         self
     }
 

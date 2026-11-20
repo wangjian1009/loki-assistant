@@ -90,6 +90,16 @@ impl Services {
             .merge(self.emacs.router())
             .merge(self.password.router())
     }
+
+    pub fn attach_remote(self: &Arc<Self>, runtime: &Arc<RuntimeState>) {
+        let runtime = Arc::downgrade(runtime);
+        self.network.set_remote_dispatcher(Arc::new(
+            crate::modules::network::remote::HttpDispatcher::new(move || {
+                let runtime = runtime.upgrade()?;
+                Some(runtime.services().router(runtime))
+            }),
+        ));
+    }
 }
 
 #[cfg(test)]

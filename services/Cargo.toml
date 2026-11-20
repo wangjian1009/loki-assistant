@@ -29,9 +29,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
+loki-mobile-network = { path = "../apps/harmony/entry/src/main/rust" }
 quircs = "0.10"
 iroh-relay = { version = "=1.4.1", default-features = false, features = ["server"] }
 tokio = { version = "1", features = ["test-util"] }
-tower = { version = "0.5", features = ["util"] }

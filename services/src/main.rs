@@ -25,6 +25,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let services = Arc::new(Services::load()?);
     let service_path = service_pfile.write()?;
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
+    services.attach_remote(&runtime);
     let network = Arc::clone(&services.network);
     let config = services.config.service();
     let network_start = tokio::spawn(async move {

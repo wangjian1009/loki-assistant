@@ -14,6 +14,8 @@ apps/harmony/build/
 apps/harmony/entry/build/
 apps/harmony/oh_modules/
 apps/harmony/entry/oh_modules/
+apps/harmony/entry/libs/
+apps/harmony/entry/src/main/rust/target/
 
 # Chrome extension build output
 /dist/chrome-plugin/

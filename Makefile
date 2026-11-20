@@ -13,7 +13,7 @@ OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
 .PHONY: emacs-load emacs-test emacs-config emacs-devices chrome-build chrome-test export-icons
-.PHONY: relay-image
+.PHONY: relay-image harmony-test
 
 .PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
 
@@ -48,6 +48,7 @@ help:
 	  'make harmony-deps    检查 SDK 并安装 HarmonyOS 工程依赖' \
 	  'make harmony-check-sdk 检查 HarmonyOS SDK 安装' \
 	  'make harmony-build   构建 HarmonyOS 手机应用并使用 OrgTasksDebug 签名' \
+	  'make harmony-test    检查并测试 HarmonyOS 设备管理 Rust 模块' \
 	  'make harmony-install 构建并安装 HarmonyOS 手机应用' \
 	  'make harmony-run     启动 HarmonyOS 手机应用' \
 	  'make harmony-deploy  同 make deploy，检查真机后构建、安装并启动' \
@@ -185,6 +186,9 @@ harmony-check-sdk:
 
 harmony-build:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" build
+
+harmony-test:
+	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" test
 
 harmony-install:
 	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" install

@@ -1,0 +1,170 @@
+#+TITLE: Workspace 与 Network 统一访问接口
+
+* 实现与职责
+
+Rust 已提供 ~Workspace~ 、~Network~ 与通用 HTTP 请求通道。~Workspace~ 是应用组合根对象，不是 Cargo workspace 配置；由它创建一个 Network，设置预先恢复的 service，并在构造其他模块时注入同一个 ~Arc<Network>~ 。
+
+一个 Network 同时只管理一个 service。service 由外部绑定模块创建并通过 ~set_service~ 设置；业务直接调用实例的 ~network.request()~ ，不再指定 service。没有 service 时通过错误回调报告 ~service-not-configured~ 。
+
+手机与电脑的完整通道为：手机业务 → Network.request → iroh → 电脑 network → 进程内 HTTP request → 现有 Axum handler → HTTP 响应 → 原请求回调。请求到 HTTP 的转换统一在网络模块完成，业务模块只保留已有 HTTP handler。
+
+| 对象 | 职责 |
+|------+------|
+| ~Workspace~ | 构造 Network 和设备模块，恢复身份与选中绑定，持有 Rust 执行环境和整体生命周期 |
+| ~Network~ | 管理唯一 service、连接复用、HTTP 请求、超时、取消、成功与错误回调 |
+| ~Service~ | 封装已绑定电脑的身份与中继资料，凭据不向 UI 导出 |
+| ~DeviceManager~ | 接收构造时注入的 Network，处理扫码、选择、状态确认与绑定持久化 |
+| ~HttpDispatcher~ | 电脑网络模块中的适配器，把通用请求转为进程内 HTTP 调用 |
+| NAPI | 持有 Workspace 的原生对象引用，转发实例调用并将结果投递至 ArkTS 线程 |
+
+* Workspace 装配
+
+~Workspace::open~ 为同步本机初始化，不进行网络连接；它加载私有存储并创建 Tokio runtime，因此 UI 通过 NAPI 异步工作线程调用。~Network::new~ 在 Workspace 建立的 Tokio 上下文中构造；业务模块不自行构造 Network，也不通过全局变量查找实例。
+
+#+begin_src rust
+use loki_mobile_network::{Workspace, WorkspaceOptions};
+
+let workspace = Workspace::open(WorkspaceOptions::new(private_directory))?;
+let network = workspace.network(); // Arc<Network>，多次获取共享同一个实例
+let devices = workspace.devices();
+#+end_src
+
+Workspace 内部按顺序创建执行环境、Network、恢复的 Service 和 DeviceManager。DeviceManager 的构造函数显式接收 ~Arc<Network>~ 及它需要的存储依赖；后续业务模块以相同方式由 Workspace 构造。~workspace.stop().await~ 先停止接收业务操作，再主动取消网络请求，等待错误回调与业务收尾完成，支持重复或并发调用。NAPI 的 stop 在此后关闭 Rust 执行环境；纯 Rust 异步调用在 Workspace 销毁时释放执行环境。原 close 入口保留为 stop 的兼容别名。
+
+* 手机端 Network API
+
+** 设置唯一 service
+
+#+begin_src rust
+let service = Service::new(identity, endpoint_id, relay_url, relay_token)?;
+network.set_service(service)?;
+assert!(network.has_service());
+network.clear_service();
+#+end_src
+
+Service 由外部绑定业务创建，Network 不主动发现或选择其他电脑。相同绑定重复设置不重建连接；替换或清除时关闭旧 service 的连接，旧请求通过 ~service-changed~ 返回，不向新电脑重发。清除运行时 service 不等于撤销电脑端授权；设备业务负责双端解绑和持久化。
+
+** 通用 HTTP 请求
+
+#+begin_src rust
+pub struct ServiceRequest {
+    pub method: http::Method,
+    pub path: String,
+    pub query: Vec<QueryParameter>,
+    pub body: Option<serde_json::Value>,
+}
+
+pub struct QueryParameter {
+    pub name: String,
+    pub value: String,
+}
+
+pub struct RequestOptions {
+    pub timeout: Duration,
+}
+
+pub struct ServiceResponse<T> {
+    pub request_id: Uuid,
+    pub status: http::StatusCode,
+    pub data: T,
+    pub generation: u64,
+}
+
+impl Network {
+    pub fn request<T, OnSuccess, OnError>(
+        &self,
+        request: ServiceRequest,
+        options: RequestOptions,
+        on_success: OnSuccess,
+        on_error: OnError,
+    ) -> RequestHandle
+    where
+        T: DeserializeOwned + Send + 'static,
+        OnSuccess: FnOnce(ServiceResponse<T>) + Send + 'static,
+        OnError: FnOnce(NetworkError) + Send + 'static;
+}
+#+end_src
+
+~request~ 立即返回 RequestHandle，在 Workspace 的 Rust 执行线程触发成功或错误回调之一；Network 已关闭时可在调用线程立即交付关闭错误。业务填写 HTTP 方法、路径、查询参数与 JSON body，不传 service、Endpoint ID、ALPN 或中继资料。
+
+#+begin_src rust
+network.request::<serde_json::Value, _, _>(
+    ServiceRequest::get("/network/session"),
+    RequestOptions::default(),
+    |response| {
+        // response.status 保留 HTTP 状态；response.data 是解码后的 JSON。
+    },
+    |error| {
+        // 包括未设置 service、连接失败、超时与 HTTP 业务错误。
+    },
+);
+#+end_src
+
+~path~ 使用现有 HTTP 资源路径，以 ~/~ 开始，不含 scheme、host、query 或 fragment；动态路径段应进行 URI 路径编码。~query~ 保存未编码的字符串，允许重复键，由网络模块统一编码。~body: None~ 表示无请求体，~Some(Value::Null)~ 表示显式 JSON null。
+
+2xx 状态触发成功回调，201、202、204 等状态保留；204 的响应数据为 JSON null，DTO 须允许 null。Rust 通过 Serde 解码业务 DTO，结构不匹配触发协议错误。非 2xx 状态通过错误回调保留服务端 ~status/source/code/message~ 。
+
+默认超时 10 秒，允许设置 1 至 30 秒，覆盖连接、发送、读取与解码。不自动重试。~RequestHandle::cancel()~ 显式取消，通过 ~request-cancelled~ 进入错误回调；丢弃 handle 不取消。超时或取消不保证已经发出的写操作回滚。
+
+~network.shutdown().await~ 主动取消所有未完成请求，通过 ~Cancelled~ / ~request-cancelled~ 错误回调通知每个调用者，等待回调完成并关闭连接。shutdown 返回后不再接受新请求，新调用立即收到 ~network-closed~ 。丢弃 Workspace 或显式 stop 都会执行该收尾流程，停止时保留已有绑定和待确认记录。
+
+绑定代次随设置、清除和关闭变化；响应附带 ~generation~ ，设备业务在提交状态前验证当前代次，避免旧电脑响应更新新电脑视图。
+
+** ArkTS 适配
+
+EntryAbility 持有一个 Workspace，页面使用它创建的设备模块；NAPI 不按请求新建 Workspace。其他手机业务可以调用 ~workspace.network.request~ ，返回 Promise，成功返回 ~request_id/status/body~ ，错误通过 NetworkError 保留 Rust 的结构化 ~details~ 。业务协议和连接状态仍由 Rust 管理。
+
+#+begin_src typescript
+const response = await workspace.network.request({
+  method: 'GET',
+  path: '/network/session'
+})
+#+end_src
+
+* 电脑端分发接口
+
+~RequestDispatcher~ 与发起请求的 Network.request 属于收发两侧接口。电脑网络模块接收请求，验证认证身份、绑定与接口访问范围，再调用内置 HttpDispatcher：
+
+#+begin_src rust
+pub struct RequestContext {
+    pub request_id: Uuid,
+    pub peer_id: EndpointId,
+}
+
+pub struct DispatchRequest {
+    pub method: http::Method,
+    pub path: String,
+    pub query: Vec<QueryParameter>,
+    pub body: Option<serde_json::Value>,
+}
+
+pub struct DispatchResponse {
+    pub status: http::StatusCode,
+    pub body: serde_json::Value,
+}
+
+pub type DispatchFuture = Pin<Box<dyn Future<Output = DispatchResponse> + Send>>;
+pub trait RequestDispatcher: Send + Sync {
+    fn dispatch(&self, context: RequestContext, request: DispatchRequest) -> DispatchFuture;
+}
+#+end_src
+
+HttpDispatcher 负责构造 HTTP request、编码 query 和 body、注入已认证 peer 扩展、调用 Router 并读取 HTTP 状态与 JSON body；业务模块不实现 RequestDispatcher，不建立额外 HTTP 监听或 TCP 回拨。
+
+Services 组合根通过 ~attach_remote~ 注入基于 Weak 引用的 Router 工厂。请求使用现有业务实例，不形成 Network → Router → Services 的永久循环持有，也不复制 handler。~peer_id~ 只来自 iroh 已认证连接，不能从请求 JSON 或 HTTP header 伪造。
+
+API 使用 ~#[loki_api(access = "paired")]~ 显式开放给绑定设备，默认 ~local~ 。同一份编译期元数据生成基于 Axum 路由模板的访问检查和 discover 的 ~access~ 字段。首期开放 ~GET /network/session~ ；未开放的接口返回 ~remote-api-forbidden~ 。正式协议见 [[file:control-center-services.org::*通用 services 请求通道][通用 services 请求通道]]。
+
+* 错误和生命周期
+
+NetworkError 实现标准 Rust Error，包含 ~kind/code/message/request_id/outcome/status/source~ 。常见错误码包括 ~service-not-configured~ 、~service-changed~ 、~network-closed~ 、~unreachable~ 、~request-timeout~ 、~request-cancelled~ 和 ~invalid-service-response~ 。API 错误保留电脑返回的版本化错误。
+
+~outcome~ 为 ~not_sent~ 、~rejected~ 或 ~unknown~ ：分别表示尚未发送、收到合法失败响应、已发送但结果未知。~rejected~ 不自动保证业务无副作用，重试仍由业务决定。凭据不进入回调诊断或请求日志。
+
+* 现有代码切换
+
+手机的原状态查询已切换为注入的 ~network.request(GET /network/session)~ 。扫码仍使用独立 ~pair/1~ 引导协议，绑定成功后设置 Network 的 Service。既有随机身份与电脑记录保留，存储新增可选字段 ~selected_endpoint_id~ 。
+
+恢复时只有一台电脑则自动设置；旧存储有多台且没有选择时由首页“使用此电脑”明确设置，未选中电脑不进行状态轮询。Network 始终只持有选中的一个 service；其他历史记录属于设备业务存储。
+
+电脑保留旧 ~device-status/1~ 供兼容，新手机只使用 ~services/1~ 通用请求通道。电脑服务须先更新，不自动降级重发。真实 relay 测试已覆盖手机请求进入 HTTP handler、路径与重复查询参数、JSON null 与空请求体、并发关联、状态与错误保真、响应限制及解绑拒绝。

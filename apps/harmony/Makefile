@@ -16,7 +16,7 @@ BUNDLE_NAME := cc.loki.assistant.mobile
 ABILITY_NAME := EntryAbility
 HAP_FILE := entry/build/default/outputs/default/entry-default-signed.hap
 
-.PHONY: build deps check-sdk install run deploy devices clean help
+.PHONY: build deps check-sdk test install run deploy devices clean help
 
 check-sdk:
 	@test -d "$(DEVECO_SDK_HOME)" || { echo "未找到 HarmonyOS SDK：$(DEVECO_SDK_HOME)" >&2; exit 1; }
@@ -30,6 +30,7 @@ deps: check-sdk
 	cd entry && "$(OHPM)" install
 
 build: deps
+	DEVECO_HOME="$(DEVECO_HOME)" sh scripts/build-device-network.sh
 	rm -f "$(HAP_FILE)"
 	"$(HVIGORW)" default@PackingCheck default@CollectDebugSymbol --mode module \
 	  -p module=entry@default -p product=default -p buildMode=debug -p debuggable=true --no-daemon
@@ -41,6 +42,10 @@ install: build
 
 run:
 	$(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME)
+
+test:
+	cargo fmt --manifest-path entry/src/main/rust/Cargo.toml --check
+	cargo test --locked --manifest-path entry/src/main/rust/Cargo.toml
 
 # 固定同一台真机，按顺序完成安装和启动，支持并行 make。
 deploy:
@@ -55,12 +60,14 @@ devices:
 clean:
 	"$(HVIGORW)" clean --no-daemon
 	rm -rf entry/build build
+	rm -rf entry/libs entry/src/main/rust/target
 
 help:
 	@printf '%s\n' \
 	  'make deps     检查 SDK 并安装 HarmonyOS 工程依赖' \
 	  'make check-sdk 检查 HarmonyOS SDK 安装' \
 	  'make build    构建 Debug HAP，使用 OrgTasksDebug 调试签名' \
+	  'make test     检查并测试手机设备管理 Rust 模块' \
 	  'make install  安装到已连接的 HarmonyOS 设备' \
 	  'make run      启动手机应用' \
 	  'make deploy   检查真机，构建、安装并启动' \

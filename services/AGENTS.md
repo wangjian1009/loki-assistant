@@ -10,6 +10,10 @@
 
 扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个本机邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 安全读写 `~/.assistant/peers.json`。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
 
+同一 Endpoint 同时接收 `loki-assistant/device-status/1`，仅响应已绑定手机的 `device.status` 请求，逐次查询同一份设备授权记录；此兼容协议只提供固定状态查询。连接纳入既有跟踪和解绑撤销；未绑定或已解绑返回 `peer-not-bound`。真实 relay 测试调用手机 Rust 客户端，验证绑定、恢复、状态和解绑。
+
+`remote.rs` 同时实现 `loki-assistant/services/1` 和 `HttpDispatcher`，统一将手机 Network 的 method/path/query/body 转为进程内 HTTP request，调用现有 Router；业务模块不另写远程分发。Services 组合根通过 `attach_remote(&runtime)` 注入 Weak runtime 的 Router 工厂，共用现有业务和 RuntimeState，不重复构造服务或引入循环持有。每条 stream 重新验证认证身份、绑定和 API 访问范围；`#[loki_api(access = "paired")]` 显式开放，默认 local，discover 同时暴露 access。新手机状态改用 `/network/session`，旧状态 ALPN 只保留兼容。
+
 二维码由 `qr_code.rs` 在阻塞工作线程中生成 PNG，经创建响应的 `qr_code_png_base64` 返回；仅保留令牌摘要，不缓存图片或原始令牌。图片编码失败须保留原邀请。设备管理界面属于 Emacs，托盘不提供绑定入口；服务端测试实际解码生成图片并比较完整 payload。
 
 `modules/service/` 在服务组合时向共享 `StatusService` 发布 `service`，当前包含本次 services 进程的 `start_at`（Unix 秒）；该状态只保存在内存，重启后重新发布。
