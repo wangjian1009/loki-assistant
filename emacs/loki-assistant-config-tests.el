@@ -64,6 +64,38 @@
       (should (string-match-p (regexp-quote "[撤销编辑] 默认值\n") (buffer-string)))
       (should (string-match-p (regexp-quote "[撤销编辑] 用户设置，已保存\n") (buffer-string))))))
 
+(ert-deftest loki-assistant-config-test-file-chooser-accepts-null-metadata ()
+  (loki-assistant-config-test--with-buffer
+    (let ((default-directory temporary-file-directory)
+          (directory (make-temp-file "loki-config-chooser-" t)))
+      (unwind-protect
+          (progn
+            (loki-assistant-config--render-entry
+             "test" '((key . "store") (name . "目录") (data_type . "file_path")
+                      (file_path (directory . t)) (executable . :null)) nil)
+            (loki-assistant-config--render-entry
+             "test" `((key . "program") (name . "程序") (data_type . "executable")
+                      (file_path . :null) (executable (search_paths . [,directory]))) nil)
+            (widget-setup)
+            (cl-letf (((symbol-function 'read-directory-name)
+                       (lambda (_prompt start &rest _)
+                         (should (equal start default-directory))
+                         directory))
+                      ((symbol-function 'read-file-name)
+                       (lambda (_prompt start &rest _)
+                         (should (equal start directory))
+                         (expand-file-name "Example.app/Contents/MacOS/example" directory))))
+              (dolist (case `(("store" . ,directory)
+                              ("program" . ,(expand-file-name "Example.app/Contents/MacOS/example" directory))))
+                (let* ((entry (loki-assistant-config-test--entry (car case)))
+                       (button (cl-find "选择文件…" (loki-assistant-config--entry-buttons entry)
+                                        :key #'widget-value :test #'equal)))
+                  (should button)
+                  (widget-apply-action button)
+                  (should (equal (loki-assistant-config--value entry) (cdr case)))
+                  (should (loki-assistant-config--dirty-p entry))))))
+        (delete-directory directory)))))
+
 (ert-deftest loki-assistant-config-test-json-roundtrip ()
   (loki-assistant-config-test--with-buffer
     (loki-assistant-config-test--fixture)

@@ -7,6 +7,7 @@
 ;;; Code:
 
 (require 'loki-assistant)
+(require 'cus-edit)
 (require 'wid-edit)
 
 (defcustom loki-assistant-config-save-timeout 120
@@ -251,13 +252,15 @@
             (loki-assistant-config--entry-uncertain entry))
     (user-error "请先等待执行完成或刷新核对保存结果"))
   (let* ((item (loki-assistant-config--entry-item entry))
-         (directory (eq (alist-get 'directory (alist-get 'file_path item)) t))
+         (file-path (alist-get 'file_path item))
+         (executable (alist-get 'executable item))
+         (directory (and (listp file-path) (eq (alist-get 'directory file-path) t)))
          (current (widget-value (loki-assistant-config--entry-field entry)))
-         (suggested (alist-get 'search_paths (alist-get 'executable item)))
+         (suggested (and (listp executable) (alist-get 'search_paths executable)))
          (start (or (and (file-name-absolute-p current)
                          (file-directory-p (file-name-directory current))
                          (file-name-directory current))
-                    (cl-find-if #'file-directory-p (append suggested nil))
+                    (and (sequencep suggested) (cl-find-if #'file-directory-p suggested))
                     default-directory))
          (selected (if directory (read-directory-name "选择目录：" start)
                      (read-file-name "选择文件（可进入 .app 包）：" start))))
