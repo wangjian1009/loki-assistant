@@ -9,5 +9,6 @@ pub mod network;
 pub mod notification;
 pub mod password;
 pub mod service;
+pub mod slack;
 
 pub mod status;

@@ -8,9 +8,11 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::Response,
-    routing::{get, post},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, CACHE_CONTROL, IF_NONE_MATCH},
+    },
+    response::{IntoResponse, Response},
 };
 use loki_services_macros::loki_api;
 use serde_json::Value;
@@ -18,26 +20,19 @@ use serde_json::Value;
 use super::{
     model::{ConfigModuleMetadata, ConfigValue, ConfigValueSource},
     protocol::{
-        MetaResponse, ModuleDataResponse, ValidateRequest, ValidateResponse, ValueResponse,
+        MetaResponse, ModuleDataResponse, ModuleMetaResponse, RecordResponse, ValidateRequest,
+        ValidateResponse, ValueResponse,
     },
     service::{ConfigService, ConfigServiceError},
 };
 
 pub fn router(service: Arc<ConfigService>) -> Router {
-    Router::new()
-        .route("/meta", get(meta))
-        .route("/config/validate", post(validate))
-        .route("/meta/{module_id}", get(module_meta))
-        .route("/data/{module_id}", get(module_data))
-        .route(
-            "/data/{module_id}/{key}",
-            get(get_value).put(put_value).post(post_value),
-        )
-        .with_state(service)
+    crate::http::mount_routes(Router::new(), "config").with_state(service)
 }
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "validate",
     method = "POST",
     path = "/config/validate",
@@ -51,6 +46,10 @@ async fn validate(
     Json(request): Json<ValidateRequest>,
 ) -> Result<Json<ValidateResponse>, Response> {
     check_access(&service, &headers, &request.module_id, &request.key, true).await?;
+    service
+        .authorize_secret_request(&request.module_id, &request.key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
     let (value, error) = match service
         .validate_value(&request.module_id, &request.key, &request.value)
         .await
@@ -77,6 +76,7 @@ async fn validate(
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "meta",
     method = "GET",
     path = "/meta",
@@ -86,12 +86,17 @@ async fn validate(
 )]
 async fn meta(State(service): State<Arc<ConfigService>>, headers: HeaderMap) -> Json<MetaResponse> {
     Json(MetaResponse {
-        modules: visible_metadata(&service, &headers).await,
+        modules: visible_metadata(&service, &headers)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     })
 }
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "module-meta",
     method = "GET",
     path = "/meta/{module_id}",
@@ -103,17 +108,18 @@ async fn module_meta(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
     headers: HeaderMap,
-) -> Result<Json<ConfigModuleMetadata>, Response> {
+) -> Result<Json<ModuleMetaResponse>, Response> {
     visible_metadata(&service, &headers)
         .await
         .into_iter()
         .find(|metadata| metadata.id == module_id)
-        .map(Json)
+        .map(|metadata| Json(metadata.into()))
         .ok_or_else(|| error_response(ConfigServiceError::ModuleNotFound(module_id)))
 }
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "module-data",
     method = "GET",
     path = "/data/{module_id}",
@@ -135,6 +141,7 @@ async fn module_data(
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "value",
     method = "GET",
     path = "/data/{module_id}/{key}",
@@ -163,6 +170,7 @@ async fn get_value(
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "set-value",
     method = "PUT",
     path = "/data/{module_id}/{key}",
@@ -177,6 +185,10 @@ async fn put_value(
     Json(value): Json<Value>,
 ) -> Result<Json<ValueResponse>, Response> {
     check_access(&service, &headers, &module_id, &key, true).await?;
+    service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
     service
         .replace(&module_id, &key, value)
         .await
@@ -195,6 +207,7 @@ async fn put_value(
 
 #[loki_api(
     module = "config",
+    mount = "Arc<ConfigService>",
     id = "patch-value",
     method = "POST",
     path = "/data/{module_id}/{key}",
@@ -255,14 +268,106 @@ async fn check_access(
     Ok(())
 }
 
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "set-record",
+    mount = "Arc<ConfigService>",
+    method = "PUT",
+    path = "/data/{module_id}/{key}/{instance}",
+    summary = "保存一条配置记录",
+    description = "保存工作流集合中的单条记录；携带 If-None-Match: * 时仅允许新增。"
+)]
+async fn put_record(
+    State(service): State<Arc<ConfigService>>,
+    Path((module_id, key, instance)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(value): Json<Value>,
+) -> Result<Response, Response> {
+    let create_only = match headers.get(IF_NONE_MATCH) {
+        None => false,
+        Some(header) if header == "*" => true,
+        Some(_) => {
+            return Err(error_response(ConfigServiceError::InvalidValue(
+                "配置记录仅接受 If-None-Match: *。".into(),
+            )));
+        }
+    };
+    check_access(&service, &headers, &module_id, &key, true).await?;
+    service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    let value = if create_only && service.creation_field(&module_id, &key).await.is_some() {
+        let config = Arc::clone(&service);
+        let (module, key, instance) = (module_id.clone(), key.clone(), instance.clone());
+        tokio::spawn(async move { config.prepare_record(&module, &key, &instance, value).await })
+            .await
+            .map_err(|_| error_response(ConfigServiceError::Storage("保存任务中断。".into())))?
+    } else {
+        service
+            .replace_record(
+                module_id.clone(),
+                key.clone(),
+                instance.clone(),
+                value,
+                create_only,
+                false,
+            )
+            .await
+    }
+    .map_err(error_response)?;
+    Ok(Json(RecordResponse {
+        module_id,
+        key,
+        instance,
+        value,
+    })
+    .into_response())
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "start-action",
+    mount = "Arc<ConfigService>",
+    method = "POST",
+    path = "/config/actions/{module}/{action}/{instance}",
+    summary = "执行配置操作",
+    description = "按配置元数据启动指定实例的配置操作。"
+)]
+async fn start_action(
+    State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
+    Path((module, action, instance)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let data = service
+        .action(&module, &action, &instance, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    Ok(([(CACHE_CONTROL, "no-store")], Json(data)).into_response())
+}
+
 fn error_response(error: ConfigServiceError) -> Response {
     let status = match &error {
         ConfigServiceError::ModuleNotFound(_) | ConfigServiceError::ItemNotFound { .. } => {
             StatusCode::NOT_FOUND
         }
         ConfigServiceError::ValueNotSet { .. } => StatusCode::NOT_FOUND,
+        ConfigServiceError::ActionNotFound => StatusCode::NOT_FOUND,
+        ConfigServiceError::RecordExists => StatusCode::PRECONDITION_FAILED,
+        ConfigServiceError::RecordAuthorizationRequired => StatusCode::CONFLICT,
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
         ConfigServiceError::RemoteAccessForbidden { .. } => StatusCode::FORBIDDEN,
+        ConfigServiceError::SecretUnauthorized => StatusCode::UNAUTHORIZED,
         ConfigServiceError::Storage(_) | ConfigServiceError::ChangeRejected { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -282,6 +387,10 @@ fn error_code(error: &ConfigServiceError) -> &'static str {
         ConfigServiceError::ValueNotSet { .. } => "config-not-set",
         ConfigServiceError::InvalidValue(_) => "invalid-config",
         ConfigServiceError::RemoteAccessForbidden { .. } => "remote-config-forbidden",
+        ConfigServiceError::SecretUnauthorized => "config-secret-auth-required",
+        ConfigServiceError::ActionNotFound => "config-action-not-found",
+        ConfigServiceError::RecordExists => "config-record-exists",
+        ConfigServiceError::RecordAuthorizationRequired => "config-record-authorization-required",
         ConfigServiceError::Storage(_) => "config-storage-error",
         ConfigServiceError::ChangeRejected { .. } => "config-change-rejected",
     }

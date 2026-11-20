@@ -66,6 +66,8 @@ struct ApiArguments {
     path: LitStr,
     summary: LitStr,
     description: LitStr,
+    mount: LitStr,
+    mount_group: Option<LitStr>,
 }
 
 impl Parse for ApiArguments {
@@ -77,6 +79,8 @@ impl Parse for ApiArguments {
         let mut summary = None;
         let mut description = None;
         let mut access = None;
+        let mut mount = None;
+        let mut mount_group = None;
 
         while !input.is_empty() {
             let name: syn::Ident = input.parse()?;
@@ -89,6 +93,8 @@ impl Parse for ApiArguments {
                 "path" => path = Some(value),
                 "summary" => summary = Some(value),
                 "description" => description = Some(value),
+                "mount" => mount = Some(value),
+                "mount_group" => mount_group = Some(value),
                 "access" => {
                     if !matches!(value.value().as_str(), "local" | "paired") {
                         return Err(syn::Error::new(
@@ -106,6 +112,10 @@ impl Parse for ApiArguments {
         }
 
         Ok(Self {
+            mount: mount.ok_or_else(|| {
+                syn::Error::new(input.span(), "缺少 mount，无状态接口使用 mount = \"()\"")
+            })?,
+            mount_group,
             access: access.unwrap_or_else(|| LitStr::new("local", input.span())),
             module: module.ok_or_else(|| syn::Error::new(input.span(), "缺少 module"))?,
             id: id.ok_or_else(|| syn::Error::new(input.span(), "缺少 id"))?,
@@ -115,6 +125,36 @@ impl Parse for ApiArguments {
             description: description
                 .ok_or_else(|| syn::Error::new(input.span(), "缺少 description"))?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiArguments;
+
+    #[test]
+    fn api_metadata_requires_a_mount_declaration() {
+        let arguments = r#"
+            module = "test",
+            id = "test",
+            method = "GET",
+            path = "/test",
+            summary = "测试接口",
+            description = "验证接口必须声明挂载状态"
+        "#;
+        let Err(error) = syn::parse_str::<ApiArguments>(arguments) else {
+            panic!("仅声明接口元数据时应拒绝解析");
+        };
+        assert!(error.to_string().contains("缺少 mount"));
+
+        let mounted = format!(r#"{arguments}, mount = "()""#);
+        assert_eq!(
+            syn::parse_str::<ApiArguments>(&mounted)
+                .unwrap()
+                .mount
+                .value(),
+            "()"
+        );
     }
 }
 
@@ -132,6 +172,8 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
         path,
         summary,
         description,
+        mount,
+        mount_group,
     } = args;
     let path_value = path.value();
     let path_parameters = path_value
@@ -153,8 +195,37 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
 
+    let state: syn::Type = match mount.parse() {
+        Ok(state) => state,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let method_name = method.value().to_ascii_lowercase();
+    if !matches!(method_name.as_str(), "get" | "post" | "put" | "patch" | "delete" | "head" | "options") {
+        return syn::Error::new(method.span(), "不支持自动挂载此 HTTP 方法").to_compile_error().into();
+    }
+    let method_name = format_ident!("{method_name}");
+    let group = mount_group.unwrap_or_else(|| module.clone());
+    let route_registration = format_ident!("__LOKI_ROUTE_{}", function_name);
+    let route = quote! {
+        #[::linkme::distributed_slice(::loki_services::http::ROUTES)]
+        #[allow(non_upper_case_globals)]
+        static #route_registration: ::loki_services::http::RouteRegistration =
+            ::loki_services::http::RouteRegistration {
+                group: #group,
+                path: #path,
+                mount: |router| {
+                    let router = router.downcast_mut::<::axum::Router<#state>>()
+                        .expect(concat!("路由组的状态类型不匹配：", #group, " ", #path));
+                    *router = ::std::mem::take(router).route(
+                        #path, ::axum::routing::#method_name(#function_name)
+                    );
+                },
+            };
+    };
+
     quote! {
         #function
+        #route
 
         #[::linkme::distributed_slice(::loki_services::modules::discover::registry::API_DESCRIPTORS)]
         #[allow(non_upper_case_globals)]

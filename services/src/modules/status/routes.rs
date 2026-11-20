@@ -15,23 +15,17 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::get,
 };
 use loki_services_macros::loki_api;
 use std::sync::Arc;
 
 pub fn router(service: Arc<StatusService>) -> Router {
-    Router::new()
-        .route("/stats/meta", get(metadata))
-        .route("/status", get(snapshot))
-        .route("/status/{module_id}", get(module_value))
-        .route("/status/{module_id}/{key}/{*path}", get(path_value))
-        .route("/status/{module_id}/{key}", get(value))
-        .with_state(service)
+    crate::http::mount_routes(Router::new(), "status").with_state(service)
 }
 
 #[loki_api(
     module = "status",
+    mount = "Arc<StatusService>",
     id = "meta",
     method = "GET",
     path = "/stats/meta",
@@ -58,6 +52,7 @@ async fn metadata(
 
 #[loki_api(
     module = "status",
+    mount = "Arc<StatusService>",
     id = "snapshot",
     method = "GET",
     path = "/status",
@@ -74,6 +69,7 @@ async fn snapshot(
 
 #[loki_api(
     module = "status",
+    mount = "Arc<StatusService>",
     id = "module-value",
     method = "GET",
     path = "/status/{module_id}",
@@ -94,6 +90,7 @@ async fn module_value(
 
 #[loki_api(
     module = "status",
+    mount = "Arc<StatusService>",
     id = "value",
     method = "GET",
     path = "/status/{module_id}/{key}",
@@ -119,6 +116,7 @@ async fn value(
 
 #[loki_api(
     module = "status",
+    mount = "Arc<StatusService>",
     id = "path-value",
     method = "GET",
     path = "/status/{module_id}/{key}/{*path}",

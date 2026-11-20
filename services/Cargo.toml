@@ -13,6 +13,8 @@ resolver = "2"
 iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
 axum = "0.8"
 base64 = "0.22"
+futures-util = { version = "0.3", features = ["sink"] }
+getrandom = "0.4"
 linkme = "0.3"
 libc = "0.2"
 loki-services-macros = { path = "macros" }
@@ -20,16 +22,23 @@ percent-encoding = "2"
 png = "0.18"
 qrcode = { version = "0.14", default-features = false }
 regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form", "query"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 subtle = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-uuid = { version = "1", features = ["v4"] }
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 
 [dev-dependencies]
 loki-mobile-network = { path = "../apps/harmony/entry/src/main/rust" }

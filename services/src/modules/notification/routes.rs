@@ -5,7 +5,6 @@ use axum::{
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::Response,
-    routing::{get, post},
 };
 use loki_services_macros::loki_api;
 
@@ -16,14 +15,12 @@ use super::{
 use crate::http::error::{ErrorSource, response};
 
 pub fn router(service: Arc<NotificationService>) -> Router {
-    Router::new()
-        .route("/notification/{id}", get(status))
-        .route("/notification/{id}/receipt", post(receipt))
-        .with_state(service)
+    crate::http::mount_routes(Router::new(), "notification").with_state(service)
 }
 
 #[loki_api(
     module = "notification",
+    mount = "Arc<NotificationService>",
     id = "status",
     method = "GET",
     path = "/notification/{id}",
@@ -40,6 +37,7 @@ async fn status(
 
 #[loki_api(
     module = "notification",
+    mount = "Arc<NotificationService>",
     id = "receipt",
     method = "POST",
     path = "/notification/{id}/receipt",

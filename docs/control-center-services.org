@@ -21,6 +21,7 @@
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
+| ~modules/slack~ | OAuth、后台私信接收、系统通知与 Emacs 消息查询和回复 | 已实现首期，目标工作区待验证 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |
@@ -29,7 +30,7 @@
 
 services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该文件获取服务地址和端口，再请求 HTTP 接口；不应在客户端写死服务端口。
 
-业务模块在自己的目录中维护 ~model.rs~、~protocol.rs~、~routes.rs~ 和业务逻辑。HTTP API 使用 ~#[loki_api]~ 声明，模块描述通过 ~linkme~ 在编译/链接阶段收集；~Services::build~ 负责模块组装、配置处理器注入和路由组合。
+业务模块在自己的目录中维护 ~model.rs~、~protocol.rs~、~routes.rs~ 和业务逻辑。HTTP API 的方法、路径和挂载状态统一在 handler 的 ~#[loki_api]~ 声明中维护。宏通过 ~linkme~ 同步注册挂载入口和发现元数据，~Services::build~ 负责模块组装、配置处理器注入和路由组合。
 
 ** 错误响应原则
 
@@ -67,6 +68,9 @@ emacs/                      HTTP 客户端、通知和服务配置界面
 * HTTP 接口
 
 Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:service-client.org][Workspace 与 Network 统一访问接口]]。
+
+每个 ~#[loki_api]~ 都须声明 ~mount~ 。~mount~ 填写 Axum Router 的状态类型，无状态接口使用 ~mount = "()"~ 。~mount_group~ 默认为模块 ID，可用来为不同接口组注入状态或中间件。模块 Router 通过 ~mount_routes~ 挂载整组 handler，再应用请求体限制、鉴权或统一错误响应。绑定设备的远端访问检查读取同一声明中的方法、路径和 ~access~ 。
+
 
 | 方法 | 路径 | 返回内容 |
 |------+------|----------|
@@ -119,7 +123,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 }
 #+end_src
 
-配置项的 ~data_type~ 支持 ~string~、~integer~、~number~、~boolean~、~dictionary~、~list~、~file_path~ 和 ~executable~。~Executable~ 的值仍是 JSON string，允许完整路径或程序名。元数据还可声明默认程序名与建议搜索目录 (~search_paths~)；建议目录可以通过程序内常量静态定义，Emacs 模块使用 ~EMACSCLIENT_SEARCH_PATHS~ ，随模块元数据返回。
+配置项的 ~data_type~ 支持 ~string~、~password~、~integer~、~number~、~boolean~、~dictionary~、~list~、~file_path~ 和 ~executable~。~Executable~ 的值仍是 JSON string，允许完整路径或程序名。元数据还可声明默认程序名与建议搜索目录 (~search_paths~)；建议目录可以通过程序内常量静态定义，Emacs 模块使用 ~EMACSCLIENT_SEARCH_PATHS~ ，随模块元数据返回。
 
 #+begin_src json
 {
@@ -214,6 +218,20 @@ control-center:
 文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
 
 启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
+
+** 结构化配置
+
+~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /data/{module}/{key}~ 追加元素。
+
+配置项可声明 ~actions~、~requires_local_auth~ 和 ~save_timeout_seconds~ 。业务模块可以为新增记录的指定字段注册处理器。配置 API 等待处理结果，成功时返回生效记录。
+
+配置模块按模块 ID 和配置键合并 ~CONFIG_ITEMS~ 注册的可选元数据。
+
+| 操作 | 请求 | 结果 |
+|------+-------+------|
+| 读取配置定义和值 | ~GET /meta~、~GET /data/{module}~ | 生成结构表单或数组列表 |
+| 保存记录 | ~PUT /data/{module}/{key}/{instance}~ | 更新返回 ~200~ 。新增使用 ~If-None-Match: *~ ，已存在的主键返回 ~412 config-record-exists~ |
+| 执行配置操作 | ~POST /config/actions/{module}/{action}/{instance}~ | 调用已注册的模块处理器，返回操作结果 |
 
 * 控制中心模块
 

@@ -10,7 +10,6 @@ use axum::{
     http::{HeaderValue, StatusCode, header::CACHE_CONTROL},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use loki_services_macros::loki_api;
 use serde_json::json;
@@ -22,15 +21,7 @@ use super::{
 use crate::http::error::{ErrorSource, response as api_error};
 
 pub(super) fn router(service: Arc<NetworkService>) -> Router {
-    Router::new()
-        .route("/network/session", get(session))
-        .route("/network/pairings", post(create))
-        .route("/network/pairings/{id}", get(query).delete(cancel))
-        .route("/network/peers", get(peers))
-        .route(
-            "/network/peers/{endpoint_id}",
-            axum::routing::delete(remove_peer),
-        )
+    crate::http::mount_routes(Router::new(), "network")
         .method_not_allowed_fallback(|| async {
             api_error(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -53,6 +44,7 @@ async fn no_store(mut response: Response) -> Response {
 
 #[loki_api(
     module = "network",
+    mount = "Arc<NetworkService>",
     id = "session",
     method = "GET",
     path = "/network/session",
@@ -95,6 +87,7 @@ fn pairing_id(path: Result<Path<String>, PathRejection>) -> Result<String, Respo
 
 #[loki_api(
     module = "network",
+    mount = "Arc<NetworkService>",
     id = "create-pairing",
     method = "POST",
     path = "/network/pairings",
@@ -122,6 +115,7 @@ async fn create(
 
 #[loki_api(
     module = "network",
+    mount = "Arc<NetworkService>",
     id = "pairing",
     method = "GET",
     path = "/network/pairings/{id}",
@@ -142,6 +136,7 @@ async fn query(
 
 #[loki_api(
     module = "network",
+    mount = "Arc<NetworkService>",
     id = "cancel-pairing",
     method = "DELETE",
     path = "/network/pairings/{id}",
@@ -162,6 +157,7 @@ async fn cancel(
 
 #[loki_api(
     module = "network",
+    mount = "Arc<NetworkService>",
     id = "peers",
     method = "GET",
     path = "/network/peers",
@@ -178,6 +174,7 @@ async fn peers(State(service): State<Arc<NetworkService>>) -> Response {
 
 #[loki_api(
     module = "network",
+    mount = "Arc<NetworkService>",
     id = "remove-peer",
     method = "DELETE",
     path = "/network/peers/{endpoint_id}",

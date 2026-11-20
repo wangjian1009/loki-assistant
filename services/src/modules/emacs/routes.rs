@@ -8,7 +8,6 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use loki_services_macros::loki_api;
 
@@ -22,28 +21,14 @@ use super::{
 };
 
 pub fn router(service: Arc<EmacsService>) -> Router {
-    Router::new()
-        .route("/emacs/eval", post(eval))
-        .route("/emacs/receiver/status", post(receive_status))
-        .route("/emacs/activate", post(activate))
-        .route("/emacs/apps/open", post(open_app))
-        .route("/emacs/capture/full", post(capture_full))
-        .route("/emacs/receiver/notification", post(notification))
-        .route(
-            "/emacs/receiver/notification/{id}",
-            get(notification_status),
-        )
-        .route(
-            "/emacs/receiver/notification/{id}/receipt",
-            post(notification_receipt),
-        )
-        .route("/emacs/buffers", get(buffers))
+    crate::http::mount_routes(Router::new(), "emacs")
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024 + 4096))
         .with_state(service)
 }
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "eval",
     method = "POST",
     path = "/emacs/eval",
@@ -70,6 +55,7 @@ async fn eval(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "open-app",
     method = "POST",
     path = "/emacs/apps/open",
@@ -96,6 +82,7 @@ async fn open_app(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "capture-full",
     method = "POST",
     path = "/emacs/capture/full",
@@ -131,6 +118,7 @@ async fn capture_full(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "notification",
     method = "POST",
     path = "/emacs/receiver/notification",
@@ -159,6 +147,7 @@ async fn notification(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "notification-status",
     method = "GET",
     path = "/emacs/receiver/notification/{id}",
@@ -179,6 +168,7 @@ async fn notification_status(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "notification-receipt",
     method = "POST",
     path = "/emacs/receiver/notification/{id}/receipt",
@@ -201,6 +191,7 @@ async fn notification_receipt(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "activate",
     method = "POST",
     path = "/emacs/activate",
@@ -227,6 +218,7 @@ async fn activate(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "buffers",
     method = "GET",
     path = "/emacs/buffers",
@@ -251,6 +243,7 @@ async fn buffers(
 
 #[loki_api(
     module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "receive-status",
     method = "POST",
     path = "/emacs/receiver/status",

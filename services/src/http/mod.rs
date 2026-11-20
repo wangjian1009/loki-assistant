@@ -6,6 +6,41 @@ use axum::{Router, middleware};
 
 use crate::{modules::network::remote::strip_device_headers, runtime::RuntimeState};
 
+pub struct RouteRegistration {
+    pub group: &'static str,
+    pub path: &'static str,
+    pub mount: fn(&mut dyn std::any::Any),
+}
+
+#[linkme::distributed_slice]
+pub static ROUTES: [RouteRegistration];
+
+pub fn mount_routes<S: Clone + Send + Sync + 'static>(
+    mut router: Router<S>,
+    group: &str,
+) -> Router<S> {
+    for route in ROUTES.iter().filter(|route| route.group == group) {
+        (route.mount)(&mut router);
+    }
+    router
+}
+
+pub fn mount_route_paths<S: Clone + Send + Sync + 'static>(
+    mut router: Router<S>,
+    groups: &[&str],
+    forward: axum::routing::MethodRouter<S>,
+) -> Router<S> {
+    let paths: std::collections::BTreeSet<_> = ROUTES
+        .iter()
+        .filter(|route| groups.contains(&route.group))
+        .map(|route| route.path)
+        .collect();
+    for path in paths {
+        router = router.route(path, forward.clone());
+    }
+    router
+}
+
 pub fn router(runtime: Arc<RuntimeState>) -> Router {
     Router::new()
         .merge(runtime.services().router(runtime))

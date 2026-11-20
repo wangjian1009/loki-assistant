@@ -454,16 +454,10 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
             service
                 .router()
                 .merge(routes.clone())
-                .route(
-                    "/network-test/echo/{id}",
-                    axum::routing::post(echo_channel).get(query_channel),
-                )
-                .route(
-                    "/network-test/echo/local",
-                    axum::routing::get(|| async { "本机" }),
-                )
-                .route("/network-test/bad", axum::routing::get(bad_channel))
-                .route("/network-test/large", axum::routing::get(large_channel))
+                .merge(crate::http::mount_routes(
+                    axum::Router::new(),
+                    "network-test",
+                ))
         })
     })));
     let receiver = tokio::spawn(service.clone().receive_pairings());
@@ -1024,6 +1018,7 @@ async fn check_remote_config_and_status(
 
 #[loki_services_macros::loki_api(
     module = "network-test",
+    mount = "()",
     id = "echo",
     method = "POST",
     path = "/network-test/echo/{id}",
@@ -1049,6 +1044,7 @@ async fn echo_channel(
 
 #[loki_services_macros::loki_api(
     module = "network-test",
+    mount = "()",
     id = "query",
     method = "GET",
     path = "/network-test/echo/{id}",
@@ -1066,6 +1062,20 @@ async fn query_channel(
 
 #[loki_services_macros::loki_api(
     module = "network-test",
+    mount = "()",
+    id = "local",
+    method = "GET",
+    path = "/network-test/echo/local",
+    summary = "测试本机路由",
+    description = "验证固定本机路径优先于带参数的远端路由。"
+)]
+async fn local_channel() -> &'static str {
+    "本机"
+}
+
+#[loki_services_macros::loki_api(
+    module = "network-test",
+    mount = "()",
     id = "bad",
     method = "GET",
     path = "/network-test/bad",
@@ -1079,6 +1089,7 @@ async fn bad_channel() -> &'static str {
 
 #[loki_services_macros::loki_api(
     module = "network-test",
+    mount = "()",
     id = "large",
     method = "GET",
     path = "/network-test/large",

@@ -1,5 +1,5 @@
 use crate::http::error::{ErrorSource, response as error_response};
-use axum::{Json, Router, extract::Path, http::StatusCode, response::Response, routing::get};
+use axum::{Json, Router, extract::Path, http::StatusCode, response::Response};
 
 use super::{
     model::ModuleMetadata,
@@ -10,14 +10,12 @@ use super::{
 use loki_services_macros::loki_api;
 
 pub fn router() -> Router {
-    Router::new()
-        .route("/discover", get(discover))
-        .route("/discover/modules", get(list_modules))
-        .route("/discover/modules/{module_id}", get(get_module))
+    crate::http::mount_routes(Router::new(), "discover")
 }
 
 #[loki_api(
     module = "discover",
+    mount = "()",
     id = "discover",
     method = "GET",
     path = "/discover",
@@ -36,6 +34,7 @@ async fn discover() -> Json<DiscoverResponse> {
 
 #[loki_api(
     module = "discover",
+    mount = "()",
     id = "list-modules",
     method = "GET",
     path = "/discover/modules",
@@ -52,6 +51,7 @@ async fn list_modules() -> Json<ModuleListResponse> {
 
 #[loki_api(
     module = "discover",
+    mount = "()",
     id = "get-module",
     method = "GET",
     path = "/discover/modules/{module_id}",

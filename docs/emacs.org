@@ -21,6 +21,12 @@
 
 每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
 
+* Slack 私信
+
+~M-x loki-assistant-config~ 在 Slack 分组内按 Metadata 显示工作区列表、表单和操作按钮。保存新工作区时会打开浏览器授权。授权成功后，可在该行检查已有 pass 令牌或录入应用令牌。Slack 会话界面显示授权和连接状态。 [[file:slack-integration.org::*首次配置与使用][Slack 配置与使用]]
+
+~M-x loki-assistant-slack~ 打开会话列表，前缀键映射中的 ~s~ 也可进入。按 ~P~ 切换项目，~u~ 切换未读或全部会话，~RET~ 查看聊天，~t~ 展开线程，~r~ 起草，~C-c C-c~ 发送，~m~ 更新本机已读位置。
+
 * 设备管理
 
 ~M-x loki-assistant-devices~ 打开 ~*Loki Assistant Devices*~ buffer；默认只显示当前绑定设备的名称、身份与绑定时间，以及“新增设备”入口。不在托盘中提供设备绑定功能，托盘的其他功能保留。

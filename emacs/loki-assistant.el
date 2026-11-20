@@ -48,6 +48,22 @@
   :type 'number
   :group 'loki-assistant)
 
+(defun loki-assistant--module-api-token (module)
+  "读取 services 为 MODULE 创建的本机凭据。"
+  (let* ((path (expand-file-name (format "%s-api-token" module)
+                                 (file-name-directory
+                                  (expand-file-name loki-assistant-service-file))))
+         (mode (file-modes path)))
+    (unless (and (integerp mode) (zerop (logand mode #o077))
+                 (file-regular-p path) (not (file-symlink-p path)))
+      (error "模块本机凭据不可用，请确认 services 已运行"))
+    (with-temp-buffer
+      (insert-file-contents-literally path nil 0 64)
+      (let ((token (string-trim (buffer-string))))
+        (unless (and (= (length token) 43) (string-match-p "\\`[-_[:alnum:]]+\\'" token))
+          (error "模块本机凭据格式无效"))
+        token))))
+
 (defun loki-assistant--service-url ()
   "读取 pfile，返回经过 loopback 校验的 HTTP 地址。"
   (let* ((service (with-temp-buffer

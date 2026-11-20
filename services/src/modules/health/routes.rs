@@ -1,19 +1,18 @@
 use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State};
 use loki_services_macros::loki_api;
 
 use super::protocol::HealthResponse;
 use crate::runtime::RuntimeState;
 
 pub fn router(runtime: Arc<RuntimeState>) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .with_state(runtime)
+    crate::http::mount_routes(Router::new(), "health").with_state(runtime)
 }
 
 #[loki_api(
     module = "health",
+    mount = "Arc<RuntimeState>",
     id = "healthz",
     method = "GET",
     path = "/healthz",

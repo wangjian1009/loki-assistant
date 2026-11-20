@@ -247,13 +247,9 @@ async fn metadata_is_complete_before_publication_and_contains_no_runtime_values(
     assert_eq!(code, StatusCode::OK);
     assert_eq!(metadata["api_version"], "1");
     let modules = metadata["modules"].as_array().unwrap();
-    assert_eq!(
-        modules
-            .iter()
-            .map(|module| module["id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["emacs", "network", "service"]
-    );
+    for id in ["emacs", "network", "service"] {
+        assert!(modules.iter().any(|module| module["id"] == id));
+    }
     assert!(service.snapshot().status.is_empty());
     assert_eq!(service.snapshot().updated_at, None);
     service

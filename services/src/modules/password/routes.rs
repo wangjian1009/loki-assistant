@@ -9,7 +9,6 @@ use axum::{
     http::{HeaderValue, StatusCode, header::CACHE_CONTROL},
     middleware,
     response::{IntoResponse, Response},
-    routing::get,
 };
 use loki_services_macros::loki_api;
 
@@ -21,9 +20,7 @@ use super::{
 };
 
 pub(super) fn router(service: Arc<PasswordService>) -> Router {
-    Router::new()
-        .route("/password/entries", get(entries))
-        .route("/password/entries/{*file}", get(entry))
+    crate::http::mount_routes(Router::new(), "password")
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::map_response(no_store))
         .with_state(service)
@@ -47,6 +44,7 @@ async fn no_store(mut response: Response) -> Response {
 
 #[loki_api(
     module = "password",
+    mount = "Arc<PasswordService>",
     id = "entries",
     method = "GET",
     path = "/password/entries",
@@ -70,6 +68,7 @@ async fn entries(
 
 #[loki_api(
     module = "password",
+    mount = "Arc<PasswordService>",
     id = "entry",
     method = "GET",
     path = "/password/entries/{*file}",

@@ -10,6 +10,32 @@ use crate::{
     runtime::RuntimeState,
 };
 
+pub struct ExtensionContext<'a> {
+    pub config: &'a Arc<config::service::ConfigService>,
+    pub notification: &'a Arc<NotificationService>,
+    pub status: &'a Arc<StatusService>,
+    pub emacs: &'a emacs::Module,
+    pub password: &'a password::Module,
+}
+
+pub type ExtensionFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+pub trait ServiceExtension: std::fmt::Debug + Send + Sync {
+    fn config_handler(
+        &self,
+    ) -> Option<(&'static str, Arc<dyn config::service::ConfigChangeHandler>)>;
+    fn router(&self) -> Router;
+    fn run(self: Arc<Self>, port: u16) -> ExtensionFuture<'static>;
+    fn stop(&self) -> ExtensionFuture<'_>;
+}
+
+pub struct ExtensionRegistration {
+    pub build: fn(&ExtensionContext<'_>) -> Arc<dyn ServiceExtension>,
+}
+
+#[linkme::distributed_slice]
+pub static EXTENSIONS: [ExtensionRegistration];
+
 /// 控制中心服务模块的组合根。
 #[derive(Debug)]
 pub struct Services {
@@ -22,6 +48,7 @@ pub struct Services {
     pub emacs: emacs::Module,
     pub network: Arc<network::NetworkService>,
     pub password: password::Module,
+    extensions: Vec<Arc<dyn ServiceExtension>>,
 }
 
 /// 与需求文档中的 CoreService 名称兼容的别名。
@@ -54,17 +81,33 @@ impl Services {
             Arc::clone(&status),
             Duration::from_secs(10),
         ));
-        let config = config::Module::from_service(
-            config
-                .with_change_handler("control-center", control_center::handler())
-                .with_change_handler("network", network.clone()),
-        );
+        let base_config = Arc::new(config.clone());
+        let password = password::Module::new(Arc::clone(&base_config));
         let emacs = emacs::Module::new(
-            config.service(),
+            Arc::clone(&base_config),
             Arc::clone(&notification),
             Arc::clone(&status),
         );
-        let password = password::Module::new(config.service());
+        let context = ExtensionContext {
+            config: &base_config,
+            notification: &notification,
+            status: &status,
+            emacs: &emacs,
+            password: &password,
+        };
+        let extensions: Vec<_> = EXTENSIONS
+            .iter()
+            .map(|entry| (entry.build)(&context))
+            .collect();
+        let mut config = config
+            .with_change_handler("control-center", control_center::handler())
+            .with_change_handler("network", network.clone());
+        for extension in &extensions {
+            if let Some((module, handler)) = extension.config_handler() {
+                config = config.with_change_handler(module, handler);
+            }
+        }
+        let config = config::Module::from_service(config);
 
         Self {
             health,
@@ -76,11 +119,12 @@ impl Services {
             emacs,
             network,
             password,
+            extensions,
         }
     }
 
     pub fn router(&self, runtime: Arc<RuntimeState>) -> Router {
-        Router::new()
+        let router = Router::new()
             .merge(self.health.router(runtime))
             .merge(self.discover.router())
             .merge(self.config.router())
@@ -88,7 +132,26 @@ impl Services {
             .merge(self.status.router())
             .merge(self.network.router())
             .merge(self.emacs.router())
-            .merge(self.password.router())
+            .merge(self.password.router());
+        self.extensions
+            .iter()
+            .fold(router, |router, extension| router.merge(extension.router()))
+    }
+
+    pub fn start_extensions(&self, port: u16) -> Vec<tokio::task::JoinHandle<()>> {
+        self.extensions
+            .iter()
+            .map(|extension| tokio::spawn(Arc::clone(extension).run(port)))
+            .collect()
+    }
+
+    pub async fn stop_extensions(&self, tasks: Vec<tokio::task::JoinHandle<()>>) {
+        for extension in &self.extensions {
+            extension.stop().await;
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     pub fn attach_remote(self: &Arc<Self>, runtime: &Arc<RuntimeState>) {
