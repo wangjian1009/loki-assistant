@@ -81,6 +81,8 @@ where
 pub enum EmacsError {
     #[error("请求无效：{0}")]
     InvalidRequest(String),
+    #[error("{0}")]
+    RemoteStatusForbidden(String),
     #[error("Emacs 配置无效：{0}")]
     Config(String),
     #[error("执行 emacsclient 失败：{0}")]
@@ -169,9 +171,23 @@ impl EmacsService {
 
     /// Emacs 业务入口接收上报后，通过共享 Rust 接口发布，不另建状态缓存。
     pub fn receive_status(&self, values: StatusValues) -> Result<StatusResponse, EmacsError> {
+        self.receive_status_for(values, false)
+    }
+
+    pub(super) fn receive_status_for(
+        &self,
+        values: StatusValues,
+        remote: bool,
+    ) -> Result<StatusResponse, EmacsError> {
+        use crate::modules::status::StatusError;
         self.status
-            .publish_many_validated(values)
-            .map_err(|error| EmacsError::InvalidRequest(error.to_string()))
+            .publish_many_validated_for(values, remote)
+            .map_err(|error| match error {
+                StatusError::RemoteAccessForbidden(..) => {
+                    EmacsError::RemoteStatusForbidden(error.to_string())
+                }
+                _ => EmacsError::InvalidRequest(error.to_string()),
+            })
     }
 
     pub async fn eval(&self, script: &str) -> Result<String, EmacsError> {

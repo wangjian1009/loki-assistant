@@ -46,6 +46,7 @@ impl PasswordConfig {
                     name: "本地 pass 目录".to_owned(),
                     description: "密码库的绝对目录；必须显式设置，不展开 ~ 和环境变量。".to_owned(),
                     data_type: ConfigDataType::FilePath,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: false,
                     default: None,
                     dictionary: None,
@@ -67,6 +68,7 @@ impl PasswordConfig {
                     description: "pass 可执行文件或 PATH 中的命令名；不展开 ~ 和环境变量。"
                         .to_owned(),
                     data_type: ConfigDataType::Executable,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: false,
                     default: None,
                     dictionary: None,

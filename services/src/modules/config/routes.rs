@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use crate::http::error::{ApiError, ErrorSource, response as api_error_response};
+use crate::{
+    http::error::{ApiError, ErrorSource, response as api_error_response},
+    modules::network::remote::is_remote,
+};
 
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::{get, post},
 };
@@ -38,13 +41,16 @@ pub fn router(service: Arc<ConfigService>) -> Router {
     id = "validate",
     method = "POST",
     path = "/config/validate",
+    access = "paired",
     summary = "校验配置值",
     description = "校验 module_id、key 对应的 value，不修改配置；成功返回规范化 value，失败返回 valid=false 和错误说明。保存接口执行相同校验。"
 )]
 async fn validate(
     State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
     Json(request): Json<ValidateRequest>,
 ) -> Result<Json<ValidateResponse>, Response> {
+    check_access(&service, &headers, &request.module_id, &request.key, true).await?;
     let (value, error) = match service
         .validate_value(&request.module_id, &request.key, &request.value)
         .await
@@ -74,12 +80,13 @@ async fn validate(
     id = "meta",
     method = "GET",
     path = "/meta",
+    access = "paired",
     summary = "获取完整配置模型",
     description = "返回所有配置模块及配置项类型、默认值和检查器描述。"
 )]
-async fn meta(State(service): State<Arc<ConfigService>>) -> Json<MetaResponse> {
+async fn meta(State(service): State<Arc<ConfigService>>, headers: HeaderMap) -> Json<MetaResponse> {
     Json(MetaResponse {
-        modules: service.metadata().await,
+        modules: visible_metadata(&service, &headers).await,
     })
 }
 
@@ -88,15 +95,16 @@ async fn meta(State(service): State<Arc<ConfigService>>) -> Json<MetaResponse> {
     id = "module-meta",
     method = "GET",
     path = "/meta/{module_id}",
+    access = "paired",
     summary = "获取模块配置模型",
     description = "返回单个配置模块的完整描述。"
 )]
 async fn module_meta(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
 ) -> Result<Json<ConfigModuleMetadata>, Response> {
-    service
-        .metadata()
+    visible_metadata(&service, &headers)
         .await
         .into_iter()
         .find(|metadata| metadata.id == module_id)
@@ -109,15 +117,17 @@ async fn module_meta(
     id = "module-data",
     method = "GET",
     path = "/data/{module_id}",
+    access = "paired",
     summary = "获取模块配置数据",
     description = "返回模块生效配置；每项包含 value 和 source，source 为 user 或 default。"
 )]
 async fn module_data(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
 ) -> Result<Json<ModuleDataResponse>, Response> {
     service
-        .module_values(&module_id)
+        .module_values_for(&module_id, is_remote(&headers))
         .await
         .map(|values| Json(ModuleDataResponse { module_id, values }))
         .map_err(error_response)
@@ -128,13 +138,16 @@ async fn module_data(
     id = "value",
     method = "GET",
     path = "/data/{module_id}/{key}",
+    access = "paired",
     summary = "获取配置项",
     description = "返回单个生效配置的 value 和 source；用户设置优先，否则返回默认值。"
 )]
 async fn get_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
 ) -> Result<Json<ValueResponse>, Response> {
+    check_access(&service, &headers, &module_id, &key, false).await?;
     service
         .value(&module_id, &key)
         .await
@@ -153,14 +166,17 @@ async fn get_value(
     id = "set-value",
     method = "PUT",
     path = "/data/{module_id}/{key}",
+    access = "paired",
     summary = "设置完整配置值",
     description = "替换一个配置项的完整值。"
 )]
 async fn put_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Result<Json<ValueResponse>, Response> {
+    check_access(&service, &headers, &module_id, &key, true).await?;
     service
         .replace(&module_id, &key, value)
         .await
@@ -182,14 +198,17 @@ async fn put_value(
     id = "patch-value",
     method = "POST",
     path = "/data/{module_id}/{key}",
+    access = "paired",
     summary = "部分更新配置值",
     description = "合并字典或追加列表项。"
 )]
 async fn post_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Result<Json<ValueResponse>, Response> {
+    check_access(&service, &headers, &module_id, &key, true).await?;
     service
         .partial(&module_id, &key, value)
         .await
@@ -206,6 +225,36 @@ async fn post_value(
         .map_err(error_response)
 }
 
+async fn visible_metadata(
+    service: &ConfigService,
+    headers: &HeaderMap,
+) -> Vec<ConfigModuleMetadata> {
+    let mut modules = service.metadata().await;
+    if is_remote(headers) {
+        for module in &mut modules {
+            module.items.retain(|item| item.remote_access.allows_read());
+        }
+        modules.retain(|module| !module.items.is_empty());
+    }
+    modules
+}
+
+async fn check_access(
+    service: &ConfigService,
+    headers: &HeaderMap,
+    module_id: &str,
+    key: &str,
+    write: bool,
+) -> Result<(), Response> {
+    if is_remote(headers) {
+        service
+            .require_remote_access(module_id, key, write)
+            .await
+            .map_err(error_response)?;
+    }
+    Ok(())
+}
+
 fn error_response(error: ConfigServiceError) -> Response {
     let status = match &error {
         ConfigServiceError::ModuleNotFound(_) | ConfigServiceError::ItemNotFound { .. } => {
@@ -213,6 +262,7 @@ fn error_response(error: ConfigServiceError) -> Response {
         }
         ConfigServiceError::ValueNotSet { .. } => StatusCode::NOT_FOUND,
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
+        ConfigServiceError::RemoteAccessForbidden { .. } => StatusCode::FORBIDDEN,
         ConfigServiceError::Storage(_) | ConfigServiceError::ChangeRejected { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -231,6 +281,7 @@ fn error_code(error: &ConfigServiceError) -> &'static str {
         ConfigServiceError::ItemNotFound { .. } => "config-not-found",
         ConfigServiceError::ValueNotSet { .. } => "config-not-set",
         ConfigServiceError::InvalidValue(_) => "invalid-config",
+        ConfigServiceError::RemoteAccessForbidden { .. } => "remote-config-forbidden",
         ConfigServiceError::Storage(_) => "config-storage-error",
         ConfigServiceError::ChangeRejected { .. } => "config-change-rejected",
     }
@@ -257,6 +308,7 @@ mod tests {
                     name: "配置 A".to_owned(),
                     description: "字符串".to_owned(),
                     data_type: ConfigDataType::String,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: false,
                     default: Some(json!("默认值")),
                     dictionary: None,
@@ -270,6 +322,7 @@ mod tests {
                     name: "配置 B".to_owned(),
                     description: "字典".to_owned(),
                     data_type: ConfigDataType::Dictionary,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: false,
                     default: None,
                     dictionary: None,

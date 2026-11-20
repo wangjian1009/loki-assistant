@@ -21,6 +21,7 @@ pub fn router() -> Router {
     id = "discover",
     method = "GET",
     path = "/discover",
+    access = "paired",
     summary = "获取完整服务描述",
     description = "返回所有模块及其 HTTP API 的完整元数据。"
 )]
@@ -38,6 +39,7 @@ async fn discover() -> Json<DiscoverResponse> {
     id = "list-modules",
     method = "GET",
     path = "/discover/modules",
+    access = "paired",
     summary = "获取模块列表",
     description = "返回模块名称、版本和简要描述。"
 )]
@@ -53,6 +55,7 @@ async fn list_modules() -> Json<ModuleListResponse> {
     id = "get-module",
     method = "GET",
     path = "/discover/modules/{module_id}",
+    access = "paired",
     summary = "获取模块描述",
     description = "根据模块标识返回单个模块的完整元数据。"
 )]

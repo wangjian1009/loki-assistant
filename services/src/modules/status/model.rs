@@ -15,6 +15,7 @@ pub struct StatusItemMetadata {
     pub key: String,
     pub name: String,
     pub description: String,
+    pub remote_access: bool,
     pub schema: StatusSchema,
 }
 

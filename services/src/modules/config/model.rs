@@ -49,6 +49,8 @@ pub struct ConfigItemMetadata {
     pub name: String,
     pub description: String,
     pub data_type: ConfigDataType,
+    #[serde(default)]
+    pub remote_access: ConfigRemoteAccess,
     pub required: bool,
     pub default: Option<Value>,
     pub dictionary: Option<DictionaryMetadata>,
@@ -56,6 +58,25 @@ pub struct ConfigItemMetadata {
     pub checker: Option<CheckerMetadata>,
     pub file_path: Option<FilePathMetadata>,
     pub executable: Option<ExecutableMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigRemoteAccess {
+    #[default]
+    Local,
+    Read,
+    ReadWrite,
+}
+
+impl ConfigRemoteAccess {
+    pub fn allows_read(self) -> bool {
+        self != Self::Local
+    }
+
+    pub fn allows_write(self) -> bool {
+        self == Self::ReadWrite
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

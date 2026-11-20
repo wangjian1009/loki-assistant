@@ -143,11 +143,11 @@ pub trait RequestDispatcher: Send + Sync {
 }
 #+end_src
 
-HttpDispatcher 负责构造 HTTP request、编码 query 和 body、注入已认证 peer 扩展、调用 Router 并读取 HTTP 状态与 JSON body；业务模块不实现 RequestDispatcher，不建立额外 HTTP 监听或 TCP 回拨。
+HttpDispatcher 构造 HTTP request，编码 query 和 body，将认证后的设备 Endpoint ID 写入 ~x-loki-device~ 和 ~x-loki-remote-devices~ ，然后调用 Router 并读取 HTTP 状态与 JSON body。
 
 Services 组合根通过 ~attach_remote~ 注入基于 Weak 引用的 Router 工厂。请求使用现有业务实例，不形成 Network → Router → Services 的永久循环持有，也不复制 handler。~peer_id~ 只来自 iroh 已认证连接，不能从请求 JSON 或 HTTP header 伪造。
 
-API 使用 ~#[loki_api(access = "paired")]~ 显式开放给绑定设备，默认 ~local~ 。同一份编译期元数据生成基于 Axum 路由模板的访问检查和 discover 的 ~access~ 字段。首期开放 ~GET /network/session~ ；未开放的接口返回 ~remote-api-forbidden~ 。正式协议见 [[file:control-center-services.org::*通用 services 请求通道][通用 services 请求通道]]。
+API 使用 ~#[loki_api(access = "paired")]~ 显式开放给绑定设备，默认 ~local~ 。未开放的接口返回 ~remote-api-forbidden~ 。配置项和状态项各自声明远端访问范围。[[file:control-center-services.org::*通用 services 请求通道][通用 services 请求通道]]
 
 * 设备名称与类型
 

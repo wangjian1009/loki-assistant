@@ -59,6 +59,7 @@ impl EmacsConfig {
                         "请选择 emacsclient 可执行文件，也可输入 PATH 中的命令名；不展开 ~ 和环境变量。"
                             .to_owned(),
                     data_type: ConfigDataType::Executable,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: false,
                     default: None,
                     dictionary: None,
@@ -85,6 +86,7 @@ impl EmacsConfig {
                     name: "Emacs server socket".to_owned(),
                     description: "指定目标 Emacs 的本机 socket 名称或绝对路径；默认连接 server，不回退到其他实例。".to_owned(),
                     data_type: ConfigDataType::String,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: true,
                     default: Some(Value::String("server".to_owned())),
                     dictionary: None,

@@ -8,11 +8,11 @@
 
 `modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
-扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个本机邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 安全读写 `~/.assistant/peers.json`。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
+扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 安全读写 `~/.assistant/peers.json`。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
 
 同一 Endpoint 同时接收 `loki-assistant/device-status/1`，仅响应已绑定手机的 `device.status` 请求，逐次查询同一份设备授权记录；此兼容协议只提供固定状态查询。连接纳入既有跟踪和解绑撤销；未绑定或已解绑返回 `peer-not-bound`。状态请求必须携带绑定后签发的凭据；只有绑定接口允许无凭据。真实 relay 测试调用手机 Rust 客户端，验证绑定、配置恢复、状态和解绑。
 
-`remote.rs` 同时实现 `loki-assistant/services/1` 和 `HttpDispatcher`，统一将手机 Network 的 method/path/query/body 转为进程内 HTTP request，调用现有 Router；业务模块不另写远程分发。Services 组合根通过 `attach_remote(&runtime)` 注入 Weak runtime 的 Router 工厂，共用现有业务和 RuntimeState，不重复构造服务或引入循环持有。每条 stream 重新验证认证身份、绑定、随机 `binding_token` 和 API 访问范围；`#[loki_api(access = "paired")]` 显式开放，默认 local，discover 同时暴露 access。新手机状态改用 `/network/session`，旧状态 ALPN 只保留兼容。
+`remote.rs` 同时实现 `loki-assistant/services/1` 和 `HttpDispatcher`，统一将手机 Network 的 method/path/query/body 转为进程内 HTTP request，调用现有 Router；业务模块不另写远程分发。Services 组合根通过 `attach_remote(&runtime)` 注入 Weak runtime 的 Router 工厂，共用现有业务和 RuntimeState，不重复构造服务或引入循环持有。每条 stream 重新验证认证身份、绑定、随机 `binding_token` 和 API 访问范围；`#[loki_api(access = "paired")]` 显式开放，默认 local，discover 同时暴露 access。HttpDispatcher 校验实际选中的路由并将认证后的 Endpoint ID 注入 `x-loki-device` 与 `x-loki-remote-devices`，loopback HTTP 入口移除这两个请求头。现有 `password` API 仅限本机，其余现有 API 开放给绑定设备。新手机状态改用 `/network/session`，旧状态 ALPN 只保留兼容。
 
 绑定成功生成并持久化每个手机的随机 256 bit `binding_token`，仅在认证绑定响应中交付；有效邀请入队，超时定时丢弃，成功绑定后立即移出有效队列；后续重复、过期或未知邀请一律返回 `pairing-expired`，不再次签发 token。仅保留最近 128 条供本机查询的结果元数据，不保存令牌摘要或原 token。重新扫码绑定替换凭据，解绑删除。`peers.rs` 的 StoredPeer 独立于公开 Peer DTO，设备列表、邀请查询、监控、Debug 和日志不泄露 token。兼容状态 ALPN 同样要求 token。旧授权无 token 时必须重新扫码，不开放无凭据恢复接口。
 
@@ -69,7 +69,7 @@ src/
     │   ├── pairing.rs   绑定邀请、单次消费和设备授权事务
     │   ├── peers.rs     ~/.assistant/peers.json 安全读写
     │   ├── qr_code.rs   绑定 JSON 二维码的 PNG 与 Base64 编码
-    │   ├── routes.rs    本机绑定邀请与设备管理 HTTP
+    │   ├── routes.rs    绑定邀请与设备管理 HTTP
     │   ├── relay.rs     可注入的中转注册器与 iroh 连接
     │   ├── service.rs   配置处理、启动注册、连接切换与通知
     │   ├── tests.rs     身份、事务、通知与随机端口 relay 测试
@@ -157,7 +157,7 @@ modules/<module>
 
 配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。
 
-Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `Arc<ConfigService>`，每个配置项对应独立异步方法，例如 `emacsclient_path()`。方法每次调用配置中心并返回带 `value`、`source` 的 `ConfigValue`，不缓存属性值；`EmacsService` 持有 `EmacsConfig` 并通过这些方法读取。配置项键、默认值和搜索目录均由该文件维护。`EmacsConfig::metadata()` 是不依赖实例的静态函数，经 `#[loki_config]` 注册，配置中心与 API 发现一样通过编译期目录获取元数据。
+Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `Arc<ConfigService>`，每个配置项对应独立异步方法，例如 `emacsclient_path()`。方法每次调用配置中心并返回带 `value`、`source` 的 `ConfigValue`，不缓存属性值；`EmacsService` 持有 `EmacsConfig` 并通过这些方法读取。配置项键、默认值和搜索目录均由该文件维护。`EmacsConfig::metadata()` 是不依赖实例的静态函数，经 `#[loki_config]` 注册，配置中心与 API 发现一样通过编译期目录获取元数据。配置项声明 `remote_access`，配置中心对远端请求按项限制读取、写入和预检，列表过滤本机专用项。
 
 `POST /config/validate` 提供只读配置预检，与保存共用 `ConfigService::validate_value`。`Executable` 必须解析到存在且具有执行权限的普通文件，成功后规范化为绝对路径。校验失败禁止更新内存、YAML 与变化订阅；界面只消费服务端结果。文件系统校验测试使用临时文件，不执行待检查的程序。
 
@@ -195,6 +195,6 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 状态发布方必须在构造时接收并持有 `Arc<StatusService>` 字段，通过 `self.status.publish` / `self.status.publish_many` 调用实例方法。实例只由 `Services` 组合根创建，再经 `Arc::clone` 注入；业务模块不得自行创建独立实例，不使用全局或静态状态。查询路由挂载组合根持有的同一实例。
 
-状态结构由业务模块自己的 `status.rs` 定义，通过 `#[loki_status]` 注册无参数同步 `StatusModuleMetadata` 函数。`modules/status/model.rs` 定义递归 schema，`registry.rs` 仅聚合静态声明，`GET /stats/meta` 返回完整目录；元数据不依赖运行时值或业务实例，不在状态中心硬编码各业务结构，不包含用户身份或令牌。静态声明目录与每个 StatusService 实例持有的运行状态相互独立。
+状态结构由业务模块自己的 `status.rs` 定义，通过 `#[loki_status]` 注册无参数同步 `StatusModuleMetadata` 函数。`modules/status/model.rs` 定义递归 schema，`registry.rs` 仅聚合静态声明，`GET /stats/meta` 返回完整目录；元数据不依赖运行时值或业务实例，不在状态中心硬编码各业务结构，不包含用户身份或令牌。静态声明目录与每个 StatusService 实例持有的运行状态相互独立。状态项以 `remote_access` 显式开放远端访问，状态中心按项过滤远端元数据和快照，并校验单项、嵌套路径和远端上报。
 
 HTTP 业务上报必须调用注入实例的 `publish_many_validated`，按状态元数据严格校验类型、必填、可空、枚举与嵌套结构，拒绝未知状态项和对象字段。校验整个批次后才写入，失败返回 400 `invalid-request` 和字段路径，不能回显提交值，不得改变已有数据或更新时间。Rust 内部发布仍通过持有实例的 `publish` / `publish_many`。

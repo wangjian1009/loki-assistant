@@ -125,6 +125,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 {
   "key": "emacsclient_path",
   "data_type": "executable",
+  "remote_access": "local",
   "default": null,
   "executable": {
     "default_program": "emacsclient",
@@ -134,6 +135,8 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 #+end_src
 
 没有用户设置和静态 ~default~ 时，配置模块按 services 启动时的 ~PATH~ 顺序搜索，再按 ~search_paths~ 的顺序补充查找。只接受实际可执行的普通文件（允许符号链接），返回绝对路径；不通过 shell，不执行待查找的程序，也不展开 ~ 和环境变量。每次读取重新查找，因此安装或移除程序后，下次读取即可反映变化。找不到程序时不生成默认值，Emacs 配置界面显示“未设置”并提供文件选择入口。
+
+配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取，~read_write~ 另开放替换、部分更新和预检。配置中心依据 network 注入的 ~x-loki-remote-devices~ 判断请求来源。远端元数据和模块值只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 为只读，~control-center/center_auto_start~ 可读写，其余配置项仅限本机。
 
 ** 生效值与来源
 
@@ -234,7 +237,7 @@ control-center:
 
 只有地址和令牌都非空、且不全为空白时才开始注册；缺少任意一项均视为未配置，可以先后保存两项，第一项保存不连接、不发出注册失败通知。配置处理器使用包含本次候选值的模块快照判断，第二项提交时使用第一项已保存的值。完整配置中的地址须为 HTTP(S) URL，不接受账号、密码、查询或片段；TLS 验证保持启用，没有固定对端或备用 relay。
 
-“注册”表示使用本地持久化身份与指定 iroh-relay 建立中转连接，确认 relay 已接受节点。端点同时声明绑定协议 ~loki-assistant/pair/1~ 、兼容设备状态协议 ~loki-assistant/device-status/1~ 和通用请求协议 ~loki-assistant/services/1~ ，由进程入口显式调度接收任务；当前接收绑定与通用 HTTP 请求分发，首期仅开放已绑定设备的会话查询；HTTP listener 仍只监听 loopback。注册最多等待 10 秒，认证拒绝提前失败。地址或令牌变化均重新注册，成功后才允许落盘，并在 ~committed~ 中替换旧连接、作废未完成邀请并发送成功通知；失败发送失败通知，返回 ~config-change-rejected~ ，保留原配置、连接和邀请。相同配置已连接时不重复注册，失败后重新提交可以重试。
+“注册”表示使用本地持久化身份与指定 iroh-relay 建立中转连接，确认 relay 已接受节点。端点同时声明绑定协议 ~loki-assistant/pair/1~ 、兼容设备状态协议 ~loki-assistant/device-status/1~ 和通用请求协议 ~loki-assistant/services/1~ ，由进程入口显式调度接收任务；当前接收绑定与已绑定设备的通用 HTTP 请求。HTTP listener 只监听 loopback。注册最多等待 10 秒，认证拒绝提前失败。地址或令牌变化均重新注册，成功后才允许落盘，并在 ~committed~ 中替换旧连接、作废未完成邀请并发送成功通知；失败发送失败通知，返回 ~config-change-rejected~ ，保留原配置、连接和邀请。相同配置已连接时不重复注册，失败后重新提交可以重试。
 
 落盘失败时撤销候选连接并恢复原状态。清空任意一项在保存成功后关闭现有连接，保留身份；再次补齐后重新注册。启动时仍确保身份存在，配置完整才在后台注册；失败不影响本机 HTTP 服务。进程入口显式管理初始化和连接监控任务，构造模块不启动任务；关闭时取消任务并释放连接。
 
@@ -386,13 +389,15 @@ query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体
 
 电脑 network 模块统一完成通用请求到 HTTP request 的转换，通过进程内 Axum Router 调用现有 handler；业务模块不另写远程分发逻辑。Services 组合根调用 ~attach_remote~ 注入共享业务路由工厂，仅持有 Weak 引用。每次请求都校验当前会话、已认证手机的绑定记录以及 ~binding_token~ ，凭据使用常量时间比较，解绑关闭被跟踪连接及其 stream。
 
-~#[loki_api]~ 新增 ~access~ 属性：默认 ~local~ ，显式 ~paired~ 才允许远程调用，discover 同时返回 access。访问检查用 Axum 路由模板匹配 method/path，不使用字符串前缀。当前只开放 ~GET /network/session~ ，返回当前电脑身份、online、认证手机的 bound_at，以及电脑 name 和 device_type；本机 HTTP 缺少认证上下文时返回 401 ~peer-authentication-required~ ，不接受伪造 header 或查询字段。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
+~#[loki_api]~ 的 ~access~ 默认 ~local~ ，显式声明 ~paired~ 后允许绑定设备调用。discover 返回同一份声明，network 检查请求方法与实际匹配的 Axum 路由模板。现有 ~password~ API 仅限本机，其余现有 API 开放给绑定设备。配置项与状态项继续按各自的 ~remote_access~ 检查。
+
+network 将 iroh 已认证的 Endpoint ID 写入 ~x-loki-device~ 和 ~x-loki-remote-devices~ 。配置中心和状态中心通过后者判断请求来源。通用协议没有客户端请求头字段，loopback HTTP 入口移除这两个请求头。~GET /network/session~ 返回当前电脑的身份、在线状态、名称、设备类型和请求方的绑定时间。本机调用该接口返回 401 ~peer-authentication-required~ 。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
 
 请求最大 1 MiB，响应最大 4 MiB；每个手机最多 8 个正在执行请求，服务总上限 64，超限返回 429。服务端 stream 处理上限 30 秒；手机请求默认 10 秒，允许 1 至 30 秒，覆盖连接、发送与读取。手机显式取消 reset 当前 stream，超时和取消不保证已经执行的写操作回滚。网络层不自动重发请求。
 
 *** 错误和敏感数据
 
-绑定 HTTP 接口成功与失败响应均包含 ~Cache-Control: no-store~ ，沿用统一 ~api_version/status/error{source,code,message}~ 外壳；iroh 错误使用相同 JSON 结构，~status~ 为对应 HTTP 数字语义。模块通过 ~#[loki_api]~ 暴露五个本机绑定管理接口和会话查询接口的静态元数据，不暴露运行时身份或令牌。
+绑定 HTTP 接口成功与失败响应均包含 ~Cache-Control: no-store~ ，沿用统一 ~api_version/status/error{source,code,message}~ 外壳；iroh 错误使用相同 JSON 结构，~status~ 为对应 HTTP 数字语义。模块通过 ~#[loki_api]~ 暴露五个绑定管理接口和会话查询接口的静态元数据，不暴露运行时身份或令牌。
 
 | status | code | 含义 |
 |--------+------+------|
@@ -517,7 +522,9 @@ GET /password/entries/example.com/alice.gpg
 
 状态定义采用与配置元数据相同的编译期注册方式：业务模块在自己的 ~status.rs~ 中用 ~#[loki_status]~ 修饰无参数、无泛型的同步函数，返回 ~StatusModuleMetadata~ 。过程宏通过 ~linkme~ 注册到 ~STATUS_MODULES~ ，不在运行时注册，也不需要创建业务实例。当前服务自身状态模块声明 ~start_at~，Emacs 声明 ~buffers~ 和 ~runtime~ ，网络模块声明 ~my~ 。
 
-~GET /stats/meta~ 返回 ~api_version~ 和完整 ~modules~ 列表；模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 和递归 ~schema~ ，数据路径为 ~/status/{模块 id}/{状态项 key}~；嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~。当前包含 ~service~、~emacs/buffers~、~emacs/runtime~ 和 ~network/my~ ，其中读取本次 services 启动时间使用 ~GET /status/service~ 。
+~GET /stats/meta~ 返回 ~api_version~ 和 ~modules~ 列表。模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 、 ~remote_access~ 和递归 ~schema~ 。数据路径为 ~/status/{模块 id}/{状态项 key}~ ，嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~ 。本次 services 启动时间可通过 ~GET /status/service~ 查询。
+
+状态项以 ~remote_access: true~ 开放远端访问。目前开放 ~service~ 的所有状态项和 ~network/my~ ，Emacs 状态与未声明状态项仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。远端上报包含受限项时拒绝整个批次，成功返回的快照同样按权限过滤。
 
 ~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未配置、未连接、连接成功、连接失败和连接中的五个值及说明。
 

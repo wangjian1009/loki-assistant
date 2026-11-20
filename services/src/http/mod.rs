@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 pub mod error;
 
-use axum::Router;
+use axum::{Router, middleware};
 
-use crate::runtime::RuntimeState;
+use crate::{modules::network::remote::strip_device_headers, runtime::RuntimeState};
 
 pub fn router(runtime: Arc<RuntimeState>) -> Router {
-    Router::new().merge(runtime.services().router(runtime))
+    Router::new()
+        .merge(runtime.services().router(runtime))
+        .layer(middleware::from_fn(strip_device_headers))
 }
 
 pub async fn serve(
@@ -77,5 +79,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn local_http_discards_device_headers_before_dispatch() {
+        let app = router(Arc::new(RuntimeState::default()));
+        for (path, expected) in [
+            ("/data/network/relay_token", 200),
+            ("/network/session", 401),
+        ] {
+            let request = Request::builder()
+                .uri(path)
+                .header("x-loki-device", "spoofed-device")
+                .header("x-loki-remote-devices", "spoofed-device")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
     }
 }

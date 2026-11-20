@@ -12,6 +12,7 @@ fn emacs_status_metadata() -> StatusModuleMetadata {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         items: vec![
             StatusItemMetadata {
+                remote_access: false,
                 key: "buffers".to_owned(),
                 name: "关注的 buffer".to_owned(),
                 description: "关注的 mode 及其派生 mode 的 buffer 列表；没有关注项时为空数组。"
@@ -55,6 +56,7 @@ fn emacs_status_metadata() -> StatusModuleMetadata {
                 },
             },
             StatusItemMetadata {
+                remote_access: false,
                 key: "runtime".to_owned(),
                 name: "运行信息".to_owned(),
                 description: "Emacs 进程与最近上报时间。".to_owned(),

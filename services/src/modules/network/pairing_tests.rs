@@ -387,14 +387,7 @@ async fn services_mounts_network_apis_and_access_without_exposing_credentials() 
         serde_json::from_slice(&to_bytes(response.into_body(), 65_536).await.unwrap()).unwrap();
     assert_eq!(metadata["apis"].as_array().unwrap().len(), 6);
     for api in metadata["apis"].as_array().unwrap() {
-        assert_eq!(
-            api["access"],
-            if api["id"] == "session" {
-                "paired"
-            } else {
-                "local"
-            }
-        );
+        assert_eq!(api["access"], "paired");
     }
     assert!(!metadata.to_string().contains("relay_token"));
     assert_eq!(http(app, "POST", "/network/pairings").await.0, 503);
@@ -427,33 +420,53 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     server_config.relay = Some(relay_config);
     let relay = Server::spawn(server_config).await.unwrap();
     let address = format!("http://{}", relay.http_addr().unwrap());
+    let notification = Arc::new(
+        crate::modules::notification::NotificationService::with_launcher(
+            fixture.launcher.clone(),
+            Duration::from_secs(1),
+        ),
+    );
     let service = Arc::new(NetworkService::new(
         Ok(fixture.store()),
         Arc::new(IrohRelayRegistrar::new()),
-        Arc::new(
-            crate::modules::notification::NotificationService::with_launcher(
-                fixture.launcher.clone(),
-                Duration::from_secs(1),
-            ),
-        ),
+        notification.clone(),
         fixture.status.clone(),
         Duration::from_secs(10),
     ));
+    let config = fixture.config(service.clone());
+    let remote_config = crate::modules::config::Module::new();
+    let remote_config_service = remote_config.service();
+    let routes = remote_config
+        .router()
+        .merge(fixture.status.router())
+        .merge(crate::modules::password::Module::new(remote_config_service.clone()).router())
+        .merge(
+            crate::modules::emacs::Module::new(
+                remote_config_service.clone(),
+                notification,
+                fixture.status.clone(),
+            )
+            .router(),
+        );
     let weak = Arc::downgrade(&service);
     service.set_remote_dispatcher(Arc::new(super::remote::HttpDispatcher::new(move || {
         weak.upgrade().map(|service| {
             service
                 .router()
+                .merge(routes.clone())
                 .route(
                     "/network-test/echo/{id}",
                     axum::routing::post(echo_channel).get(query_channel),
+                )
+                .route(
+                    "/network-test/echo/local",
+                    axum::routing::get(|| async { "本机" }),
                 )
                 .route("/network-test/bad", axum::routing::get(bad_channel))
                 .route("/network-test/large", axum::routing::get(large_channel))
         })
     })));
     let receiver = tokio::spawn(service.clone().receive_pairings());
-    let config = fixture.config(service.clone());
     config
         .replace("network", "relay_url", json!(address))
         .await
@@ -737,9 +750,9 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         ]
     );
     let (status, body) = mobile_http(debug_address, "/service/network/peers").await;
-    assert_eq!(status, 403);
-    assert_eq!(body["kind"], "services");
-    assert_eq!(body["code"], "remote-api-forbidden");
+    assert_eq!(status, 200);
+    assert_eq!(body["peers"][0]["endpoint_id"], mobile_id);
+    assert!(!body.to_string().contains(&token));
     let (status, body) = mobile_http(debug_address, "/service/missing").await;
     assert_eq!(status, 404);
     assert_eq!(body["status"], 404);
@@ -766,6 +779,8 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .unwrap();
     assert_eq!(echoed.status, 202);
     assert_eq!(echoed.data["id"], "phone test");
+    assert_eq!(echoed.data["device"], mobile_id);
+    assert_eq!(echoed.data["remote_device"], mobile_id);
     let query = echoed.data["query"].as_str().unwrap();
     assert_eq!(
         url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>()[0].1,
@@ -806,12 +821,19 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         assert_eq!(response.data["status"], "online");
         assert!(ids.insert(response.request_id));
     }
-    let forbidden = channel_request(network.clone(), ServiceRequest::get("/network/peers"))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(forbidden,ResponsError::Services(error) if error.code == "remote-api-forbidden")
-    );
+    for path in [
+        "/password/entries",
+        "/password/entries/test/item.gpg",
+        "/network-test/echo/local",
+    ] {
+        let forbidden = channel_request(network.clone(), ServiceRequest::get(path))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(forbidden, ResponsError::Services(error) if error.code == "remote-api-forbidden")
+        );
+    }
+    check_remote_config_and_status(network.clone(), &fixture, &remote_config_service).await;
     let missing = channel_request(network.clone(), ServiceRequest::get("/missing"))
         .await
         .unwrap_err();
@@ -865,6 +887,141 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     relay.shutdown().await.unwrap();
 }
 
+async fn check_remote_config_and_status(
+    network: Arc<loki_mobile_network::network::Network>,
+    fixture: &Fixture,
+    config: &crate::modules::config::service::ConfigService,
+) {
+    use loki_mobile_network::network::{ResponsError, ServiceRequest};
+
+    config
+        .replace("network", "relay_token", json!("本机配置"))
+        .await
+        .unwrap();
+    fixture
+        .status
+        .publish("emacs", "runtime", json!({"pid":123}))
+        .unwrap();
+    fixture
+        .status
+        .publish("custom", "private", json!(true))
+        .unwrap();
+    fixture
+        .status
+        .publish("service", "name", json!("测试电脑"))
+        .unwrap();
+    let get = |path: &'static str| channel_request(network.clone(), ServiceRequest::get(path));
+    assert_eq!(
+        get("/data/network").await.unwrap().data["values"],
+        json!({"relay_url":{"value":"","source":"default"}})
+    );
+    let metadata = get("/meta/network").await.unwrap().data;
+    assert_eq!(metadata["items"].as_array().unwrap().len(), 1);
+    assert_eq!(metadata["items"][0]["key"], "relay_url");
+    assert_eq!(metadata["items"][0]["remote_access"], "read");
+    assert_eq!(
+        get("/status/network/my/status").await.unwrap().data["value"],
+        "connected"
+    );
+    let snapshot = get("/status").await.unwrap().data;
+    assert!(snapshot["status"].get("emacs").is_none());
+    assert!(snapshot["status"].get("custom").is_none());
+    assert!(
+        get("/stats/meta").await.unwrap().data["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|module| module["id"] != "emacs")
+    );
+
+    for (method, path, body, code) in [
+        (
+            "GET",
+            "/data/network/relay_token",
+            None,
+            "remote-config-forbidden",
+        ),
+        (
+            "PUT",
+            "/data/network/relay_url",
+            Some(json!("其他地址")),
+            "remote-config-forbidden",
+        ),
+        (
+            "POST",
+            "/data/network/relay_token",
+            Some(json!("其他令牌")),
+            "remote-config-forbidden",
+        ),
+        (
+            "POST",
+            "/config/validate",
+            Some(json!({"module_id":"network","key":"relay_token","value":"其他令牌"})),
+            "remote-config-forbidden",
+        ),
+        (
+            "GET",
+            "/status/emacs/runtime",
+            None,
+            "remote-status-forbidden",
+        ),
+        (
+            "GET",
+            "/status/emacs/runtime/pid",
+            None,
+            "remote-status-forbidden",
+        ),
+        (
+            "GET",
+            "/status/custom/private",
+            None,
+            "remote-status-forbidden",
+        ),
+        (
+            "POST",
+            "/emacs/receiver/status",
+            Some(json!({"emacs":{"runtime":{}},"service":{"name":"禁止提交的名称"}})),
+            "remote-status-forbidden",
+        ),
+    ] {
+        let mut request = ServiceRequest::get(path);
+        request.method = method.parse().unwrap();
+        request.body = body;
+        let error = channel_request(network.clone(), request).await.unwrap_err();
+        assert!(
+            matches!(error, ResponsError::Services(error) if error.status == 403 && error.code == code)
+        );
+    }
+    assert_eq!(
+        fixture.status.value("service", "name").unwrap().value,
+        "测试电脑"
+    );
+
+    let mut report = ServiceRequest::get("/emacs/receiver/status");
+    report.method = axum::http::Method::POST;
+    report.body = Some(json!({"service":{"name":"更新后的名称"}}));
+    let reported = channel_request(network.clone(), report).await.unwrap().data;
+    assert_eq!(reported["status"]["service"]["name"], "更新后的名称");
+    assert!(reported["status"].get("emacs").is_none());
+    assert!(reported["status"].get("custom").is_none());
+
+    let mut request = ServiceRequest::get("/data/control-center/center_auto_start");
+    request.method = axum::http::Method::PUT;
+    request.body = Some(json!(true));
+    assert_eq!(
+        channel_request(network, request).await.unwrap().data["value"],
+        true
+    );
+    assert_eq!(
+        config.value("network", "relay_token").await.unwrap().value,
+        "本机配置"
+    );
+    assert_eq!(
+        fixture.status.value("emacs", "runtime").unwrap().value["pid"],
+        123
+    );
+}
+
 #[loki_services_macros::loki_api(
     module = "network-test",
     id = "echo",
@@ -877,12 +1034,15 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
 async fn echo_channel(
     axum::extract::Path(id): axum::extract::Path<String>,
     query: axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> impl axum::response::IntoResponse {
     (
         axum::http::StatusCode::ACCEPTED,
         axum::Json(
-            json!({"id":id,"query":query.0,"body":String::from_utf8(body.to_vec()).unwrap()}),
+            json!({"id":id,"query":query.0,"body":String::from_utf8(body.to_vec()).unwrap(),
+                "device":headers.get("x-loki-device").and_then(|value| value.to_str().ok()),
+                "remote_device":headers.get("x-loki-remote-devices").and_then(|value| value.to_str().ok())}),
         ),
     )
 }
@@ -899,8 +1059,9 @@ async fn echo_channel(
 async fn query_channel(
     id: axum::extract::Path<String>,
     query: axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
-    echo_channel(id, query, axum::body::Bytes::new()).await
+    echo_channel(id, query, headers, axum::body::Bytes::new()).await
 }
 
 #[loki_services_macros::loki_api(

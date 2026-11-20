@@ -27,6 +27,7 @@ pub fn router(service: Arc<NotificationService>) -> Router {
     id = "status",
     method = "GET",
     path = "/notification/{id}",
+    access = "paired",
     summary = "查询系统通知处理状态",
     description = "协议版本 1：查询 forwarded、submitted、failed 或 unconfirmed；记录保留 15 分钟，services 重启后失效。"
 )]
@@ -42,6 +43,7 @@ async fn status(
     id = "receipt",
     method = "POST",
     path = "/notification/{id}/receipt",
+    access = "paired",
     summary = "接收系统通知回执",
     description = "协议版本 1：接收 submitted 或带 code、message 的 failed；相同回执幂等，冲突返回 409。"
 )]

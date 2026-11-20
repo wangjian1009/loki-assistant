@@ -9,7 +9,9 @@ use std::{
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Method, Request, StatusCode},
+    extract::MatchedPath,
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -65,7 +67,20 @@ impl DispatchResponse {
 }
 
 #[derive(Clone)]
-pub struct AuthenticatedPeer(pub EndpointId);
+pub(super) struct AuthenticatedPeer(pub EndpointId);
+
+const DEVICE_HEADER: HeaderName = HeaderName::from_static("x-loki-device");
+const REMOTE_DEVICES_HEADER: HeaderName = HeaderName::from_static("x-loki-remote-devices");
+
+pub(crate) fn is_remote(headers: &HeaderMap) -> bool {
+    headers.contains_key(REMOTE_DEVICES_HEADER)
+}
+
+pub(crate) async fn strip_device_headers(mut request: Request<Body>, next: Next) -> Response {
+    request.headers_mut().remove(DEVICE_HEADER);
+    request.headers_mut().remove(REMOTE_DEVICES_HEADER);
+    next.run(request).await
+}
 
 pub(super) struct Gateway {
     dispatcher: RwLock<Option<Arc<dyn RequestDispatcher>>>,
@@ -82,6 +97,14 @@ impl std::fmt::Debug for Gateway {
 
 fn error(status: StatusCode, code: &str, message: &str) -> Response {
     api_error(status, ErrorSource::Services, code, message)
+}
+
+fn remote_api_forbidden() -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        "remote-api-forbidden",
+        "此接口仅限电脑本机调用",
+    )
 }
 
 impl Gateway {
@@ -104,11 +127,7 @@ impl Gateway {
                     async move {
                         match access {
                             Some("paired") => StatusCode::NO_CONTENT.into_response(),
-                            Some(_) => error(
-                                StatusCode::FORBIDDEN,
-                                "remote-api-forbidden",
-                                "此接口仅限电脑本机调用",
-                            ),
+                            Some(_) => remote_api_forbidden(),
                             None => error(
                                 StatusCode::METHOD_NOT_ALLOWED,
                                 "method-not-allowed",
@@ -338,16 +357,26 @@ impl HttpDispatcher {
     }
 }
 
+async fn authorize_http_route(request: Request<Body>, next: Next) -> Response {
+    let Some(path) = request.extensions().get::<MatchedPath>() else {
+        return error(StatusCode::NOT_FOUND, "api-not-found", "未找到接口");
+    };
+    // 校验实际选中的路由，防止动态路径的访问权限被继承到其他 handler。
+    let allowed = API_DESCRIPTORS.iter().any(|api| {
+        api.path == path.as_str()
+            && api.method == request.method().as_str()
+            && api.access == "paired"
+    });
+    if !allowed {
+        return remote_api_forbidden();
+    }
+    next.run(request).await
+}
+
 impl RequestDispatcher for HttpDispatcher {
-    fn dispatch(
-        &self,
-        context: crate::modules::network::remote::RequestContext,
-        request: crate::modules::network::remote::DispatchRequest,
-    ) -> crate::modules::network::remote::DispatchFuture {
-        use crate::modules::network::remote::{AuthenticatedPeer, DispatchResponse};
+    fn dispatch(&self, context: RequestContext, request: DispatchRequest) -> DispatchFuture {
         let router = self.router.clone();
         Box::pin(async move {
-            use tower::ServiceExt;
             let Some(router) = router() else {
                 return DispatchResponse::from_http(crate::http::error::response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -369,14 +398,19 @@ impl RequestDispatcher for HttpDispatcher {
                 .body
                 .map(|value| serde_json::to_vec(&value).unwrap())
                 .unwrap_or_default();
+            let device = HeaderValue::from_str(&context.peer_id.to_string())
+                .expect("Endpoint ID 可以作为 HTTP 请求头值");
             let mut http = axum::http::Request::builder()
                 .method(request.method)
                 .uri(uri)
                 .header("content-type", "application/json")
+                .header(DEVICE_HEADER, device.clone())
+                .header(REMOTE_DEVICES_HEADER, device)
                 .body(axum::body::Body::from(body))
                 .unwrap();
             http.extensions_mut()
                 .insert(AuthenticatedPeer(context.peer_id));
+            let router = router.layer(middleware::from_fn(authorize_http_route));
             DispatchResponse::from_http(router.oneshot(http).await.unwrap()).await
         })
     }

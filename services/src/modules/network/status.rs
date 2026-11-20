@@ -47,6 +47,7 @@ fn network_status_metadata() -> StatusModuleMetadata {
         description: "本机网络连接状态。".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         items: vec![StatusItemMetadata {
+            remote_access: true,
             key: "my".to_owned(),
             name: "本机节点".to_owned(),
             description: "由网络模块发布的本机连接状态。".to_owned(),

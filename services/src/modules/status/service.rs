@@ -23,6 +23,8 @@ pub enum StatusError {
     InvalidValue { path: String, reason: String },
     #[error("尚未收到状态信息：{0}/{1}")]
     NotFound(String, String),
+    #[error("状态项 {0}/{1} 仅限本机访问")]
+    RemoteAccessForbidden(String, String),
 }
 
 #[derive(Debug, Default)]
@@ -56,11 +58,86 @@ impl StatusService {
     }
 
     pub fn snapshot(&self) -> StatusResponse {
+        self.snapshot_for(false)
+    }
+
+    pub(super) fn snapshot_for(&self, remote: bool) -> StatusResponse {
+        let metadata = remote.then(|| self.metadata());
         let state = self.snapshot.read().expect("状态锁不应中毒");
+        Self::snapshot_from(&state, metadata.as_deref())
+    }
+
+    fn snapshot_from(
+        state: &Snapshot,
+        metadata: Option<&[StatusModuleMetadata]>,
+    ) -> StatusResponse {
+        let (status, updated_at) = match metadata {
+            None => (state.values.clone(), state.updated_at),
+            Some(metadata) => {
+                let mut updated_at = None;
+                let status = state
+                    .values
+                    .iter()
+                    .filter_map(|(module_id, values)| {
+                        let (visible, module_updated_at) =
+                            Self::visible_module_values(state, module_id, values, Some(metadata));
+                        updated_at = updated_at.max(module_updated_at);
+                        (!visible.is_empty()).then(|| (module_id.clone(), visible))
+                    })
+                    .collect();
+                (status, updated_at)
+            }
+        };
         StatusResponse {
             api_version: API_VERSION.to_owned(),
-            status: state.values.clone(),
-            updated_at: state.updated_at,
+            status,
+            updated_at,
+        }
+    }
+
+    fn visible_module_values(
+        state: &Snapshot,
+        module_id: &str,
+        values: &BTreeMap<String, Value>,
+        metadata: Option<&[StatusModuleMetadata]>,
+    ) -> (BTreeMap<String, Value>, Option<u64>) {
+        let mut updated_at = None;
+        let visible = values
+            .iter()
+            .filter(|(key, _)| {
+                metadata.is_none_or(|metadata| Self::allows_remote(metadata, module_id, key))
+            })
+            .map(|(key, value)| {
+                let timestamp = state.timestamps[&(module_id.to_owned(), key.clone())];
+                updated_at = updated_at.max(Some(timestamp));
+                (key.clone(), value.clone())
+            })
+            .collect();
+        (visible, updated_at)
+    }
+
+    fn allows_remote(metadata: &[StatusModuleMetadata], module_id: &str, key: &str) -> bool {
+        metadata
+            .iter()
+            .find(|module| module.id == module_id)
+            .and_then(|module| module.items.iter().find(|item| item.key == key))
+            .is_some_and(|item| item.remote_access)
+    }
+
+    pub(super) fn require_remote_access(
+        &self,
+        module_id: &str,
+        key: &str,
+    ) -> Result<(), StatusError> {
+        Self::valid_name(module_id)?;
+        Self::valid_name(key)?;
+        if Self::allows_remote(&self.metadata(), module_id, key) {
+            Ok(())
+        } else {
+            Err(StatusError::RemoteAccessForbidden(
+                module_id.to_owned(),
+                key.to_owned(),
+            ))
         }
     }
 
@@ -83,21 +160,29 @@ impl StatusService {
     }
 
     pub fn module_value(&self, module_id: &str) -> Result<StatusModuleResponse, StatusError> {
+        self.module_value_for(module_id, false)
+    }
+
+    pub(super) fn module_value_for(
+        &self,
+        module_id: &str,
+        remote: bool,
+    ) -> Result<StatusModuleResponse, StatusError> {
         Self::valid_name(module_id)?;
+        let metadata = remote.then(|| self.metadata());
         let state = self.snapshot.read().expect("状态锁不应中毒");
         let values = state
             .values
             .get(module_id)
             .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
-        let updated_at = values
-            .keys()
-            .map(|key| state.timestamps[&(module_id.to_owned(), key.clone())])
-            .max()
-            .expect("已发布模块至少包含一个状态项");
+        let (value, updated_at) =
+            Self::visible_module_values(&state, module_id, values, metadata.as_deref());
+        let updated_at =
+            updated_at.ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
         Ok(StatusModuleResponse {
             api_version: API_VERSION.to_owned(),
             module_id: module_id.to_owned(),
-            value: values.clone(),
+            value,
             updated_at,
         })
     }
@@ -172,6 +257,14 @@ impl StatusService {
 
     pub fn publish_many(&self, values: StatusValues) -> Result<StatusResponse, StatusError> {
         Self::validate_names(&values)?;
+        Ok(self.publish_batch(values, None))
+    }
+
+    fn publish_batch(
+        &self,
+        values: StatusValues,
+        metadata: Option<&[StatusModuleMetadata]>,
+    ) -> StatusResponse {
         let mut state = self.snapshot.write().expect("状态锁不应中毒");
         let now = Self::now();
         for (module, items) in values {
@@ -179,17 +272,21 @@ impl StatusService {
                 Self::put(&mut state, module.clone(), key, value, now);
             }
         }
-        Ok(StatusResponse {
-            api_version: API_VERSION.to_owned(),
-            status: state.values.clone(),
-            updated_at: state.updated_at,
-        })
+        Self::snapshot_from(&state, metadata)
     }
 
     /// 外部上报使用声明结构严格校验，整批通过后才更新共享状态。
     pub fn publish_many_validated(
         &self,
         values: StatusValues,
+    ) -> Result<StatusResponse, StatusError> {
+        self.publish_many_validated_for(values, false)
+    }
+
+    pub(crate) fn publish_many_validated_for(
+        &self,
+        values: StatusValues,
+        remote: bool,
     ) -> Result<StatusResponse, StatusError> {
         Self::validate_names(&values)?;
         let metadata = self.metadata();
@@ -202,10 +299,16 @@ impl StatusService {
                         module_id: module_id.clone(),
                         key: key.clone(),
                     })?;
+                if remote && !item.remote_access {
+                    return Err(StatusError::RemoteAccessForbidden(
+                        module_id.clone(),
+                        key.clone(),
+                    ));
+                }
                 super::validation::validate(&item.schema, value, &format!("{module_id}/{key}"))?;
             }
         }
-        self.publish_many(values)
+        Ok(self.publish_batch(values, remote.then_some(metadata.as_slice())))
     }
 
     fn validate_names(values: &StatusValues) -> Result<(), StatusError> {

@@ -18,6 +18,7 @@ fn network_config_metadata() -> ConfigModuleMetadata {
                     "中转服务器的完整 HTTP(S) URL；地址和令牌都非空时注册，缺少任意一项视为未配置。"
                         .to_owned(),
                 data_type: ConfigDataType::String,
+                remote_access: crate::modules::config::model::ConfigRemoteAccess::Read,
                 required: false,
                 default: Some(Value::String(String::new())),
                 dictionary: None,
@@ -32,6 +33,7 @@ fn network_config_metadata() -> ConfigModuleMetadata {
                 description: "与中转服务器约定的共享访问令牌；与地址一起生效，留空断开中转连接。"
                     .to_owned(),
                 data_type: ConfigDataType::String,
+                remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                 required: false,
                 default: Some(Value::String(String::new())),
                 dictionary: None,

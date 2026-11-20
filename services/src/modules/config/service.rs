@@ -73,6 +73,8 @@ pub enum ConfigServiceError {
     ItemNotFound { module_id: String, key: String },
     #[error("配置项 {module_id}/{key} 尚未设置")]
     ValueNotSet { module_id: String, key: String },
+    #[error("配置项 {module_id}/{key} 不允许此远端操作")]
+    RemoteAccessForbidden { module_id: String, key: String },
     #[error("配置值无效：{0}")]
     InvalidValue(String),
     #[error("配置文件读写失败：{0}")]
@@ -168,6 +170,14 @@ impl ConfigService {
         &self,
         module_id: &str,
     ) -> Result<BTreeMap<String, ConfigValue>, ConfigServiceError> {
+        self.module_values_for(module_id, false).await
+    }
+
+    pub(super) async fn module_values_for(
+        &self,
+        module_id: &str,
+        remote: bool,
+    ) -> Result<BTreeMap<String, ConfigValue>, ConfigServiceError> {
         let metadata = self.module_metadata(module_id).await?;
         let user_values = self
             .values
@@ -177,7 +187,11 @@ impl ConfigService {
             .cloned()
             .unwrap_or_default();
         let mut resolved = BTreeMap::new();
-        for item in metadata.items {
+        for item in metadata
+            .items
+            .into_iter()
+            .filter(|item| !remote || item.remote_access.allows_read())
+        {
             if let Some(value) = self
                 .resolve_value(&item, user_values.get(&item.key))
                 .await?
@@ -186,6 +200,28 @@ impl ConfigService {
             }
         }
         Ok(resolved)
+    }
+
+    pub(super) async fn require_remote_access(
+        &self,
+        module_id: &str,
+        key: &str,
+        write: bool,
+    ) -> Result<(), ConfigServiceError> {
+        let metadata = self.module_metadata(module_id).await?;
+        let item = metadata
+            .item(key)
+            .ok_or_else(|| ConfigServiceError::ItemNotFound {
+                module_id: module_id.to_owned(),
+                key: key.to_owned(),
+            })?;
+        if !item.remote_access.allows_read() || (write && !item.remote_access.allows_write()) {
+            return Err(ConfigServiceError::RemoteAccessForbidden {
+                module_id: module_id.to_owned(),
+                key: key.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn value(
@@ -598,6 +634,7 @@ mod tests {
                     name: "配置 A".to_owned(),
                     description: "字符串配置".to_owned(),
                     data_type: ConfigDataType::String,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: true,
                     default: Some(json!("默认值")),
                     dictionary: None,
@@ -611,6 +648,7 @@ mod tests {
                     name: "配置 B".to_owned(),
                     description: "字典配置".to_owned(),
                     data_type: ConfigDataType::Dictionary,
+                    remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                     required: false,
                     default: None,
                     dictionary: None,

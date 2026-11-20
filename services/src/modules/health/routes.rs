@@ -17,6 +17,7 @@ pub fn router(runtime: Arc<RuntimeState>) -> Router {
     id = "healthz",
     method = "GET",
     path = "/healthz",
+    access = "paired",
     summary = "读取服务健康状态",
     description = "返回服务名称、版本和运行时间。"
 )]

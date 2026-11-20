@@ -6,11 +6,14 @@ use super::{
     },
     service::StatusError,
 };
-use crate::http::error::{ErrorSource, response};
+use crate::{
+    http::error::{ErrorSource, response},
+    modules::network::remote::is_remote,
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::get,
 };
@@ -32,13 +35,24 @@ pub fn router(service: Arc<StatusService>) -> Router {
     id = "meta",
     method = "GET",
     path = "/stats/meta",
+    access = "paired",
     summary = "获取全部状态数据结构",
     description = "返回各模块静态声明的状态项、嵌套字段、类型、可空性和枚举值，不包含运行时数据；未发布状态也提供完整元数据。"
 )]
-async fn metadata(State(service): State<Arc<StatusService>>) -> Json<StatusMetaResponse> {
+async fn metadata(
+    State(service): State<Arc<StatusService>>,
+    headers: HeaderMap,
+) -> Json<StatusMetaResponse> {
+    let mut modules = service.metadata();
+    if is_remote(&headers) {
+        for module in &mut modules {
+            module.items.retain(|item| item.remote_access);
+        }
+        modules.retain(|module| !module.items.is_empty());
+    }
     Json(StatusMetaResponse {
         api_version: API_VERSION.to_owned(),
-        modules: service.metadata(),
+        modules,
     })
 }
 
@@ -47,11 +61,15 @@ async fn metadata(State(service): State<Arc<StatusService>>) -> Json<StatusMetaR
     id = "snapshot",
     method = "GET",
     path = "/status",
+    access = "paired",
     summary = "读取全部状态",
     description = "返回各发布方最后设置的模块/数据项快照；只读内存，不连接业务程序。"
 )]
-async fn snapshot(State(service): State<Arc<StatusService>>) -> Json<StatusResponse> {
-    Json(service.snapshot())
+async fn snapshot(
+    State(service): State<Arc<StatusService>>,
+    headers: HeaderMap,
+) -> Json<StatusResponse> {
+    Json(service.snapshot_for(is_remote(&headers)))
 }
 
 #[loki_api(
@@ -59,15 +77,17 @@ async fn snapshot(State(service): State<Arc<StatusService>>) -> Json<StatusRespo
     id = "module-value",
     method = "GET",
     path = "/status/{module_id}",
+    access = "paired",
     summary = "读取模块完整状态",
     description = "返回指定模块的完整状态对象及最后更新时间；service 对象直接包含 start_at，不增加节点层级。"
 )]
 async fn module_value(
     State(service): State<Arc<StatusService>>,
     Path(module): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<StatusModuleResponse>, Response> {
     service
-        .module_value(&module)
+        .module_value_for(&module, is_remote(&headers))
         .map(Json)
         .map_err(error_response)
 }
@@ -77,13 +97,20 @@ async fn module_value(
     id = "value",
     method = "GET",
     path = "/status/{module_id}/{key}",
+    access = "paired",
     summary = "读取指定状态",
     description = "返回指定模块/数据项的 value 与最后更新时间，未发布时返回 404 status-not-found。"
 )]
 async fn value(
     State(service): State<Arc<StatusService>>,
     Path((module, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<StatusValueResponse>, Response> {
+    if is_remote(&headers) {
+        service
+            .require_remote_access(&module, &key)
+            .map_err(error_response)?;
+    }
     service
         .value(&module, &key)
         .map(Json)
@@ -95,13 +122,20 @@ async fn value(
     id = "path-value",
     method = "GET",
     path = "/status/{module_id}/{key}/{*path}",
+    access = "paired",
     summary = "读取层级状态字段",
     description = "按 module/key/field/path 层级读取 object 或 array 中的字段，避免在状态接口路径和响应约定中使用点号。"
 )]
 async fn path_value(
     State(service): State<Arc<StatusService>>,
     Path((module, key, path)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<StatusPathResponse>, Response> {
+    if is_remote(&headers) {
+        service
+            .require_remote_access(&module, &key)
+            .map_err(error_response)?;
+    }
     service
         .path_value(&module, &key, &path)
         .map(Json)
@@ -111,6 +145,9 @@ async fn path_value(
 fn error_response(error: StatusError) -> Response {
     let (status, code) = match &error {
         StatusError::NotFound(..) => (StatusCode::NOT_FOUND, "status-not-found"),
+        StatusError::RemoteAccessForbidden(..) => {
+            (StatusCode::FORBIDDEN, "remote-status-forbidden")
+        }
         _ => (StatusCode::BAD_REQUEST, "invalid-request"),
     };
     response(status, ErrorSource::Business, code, error.to_string())

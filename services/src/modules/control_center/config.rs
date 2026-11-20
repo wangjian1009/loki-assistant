@@ -15,6 +15,7 @@ fn control_center_metadata() -> ConfigModuleMetadata {
             name: "登录时自动启动".to_owned(),
             description: "登录 macOS 后自动启动菜单栏程序；系统操作成功后才保存。".to_owned(),
             data_type: ConfigDataType::Boolean,
+            remote_access: crate::modules::config::model::ConfigRemoteAccess::ReadWrite,
             required: false,
             default: Some(Value::Bool(false)),
             dictionary: None,
