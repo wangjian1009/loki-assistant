@@ -46,8 +46,8 @@ install: build
 run:
 	@set --; \
 	  if [ -n "$$PAGE" ]; then \
-	    printf '%s\n' "$$PAGE" | grep -Eq '^(Index|Settings)(,(Index|Settings))*$$' || { \
-	      echo 'PAGE 可指定 Index、Settings 或逗号分隔的页面路径，例如 Index,Settings' >&2; exit 1; \
+	    printf '%s\n' "$$PAGE" | grep -Eq '^(Index|Devices|Settings)(,(Index|Devices|Settings))*$$' || { \
+	      echo 'PAGE 可指定 Index、Devices、Settings 或逗号分隔的页面路径，例如 Index,Settings' >&2; exit 1; \
 	    }; \
 	    set -- "$$@" --ps page "$$PAGE"; \
 	  fi; \
@@ -85,7 +85,7 @@ help:
 	  'make build    构建 Debug HAP，使用 OrgTasksDebug 调试签名' \
 	  'make test     检查并测试手机应用层与 Rust 网络模块' \
 	  'make install  安装到已连接的 HarmonyOS 设备' \
-	  'make run      启动手机应用，可指定 PAGE=Settings 或 PAGE=Index,Settings' \
+	  'make run      启动手机应用，可指定 PAGE=Devices 或 PAGE=Index,Settings' \
 	  'HTTP_API_ENABLED=true/false 可开启或关闭当前 Debug 会话的 HTTP 服务' \
 	  'make deploy   检查真机，构建、安装并启动' \
 	  'make devices  查看 hdc 设备' \

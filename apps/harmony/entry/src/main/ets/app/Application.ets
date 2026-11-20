@@ -101,7 +101,9 @@ export class Application {
       ids.push(computer.endpoint_id)
     }
     if (state.selected_endpoint_id && !ids.includes(state.selected_endpoint_id)) { throw new Error('选中的电脑记录不存在') }
-    if (!state.selected_endpoint_id && state.computers.length === 1) { state.selected_endpoint_id = state.computers[0].endpoint_id }
+    if (input.selected_endpoint_id === undefined && state.computers.length === 1) {
+      state.selected_endpoint_id = state.computers[0].endpoint_id
+    }
     const selected = state.computers.find((computer: ComputerRecord) => computer.endpoint_id === state.selected_endpoint_id)
     if (selected) { await this.workspace.network.setService(this.service(selected)) }
     this.endpointId = stored.endpoint_id
@@ -132,7 +134,7 @@ export class Application {
         bound_at: computer.binding.status === 'bound' ? computer.binding.credential.bound_at : null,
         status: failed ? 'binding_failed' : active && computer.binding.status === 'binding' ? 'binding' : 'offline',
         detail: failed ? `${bindingError?.message}；${BINDING_FAILED_DETAIL}` : active && computer.binding.status === 'binding' ?
-          '正在与电脑建立绑定' : active ? '等待检查电脑状态' : '左右滑动到此设备以连接',
+          '正在与电脑建立绑定' : active ? '等待检查电脑状态' : '选择此电脑以连接',
         checked_at: 0, active: active, binding_error: bindingError
       }
     })

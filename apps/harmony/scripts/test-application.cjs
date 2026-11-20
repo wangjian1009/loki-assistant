@@ -129,6 +129,15 @@ test('冷启动只加载末级页面，多级返回按需加载父页并复用�
   assert.equal(await navigator.setPath(settingsPath), NavigationResult.Ok);
   assert.deepEqual(navigator.snapshot(), settingsPath);
   assert.deepEqual(operations.slice(5), [['replace', 'pages/Settings']]);
+
+  const devicesPath = { pages: [{ url: PageName.Index }, { url: PageName.Devices }] };
+  assert.deepEqual(launchPath({ parameters: { page: 'Index,Devices' } }, false), devicesPath);
+  assert.deepEqual(parseNavigationPath('{"pages":[{"url":"Index"},{"url":"Devices"}]}'), devicesPath);
+  assert.equal(await navigator.openSection(PageName.Devices), NavigationResult.Ok);
+  assert.deepEqual(navigator.snapshot(), devicesPath);
+  assert.equal(await navigator.back(), NavigationResult.Ok);
+  assert.deepEqual(navigator.snapshot(), home);
+  assert.deepEqual(operations.slice(6), [['replace', 'pages/Devices'], ['replace', 'pages/Index']]);
 });
 
 test('应用保存多台电脑，Network 只恢复选中的一个目标', async () => {
@@ -186,6 +195,13 @@ test('未选择的旧多设备记录不自动连接，损坏凭据不覆盖', as
   let fixtureState = fixture({ computers: [record(1), record(2)] }); let { app, workspace } = fixtureState.create();
   assert.ok((await app.list()).every(view => view.status === 'offline'));
   assert.equal(await workspace.network.service(), null); assert.equal(fixtureState.control.writes, 0);
+  fixtureState = fixture({ computers: [record(1)], selected_endpoint_id: null });
+  ({ app, workspace } = fixtureState.create());
+  assert.equal((await app.list())[0].active, false);
+  assert.equal(await workspace.network.service(), null);
+  fixtureState = fixture({ computers: [record(1)] });
+  ({ app } = fixtureState.create());
+  assert.equal((await app.list())[0].active, true);
   const invalid = record(1); invalid.binding = { status: 'bound' };
   fixtureState = fixture({ computers: [invalid] }); ({ app } = fixtureState.create());
   await assert.rejects(app.list(), /绑定凭据已损坏/); assert.equal(fixtureState.control.writes, 0);

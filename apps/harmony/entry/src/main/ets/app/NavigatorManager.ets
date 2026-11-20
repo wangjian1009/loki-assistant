@@ -3,6 +3,7 @@ import { Router, window } from '@kit.ArkUI'
 
 export enum PageName {
   Index = 'Index',
+  Devices = 'Devices',
   Settings = 'Settings'
 }
 
@@ -23,6 +24,7 @@ export enum NavigationResult {
 
 function pageName(value: Object | undefined): PageName | undefined {
   if (value === PageName.Index) return PageName.Index
+  if (value === PageName.Devices) return PageName.Devices
   if (value === PageName.Settings) return PageName.Settings
   return undefined
 }
@@ -131,6 +133,12 @@ export class NavigatorManager {
       this.path = { pages: this.path.pages.concat([{ url: page }]) }
       this.nativeDepth++
     })
+  }
+
+  openSection(page: PageName): Promise<NavigationResult> {
+    const pages: PageRoute[] = [{ url: PageName.Index }]
+    if (page !== PageName.Index) pages.push({ url: page })
+    return this.setPath({ pages })
   }
 
   canGoBack(): boolean {
