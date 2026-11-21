@@ -2,21 +2,15 @@ use std::{
     collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
 };
 
-use axum::{
-    Router,
-    extract::{Request, State},
-    http::{HeaderValue, header::CACHE_CONTROL},
-    response::{IntoResponse, Response},
-    routing::any,
-};
+use axum::Router;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::{
     sync::{Mutex, Notify, RwLock, oneshot},
     task::JoinHandle,
 };
-use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
@@ -27,15 +21,15 @@ use crate::{
         },
         emacs::service::EmacsService,
         notification::NotificationService,
-        password::{config::PasswordConfig, service::PasswordService},
+        password::service::{PasswordService, validate_file},
         status::StatusService,
     },
     runtime::ServicePfile,
 };
 
 use super::{
-    password::{SlackPasswords, validate_file},
-    protocol::{Error, valid_id},
+    mailbox::{next_cursor, read_cursor},
+    protocol::{Error, Page},
     routes,
     service::SlackService,
     status::ProjectsStatus,
@@ -49,7 +43,7 @@ pub(super) struct Backend {
     pub api: String,
     pub client_id: Option<&'static str>,
     pub keychain: Arc<dyn Fn(String) -> Arc<dyn Keychain> + Send + Sync>,
-    pub passwords: Option<Arc<SlackPasswords>>,
+    pub passwords: Option<Arc<PasswordService>>,
     pub emacs: Option<Arc<EmacsService>>,
     pub open_browser: Arc<dyn Fn(String) -> BrowserFuture + Send + Sync>,
 }
@@ -61,6 +55,7 @@ pub(super) struct SlackTeam {
     pub legacy_id: Option<String>,
     pub team_id: Option<String>,
     pub password_id: Option<String>,
+    pub token: Option<String>,
 }
 
 pub(crate) fn valid_project(id: &str) -> bool {
@@ -69,6 +64,14 @@ pub(crate) fn valid_project(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+pub(super) fn valid_team_id(id: &str) -> bool {
+    (2..=48).contains(&id.len())
+        && id.starts_with('T')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 fn parse_projects(value: &Value) -> Result<BTreeMap<String, SlackTeam>, String> {
@@ -80,9 +83,7 @@ fn parse_projects(value: &Value) -> Result<BTreeMap<String, SlackTeam>, String> 
         let id = settings
             .team_id
             .as_ref()
-            .filter(|team| {
-                team.starts_with('T') && team.len() > 1 && valid_id(team) && valid_project(team)
-            })
+            .filter(|team| valid_team_id(team))
             .ok_or("Slack Team ID 无效。")?
             .clone();
         if settings.name.trim().is_empty() || settings.name.chars().count() > 80 {
@@ -112,7 +113,6 @@ fn default_password_id(project: &str) -> String {
 struct Project {
     settings: SlackTeam,
     service: Arc<SlackService>,
-    router: Router,
     worker: JoinHandle<()>,
 }
 
@@ -124,7 +124,8 @@ impl Drop for Project {
 
 struct TeamDraft {
     attempt: Uuid,
-    record: Value,
+    record: Option<Value>,
+    processing: bool,
     config: std::sync::Weak<ConfigService>,
     service: Arc<SlackService>,
     outcome: oneshot::Sender<Result<Value, ConfigServiceError>>,
@@ -159,10 +160,6 @@ impl Projects {
         passwords: Arc<PasswordService>,
         emacs: Arc<EmacsService>,
     ) -> Self {
-        let passwords = Arc::new(SlackPasswords::new(
-            PasswordConfig::new(config.clone()),
-            passwords,
-        ));
         Self::with_backend(
             config,
             notification,
@@ -195,7 +192,7 @@ impl Projects {
                         if status.is_some_and(|status| status.success()) {
                             Ok(())
                         } else {
-                            Err("无法打开 Slack 授权浏览器。".into())
+                            Err("无法打开 Slack 令牌导入页面。".into())
                         }
                     })
                 }),
@@ -224,9 +221,7 @@ impl Projects {
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
-        let router = crate::http::mount_routes(Router::new(), "team-management");
-        crate::http::mount_route_paths(router, &["team-authenticated", "team-oauth"], any(dispatch))
-            .with_state(Arc::clone(self))
+        routes::router(Arc::clone(self))
     }
 
     pub async fn run(self: Arc<Self>, port: u16) {
@@ -253,57 +248,300 @@ impl Projects {
         self.shutdown.notify_one();
     }
 
-    async fn finish_draft(&self, id: &str, service: &Arc<SlackService>) {
-        let mut drafts = self.drafts.lock().await;
-        if drafts
-            .get(id)
-            .is_none_or(|draft| !Arc::ptr_eq(&draft.service, service))
-        {
-            return;
+    pub(super) fn verify_local(&self, token: Option<&str>) -> Result<(), Error> {
+        let expected = self.local_token.get().ok_or(Error::Storage)?;
+        if token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(expected.as_bytes()))) {
+            Ok(())
+        } else {
+            Err(Error::LocalAuth)
         }
-        let draft = drafts.remove(id).expect("待授权工作区仍在初始请求中");
-        let outcome = async {
-            service
-                .authorization_result(draft.attempt)
+    }
+
+    pub(super) async fn service(&self, team_id: &str) -> Result<Arc<SlackService>, Error> {
+        self.projects
+            .read()
+            .await
+            .get(team_id)
+            .map(|project| Arc::clone(&project.service))
+            .ok_or(Error::Project)
+    }
+
+    async fn active_sessions(
+        &self,
+        team_id: Option<&str>,
+    ) -> Result<(Vec<(String, Arc<SlackService>, Uuid)>, String), Error> {
+        let services: Vec<_> = if let Some(team_id) = team_id {
+            vec![(team_id.to_owned(), self.service(team_id).await?)]
+        } else {
+            self.projects
+                .read()
                 .await
-                .ok_or_else(|| Self::rejected("teams", "Slack 授权还未完成。"))?
-                .map_err(|error| Self::slack_rejected("teams", error))?;
-            let mut record = draft.record;
-            let config = draft
-                .config
-                .upgrade()
-                .ok_or(ConfigServiceError::ActionNotFound)?;
-            let reference = service
-                .credential_id()
-                .await
-                .ok_or(ConfigServiceError::ActionNotFound)?;
-            record["oauth_credential_id"] = Value::String(reference);
-            config
-                .replace_record(
-                    "slack".into(),
-                    "teams".into(),
-                    id.into(),
-                    record,
-                    true,
-                    true,
-                )
-                .await
-        }
-        .await;
-        if outcome.is_err() {
-            let session = service
-                .state
-                .lock()
-                .await
-                .secrets
-                .account
-                .as_ref()
-                .map(|account| account.identity.session_id);
-            if let Some(session) = session {
-                let _ = service.disconnect(session).await;
+                .iter()
+                .map(|(id, project)| (id.clone(), Arc::clone(&project.service)))
+                .collect()
+        };
+        let mut sessions = Vec::new();
+        let mut fingerprint = Sha256::new();
+        for (id, service) in services {
+            if let Some(session) = service.session_id().await {
+                fingerprint.update(id.as_bytes());
+                fingerprint.update(session.as_bytes());
+                sessions.push((id, service, session));
             }
         }
-        let _ = draft.outcome.send(outcome);
+        Ok((sessions, format!("{:x}", fingerprint.finalize())))
+    }
+
+    pub(super) async fn users(&self, page: Page) -> Result<Value, Error> {
+        let limit = page.limit()?;
+        let (sessions, fingerprint) = self.active_sessions(None).await?;
+        let target = format!("users:{fingerprint}");
+        let anchor = read_cursor(&page, Uuid::nil(), &target)?;
+        let anchor = anchor.as_deref().unwrap_or_default();
+        let results = futures_util::future::join_all(
+            sessions
+                .iter()
+                .map(|(id, service, session)| async move { (id, service.users(*session).await) }),
+        )
+        .await;
+        let mut directories = Vec::new();
+        let mut issues = Vec::new();
+        let mut first_error = None;
+        for (id, result) in results {
+            match result {
+                Ok(users) => directories.push(users),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    issues.push(json!({"team_id":id,"error":error.object()}));
+                }
+            }
+        }
+        if directories.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
+        let mut users: Vec<_> = directories
+            .iter()
+            .flat_map(|directory| directory.iter())
+            .filter(|user| user.id.as_str() > anchor)
+            .collect();
+        users.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        let next_cursor = (users.len() > limit)
+            .then(|| next_cursor(Uuid::nil(), target, users[limit - 1].id.clone()));
+        users.truncate(limit);
+        Ok(json!({"api_version":"1","items":users,"next_cursor":next_cursor,"issues":issues}))
+    }
+
+    pub(super) async fn conversations(
+        &self,
+        team_id: Option<&str>,
+        page: Page,
+    ) -> Result<Value, Error> {
+        let limit = page.limit()?;
+        let unread = page.unread.unwrap_or_default();
+        let kind = page.kind.as_deref().unwrap_or_default();
+        if !matches!(
+            kind,
+            "" | "im" | "mpim" | "public_channel" | "private_channel"
+        ) {
+            return Err(Error::Invalid);
+        }
+        let (sessions, fingerprint) = self.active_sessions(team_id).await?;
+        if team_id.is_some() && sessions.is_empty() {
+            return Err(Error::Authorization);
+        }
+        let target = format!(
+            "conversations:{}:{kind}:{unread}:{fingerprint}",
+            team_id.unwrap_or_default()
+        );
+        // 排序键同时包含工作区和会话 ID，允许相同会话 ID 出现在不同工作区。
+        let anchor = read_cursor(&page, Uuid::nil(), &target)?
+            .map(|value| {
+                serde_json::from_str::<(Option<(u64, u32)>, String, String)>(&value)
+                    .map_err(|_| Error::Cursor)
+            })
+            .transpose()?;
+        let results = futures_util::future::join_all(sessions.iter().map(
+            |(id, service, session)| async move {
+                (id, service.conversation_rows(*session, unread, kind).await)
+            },
+        ))
+        .await;
+        let mut items = Vec::new();
+        let mut live = true;
+        let mut issues = Vec::new();
+        let mut first_error = None;
+        for (id, result) in results {
+            match result {
+                Ok((rows, connected)) => {
+                    live &= connected;
+                    items.extend(
+                        rows.into_iter()
+                            .map(|row| ((row.order, id, row.id), row.value)),
+                    );
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    issues.push(json!({"team_id":id,"error":error.object()}));
+                    live = false;
+                }
+            }
+        }
+        if issues.len() == sessions.len()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
+        let compare = |left: &(Option<(u64, u32)>, &String, String),
+                       right: &(Option<(u64, u32)>, &String, String)| {
+            right
+                .0
+                .cmp(&left.0)
+                .then(left.1.cmp(right.1))
+                .then(left.2.cmp(&right.2))
+        };
+        if let Some((order, team, conversation)) = anchor {
+            let anchor = (order, &team, conversation);
+            items.retain(|(key, _)| compare(key, &anchor).is_gt());
+        }
+        items.sort_by(|(left, _), (right, _)| compare(left, right));
+        let next_cursor = if items.len() > limit {
+            let key = serde_json::to_string(&items[limit - 1].0).expect("Slack 游标可序列化");
+            Some(next_cursor(Uuid::nil(), target, key))
+        } else {
+            None
+        };
+        let items: Vec<_> = items
+            .into_iter()
+            .take(limit)
+            .map(|(_, value)| value)
+            .collect();
+        Ok(
+            json!({"api_version":"1","items":items,"next_cursor":next_cursor,
+                  "sync_state":if live { "live" } else { "cached" },"issues":issues}),
+        )
+    }
+
+    pub(super) async fn callback(
+        &self,
+        host: &str,
+        state: &str,
+        code: Option<String>,
+        denied: bool,
+    ) -> Result<(), Error> {
+        let (team_id, _) = state.split_once('.').ok_or(Error::OAuthState)?;
+        self.service(team_id)
+            .await
+            .map_err(|_| Error::OAuthState)?
+            .callback(host, state, code, denied)
+            .await
+    }
+
+    pub(super) async fn accept_token(
+        &self,
+        team_id: &str,
+        attempt: Uuid,
+        token: String,
+    ) -> Result<(), Error> {
+        let (service, config, record) = {
+            let mut drafts = self.drafts.lock().await;
+            let draft = drafts
+                .get_mut(team_id)
+                .filter(|draft| draft.attempt == attempt && !draft.processing)
+                .ok_or(Error::ImportExpired)?;
+            draft.processing = true;
+            (
+                Arc::clone(&draft.service),
+                draft.config.clone(),
+                draft.record.take(),
+            )
+        };
+        let (outcome, failure) = match service.verify_user_token(&token).await {
+            Ok(identity) => {
+                let saved = async {
+                    let config = config.upgrade().ok_or(ConfigServiceError::ActionNotFound)?;
+                    config
+                        .save_record_password(
+                            "slack",
+                            "teams",
+                            team_id,
+                            "token",
+                            record,
+                            token.clone(),
+                        )
+                        .await
+                }
+                .await;
+                if saved.is_ok()
+                    && let Ok(current) = self.service(team_id).await
+                {
+                    // 等待启动时的凭据加载，随后安装已校验的令牌。
+                    current.initialize().await.ok();
+                    let _ = current.use_imported_token(token, identity).await;
+                }
+                let error = saved.as_ref().err().map(|_| Error::ImportSave);
+                (saved, error)
+            }
+            Err(error) => (Err(Self::slack_rejected("teams", error)), Some(error)),
+        };
+        if let Some(draft) = self.drafts.lock().await.remove(team_id) {
+            let _ = draft.outcome.send(outcome);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    async fn wait_import(
+        &self,
+        team_id: &str,
+        service: Arc<SlackService>,
+        config: std::sync::Weak<ConfigService>,
+        record: Option<Value>,
+    ) -> Result<Value, ConfigServiceError> {
+        let port = self
+            .port
+            .get()
+            .copied()
+            .ok_or(ConfigServiceError::ActionNotFound)?;
+        let (sender, mut receiver) = oneshot::channel();
+        let attempt = Uuid::new_v4();
+        {
+            let mut drafts = self.drafts.lock().await;
+            if drafts.contains_key(team_id) {
+                return Err(Self::rejected("teams", "这个工作区已有待完成的令牌导入。"));
+            }
+            drafts.insert(
+                team_id.into(),
+                TeamDraft {
+                    attempt,
+                    record,
+                    processing: false,
+                    config,
+                    service,
+                    outcome: sender,
+                },
+            );
+        }
+        let url = format!("http://127.0.0.1:{port}/slack/token-import?team={team_id}#{attempt}");
+        let failure = match (self.backend.open_browser)(url).await {
+            Ok(()) => match tokio::time::timeout(Duration::from_secs(600), &mut receiver).await {
+                Ok(result) => return result.map_err(|_| ConfigServiceError::ActionNotFound)?,
+                Err(_) => "等待 Slack 令牌导入超时。".into(),
+            },
+            Err(error) => error,
+        };
+        let mut drafts = self.drafts.lock().await;
+        if drafts
+            .get(team_id)
+            .is_some_and(|draft| draft.attempt == attempt && !draft.processing)
+        {
+            drafts.remove(team_id);
+            return Err(Self::rejected("teams", failure));
+        }
+        drop(drafts);
+        receiver
+            .await
+            .map_err(|_| ConfigServiceError::ActionNotFound)?
     }
 
     fn rejected(key: &str, message: impl Into<String>) -> ConfigServiceError {
@@ -321,18 +559,6 @@ impl Projects {
                 .as_str()
                 .unwrap_or("Slack 操作失败。"),
         )
-    }
-
-    async fn discard_draft(&self, id: &str, attempt: Uuid) -> bool {
-        let mut drafts = self.drafts.lock().await;
-        if drafts.get(id).is_some_and(|draft| draft.attempt == attempt) {
-            if let Some(draft) = drafts.remove(id) {
-                draft.service.retire().await;
-            }
-            true
-        } else {
-            false
-        }
     }
 
     async fn sync_projects(&self) -> Result<(), String> {
@@ -372,6 +598,7 @@ impl Projects {
                 generation,
                 Arc::clone(&self.status),
                 &self.backend,
+                Arc::clone(&self.config),
             ));
             self.status
                 .register(&id, generation, service.public_status().await);
@@ -380,7 +607,6 @@ impl Projects {
                 id,
                 Project {
                     settings,
-                    router: routes::router(Arc::clone(&service)),
                     service,
                     worker,
                 },
@@ -407,79 +633,42 @@ fn credential(value: Value) -> Result<Credential, String> {
 }
 
 impl ConfigChangeHandler for Projects {
+    fn record_creation_keys(&self) -> &'static [&'static str] {
+        &["teams"]
+    }
+
     fn prepare_record<'a>(
         &'a self,
-        field: &'a str,
+        _key: &'a str,
         instance: &'a str,
         value: Value,
         config: std::sync::Weak<ConfigService>,
     ) -> ActionFuture<'a> {
         Box::pin(async move {
-            if field != "team_id" {
-                return Err(ConfigServiceError::ActionNotFound);
-            }
             let settings = parse_projects(&serde_json::json!([value]))
                 .map_err(|message| Self::rejected("teams", message))?
                 .remove(instance)
                 .ok_or(ConfigServiceError::ActionNotFound)?;
-            let port = self
-                .port
-                .get()
-                .copied()
-                .ok_or(ConfigServiceError::ActionNotFound)?;
-            let (sender, mut receiver) = oneshot::channel();
-            let (attempt, data) = {
-                let mut drafts = self.drafts.lock().await;
-                if drafts.contains_key(instance) {
-                    return Err(Self::rejected("teams", "这个工作区已有待完成的授权。"));
-                }
-                let service = Arc::new(SlackService::for_project(
-                    Arc::clone(&self.notification),
-                    instance.to_owned(),
-                    settings,
-                    Uuid::new_v4(),
-                    Arc::clone(&self.status),
-                    &self.backend,
-                ));
-                service.set_port(port);
-                let (attempt, data) = service
-                    .begin_authorization()
-                    .await
-                    .map_err(|error| Self::slack_rejected("teams", error))?;
-                drafts.insert(
-                    instance.into(),
-                    TeamDraft {
-                        attempt,
-                        record: value,
-                        config,
-                        service,
-                        outcome: sender,
-                    },
-                );
-                (attempt, data)
-            };
-            let url = data["authorization_url"]
-                .as_str()
-                .expect("Slack 授权结果包含地址");
-            let failure = match (self.backend.open_browser)(url.to_owned()).await {
-                Ok(()) => match tokio::time::timeout(Duration::from_secs(600), &mut receiver).await
-                {
-                    Ok(result) => return result.map_err(|_| ConfigServiceError::ActionNotFound)?,
-                    Err(_) => "等待 Slack 授权超时。".into(),
-                },
-                Err(error) => error,
-            };
-            if self.discard_draft(instance, attempt).await {
-                Err(Self::rejected("teams", failure))
-            } else {
-                receiver
-                    .await
-                    .map_err(|_| ConfigServiceError::ActionNotFound)?
-            }
+            let service = Arc::new(SlackService::for_project(
+                Arc::clone(&self.notification),
+                instance.to_owned(),
+                settings,
+                Uuid::new_v4(),
+                Arc::clone(&self.status),
+                &self.backend,
+                Arc::clone(&self.config),
+            ));
+            self.wait_import(instance, service, config, Some(value))
+                .await
         })
     }
 
-    fn action<'a>(&'a self, action: &'a str, instance: &'a str) -> ActionFuture<'a> {
+    fn action<'a>(
+        &'a self,
+        action: &'a str,
+        instance: &'a str,
+        config: std::sync::Weak<ConfigService>,
+    ) -> ActionFuture<'a> {
         Box::pin(async move {
             let service = self
                 .projects
@@ -495,19 +684,8 @@ impl ConfigChangeHandler for Projects {
                     Ok(serde_json::json!({"valid":true,"message":"应用令牌可用。"}))
                 }
                 "authorize" => {
-                    let (attempt, data) = service.begin_authorization().await.map_err(rejected)?;
-                    let url = data["authorization_url"]
-                        .as_str()
-                        .expect("Slack 授权结果包含地址");
-                    if let Err(error) = (self.backend.open_browser)(url.to_owned()).await {
-                        service.cancel_authorization(attempt).await;
-                        return Err(Self::rejected(action, error));
-                    }
-                    if let Err(error) = service.wait_authorization(attempt).await {
-                        service.cancel_authorization(attempt).await;
-                        return Err(rejected(error));
-                    }
-                    Ok(serde_json::json!({"message":"Slack 授权成功。"}))
+                    self.wait_import(instance, service, config, None).await?;
+                    Ok(serde_json::json!({"message":"Slack 用户令牌已保存。"}))
                 }
                 _ => Err(ConfigServiceError::ActionNotFound),
             }
@@ -550,18 +728,8 @@ impl ConfigChangeHandler for Projects {
 
     fn authorize_secret<'a>(&'a self, bearer: Option<&'a str>) -> ChangeFuture<'a> {
         Box::pin(async move {
-            if self
-                .local_token
-                .get()
-                .zip(bearer)
-                .is_some_and(|(expected, provided)| {
-                    bool::from(expected.as_bytes().ct_eq(provided.as_bytes()))
-                })
-            {
-                Ok(())
-            } else {
-                Err("需要有效的本机凭据。".into())
-            }
+            self.verify_local(bearer)
+                .map_err(|_| "需要有效的本机凭据。".into())
         })
     }
 
@@ -596,113 +764,23 @@ impl ConfigChangeHandler for Projects {
     }
 }
 
-#[loki_services_macros::loki_api(
-    module = "slack",
-    id = "open-team",
-    method = "POST",
-    path = "/slack/teams/{team_id}/open",
-    mount = "Arc<Projects>",
-    mount_group = "team-management",
-    summary = "打开 Slack 工作区",
-    description = "用 Emacs 打开本机已配置的工作区。"
-)]
-async fn open_team(
-    State(projects): State<Arc<Projects>>,
-    axum::extract::Path(team_id): axum::extract::Path<String>,
-) -> Result<axum::Json<Value>, Error> {
-    if !valid_project(&team_id) || !projects.projects.read().await.contains_key(&team_id) {
-        return Err(Error::Project);
-    }
-    let emacs = projects.backend.emacs.as_ref().ok_or(Error::Unavailable)?;
-    // 工作区标识只允许字母、数字、连字符和下划线。
-    let script = format!(
-        r#"(progn
+impl Projects {
+    pub(super) async fn open(&self) -> Result<(), Error> {
+        let emacs = self.backend.emacs.as_ref().ok_or(Error::Unavailable)?;
+        let script = r#"(progn
  (require 'seq)
  (when (require 'loki-assistant-slack nil t)
    (let ((frame (or (and (display-graphic-p (selected-frame)) (selected-frame))
                     (seq-find #'display-graphic-p (frame-list))
                     (make-frame '((window-system . ns))))))
      (select-frame frame)
-     (loki-assistant-slack "{team_id}")
      (make-frame-visible frame)
      (select-frame-set-input-focus frame)
-     t)))"#
-    );
-    match emacs.eval(&script).await {
-        Ok(value) if value == "t" => Ok(axum::Json(
-            serde_json::json!({"api_version":"1","opened":true}),
-        )),
-        _ => Err(Error::Unavailable),
-    }
-}
-
-async fn dispatch(State(projects): State<Arc<Projects>>, request: Request) -> Response {
-    let uri = request.uri();
-    let callback = uri.path() == "/slack/oauth/callback";
-    let callback_project = callback
-        .then(|| {
-            url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
-                .find(|(key, _)| key == "state")
-                .and_then(|(_, value)| value.split_once('.').map(|(id, _)| id.to_owned()))
-        })
-        .flatten();
-    if let Some(id) = callback_project.as_deref() {
-        let candidate = projects
-            .drafts
-            .lock()
-            .await
-            .get(id)
-            .map(|draft| Arc::clone(&draft.service));
-        if let Some(service) = candidate {
-            // OAuth code 是一次性的。浏览器关闭时也需要完成已收到的回调。
-            let id = id.to_owned();
-            return tokio::spawn(async move {
-                let response = routes::router(Arc::clone(&service))
-                    .oneshot(request)
-                    .await
-                    .expect("Axum 路由不可失败");
-                if response.status().is_redirection() {
-                    projects.finish_draft(&id, &service).await;
-                }
-                response
-            })
-            .await
-            .unwrap_or_else(|_| Error::Unavailable.into_response());
+     (run-at-time 0 nil #'loki-assistant-slack)
+     t)))"#;
+        match emacs.eval(script).await {
+            Ok(value) if value == "t" => Ok(()),
+            _ => Err(Error::Unavailable),
         }
     }
-    if uri.path() == "/slack/oauth/result" {
-        return axum::response::Html("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>Slack 授权</title><p>请返回配置界面查看 Slack 授权结果。</p></html>").into_response();
-    }
-    let assigned = request.headers().get("x-loki-slack-project");
-    let active = projects.projects.read().await;
-    let project = if uri.path() == "/slack/oauth/result" {
-        active.values().next()
-    } else if callback {
-        callback_project.as_deref().and_then(|id| active.get(id))
-    } else if let Some(assigned) = assigned {
-        assigned.to_str().ok().and_then(|id| active.get(id))
-    } else {
-        active.get("default").or_else(|| {
-            if active.len() == 1 {
-                active.values().next()
-            } else {
-                None
-            }
-        })
-    };
-    let router = project.map(|project| project.router.clone());
-    drop(active);
-    if let Some(router) = router {
-        return router.oneshot(request).await.expect("Axum 路由不可失败");
-    }
-    let mut response = if callback {
-        Error::OAuthState
-    } else {
-        Error::Project
-    }
-    .into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
 }

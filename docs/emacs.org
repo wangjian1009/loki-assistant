@@ -21,11 +21,11 @@
 
 每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
 
-* Slack 私信
+* Slack 聊天
 
-~M-x loki-assistant-config~ 在 Slack 分组内按 Metadata 显示工作区列表、表单和操作按钮。保存新工作区时会打开浏览器授权。授权成功后，可在该行检查已有 pass 令牌或录入应用令牌。Slack 会话界面显示授权和连接状态。 [[file:slack-integration.org::*首次配置与使用][Slack 配置与使用]]
+~M-x loki-assistant-config~ 在 Slack 分组内按 Metadata 显示工作区列表、表单和操作按钮。保存新工作区时会打开浏览器授权。授权成功后，可在该行检查已有 pass 令牌或录入应用令牌。授权和连接状态由状态中心提供。 [[file:slack.org::*工作区配置][Slack 配置与使用]]
 
-~M-x loki-assistant-slack~ 打开会话列表，前缀键映射中的 ~s~ 也可进入。按 ~P~ 切换项目，~u~ 切换未读或全部会话，~RET~ 查看聊天，~t~ 展开线程，~r~ 起草，~C-c C-c~ 发送，~m~ 更新本机已读位置。
+~M-x loki-assistant-slack~ 或前缀键映射中的 ~s~ 使用 Consult 搜索联系人和频道。按 ~RET~ 打开所选聊天。聊天中按 ~t~ 打开线程，~r~ 起草，~C-c C-c~ 发送，~m~ 更新本机已读位置。
 
 * 设备管理
 
@@ -121,7 +121,7 @@ org-roam 索引，索引失败会在 Emacs 中保留错误状态并提示处理�
 | g / 刷新 | 重新读取全部元数据和实例；有未保存输入时先确认丢弃 |
 | q | 退出当前配置窗口，buffer 中的输入保留 |
 
-配置由 services 保存到 ~~/.assistant/config.yml~ ，不写入 Emacs ~custom-file~ 。保存成功后使用服务端响应更新值和来源；错误在对应项旁标红并保留输入。程序查找、类型和业务校验以 services 为准；提交时再次校验，不把预检成功当作保存成功。保存期间继续输入的内容会保留，不被旧响应覆盖。接口协议见 [[file:control-center-services.org::*配置中心][配置中心]]。
+配置由 services 保存到 ~~/.assistant/config.yml~ ，不写入 Emacs ~custom-file~ 。保存成功后使用服务端响应更新值和来源；错误在对应项旁标红并保留输入。程序查找、类型和业务校验以 services 为准；提交时再次校验，不把预检成功当作保存成功。保存期间继续输入的内容会保留，不被旧响应覆盖。接口协议见 [[file:config-module.org][配置中心]]。
 
 执行期间，配置项显示“正在校验…”或“正在执行并保存，请稍候…”及已等待秒数，每秒更新；对应操作按钮和刷新、批量保存按钮禁用，输入框仍可编辑。执行完成后恢复按钮：成功显示“保存成功”并更新来源和保存基线；失败在配置项和顶部标红显示服务端原因，保留原保存值及当前输入，可修复后重试。保存期间产生的新输入不会被旧响应覆盖，成功后仍提示有新编辑尚未保存。批量保存显示当前项与进度，失败时停止，已成功项保留。
 

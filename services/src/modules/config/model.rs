@@ -162,8 +162,8 @@ pub struct StructureField {
     pub checker: Option<CheckerMetadata>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
-    #[serde(skip)]
-    pub handle_creation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_path: Option<String>,
     pub options: Option<FieldOptions>,
 }
 

@@ -7,6 +7,8 @@ use regex::Regex;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::modules::password::service::{PasswordError, PasswordService, validate_file};
+
 use super::{
     model::{
         ActionInteraction, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
@@ -23,6 +25,7 @@ pub struct ConfigService {
     changes: broadcast::Sender<ConfigChange>,
     commits: Arc<Mutex<()>>,
     handlers: HashMap<String, Arc<dyn ConfigChangeHandler>>,
+    passwords: Option<Arc<PasswordService>>,
     storage: Option<FileStorage>,
     executable_search_path: Vec<PathBuf>,
 }
@@ -43,16 +46,37 @@ pub enum ConfigChangeOperation {
     Replace,
     Merge,
     Append,
+    Remove,
     AuthorizedCreate,
 }
 
 pub type ChangeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type ProcessFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 pub type ActionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, ConfigServiceError>> + Send + 'a>>;
 
 /// 提交前处理配置变化；不得递归提交配置。失败时处理器负责撤销自身的部分操作。
 pub trait ConfigChangeHandler: Debug + Send + Sync {
-    fn handle(&self, change: ConfigChange) -> ChangeFuture<'_>;
+    fn handle(&self, _change: ConfigChange) -> ChangeFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// 返回应保存的完整配置值。现有校验处理器可继续实现 handle。
+    fn process<'a>(&'a self, change: ConfigChange) -> ProcessFuture<'a> {
+        Box::pin(async move {
+            let value = change.value.clone();
+            self.handle(change).await?;
+            Ok(value)
+        })
+    }
+
+    fn append_records<'a>(&'a self, change: ConfigChange) -> ProcessFuture<'a> {
+        self.process(change)
+    }
+
+    fn remove_records<'a>(&'a self, change: ConfigChange) -> ProcessFuture<'a> {
+        self.process(change)
+    }
 
     fn secret_is_set<'a>(
         &'a self,
@@ -73,13 +97,23 @@ pub trait ConfigChangeHandler: Debug + Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    fn action<'a>(&'a self, _action: &'a str, _instance: &'a str) -> ActionFuture<'a> {
+    fn action<'a>(
+        &'a self,
+        _action: &'a str,
+        _instance: &'a str,
+        _config: std::sync::Weak<ConfigService>,
+    ) -> ActionFuture<'a> {
         Box::pin(async { Err(ConfigServiceError::ActionNotFound) })
+    }
+
+    /// 注册需要由模块处理新增的配置项。
+    fn record_creation_keys(&self) -> &'static [&'static str] {
+        &[]
     }
 
     fn prepare_record<'a>(
         &'a self,
-        _field: &'a str,
+        _key: &'a str,
         _instance: &'a str,
         _value: Value,
         _config: std::sync::Weak<ConfigService>,
@@ -201,6 +235,11 @@ impl ConfigService {
         self
     }
 
+    pub(crate) fn with_password_service(mut self, passwords: Arc<PasswordService>) -> Self {
+        self.passwords = Some(passwords);
+        self
+    }
+
     pub fn with_executable_search_path(mut self, paths: Vec<PathBuf>) -> Self {
         self.executable_search_path = paths;
         self
@@ -218,6 +257,7 @@ impl ConfigService {
             changes,
             commits: Arc::new(Mutex::new(())),
             handlers: HashMap::new(),
+            passwords: None,
             storage: None,
             executable_search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
@@ -230,7 +270,7 @@ impl ConfigService {
     }
 
     pub async fn action(
-        &self,
+        self: &Arc<Self>,
         module: &str,
         action: &str,
         instance: &str,
@@ -254,7 +294,9 @@ impl ConfigService {
             .authorize_secret(bearer)
             .await
             .map_err(|_| ConfigServiceError::SecretUnauthorized)?;
-        handler.action(&action.id, instance).await
+        handler
+            .action(&action.id, instance, Arc::downgrade(self))
+            .await
     }
 
     pub async fn module_values(
@@ -425,10 +467,10 @@ impl ConfigService {
             .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
     }
 
-    pub(super) async fn creation_field(&self, module: &str, key: &str) -> Option<String> {
-        let metadata = self.module_metadata(module).await.ok()?;
-        metadata.item(key)?;
-        Some(item_options(module, key).creation_field()?.to_owned())
+    pub(super) fn has_record_creation_handler(&self, module: &str, key: &str) -> bool {
+        self.handlers
+            .get(module)
+            .is_some_and(|handler| handler.record_creation_keys().contains(&key))
     }
 
     pub(super) async fn prepare_record(
@@ -512,11 +554,8 @@ impl ConfigService {
                 key: key.into(),
                 message,
             })?;
-        let field = options
-            .creation_field()
-            .ok_or(ConfigServiceError::ActionNotFound)?;
         handler
-            .prepare_record(field, instance, record, Arc::downgrade(self))
+            .prepare_record(key, instance, record, Arc::downgrade(self))
             .await
     }
 
@@ -529,6 +568,85 @@ impl ConfigService {
         create_only: bool,
         authorized: bool,
     ) -> Result<Value, ConfigServiceError> {
+        self.replace_record_inner(
+            module_id,
+            key,
+            instance,
+            Some(value),
+            create_only,
+            authorized,
+            None,
+        )
+        .await
+    }
+
+    /// 将已经由所属模块验证的凭据写入此字段注册的密码条目。
+    pub(crate) async fn save_record_password(
+        &self,
+        module: &str,
+        key: &str,
+        instance: &str,
+        field: &str,
+        new_record: Option<Value>,
+        secret: String,
+    ) -> Result<Value, ConfigServiceError> {
+        let create_only = new_record.is_some();
+        self.replace_record_inner(
+            module.to_owned(),
+            key.to_owned(),
+            instance.to_owned(),
+            new_record,
+            create_only,
+            true,
+            Some((field.to_owned(), secret)),
+        )
+        .await
+    }
+
+    /// 从已保存记录对应的密码条目读取凭据，供模块内部使用。
+    pub(crate) async fn read_record_password(
+        &self,
+        module: &str,
+        key: &str,
+        instance: &str,
+        field: &str,
+    ) -> Result<String, ConfigServiceError> {
+        let options = item_options(module, key);
+        let id_field = options
+            .structure
+            .as_ref()
+            .and_then(|value| value.id_field.as_ref())
+            .ok_or(ConfigServiceError::ActionNotFound)?;
+        let path = options.password_path(field, instance)?;
+        let data = self.value(module, key).await?;
+        if !data.value.as_array().is_some_and(|records| {
+            records.iter().any(|record| {
+                record[id_field].as_str() == Some(instance)
+                    && record[field].as_str() == Some(path.as_str())
+            })
+        }) {
+            return Err(ConfigServiceError::ActionNotFound);
+        }
+        self.passwords
+            .as_ref()
+            .ok_or_else(|| ConfigServiceError::Storage("密码模块不可用。".into()))?
+            .fetch(&path)
+            .await
+            .map_err(|error| ConfigServiceError::Storage(error.to_string()))
+    }
+
+    async fn replace_record_inner(
+        &self,
+        module_id: String,
+        key: String,
+        instance: String,
+        value: Option<Value>,
+        create_only: bool,
+        authorized: bool,
+        password: Option<(String, String)>,
+    ) -> Result<Value, ConfigServiceError> {
+        let preserve_record = value.is_none();
+        let value = value.unwrap_or_else(|| serde_json::json!({}));
         let metadata = self.module_metadata(&module_id).await?;
         let not_found = || ConfigServiceError::ItemNotFound {
             module_id: module_id.clone(),
@@ -570,6 +688,13 @@ impl ConfigService {
             ));
         }
         record.insert(id_field.clone(), Value::String(instance.clone()));
+        let password = password
+            .map(|(field, secret)| {
+                let path = options.password_path(&field, &instance)?;
+                record.insert(field.clone(), Value::String(path.clone()));
+                Ok::<_, ConfigServiceError>((field, path, secret))
+            })
+            .transpose()?;
         let default = self.resolve_value(item, None).await?.map(|data| data.value);
         let item = item.clone();
         let service = self.clone();
@@ -590,12 +715,19 @@ impl ConfigService {
                     ));
                 }
             };
-            let record = if let Some(current) = collection
+            let created = if let Some(current) = collection
                 .iter_mut()
                 .find(|value| value[&id_field].as_str() == Some(instance.as_str()))
             {
                 if create_only {
                     return Err(ConfigServiceError::RecordExists);
+                }
+                if preserve_record {
+                    let mut previous = current.as_object().cloned().ok_or_else(|| {
+                        ConfigServiceError::InvalidValue("配置记录必须为 JSON object。".into())
+                    })?;
+                    previous.extend(record);
+                    record = previous;
                 }
                 if !authorized {
                     for key in &read_only {
@@ -614,17 +746,19 @@ impl ConfigService {
                     record.insert(previous_id.0.to_owned(), previous_id.1);
                 }
                 let record = Value::Object(record);
-                *current = record.clone();
-                record
+                *current = record;
+                false
             } else {
-                let record = Value::Object(record);
-                collection.push(record.clone());
-                record
+                if preserve_record {
+                    return Err(ConfigServiceError::ItemNotFound { module_id, key });
+                }
+                collection.push(Value::Object(record));
+                true
             };
             let collection = Value::Array(collection);
             item.validate_with(&options, &collection)?;
-            service
-                .commit(
+            let stored = service
+                .commit_with_password(
                     values,
                     &item,
                     &module_id,
@@ -632,12 +766,83 @@ impl ConfigService {
                     collection,
                     if authorized {
                         ConfigChangeOperation::AuthorizedCreate
+                    } else if created {
+                        ConfigChangeOperation::Append
                     } else {
                         ConfigChangeOperation::Merge
                     },
+                    password,
                 )
                 .await?;
-            Ok(record)
+            stored
+                .as_array()
+                .and_then(|records| {
+                    records
+                        .iter()
+                        .find(|record| record[&id_field].as_str() == Some(instance.as_str()))
+                })
+                .cloned()
+                .ok_or_else(|| ConfigServiceError::Storage("保存结果缺少目标配置记录。".into()))
+        })
+        .await
+        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+    }
+
+    pub(super) async fn remove_record(
+        &self,
+        module_id: String,
+        key: String,
+        instance: String,
+    ) -> Result<(), ConfigServiceError> {
+        let metadata = self.module_metadata(&module_id).await?;
+        let not_found = || ConfigServiceError::ItemNotFound {
+            module_id: module_id.clone(),
+            key: key.clone(),
+        };
+        let item = metadata
+            .item(&key)
+            .filter(|item| item.data_type == ConfigDataType::List)
+            .ok_or_else(not_found)?;
+        let options = item_options(&module_id, &key);
+        let id_field = options
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.id_field.clone())
+            .ok_or_else(not_found)?;
+        let default = self.resolve_value(item, None).await?.map(|data| data.value);
+        let item = item.clone();
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _commit = service.commits.lock().await;
+            let values = service.values.read().await.clone();
+            let Some(Value::Array(mut records)) = values
+                .get(&module_id)
+                .and_then(|entries| entries.get(&key))
+                .cloned()
+                .or(default)
+            else {
+                return Ok(());
+            };
+            let Some(index) = records
+                .iter()
+                .position(|record| record[&id_field].as_str() == Some(instance.as_str()))
+            else {
+                return Ok(());
+            };
+            records.remove(index);
+            let value = Value::Array(records);
+            item.validate_with(&options, &value)?;
+            service
+                .commit(
+                    values,
+                    &item,
+                    &module_id,
+                    &key,
+                    value,
+                    ConfigChangeOperation::Remove,
+                )
+                .await?;
+            Ok(())
         })
         .await
         .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
@@ -878,12 +1083,26 @@ impl ConfigService {
 
     async fn commit(
         &self,
+        values: StoredValues,
+        item: &ConfigItemMetadata,
+        module_id: &str,
+        key: &str,
+        value: Value,
+        operation: ConfigChangeOperation,
+    ) -> Result<Value, ConfigServiceError> {
+        self.commit_with_password(values, item, module_id, key, value, operation, None)
+            .await
+    }
+
+    async fn commit_with_password(
+        &self,
         mut values: StoredValues,
         item: &ConfigItemMetadata,
         module_id: &str,
         key: &str,
         value: Value,
         operation: ConfigChangeOperation,
+        password: Option<(String, String, String)>,
     ) -> Result<Value, ConfigServiceError> {
         let previous_value = self
             .resolve_value(
@@ -894,7 +1113,7 @@ impl ConfigService {
             .map(|data| data.value);
         let options = item_options(module_id, key);
         if operation != ConfigChangeOperation::AuthorizedCreate
-            && options.creation_field().is_some()
+            && self.has_record_creation_handler(module_id, key)
             && let Some(id_field) = options
                 .structure
                 .as_ref()
@@ -960,32 +1179,154 @@ impl ConfigService {
                 module_values.insert(item.key, data.value);
             }
         }
-        let change = ConfigChange {
+        let operation = match (&operation, previous_value.as_ref(), value.as_array()) {
+            (ConfigChangeOperation::Replace, previous, Some(candidate))
+                if item.data_type == ConfigDataType::List =>
+            {
+                let previous = previous
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                list_operation(
+                    previous,
+                    candidate,
+                    options
+                        .structure
+                        .as_ref()
+                        .and_then(|structure| structure.id_field.as_deref()),
+                )
+            }
+            _ => operation,
+        };
+        let mut change = ConfigChange {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
-            value: value.clone(),
             operation,
             previous_value,
             module_values,
+            value,
         };
         let handler = self.handlers.get(module_id);
         if let Some(handler) = handler {
-            handler.handle(change.clone()).await.map_err(|message| {
-                ConfigServiceError::ChangeRejected {
-                    module_id: module_id.to_owned(),
-                    key: key.to_owned(),
-                    message,
+            let rejected = |message| ConfigServiceError::ChangeRejected {
+                module_id: module_id.to_owned(),
+                key: key.to_owned(),
+                message,
+            };
+            let processed = match change.operation {
+                ConfigChangeOperation::Append | ConfigChangeOperation::AuthorizedCreate => {
+                    handler.append_records(change.clone()).await
                 }
-            })?;
+                ConfigChangeOperation::Remove => handler.remove_records(change.clone()).await,
+                _ => handler.process(change.clone()).await,
+            }
+            .map_err(rejected)?;
+            let normalized = self
+                .normalize_value(module_id, item, &processed)
+                .await
+                .and_then(|processed| {
+                    if let Some(id_field) = options
+                        .structure
+                        .as_ref()
+                        .and_then(|structure| structure.id_field.as_ref())
+                        && let (Some(candidate), Some(result)) =
+                            (change.value.as_array(), processed.as_array())
+                        && (candidate.len() != result.len()
+                            || candidate.iter().any(|record| {
+                                !result
+                                    .iter()
+                                    .any(|saved| saved[id_field] == record[id_field])
+                            }))
+                    {
+                        return Err(ConfigServiceError::InvalidValue(
+                            "处理器修改了配置记录主键。".into(),
+                        ));
+                    }
+                    if let Some((field, path, _)) = &password
+                        && !processed.as_array().is_some_and(|records| {
+                            records
+                                .iter()
+                                .any(|record| record[field].as_str() == Some(path.as_str()))
+                        })
+                    {
+                        return Err(ConfigServiceError::InvalidValue(
+                            "处理器移除了密码字段引用。".into(),
+                        ));
+                    }
+                    Ok(processed)
+                });
+            let processed = match normalized {
+                Ok(processed) => processed,
+                Err(error) => {
+                    let mut message = error.to_string();
+                    if let Err(rollback) = handler.rollback(change).await {
+                        message.push_str(&format!("，撤销配置处理失败：{rollback}"));
+                    }
+                    return Err(rejected(message));
+                }
+            };
+            values
+                .entry(module_id.to_owned())
+                .or_default()
+                .insert(key.to_owned(), processed.clone());
+            change
+                .module_values
+                .insert(key.to_owned(), processed.clone());
+            change.value = processed;
         }
+        let saved = change.value.clone();
+        let previous_password = if let Some((_, path, secret)) = password {
+            let result = async {
+                let store = self
+                    .passwords
+                    .as_ref()
+                    .ok_or_else(|| ConfigServiceError::Storage("密码模块不可用。".into()))?;
+                let previous = match store.fetch(&path).await {
+                    Ok(previous) => Some(previous),
+                    Err(PasswordError::EntryNotFound) => None,
+                    Err(error) => return Err(ConfigServiceError::Storage(error.to_string())),
+                };
+                store
+                    .save(&path, &secret)
+                    .await
+                    .map_err(|error| ConfigServiceError::Storage(error.to_string()))?;
+                Ok((store, path, previous))
+            }
+            .await;
+            match result {
+                Ok(previous) => Some(previous),
+                Err(error) => {
+                    if let Some(handler) = handler {
+                        let _ = handler.rollback(change).await;
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if let Some(storage) = &self.storage {
             if let Err(error) = storage.write(values.clone()).await {
+                let password_rollback = if let Some((store, path, previous)) = previous_password {
+                    if let Some(previous) = previous {
+                        store.save(&path, previous.trim_end_matches('\n')).await
+                    } else {
+                        store.remove(&path).await
+                    }
+                } else {
+                    Ok(())
+                };
                 if let Some(handler) = handler {
                     if let Err(message) = handler.rollback(change.clone()).await {
                         return Err(ConfigServiceError::Storage(format!(
                             "{error}；撤销配置处理失败：{message}"
                         )));
                     }
+                }
+                if let Err(rollback) = password_rollback {
+                    return Err(ConfigServiceError::Storage(format!(
+                        "{error}。撤销密码写入失败：{rollback}"
+                    )));
                 }
                 return Err(error);
             }
@@ -997,8 +1338,33 @@ impl ConfigService {
                 eprintln!("配置已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
             }
         }
-        Ok(value)
+        Ok(saved)
     }
+}
+
+// 全量替换恰好只新增或删除成员时，也交给对应的数组处理器。
+fn list_operation(
+    previous: &[Value],
+    candidate: &[Value],
+    id_field: Option<&str>,
+) -> ConfigChangeOperation {
+    use std::cmp::Ordering;
+    let (larger, smaller, operation) = match previous.len().cmp(&candidate.len()) {
+        Ordering::Less => (candidate, previous, ConfigChangeOperation::Append),
+        Ordering::Greater => (previous, candidate, ConfigChangeOperation::Remove),
+        Ordering::Equal => return ConfigChangeOperation::Replace,
+    };
+    let mut unmatched: Vec<_> = larger.iter().collect();
+    for item in smaller {
+        let Some(index) = unmatched
+            .iter()
+            .position(|value| id_field.map_or(*value == item, |field| value[field] == item[field]))
+        else {
+            return ConfigChangeOperation::Replace;
+        };
+        unmatched.swap_remove(index);
+    }
+    operation
 }
 
 impl ModuleSubscription {
@@ -1015,13 +1381,31 @@ impl ModuleSubscription {
 }
 
 impl ConfigItemOptions {
-    fn creation_field(&self) -> Option<&str> {
-        self.structure
-            .as_ref()?
-            .fields
-            .iter()
-            .find(|field| field.handle_creation)
-            .map(|field| field.key.as_str())
+    fn password_path(&self, key: &str, instance: &str) -> Result<String, ConfigServiceError> {
+        let template =
+            self.structure
+                .as_ref()
+                .and_then(|structure| {
+                    structure.fields.iter().find(|field| {
+                        field.key == key && field.data_type == ConfigDataType::Password
+                    })
+                })
+                .and_then(|field| field.password_path.as_deref())
+                .ok_or(ConfigServiceError::ActionNotFound)?;
+        if !template.contains("{id}")
+            || instance.is_empty()
+            || !instance
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ConfigServiceError::InvalidValue(
+                "密码字段存储路径无效。".into(),
+            ));
+        }
+        let path = template.replace("{id}", instance);
+        validate_file(&path)
+            .map_err(|error| ConfigServiceError::InvalidValue(error.to_string()))?;
+        Ok(path)
     }
 
     fn migrate_dictionary(&self, value: Value) -> Result<Value, ConfigServiceError> {
@@ -1096,6 +1480,27 @@ impl ConfigItemMetadata {
                                 "请检查字段 {}。",
                                 field.label
                             )));
+                        }
+                    }
+                }
+                for field in structure
+                    .fields
+                    .iter()
+                    .filter(|field| field.password_path.is_some())
+                {
+                    if let Some(value) = record.get(&field.key) {
+                        let instance = structure
+                            .id_field
+                            .as_ref()
+                            .and_then(|key| record[key].as_str())
+                            .ok_or_else(|| {
+                                ConfigServiceError::InvalidValue("密码字段需要记录标识。".into())
+                            })?;
+                        let path = options.password_path(&field.key, instance)?;
+                        if value.as_str() != Some(path.as_str()) {
+                            return Err(ConfigServiceError::InvalidValue(
+                                "密码字段需要有效的存储引用。".into(),
+                            ));
                         }
                     }
                 }
@@ -1282,11 +1687,20 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestHandler {
         seen: std::sync::Mutex<Vec<ConfigChange>>,
+        processed: std::sync::Mutex<Option<Value>>,
         reject: std::sync::atomic::AtomicBool,
         service: std::sync::OnceLock<std::sync::Weak<ConfigService>>,
     }
 
     impl ConfigChangeHandler for TestHandler {
+        fn process(&self, change: ConfigChange) -> ProcessFuture<'_> {
+            Box::pin(async move {
+                let value = change.value.clone();
+                self.handle(change).await?;
+                Ok(self.processed.lock().unwrap().clone().unwrap_or(value))
+            })
+        }
+
         fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
             Box::pin(async move {
                 if let Some(service) = self.service.get().and_then(|service| service.upgrade()) {
@@ -1395,6 +1809,53 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stores_and_publishes_processed_list_and_rejects_invalid_output() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.yml");
+        let mut metadata = metadata();
+        metadata.items[1].data_type = ConfigDataType::List;
+        metadata.items[1].default = Some(json!([1, 1, 2]));
+        let handler = Arc::new(TestHandler::default());
+        let service = ConfigService::load_with_metadata(&path, vec![metadata.clone()])
+            .unwrap()
+            .with_change_handler("module_a", handler.clone());
+        let mut changes = service.subscribe();
+
+        *handler.processed.lock().unwrap() = Some(json!([1, 3]));
+        let saved = service
+            .replace("module_a", "config_b", json!([1, 2]))
+            .await
+            .unwrap();
+        assert_eq!(saved, json!([1, 3]));
+        let change = changes.try_recv().unwrap();
+        assert_eq!(change.operation, ConfigChangeOperation::Remove);
+        assert_eq!(change.value, saved);
+        assert_eq!(change.module_values["config_b"], saved);
+        let reloaded = ConfigService::load_with_metadata(&path, vec![metadata]).unwrap();
+        assert_eq!(
+            reloaded.value("module_a", "config_b").await.unwrap().value,
+            saved
+        );
+
+        let disk = fs::read(&path).unwrap();
+        *handler.processed.lock().unwrap() = Some(json!("无效的处理结果"));
+        assert!(matches!(
+            service.partial("module_a", "config_b", json!([2])).await,
+            Err(ConfigServiceError::ChangeRejected { .. })
+        ));
+        assert_eq!(
+            handler.seen.lock().unwrap().last().unwrap().operation,
+            ConfigChangeOperation::Append
+        );
+        assert_eq!(
+            service.value("module_a", "config_b").await.unwrap().value,
+            saved
+        );
+        assert_eq!(fs::read(&path).unwrap(), disk);
+        assert!(changes.try_recv().is_err());
     }
 
     struct Fixture(PathBuf);

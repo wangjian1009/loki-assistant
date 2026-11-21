@@ -35,6 +35,13 @@
       <aside id="diagnostics" class="notice" hidden><p id="connection-detail">正在连接本机服务…</p><button id="refresh" class="text-button">重试连接</button></aside>
       <p id="initial-loading" class="loading" role="status">正在检测当前页面…</p>
       <section id="tools-view" aria-label="工具" hidden>
+        <form id="slack-token-import" class="notice" hidden>
+          <p>Slack 工作区 <strong data-slack-team></strong></p>
+          <label for="slack-user-token">用户令牌</label>
+          <input id="slack-user-token" type="password" autocomplete="off" spellcheck="false" maxlength="4096" required>
+          <button class="primary" type="submit">接受</button>
+          <p class="status" role="status" aria-live="polite"></p>
+        </form>
         <div class="tool-grid" aria-label="页面工具">
           <button id="org-capture" class="tool-tile" title="将完整网页保存到 Emacs，确认后存为 Org 笔记" disabled><span class="tool-icon"><svg class="icon" aria-hidden="true"><use href="#icon-page"/></svg></span><span>全文保存</span></button>
         </div>

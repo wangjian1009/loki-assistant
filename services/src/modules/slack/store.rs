@@ -17,6 +17,8 @@ use super::protocol::{Error, Identity, Message, timestamp};
 pub(super) struct Secrets {
     pub app_token: Option<String>,
     pub account: Option<Account>,
+    #[serde(default)]
+    pub disabled_token: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -26,6 +28,8 @@ pub(super) struct Account {
     pub refresh: Option<String>,
     pub expires_at: Option<u64>,
     pub baseline: u64,
+    #[serde(default)]
+    pub imported_token_hash: Option<String>,
     #[serde(default)]
     pub revoked: bool,
 }

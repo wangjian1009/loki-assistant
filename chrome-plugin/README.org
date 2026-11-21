@@ -72,3 +72,7 @@ npm test
 
 =extension/features/org-capture/html2org/= 来自本地参考项目，许可证见
 [[file:extension/features/org-capture/html2org/LICENSE][copy-as-org-mode 许可证]]，转换器源码保留其原始许可声明。
+
+* 导入 Slack 用户令牌
+
+在 Loki Assistant 配置中保存 Slack 工作区后，services 会打开导入页。返回该页后打开插件，粘贴已有的用户令牌，点击「接受」。插件提交到本机 services，令牌保存由配置中心处理。 [[file:../docs/slack.org::*令牌导入][Slack 令牌导入]]

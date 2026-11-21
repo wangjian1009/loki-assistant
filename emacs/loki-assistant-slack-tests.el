@@ -69,7 +69,7 @@
         (with-current-buffer draft
           (loki-assistant-slack-draft-mode)
           (setq loki-assistant-slack--session "session"
-                loki-assistant-slack--conversation "D1"
+                loki-assistant-slack--conversation "TALPHA.D1"
                 loki-assistant-slack--thread "123.000001")
           (insert "收到")
           (cl-letf (((symbol-function 'loki-assistant-slack--request)
@@ -83,11 +83,28 @@
             (loki-assistant-slack-send))
           (pcase-let ((`(,retry ,query ,first) requests))
             (should (equal first retry))
-            (should (equal (cadr first) "/slack/conversations/D1/threads/123.000001/messages"))
+            (should (equal (cadr first) "/slack/conversations/TALPHA.D1/threads/123.000001/messages"))
             (should (equal (cadr query)
                            (concat "/slack/send-requests/" (plist-get (nth 2 first) :key)))))
           (should (eq loki-assistant-slack--draft-state 'unknown))
           (should (equal (buffer-string) "收到")))
       (when (buffer-live-p draft) (kill-buffer draft)))))
+
+(ert-deftest loki-assistant-slack-test-consult-opens-selected-chat ()
+  (skip-unless (require 'consult nil t))
+  (let ((loki-assistant-slack--selection 1)
+        (rooms '(((id . "TALPHA.D1") (kind . "im") (title . "林舟")
+                  (team_id . "TALPHA") (session_id . "one"))
+                 ((id . "TALPHA.C1") (kind . "public_channel") (title . "项目讨论")
+                  (team_id . "TALPHA") (session_id . "one"))
+                 ((id . "TBETA.C1") (kind . "public_channel") (title . "项目讨论")
+                  (team_id . "TBETA") (session_id . "two"))))
+        opened)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt _table &rest _) "#项目讨论 [TBETA.C1]"))
+              ((symbol-function 'loki-assistant-slack--open-view)
+               (lambda (&rest args) (setq opened args))))
+      (loki-assistant-slack--choose-room (selected-window) 1 rooms))
+    (should (equal opened '("TBETA" "two" "TBETA.C1" nil "#项目讨论")))))
 
 (provide 'loki-assistant-slack-tests)

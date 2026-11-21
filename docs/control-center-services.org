@@ -21,7 +21,7 @@
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
-| ~modules/slack~ | OAuth、后台私信接收、系统通知与 Emacs 消息查询和回复 | 已实现首期，目标工作区待验证 |
+| [[file:slack.org][modules/slack]] | 令牌导入、后台私信接收、系统通知与 Emacs 消息查询和回复 | 已实现首期，目标工作区待验证 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |
@@ -84,6 +84,8 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/data/{module_id}/{key}~ | 单个生效配置值及来源 |
 | PUT | ~/data/{module_id}/{key}~ | 替换完整配置值 |
 | POST | ~/data/{module_id}/{key}~ | 合并字典或追加列表 |
+| PUT | ~/data/{module_id}/{key}/{instance}~ | 新增或更新结构数组记录 |
+| DELETE | ~/data/{module_id}/{key}/{instance}~ | 按主键删除结构数组记录 |
 | POST | ~/config/validate~ | 预检配置值，不修改配置 |
 | POST | ~/network/pairings~ | 创建绑定邀请并返回二维码 PNG 的 Base64 与数据 |
 | GET | ~/network/pairings/{id}~ | 查询绑定进度，不返回令牌 |
@@ -112,126 +114,7 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 
 * 配置中心
 
-** 静态元数据
-
-配置元数据函数通过 ~#[loki_config]~ 声明。该过程宏与 ~#[loki_api]~ 一样在编译期生成 ~linkme~ 注册项，服务组合根不执行运行时注册。元数据函数须为无参数、无泛型的同步函数，返回 ~ConfigModuleMetadata~ ；当前配置中心、控制中心、Emacs 和网络模块均采用这一方式。
-
-#+begin_src rust
-#[loki_services_macros::loki_config]
-fn emacs_config_metadata() -> ConfigModuleMetadata {
-    EmacsConfig::metadata()
-}
-#+end_src
-
-配置项的 ~data_type~ 支持 ~string~、~password~、~integer~、~number~、~boolean~、~dictionary~、~list~、~file_path~ 和 ~executable~。~Executable~ 的值仍是 JSON string，允许完整路径或程序名。元数据还可声明默认程序名与建议搜索目录 (~search_paths~)；建议目录可以通过程序内常量静态定义，Emacs 模块使用 ~EMACSCLIENT_SEARCH_PATHS~ ，随模块元数据返回。
-
-#+begin_src json
-{
-  "key": "emacsclient_path",
-  "data_type": "executable",
-  "remote_access": "local",
-  "default": null,
-  "executable": {
-    "default_program": "emacsclient",
-    "search_paths": ["/opt/homebrew/bin", "/usr/local/bin", "/Applications/Emacs.app/Contents/MacOS/bin", "/Applications/Emacs.app/Contents/MacOS"]
-  }
-}
-#+end_src
-
-没有用户设置和静态 ~default~ 时，配置模块按 services 启动时的 ~PATH~ 顺序搜索，再按 ~search_paths~ 的顺序补充查找。只接受实际可执行的普通文件（允许符号链接），返回绝对路径；不通过 shell，不执行待查找的程序，也不展开 ~ 和环境变量。每次读取重新查找，因此安装或移除程序后，下次读取即可反映变化。找不到程序时不生成默认值，Emacs 配置界面显示“未设置”并提供文件选择入口。
-
-配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取，~read_write~ 另开放替换、部分更新和预检。配置中心依据 network 注入的 ~x-loki-remote-devices~ 判断请求来源。远端元数据和模块值只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 为只读，~control-center/center_auto_start~ 可读写，其余配置项仅限本机。
-
-** 生效值与来源
-
-~GET /data/{module_id}~ 中的每个值包含 ~value~ 和 ~source~ ：
-
-#+begin_src json
-{"module_id":"emacs","values":{"emacsclient_path":{"value":"/opt/homebrew/bin/emacsclient","source":"default"}}}
-#+end_src
-
-~GET /data/{module_id}/{key}~ 以及写入成功的响应保留模块和配置项标识，同时返回 ~value~ 与 ~source~ ：
-
-#+begin_src json
-{"module_id":"emacs","key":"emacsclient_path","value":"/opt/homebrew/bin/emacsclient","source":"user"}
-#+end_src
-
-~source~ 只支持 ~user~ 与 ~default~。显式设置的值优先，即使与默认值相同也标记为 ~user~；否则返回静态默认值或发现的程序路径，并标记为 ~default~。未设置且没有默认值的项不出现在模块数据中，单项读取返回 404 ~config-not-set~。默认值中的 ~false~、~0~ 或空字符串均是有效值，不按真假判断是否存在。
-
-~PUT~ 和 ~POST~ 的请求体仍为原始 JSON 值，不接收来源包装。字典合并或列表追加以当前生效值为基础，包括默认值，完成后整项标记为 ~user~ 。变更订阅只通知用户写入，自动发现的默认值不触发用户配置变更。
-
-** 统一校验
-
-~POST /config/validate~ 接受模块、配置项和待校验值，供客户端或其他程序使用：
-
-#+begin_src json
-{"module_id":"emacs","key":"emacsclient_path","value":"emacsclient"}
-#+end_src
-
-接口与配置保存共用校验实现。~Executable~ 检查目标存在、是普通文件并具有执行权限，允许指向普通文件的符号链接。程序名先按服务进程 ~PATH~，再按元数据 ~search_paths~ 查找；有效值规范化为绝对路径。整个检查不会执行目标程序。
-
-校验通过时返回 HTTP 200 与规范化后的值：
-
-#+begin_src json
-{"module_id":"emacs","key":"emacsclient_path","valid":true,"value":"/opt/homebrew/bin/emacsclient"}
-#+end_src
-
-配置值无效时仍返回 HTTP 200，使用 ~valid: false~ 和错误说明表示预检结果：
-
-#+begin_src json
-{"module_id":"emacs","key":"emacsclient_path","valid":false,"error":{"source":"business","code":"invalid-config","message":"配置值无效：emacsclient 位置：文件不存在：/missing/emacsclient"}}
-#+end_src
-
-不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
-
-Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入；校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，“日志”调用 ~POST /emacs/apps/open?app=logs~ 并打开 ~~/.assistant/loki-assistant.log.org~ ，应用加载、日志文件打开和窗口聚焦由 services 的 Emacs 模块负责；登录启动由 services 的控制中心模块在配置提交前处理。
-
-** 提交前变化处理
-
-模块在组装阶段通过 ~ConfigService::with_change_handler(module_id, handler)~ 注入一个 ~ConfigChangeHandler~ 。~handle~ 接收 ~ConfigChange~ ，包含 ~module_id~ 、 ~key~ 、规范化后的候选 ~value~ 、 ~operation~ 和提交前生效的 ~previous_value~ ，以及包含本次候选值的模块生效快照 ~module_values~ ，返回异步处理结果；未设置且无默认值时旧值为 ~None~ 。字典和列表处理器接收合并或追加后的完整值。未注册处理器的模块直接进入存储阶段。
-
-提交顺序为：校验、串行取得最新值、等待模块处理器成功、原子写入 YAML、更新内存、广播变化。处理器可读取提交前配置，不得递归提交配置。相同值的重复提交也会执行处理器，便于修复外部状态后重试。~POST /config/validate~ 只预检，不调用处理器，不保证系统操作成功。
-
-处理器失败返回 HTTP 500 ~config-change-rejected~ ，包含模块、键和具体失败原因；原有 YAML、内存值和来源保持不变，不广播变化。示例：
-
-#+begin_src json
-{"api_version":"1","status":500,"error":{"source":"business","code":"config-change-rejected","message":"配置变化处理失败：control-center/center_auto_start：加载托盘失败：系统拒绝操作"}}
-#+end_src
-
-处理器应自行撤销失败操作的部分副作用；如果处理成功但写入 YAML 失败，配置中心调用其 ~rollback~ 方法撤销外部操作，再返回 ~config-storage-error~ 。无外部状态的处理器可使用默认的空撤销实现；有外部状态的处理器必须实现撤销。撤销失败的原因附在返回的错误说明中，配置仍不提交。事务由独立任务完成，HTTP 请求取消不会取消已接受的处理和保存。
-
-处理器还可实现 ~committed~ 回调：配置已落盘并更新内存、广播变化后，在该回调内完成资源切换和成功通知。回调失败只记录日志，不能撤回已经成功保存的配置。网络模块使用此回调关闭旧连接，防止落盘失败时提前丢弃旧连接或发出成功通知。
-
-变化订阅仍是提交成功后的通知接口：~subscribe~ 或 ~subscribe_module~ 的接收方不参与提交结果判定。手动修改 YAML 不触发处理器，重启只加载值；需要同步系统设置时应通过配置接口提交。
-
-** YAML 存储
-
-用户配置保存到 ~~/.assistant/config.yml~ ，文件内容按模块和键组织，仅存用户值：
-
-#+begin_src yaml
-emacs:
-  emacsclient_path: /opt/homebrew/bin/emacsclient
-control-center:
-  center_auto_start: false
-#+end_src
-
-文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
-
-启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
-
-** 结构化配置
-
-~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /data/{module}/{key}~ 追加元素。
-
-配置项可声明 ~actions~、~requires_local_auth~ 和 ~save_timeout_seconds~ 。业务模块可以为新增记录的指定字段注册处理器。配置 API 等待处理结果，成功时返回生效记录。
-
-配置模块按模块 ID 和配置键合并 ~CONFIG_ITEMS~ 注册的可选元数据。
-
-| 操作 | 请求 | 结果 |
-|------+-------+------|
-| 读取配置定义和值 | ~GET /meta~、~GET /data/{module}~ | 生成结构表单或数组列表 |
-| 保存记录 | ~PUT /data/{module}/{key}/{instance}~ | 更新返回 ~200~ 。新增使用 ~If-None-Match: *~ ，已存在的主键返回 ~412 config-record-exists~ |
-| 执行配置操作 | ~POST /config/actions/{module}/{action}/{instance}~ | 调用已注册的模块处理器，返回操作结果 |
+配置模型、数组操作、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
 * 控制中心模块
 

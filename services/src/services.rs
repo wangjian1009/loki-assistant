@@ -81,8 +81,9 @@ impl Services {
             Arc::clone(&status),
             Duration::from_secs(10),
         ));
+        let password = password::Module::new(Arc::new(config.clone()));
+        let config = config.with_password_service(password.service());
         let base_config = Arc::new(config.clone());
-        let password = password::Module::new(Arc::clone(&base_config));
         let emacs = emacs::Module::new(
             Arc::clone(&base_config),
             Arc::clone(&notification),

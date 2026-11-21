@@ -3,19 +3,19 @@
 ;;; Code:
 
 (require 'loki-assistant)
-(require 'tabulated-list)
+(declare-function consult--read "consult")
+(declare-function consult--lookup-cdr "consult")
 
 (defcustom loki-assistant-slack-refresh-interval 15
   "可见 Slack 窗口自动刷新的秒数。"
   :type 'number :group 'loki-assistant)
 
 (defvar-local loki-assistant-slack--session nil)
-(defvar-local loki-assistant-slack--project nil)
-(defvar-local loki-assistant-slack--project-name nil)
+(defvar-local loki-assistant-slack--team-id nil)
+(defvar loki-assistant-slack--selection 0)
 (defvar-local loki-assistant-slack--conversation nil)
 (defvar-local loki-assistant-slack--thread nil)
 (defvar-local loki-assistant-slack--title nil)
-(defvar-local loki-assistant-slack--unread t)
 (defvar-local loki-assistant-slack--cursor nil)
 (defvar-local loki-assistant-slack--timer nil)
 (defvar-local loki-assistant-slack--generation 0)
@@ -28,7 +28,7 @@
 (defvar-local loki-assistant-slack--draft-text nil)
 (defvar-local loki-assistant-slack--draft-state nil)
 
-(cl-defun loki-assistant-slack--request (method path callback &key session params body key (project loki-assistant-slack--project))
+(cl-defun loki-assistant-slack--request (method path callback &key session params body key team-id)
   "以 SESSION 调用 METHOD PATH，将结果交给 CALLBACK。"
   (let ((token (condition-case error
                    (loki-assistant--module-api-token "slack")
@@ -39,9 +39,8 @@
                         nil))))
     (when token
       (loki-assistant-request
-       method path :params params :body body
+       method path :params (if team-id (cons (cons 'team_id team-id) params) params) :body body
        :headers (append (list (cons "Authorization" (concat "Bearer " token)))
-                        (when project (list (cons "X-Loki-Slack-Project" project)))
                         (when session (list (cons "X-Loki-Slack-Session" session)))
                         (when key (list (cons "Idempotency-Key" key))))
        :callback callback :timeout 20))))
@@ -80,49 +79,6 @@
          (current-buffer)))
   (add-hook 'kill-buffer-hook #'loki-assistant-slack--stop nil t))
 
-(defun loki-assistant-slack--status-label (state)
-  "返回 STATE 的简短中文说明。"
-  (or (cdr (assoc state '(("connected" . "已连接") ("connecting" . "连接中")
-                         ("reconnecting" . "正在重连") ("authorized" . "已授权")
-                         ("unconfigured" . "待配置") ("authorization_required" . "待授权")
-                         ("reauthorization_required" . "需重新授权")
-                         ("credentials_unavailable" . "凭据暂不可用") ("stopped" . "连接已停止"))))
-      "状态未知"))
-
-(defun loki-assistant-slack--list-refresh (&optional older)
-  "刷新会话列表。OLDER 表示追加下一页。"
-  (let ((buffer (current-buffer))
-        (generation (cl-incf loki-assistant-slack--generation))
-        (cursor (and older loki-assistant-slack--cursor)))
-    (setq loki-assistant-slack--busy t)
-    (loki-assistant-slack--request
-     "GET" "/slack/status"
-     (lambda (response)
-       (when (buffer-live-p buffer)
-         (with-current-buffer buffer
-           (when (= generation loki-assistant-slack--generation)
-             (if (not (plist-get response :ok))
-                 (setq loki-assistant-slack--busy nil
-                       header-line-format (loki-assistant-slack--error-header response))
-               (let* ((data (plist-get response :data))
-                      (session (loki-assistant-slack--non-null (alist-get 'session data)))
-                      (id (alist-get 'session_id session))
-                      (state (alist-get 'authorization_state data)))
-                 (unless (equal id loki-assistant-slack--session)
-                   (setq tabulated-list-entries nil cursor nil)
-                   (tabulated-list-print t))
-                 (setq loki-assistant-slack--session id
-                       header-line-format
-                       (format " %s · %s%s   [%s]   P 项目   u 筛选   C 配置"
-                               (or loki-assistant-slack--project-name "Slack")
-                               (loki-assistant-slack--status-label
-                                (if id (alist-get 'socket_state data) state))
-                               (if session (concat " · " (alist-get 'team_name session)) "")
-                               (if loki-assistant-slack--unread "未读" "全部")))
-                 (if id
-                     (loki-assistant-slack--list-page buffer generation id cursor)
-                   (setq loki-assistant-slack--busy nil)))))))))))
-
 (defun loki-assistant-slack--error-header (response)
   "从 RESPONSE 构造可见的错误状态。"
   (let ((message (plist-get response :error-message)))
@@ -134,94 +90,35 @@
       (format-time-string "%H:%M" (seconds-to-time (string-to-number ts)))
     ""))
 
-(defun loki-assistant-slack--list-page (buffer generation session cursor)
-  "更新 BUFFER 上属于 SESSION 和 GENERATION 的一页会话。"
-  (loki-assistant-slack--request
-   "GET" "/slack/conversations"
-   (lambda (response)
-     (when (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (when (= generation loki-assistant-slack--generation)
-           (setq loki-assistant-slack--busy nil)
-           (if (not (plist-get response :ok))
-               (setq header-line-format (loki-assistant-slack--error-header response))
-             (let* ((data (plist-get response :data))
-                    (items (append (alist-get 'items data) nil))
-                    (rows (mapcar #'loki-assistant-slack--row items)))
-               (setq loki-assistant-slack--cursor
-                     (loki-assistant-slack--non-null (alist-get 'next_cursor data)))
-               (setq tabulated-list-entries
-                     (if cursor
-                         (append (cl-remove-if
-                                  (lambda (entry) (assoc (car entry) rows))
-                                  tabulated-list-entries) rows)
-                       rows))
-               (when (equal (alist-get 'sync_state data) "cached")
-                 (setq header-line-format (concat header-line-format " · 缓存")))
-               (tabulated-list-print t)))))))
-   :session session :params (append (when loki-assistant-slack--unread '((unread . "true")))
-                                    (when cursor (list (cons 'cursor cursor))))))
-
-(defun loki-assistant-slack--row (data)
-  "将会话 DATA 转成表格行。"
-  (let ((preview (loki-assistant-slack--non-null (alist-get 'preview data))))
-    (list (alist-get 'id data)
-          (vector (alist-get 'title data)
-                  (number-to-string (or (alist-get 'unread_count data) 0))
-                  (loki-assistant-slack--time (alist-get 'last_activity_ts data))
-                  (if preview (replace-regexp-in-string "[\n\r]+" " " preview) "")))))
-
-(defun loki-assistant-slack-toggle-unread ()
-  "切换未读和全部会话。"
-  (interactive)
-  (setq loki-assistant-slack--unread (not loki-assistant-slack--unread)
-        loki-assistant-slack--cursor nil)
-  (loki-assistant-slack-refresh))
-
 (defun loki-assistant-slack-refresh ()
-  "刷新当前 Slack 视图。"
+  "刷新当前 Slack 聊天。"
   (interactive)
-  (if (derived-mode-p 'loki-assistant-slack-list-mode)
-      (loki-assistant-slack--list-refresh)
-    (loki-assistant-slack--messages-refresh)))
+  (loki-assistant-slack--messages-refresh))
 
 (defun loki-assistant-slack-older ()
-  "加载当前 Slack 视图的更早内容。"
+  "加载当前 Slack 聊天的更早消息。"
   (interactive)
   (unless (and loki-assistant-slack--cursor (not loki-assistant-slack--busy))
     (user-error "目前没有可加载的下一页"))
-  (if (derived-mode-p 'loki-assistant-slack-list-mode)
-      (loki-assistant-slack--list-refresh t)
-    (loki-assistant-slack--messages-refresh t)))
+  (loki-assistant-slack--messages-refresh t))
 
-(defun loki-assistant-slack-open-conversation ()
-  "打开列表中的会话。"
-  (interactive)
-  (let ((id (tabulated-list-get-id))
-        (row (tabulated-list-get-entry)))
-    (unless id (user-error "请选择会话"))
-    (loki-assistant-slack--open-view loki-assistant-slack--session id nil (aref row 0))))
-
-(defun loki-assistant-slack--open-view (session conversation thread title)
-  "打开 SESSION 中 CONVERSATION 的时间线或 THREAD。"
-  (let ((project loki-assistant-slack--project)
-        (buffer (get-buffer-create (format "*Slack %s %s%s*" session conversation
+(defun loki-assistant-slack--open-view (team-id session conversation thread title)
+  "打开 TEAM-ID 和 SESSION 对应的 CONVERSATION 或 THREAD。"
+  (let ((buffer (get-buffer-create (format "*Slack %s/%s%s*" conversation session
                                           (if thread (concat "/" thread) "")))))
     (with-current-buffer buffer
       (unless (derived-mode-p 'loki-assistant-slack-message-mode)
         (loki-assistant-slack-message-mode)
         (setq loki-assistant-slack--session session
-              loki-assistant-slack--project project
+              loki-assistant-slack--team-id team-id
               loki-assistant-slack--conversation conversation
               loki-assistant-slack--thread thread
               loki-assistant-slack--title title)
         (loki-assistant-slack--watch))
       (loki-assistant-slack--messages-refresh))
-    (if (>= (frame-width) 110)
-        (let ((window (display-buffer-in-side-window
-                       buffer `((side . right) (slot . ,(if thread 1 0))
-                                (window-width . ,(if thread 0.31 0.5))))))
-          (select-window window))
+    (if (and thread (>= (frame-width) 110))
+        (select-window (display-buffer-in-side-window
+                        buffer '((side . right) (slot . 1) (window-width . 0.31))))
       (pop-to-buffer-same-window buffer))))
 
 (defun loki-assistant-slack--messages-refresh (&optional older)
@@ -336,7 +233,8 @@
       (setq ts (or (loki-assistant-slack--non-null (alist-get 'thread_ts item))
                    (alist-get 'ts item)))))
   (unless ts (user-error "请选择一条消息"))
-  (loki-assistant-slack--open-view loki-assistant-slack--session loki-assistant-slack--conversation
+  (loki-assistant-slack--open-view loki-assistant-slack--team-id loki-assistant-slack--session
+                                    loki-assistant-slack--conversation
                                     (or loki-assistant-slack--thread ts) loki-assistant-slack--title))
 
 (defun loki-assistant-slack-mark-read ()
@@ -364,18 +262,18 @@
   "在当前 Slack 会话或线程中起草消息。"
   (interactive)
   (let* ((session loki-assistant-slack--session)
-         (project loki-assistant-slack--project)
+         (team-id loki-assistant-slack--team-id)
          (id loki-assistant-slack--conversation)
          (thread loki-assistant-slack--thread)
          (title loki-assistant-slack--title)
-         (buffer (get-buffer-create (format "*Slack 草稿 %s %s%s*" session id
+         (buffer (get-buffer-create (format "*Slack 草稿 %s/%s%s*" id session
                                             (if thread (concat "/" thread) "")))))
-    (unless (and session id) (user-error "请先打开会话"))
+    (unless (and team-id session id) (user-error "请先打开会话"))
     (with-current-buffer buffer
       (unless (derived-mode-p 'loki-assistant-slack-draft-mode)
         (loki-assistant-slack-draft-mode)
         (setq loki-assistant-slack--session session loki-assistant-slack--conversation id
-              loki-assistant-slack--project project
+              loki-assistant-slack--team-id team-id
               loki-assistant-slack--thread thread loki-assistant-slack--title title
               header-line-format (format " 发送到 %s%s   C-c C-c 发送   C-c C-k 取消"
                                          (replace-regexp-in-string "%" "%%" title)
@@ -445,7 +343,7 @@
               (t
                (setq loki-assistant-slack--busy nil buffer-read-only nil)
                (loki-assistant-slack--show response))))))
-       :session loki-assistant-slack--session))))
+       :session loki-assistant-slack--session :team-id loki-assistant-slack--team-id))))
 
 (defun loki-assistant-slack--send-result (buffer key data count)
   "在 BUFFER 处理 KEY 的 DATA，最多轮询有限次数 COUNT。"
@@ -474,61 +372,6 @@
   (when (or (string-empty-p (buffer-string)) (yes-or-no-p "取消当前 Slack 草稿？"))
     (set-buffer-modified-p nil)
     (kill-buffer (current-buffer))))
-
-(defun loki-assistant-slack-switch-project ()
-  "从状态中心选择 Slack 项目。"
-  (interactive)
-  (loki-assistant-slack--select-project (current-buffer) t))
-
-(defun loki-assistant-slack--select-project (buffer &optional prompt wanted)
-  "为 BUFFER 选择 WANTED 项目，PROMPT 非空时询问项目。"
-  (loki-assistant-request
-   "GET" "/status/slack/projects"
-   :callback
-   (lambda (response)
-     (when (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (if (not (plist-get response :ok))
-             (setq header-line-format (loki-assistant-slack--error-header response))
-           (let* ((projects (append (alist-get 'value (plist-get response :data)) nil))
-                  (choices (mapcar (lambda (row)
-                                     (cons (format "%s [%s]" (alist-get 'name row) (alist-get 'id row)) row))
-                                   projects))
-                  (selected (cond
-                             (wanted (cl-find wanted projects :key (lambda (row) (alist-get 'id row)) :test #'equal))
-                             ((and prompt choices)
-                              (cdr (assoc (completing-read "Slack 项目：" choices nil t) choices)))
-                             (t (or (cl-find loki-assistant-slack--project projects
-                                              :key (lambda (row) (alist-get 'id row)) :test #'equal)
-                                    (car projects))))))
-             (if selected
-                 (progn
-                   (unless (equal loki-assistant-slack--project (alist-get 'id selected))
-                     (setq loki-assistant-slack--session nil tabulated-list-entries nil))
-                   (setq loki-assistant-slack--project (alist-get 'id selected)
-                         loki-assistant-slack--project-name (replace-regexp-in-string
-                                                              "%" "%%" (alist-get 'name selected)))
-                   (loki-assistant-slack-refresh))
-               (setq header-line-format " Slack · 请按 C 配置项目")))))))))
-
-(defvar loki-assistant-slack-list-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map tabulated-list-mode-map)
-    (define-key map (kbd "RET") #'loki-assistant-slack-open-conversation)
-    (define-key map (kbd "n") #'next-line)
-    (define-key map (kbd "p") #'previous-line)
-    (define-key map (kbd "g") #'loki-assistant-slack-refresh)
-    (define-key map (kbd "o") #'loki-assistant-slack-older)
-    (define-key map (kbd "u") #'loki-assistant-slack-toggle-unread)
-    (define-key map (kbd "P") #'loki-assistant-slack-switch-project)
-    (define-key map (kbd "C") #'loki-assistant-config)
-    map))
-
-(define-derived-mode loki-assistant-slack-list-mode tabulated-list-mode "Slack 会话"
-  "Slack 私信与多人私信会话列表。"
-  (setq tabulated-list-format [("会话" 25 t) ("未读" 5 nil) ("时间" 7 nil) ("摘要" 0 nil)]
-        tabulated-list-padding 1)
-  (tabulated-list-init-header))
 
 (defun loki-assistant-slack-next-message ()
   "移动到下一条 Slack 消息。"
@@ -567,17 +410,66 @@
   "起草 Slack 会话消息或线程回复。"
   (setq-local buffer-offer-save nil))
 
+(defun loki-assistant-slack--room-label (room)
+  "返回 ROOM 在聊天选择中的名称。"
+  (let ((name (replace-regexp-in-string "[\n\r]+" " " (alist-get 'title room))))
+    (if (member (alist-get 'kind room) '("public_channel" "private_channel"))
+        (concat "#" name)
+      name)))
+
+(defun loki-assistant-slack--choose-room (window selection rooms)
+  "在 WINDOW 通过 Consult 从 ROOMS 中选择聊天。SELECTION 标记当前请求。"
+  (when (and (= selection loki-assistant-slack--selection) (window-live-p window))
+    (cond
+     ((active-minibuffer-window) (message "请退出当前 minibuffer 后重新选择 Slack 聊天。"))
+     ((null rooms) (message "没有可用的 Slack 聊天，请检查工作区授权。"))
+     (t
+      (let ((counts (make-hash-table :test #'equal)))
+        (dolist (room rooms)
+          (cl-incf (gethash (loki-assistant-slack--room-label room) counts 0)))
+        (with-selected-window window
+          (let* ((choices
+                  (mapcar
+                   (lambda (room)
+                     (let ((name (loki-assistant-slack--room-label room)))
+                       (cons (if (> (gethash name counts) 1)
+                                 (format "%s [%s]" name (alist-get 'id room))
+                               name)
+                             room)))
+                   rooms))
+                 (room (consult--read choices :prompt "Slack 聊天："
+                                      :sort nil :require-match t
+                                      :lookup #'consult--lookup-cdr)))
+            (when room
+              (loki-assistant-slack--open-view
+               (alist-get 'team_id room) (alist-get 'session_id room)
+               (alist-get 'id room) nil (loki-assistant-slack--room-label room))))))))))
+
+(defun loki-assistant-slack--load-rooms (window selection &optional cursor pages)
+  "读取聊天页，完成后在 WINDOW 发起 SELECTION。"
+  (loki-assistant-slack--request
+   "GET" "/slack/conversations"
+   (lambda (response)
+     (when (and (= selection loki-assistant-slack--selection) (window-live-p window))
+       (if (not (plist-get response :ok))
+           (loki-assistant-slack--show response)
+         (let* ((data (plist-get response :data))
+                (next (loki-assistant-slack--non-null (alist-get 'next_cursor data))))
+           (push (append (alist-get 'items data) nil) pages)
+           (if next
+               (loki-assistant-slack--load-rooms window selection next pages)
+             (run-at-time 0 nil #'loki-assistant-slack--choose-room window selection
+                          (apply #'append (nreverse pages))))))))
+   :team-id nil :params (append '((limit . 100)) (when cursor (list (cons 'cursor cursor))))))
+
 ;;;###autoload
-(defun loki-assistant-slack (&optional project)
-  "打开 Slack 未读会话，可指定 PROJECT。"
+(defun loki-assistant-slack ()
+  "使用 Consult 选择 Slack 聊天并打开消息视图。"
   (interactive)
-  (let ((buffer (get-buffer-create "*Slack 会话*")))
-    (with-current-buffer buffer
-      (unless (derived-mode-p 'loki-assistant-slack-list-mode)
-        (loki-assistant-slack-list-mode)
-        (loki-assistant-slack--watch))
-      (loki-assistant-slack--select-project buffer nil project))
-    (pop-to-buffer buffer)))
+  (unless (require 'consult nil t)
+    (user-error "选择 Slack 聊天需要安装 Consult"))
+  (loki-assistant-slack--load-rooms (selected-window)
+                                   (cl-incf loki-assistant-slack--selection)))
 
 (define-key loki-assistant-command-map (kbd "s") #'loki-assistant-slack)
 

@@ -87,7 +87,7 @@ control-center:
 
 通过配置接口保存时，services 先等待所属模块的配置变化处理器成功，再原子替换 YAML 文件，成功后更新内存并发出变化通知；处理或写入失败不会更新生效值。处理器失败返回 ~config-change-rejected~ 和具体原因；处理成功但落盘失败时调用处理器撤销外部操作。文件权限为 ~0600~ 。直接手工修改文件后需重启 services。配置文件无法读取、YAML 无效或已知配置值校验失败时，服务启动会报错。
 
-读取接口返回 ~{value, source}~，其中 ~source~ 为 ~user~ 或 ~default~ 。没有用户设置时使用静态默认值或按元数据搜索得到的程序路径；这些默认值不写入文件。完整协议见 [[file:../docs/control-center-services.org::*配置中心][配置中心协议]]。
+读取接口返回 ~{value, source}~，其中 ~source~ 为 ~user~ 或 ~default~ 。没有用户设置时使用静态默认值或按元数据搜索得到的程序路径；这些默认值不写入文件。完整协议见 [[file:../docs/config-module.org][配置中心协议]]。
 
 ~POST /config/validate~ 可提前校验配置而不保存。保存接口也执行相同检查；~Executable~ 必须指向存在、可执行的普通文件，输入程序名时按 ~PATH~ 和元数据建议目录解析并保存为绝对路径。无效输入返回错误，原有值及 YAML 文件不变。
 
@@ -95,7 +95,7 @@ control-center:
 
 “控制中心”的 ~center_auto_start~ 保持默认 ~false~ 。在 Emacs 配置界面开启“登录时自动启动”，或通过 ~PUT /data/control-center/center_auto_start~ 提交 JSON ~true~ 时，控制中心模块先同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent；系统操作成功后才保存配置。关闭时卸载任务并删除 plist；失败返回系统错误，界面保留输入，可修复后重新保存。模块构造和服务启动不会自动修改 LaunchAgent。
 
-默认使用仓库的 Debug 菜单栏可执行文件；使用其他构建位置时，在 services 启动环境设置 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 为绝对路径。详细操作和处理器接口见 [[file:../docs/control-center-services.org::*控制中心模块][控制中心模块]] 与 [[file:../docs/control-center-services.org::*提交前变化处理][提交前变化处理]]。
+默认使用仓库的 Debug 菜单栏可执行文件；使用其他构建位置时，在 services 启动环境设置 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 为绝对路径。详细操作和处理器接口见 [[file:../docs/control-center-services.org::*控制中心模块][控制中心模块]] 与 [[file:../docs/config-module.org::*提交前变化处理][提交前变化处理]]。
 
 * 网络身份与中转注册
 

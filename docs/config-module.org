@@ -1,0 +1,139 @@
+#+TITLE: 配置模块设计
+
+配置中心维护数据结构、校验、通用读写接口和提交事务。配置界面按元数据填写并提交数据。模块注册自己的配置结构和处理器，在服务端完成业务校验及外部操作。
+
+* 静态元数据
+
+配置元数据函数通过 ~#[loki_config]~ 声明。该过程宏与 ~#[loki_api]~ 一样在编译期生成 ~linkme~ 注册项，服务组合根不执行运行时注册。元数据函数须为无参数、无泛型的同步函数，返回 ~ConfigModuleMetadata~ ；当前配置中心、控制中心、Emacs 和网络模块均采用这一方式。
+
+#+begin_src rust
+#[loki_services_macros::loki_config]
+fn emacs_config_metadata() -> ConfigModuleMetadata {
+    EmacsConfig::metadata()
+}
+#+end_src
+
+配置项的 ~data_type~ 支持 ~string~、~password~、~integer~、~number~、~boolean~、~dictionary~、~structure~、~password_reference~、~list~、~file_path~ 和 ~executable~。~Executable~ 的值仍是 JSON string，允许完整路径或程序名。元数据还可声明默认程序名与建议搜索目录 (~search_paths~)；建议目录可以通过程序内常量静态定义，Emacs 模块使用 ~EMACSCLIENT_SEARCH_PATHS~ ，随模块元数据返回。
+
+#+begin_src json
+{
+  "key": "emacsclient_path",
+  "data_type": "executable",
+  "remote_access": "local",
+  "default": null,
+  "executable": {
+    "default_program": "emacsclient",
+    "search_paths": ["/opt/homebrew/bin", "/usr/local/bin", "/Applications/Emacs.app/Contents/MacOS/bin", "/Applications/Emacs.app/Contents/MacOS"]
+  }
+}
+#+end_src
+
+没有用户设置和静态 ~default~ 时，配置模块按 services 启动时的 ~PATH~ 顺序搜索，再按 ~search_paths~ 的顺序补充查找。只接受实际可执行的普通文件（允许符号链接），返回绝对路径；不通过 shell，不执行待查找的程序，也不展开 ~ 和环境变量。每次读取重新查找，因此安装或移除程序后，下次读取即可反映变化。找不到程序时不生成默认值，Emacs 配置界面显示“未设置”并提供文件选择入口。
+
+配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取，~read_write~ 另开放替换、部分更新和预检。配置中心依据 network 注入的 ~x-loki-remote-devices~ 判断请求来源。远端元数据和模块值只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 为只读，~control-center/center_auto_start~ 可读写，其余配置项仅限本机。
+
+* 生效值与来源
+
+~GET /data/{module_id}~ 中的每个值包含 ~value~ 和 ~source~ ：
+
+#+begin_src json
+{"module_id":"emacs","values":{"emacsclient_path":{"value":"/opt/homebrew/bin/emacsclient","source":"default"}}}
+#+end_src
+
+~GET /data/{module_id}/{key}~ 以及写入成功的响应保留模块和配置项标识，同时返回 ~value~ 与 ~source~ ：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","value":"/opt/homebrew/bin/emacsclient","source":"user"}
+#+end_src
+
+~source~ 只支持 ~user~ 与 ~default~。显式设置的值优先，即使与默认值相同也标记为 ~user~；否则返回静态默认值或发现的程序路径，并标记为 ~default~。未设置且没有默认值的项不出现在模块数据中，单项读取返回 404 ~config-not-set~。默认值中的 ~false~、~0~ 或空字符串均是有效值，不按真假判断是否存在。
+
+~PUT~ 和 ~POST~ 的请求体仍为原始 JSON 值，不接收来源包装。字典合并或列表追加以当前生效值为基础，包括默认值，完成后整项标记为 ~user~ 。变更订阅只通知用户写入，自动发现的默认值不触发用户配置变更。
+
+* 统一校验
+
+~POST /config/validate~ 接受模块、配置项和待校验值，供客户端或其他程序使用：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","value":"emacsclient"}
+#+end_src
+
+接口与配置保存共用校验实现。~Executable~ 检查目标存在、是普通文件并具有执行权限，允许指向普通文件的符号链接。程序名先按服务进程 ~PATH~，再按元数据 ~search_paths~ 查找；有效值规范化为绝对路径。整个检查不会执行目标程序。
+
+校验通过时返回 HTTP 200 与规范化后的值：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","valid":true,"value":"/opt/homebrew/bin/emacsclient"}
+#+end_src
+
+配置值无效时仍返回 HTTP 200，使用 ~valid: false~ 和错误说明表示预检结果：
+
+#+begin_src json
+{"module_id":"emacs","key":"emacsclient_path","valid":false,"error":{"source":"business","code":"invalid-config","message":"配置值无效：emacsclient 位置：文件不存在：/missing/emacsclient"}}
+#+end_src
+
+不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
+
+Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入；校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，“日志”调用 ~POST /emacs/apps/open?app=logs~ 并打开 ~~/.assistant/loki-assistant.log.org~ ，应用加载、日志文件打开和窗口聚焦由 services 的 Emacs 模块负责；登录启动由 services 的控制中心模块在配置提交前处理。
+
+* 提交前变化处理
+
+业务模块通过 ~ConfigService::with_change_handler(module_id, handler)~ 注册 ~ConfigChangeHandler~ 。配置中心将 ~ConfigChange~ 交给当前模块，其中包含模块、配置键、操作、候选完整值、提交前生效值，以及包含候选值的模块配置快照。处理器可读取当前配置。持有提交锁的处理器调用链禁止递归发起配置提交。
+
+| 操作 | 模块处理器 |
+|------+------------|
+| 完整值替换、字典合并、结构数组记录更新 | ~process~ |
+| 列表追加、结构数组记录新增 | ~append_records~ |
+| 结构数组记录删除 | ~remove_records~ |
+
+全量替换列表时，若成员变化只有新增或只有删除，也调用对应的数组处理器。带主键的数组按主键识别成员，其他数组按值及出现次数识别成员。同时包含新增和删除的全量替换调用 ~process~ ，该方法可以比较新旧完整值。数组处理器的默认实现调用 ~process~ 。仅需校验或同步外部状态的模块可以实现 ~handle~ ，默认的 ~process~ 在 ~handle~ 成功后返回候选值。
+
+普通提交按顺序取得最新值、校验候选值、等待模块处理器、校验处理器返回值、原子写入 YAML、更新内存并发布变更。模块处理器返回应保存的完整值，配置中心用该值更新模块快照和变更通知，也用它生成包含数据的 HTTP 成功响应。对于带主键的数组，处理器可以补充或规范化字段，记录主键集合须与候选值一致。
+
+- 模块处理失败时返回 HTTP 500 ~config-change-rejected~ 。该提交不会改动 YAML、内存配置或发布变更。处理器负责撤销失败操作产生的部分副作用。
+- 处理器返回的数据校验失败时，配置中心调用 ~rollback~ 并返回 ~config-change-rejected~ 。处理成功后发生写入失败时，同样调用 ~rollback~ 并返回 ~config-storage-error~ 。
+- YAML 写入成功后，配置中心更新内存、广播变更并调用 ~committed~ 。此回调可切换模块运行状态，失败会写日志。~subscribe~ 和 ~subscribe_module~ 的接收方在提交完成后接收变更。
+- 配置事务在服务端任务中执行。HTTP 请求断开后，已经接受的任务会继续执行。读取、预检和手动修改 YAML 均不执行模块处理器。
+
+~password~ 类型由模块注册的凭据存储处理器完成写入。配置中心只返回是否已设置，用同一布尔标记发布变更，明文由模块管理。
+
+* YAML 存储
+
+用户配置保存到 ~~/.assistant/config.yml~ ，文件内容按模块和键组织，仅存用户值：
+
+#+begin_src yaml
+emacs:
+  emacsclient_path: /opt/homebrew/bin/emacsclient
+control-center:
+  center_auto_start: false
+#+end_src
+
+文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
+
+启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
+
+* 结构化配置
+
+~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /data/{module}/{key}~ 追加元素。
+
+配置项可声明 ~actions~、~requires_local_auth~ 和 ~save_timeout_seconds~ 。配置中心按模块 ID 和配置键合并 ~CONFIG_ITEMS~ 注册的元数据。服务端依据数组类型、元素类型和可选主键决定可执行的数据操作。客户端按字段声明填写必填值，并显示服务端返回的保存结果。
+
+| 操作 | 请求 | 结果 |
+|------+-------+------|
+| 读取配置定义和值 | ~GET /meta~、~GET /data/{module}~ | 读取注册的结构和生效值 |
+| 新增带主键记录 | ~PUT /data/{module}/{key}/{instance}~ 配合 ~If-None-Match: *~ | 返回 ~200~ 和保存记录，主键已存在时返回 ~412 config-record-exists~ |
+| 修改带主键记录 | ~PUT /data/{module}/{key}/{instance}~ | 返回 ~200~ 和保存记录 |
+| 删除带主键记录 | ~DELETE /data/{module}/{key}/{instance}~ | 返回 ~204~ 。记录已不存在时同样返回 ~204~ |
+| 追加无主键元素 | ~POST /data/{module}/{key}~ ，请求体是数组 | 返回保存后的完整数组 |
+| 修改或删除无主键元素 | ~PUT /data/{module}/{key}~ ，请求体是替换后的数组 | 返回保存后的完整数组 |
+| 执行配置操作 | ~POST /config/actions/{module}/{action}/{instance}~ | 返回已注册的操作结果 |
+
+* 结构中的密码字段
+
+带主键的结构数组可声明 ~data_type: password~ 和 ~password_path~ 。路径是 pass 内相对的 ~.gpg~ 条目，~{id}~ 展开为当前记录的主键。所属模块校验令牌后调用 ~save_record_password~ 。配置中心通过密码模块写入原文，配置和 HTTP 响应保存条目引用。模块通过 ~read_record_password~ 读取原文。配置写入失败时，配置中心尝试恢复原条目。
+
+* 需要模块准备的新增
+
+模块处理器可以通过 ~record_creation_keys~ 为指定配置键注册 ~prepare_record~ 。配置中心根据服务端注册识别该配置项。带 ~If-None-Match: *~ 的记录新增先由配置中心填入请求路径中的主键，校验必填字段、类型、主键唯一性和只读字段，再交给模块准备。仅接受新增接口创建需要准备的记录，避免由集合替换或追加入口绕过准备步骤。
+
+~prepare_record~ 在落盘事务前运行，可以等待外部交互。完成准备后，模块通过配置服务提交带处理结果的记录，配置中心再次校验并在提交锁内检查主键唯一性。准备失败由原请求返回配置错误。Slack 的具体用法见 [[file:slack.org::*工作区配置][Slack 工作区配置]]。

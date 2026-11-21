@@ -30,6 +30,9 @@ pub(super) enum Error {
     Conflict,
     ReadPosition,
     AppToken,
+    UserToken,
+    ImportExpired,
+    ImportSave,
     RateLimited(u64),
     Upstream,
     Unavailable,
@@ -104,6 +107,21 @@ impl Error {
                 422,
                 "slack-invalid-read-position",
                 "此消息不属于指定的时间线。",
+            ),
+            Self::UserToken => (
+                422,
+                "slack-invalid-user-token",
+                "请输入 Slack 用户令牌（xoxp- 开头）。",
+            ),
+            Self::ImportExpired => (
+                404,
+                "slack-token-import-expired",
+                "本次令牌导入已失效，请重新提交配置。",
+            ),
+            Self::ImportSave => (
+                500,
+                "slack-token-import-save-failed",
+                "无法保存 Slack 配置，请查看原保存请求。",
             ),
             Self::AppToken => (
                 422,

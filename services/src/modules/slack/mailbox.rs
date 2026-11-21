@@ -20,7 +20,11 @@ struct Cursor {
     expires: u64,
 }
 
-fn read_cursor(page: &Page, session: Uuid, target: &str) -> Result<Option<String>, Error> {
+pub(super) fn read_cursor(
+    page: &Page,
+    session: Uuid,
+    target: &str,
+) -> Result<Option<String>, Error> {
     let Some(cursor) = &page.cursor else {
         return Ok(None);
     };
@@ -35,7 +39,7 @@ fn read_cursor(page: &Page, session: Uuid, target: &str) -> Result<Option<String
     Ok(Some(cursor.anchor))
 }
 
-fn next_cursor(session: Uuid, target: String, anchor: String) -> String {
+pub(super) fn next_cursor(session: Uuid, target: String, anchor: String) -> String {
     let cursor = Cursor {
         session,
         target,
@@ -45,8 +49,112 @@ fn next_cursor(session: Uuid, target: String, anchor: String) -> String {
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("Slack 游标可序列化"))
 }
 
+#[derive(Serialize)]
+pub(super) struct UserProfile {
+    pub id: String,
+    team_id: String,
+    name: String,
+    is_bot: bool,
+}
+
+pub(super) struct UserDirectory {
+    session: Uuid,
+    expires_at: u64,
+    users: std::sync::Arc<[UserProfile]>,
+}
+
+pub(super) struct ConversationRow {
+    pub order: Option<(u64, u32)>,
+    pub id: String,
+    pub value: Value,
+}
+
 impl SlackService {
-    pub(super) async fn refresh_directory(&self, session: Uuid) -> Result<(), Error> {
+    pub(super) async fn users(
+        &self,
+        session: Uuid,
+    ) -> Result<std::sync::Arc<[UserProfile]>, Error> {
+        let mut directory = self.user_directory.lock().await;
+        let team_id = self
+            .state
+            .lock()
+            .await
+            .account(session)?
+            .identity
+            .team_id
+            .clone();
+        if let Some(current) = directory.as_ref()
+            && current.session == session
+            && current.expires_at > now()
+        {
+            return Ok(current.users.clone());
+        }
+        let mut cursor = String::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut users = BTreeMap::new();
+        loop {
+            let response = self
+                .slack_get(
+                    session,
+                    "users.list",
+                    &[("limit", "200"), ("cursor", &cursor)],
+                )
+                .await?;
+            let members = response["members"].as_array().ok_or(Error::Upstream)?;
+            for user in members {
+                let Some(id) = user["id"].as_str().filter(|id| valid_id(id)) else {
+                    continue;
+                };
+                if user["deleted"] == true {
+                    continue;
+                }
+                let name = [
+                    &user["profile"]["display_name"],
+                    &user["real_name"],
+                    &user["name"],
+                ]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|name| !name.trim().is_empty())
+                .unwrap_or(id);
+                let id = format!("{team_id}.{id}");
+                users.insert(
+                    id.clone(),
+                    UserProfile {
+                        id,
+                        team_id: team_id.clone(),
+                        name: name.to_owned(),
+                        is_bot: user["is_bot"] == true,
+                    },
+                );
+            }
+            let next = response["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or_default();
+            if next.is_empty() {
+                break;
+            }
+            if !seen.insert(next.to_owned()) {
+                return Err(Error::Upstream);
+            }
+            cursor = next.to_owned();
+        }
+        let state = self.state.lock().await;
+        state.account(session)?;
+        let users: std::sync::Arc<[UserProfile]> = users.into_values().collect();
+        *directory = Some(UserDirectory {
+            session,
+            expires_at: now() + 300,
+            users: users.clone(),
+        });
+        Ok(users)
+    }
+
+    async fn directory(
+        &self,
+        session: Uuid,
+        types: &str,
+    ) -> Result<BTreeMap<String, Conversation>, Error> {
         let mut directory = BTreeMap::new();
         let mut cursor = String::new();
         loop {
@@ -55,7 +163,7 @@ impl SlackService {
                     session,
                     "users.conversations",
                     &[
-                        ("types", "im,mpim"),
+                        ("types", types),
                         ("exclude_archived", "true"),
                         ("limit", "100"),
                         ("cursor", &cursor),
@@ -71,6 +179,10 @@ impl SlackService {
                     "im"
                 } else if channel["is_mpim"] == true {
                     "mpim"
+                } else if channel["is_private"] == true || channel["is_group"] == true {
+                    "private_channel"
+                } else if channel["is_channel"] == true {
+                    "public_channel"
                 } else {
                     continue;
                 };
@@ -103,6 +215,18 @@ impl SlackService {
             }
             cursor = next.into();
         }
+        Ok(directory)
+    }
+
+    pub(super) async fn refresh_directory(&self, session: Uuid) -> Result<(), Error> {
+        let directory = match self
+            .directory(session, "im,mpim,public_channel,private_channel")
+            .await
+        {
+            // 已授权的旧凭据可能只有私信权限。
+            Err(Error::Permission) => self.directory(session, "im,mpim").await?,
+            result => result?,
+        };
         self.update_cache(session, move |cache, _| {
             cache
                 .conversations
@@ -113,7 +237,9 @@ impl SlackService {
                     .entry(id)
                     .and_modify(|current| {
                         current.kind.clone_from(&entry.kind);
-                        if current.participants != entry.participants {
+                        if current.participants != entry.participants
+                            || matches!(entry.kind.as_str(), "public_channel" | "private_channel")
+                        {
                             current.participants.clone_from(&entry.participants);
                             current.title.clone_from(&entry.title);
                         }
@@ -126,69 +252,38 @@ impl SlackService {
         .await
     }
 
-    pub(super) async fn conversations(&self, session: Uuid, page: Page) -> Result<Value, Error> {
-        let limit = page.limit()?;
-        let unread = page.unread.unwrap_or_default();
-        let kind = page.kind.as_deref().unwrap_or_default();
-        if !matches!(kind, "" | "im" | "mpim") {
-            return Err(Error::Invalid);
-        }
-        let target = format!("conversations:{kind}:{unread}");
-        let anchor = read_cursor(&page, session, &target)?
-            .map(|value| {
-                let (time, id) = value.split_once('|').ok_or(Error::Cursor)?;
-                let time = if time.is_empty() {
-                    None
-                } else {
-                    Some(timestamp(time).ok_or(Error::Cursor)?)
-                };
-                Ok::<_, Error>((time, id.to_owned()))
-            })
-            .transpose()?;
+    pub(super) async fn conversation_rows(
+        &self,
+        session: Uuid,
+        unread: bool,
+        kind: &str,
+    ) -> Result<(Vec<ConversationRow>, bool), Error> {
         if !self.state.lock().await.cache.directory_loaded {
             self.refresh_directory(session).await?;
         }
         let state = self.state.lock().await;
         let account = state.account(session)?;
-        let mut items: Vec<_> = state
+        let rows = state
             .cache
             .conversations
             .values()
             .filter(|value| kind.is_empty() || value.kind == kind)
             .filter_map(|value| {
-                let (latest, unread_time, summary) = value.summarize(account);
+                let (latest, unread_time, mut summary) = value.summarize(account);
                 if unread && unread_time.is_none() {
                     return None;
                 }
-                let order = if unread { unread_time } else { latest };
-                if anchor.as_ref().is_some_and(|(after_time, after_id)| {
-                    order > *after_time || (order == *after_time && value.id <= *after_id)
-                }) {
-                    return None;
-                }
-                Some((order, &value.id, summary))
+                summary["id"] = json!(format!("{}.{}", account.identity.team_id, value.id));
+                summary["team_id"] = json!(account.identity.team_id);
+                summary["session_id"] = json!(session);
+                Some(ConversationRow {
+                    order: if unread { unread_time } else { latest },
+                    id: value.id.clone(),
+                    value: summary,
+                })
             })
             .collect();
-        items.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(right.1)));
-        let more = items.len() > limit;
-        items.truncate(limit);
-        let next = if more {
-            items.last().map(|(time, id, _)| {
-                let time = time
-                    .map(|(seconds, fraction)| format!("{seconds}.{fraction:09}"))
-                    .unwrap_or_default();
-                next_cursor(session, target, format!("{time}|{id}"))
-            })
-        } else {
-            None
-        };
-        let items: Vec<_> = items.into_iter().map(|(_, _, summary)| summary).collect();
-        let sync = if state.socket_state == "connected" {
-            "live"
-        } else {
-            "cached"
-        };
-        Ok(json!({"api_version":"1","items":items,"next_cursor":next,"sync_state":sync}))
+        Ok((rows, state.socket_state == "connected"))
     }
 
     pub(super) async fn messages(
@@ -312,25 +407,63 @@ impl SlackService {
             return self.fetch_thread(session, id, thread, before, limit).await;
         }
         let number = limit.to_string();
-        let mut params = vec![("channel", id), ("limit", number.as_str())];
-        if let Some(before) = before {
-            params.push(("latest", before));
-        }
-        let response = self
-            .slack_get(session, "conversations.history", &params)
-            .await?;
-        let more = response["has_more"] == true
-            || response["response_metadata"]["next_cursor"]
+        let mut latest = before.map(str::to_owned);
+        let mut cursor = String::new();
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let (items, more) = loop {
+            let mut params = vec![("channel", id), ("limit", number.as_str())];
+            if let Some(latest) = &latest {
+                params.push(("latest", latest));
+            }
+            if !cursor.is_empty() {
+                params.push(("cursor", &cursor));
+            }
+            let response = self
+                .slack_get(session, "conversations.history", &params)
+                .await?;
+            let next = response["response_metadata"]["next_cursor"]
                 .as_str()
-                .is_some_and(|cursor| !cursor.is_empty());
-        let mut items: Vec<_> = response["messages"]
-            .as_array()
-            .ok_or(Error::Upstream)?
-            .iter()
-            .filter_map(|value| Message::from_slack(value, None))
-            .filter(|message| message.thread_ts.is_none())
-            .collect();
-        items.sort_by_key(|message| timestamp(&message.ts));
+                .unwrap_or_default();
+            let more = !next.is_empty() || response["has_more"] == true;
+            let messages = response["messages"].as_array().ok_or(Error::Upstream)?;
+            let mut items: Vec<_> = messages
+                .iter()
+                .filter_map(|value| Message::from_slack(value, None))
+                .filter(|message| {
+                    message.thread_ts.is_none()
+                        && latest
+                            .as_deref()
+                            .is_none_or(|latest| timestamp(&message.ts) < timestamp(latest))
+                })
+                .collect();
+            if !items.is_empty() || !more {
+                items.sort_by_key(|message| timestamp(&message.ts));
+                break (items, more);
+            }
+            // 过滤掉线程广播后，仍需继续寻找顶层消息。
+            if !next.is_empty() {
+                if !seen_cursors.insert(next.to_owned()) {
+                    return Err(Error::Upstream);
+                }
+                cursor = next.to_owned();
+            } else {
+                let boundary = messages
+                    .iter()
+                    .filter_map(|message| message["ts"].as_str())
+                    .filter_map(|ts| timestamp(ts).map(|time| (time, ts)))
+                    .filter(|(time, _)| {
+                        latest
+                            .as_deref()
+                            .and_then(timestamp)
+                            .is_none_or(|latest| *time < latest)
+                    })
+                    .min_by_key(|(time, _)| *time)
+                    .ok_or(Error::Upstream)?;
+                latest = Some(boundary.1.to_owned());
+                cursor.clear();
+                seen_cursors.clear();
+            }
+        };
         self.store_page(session, id, None, &items, None, more)
             .await?;
         Ok((items, None, more))
@@ -349,6 +482,9 @@ impl SlackService {
         let mut root = None;
         let mut count = 0usize;
         let mut cursor = String::new();
+        let mut oldest: Option<String> = None;
+        let mut last_reply = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
         loop {
             let mut params = vec![("channel", id), ("ts", thread), ("limit", "100")];
             if let Some(before) = before {
@@ -356,6 +492,9 @@ impl SlackService {
             }
             if !cursor.is_empty() {
                 params.push(("cursor", &cursor));
+            }
+            if let Some(oldest) = &oldest {
+                params.push(("oldest", oldest));
             }
             let response = self
                 .slack_get(session, "conversations.replies", &params)
@@ -366,9 +505,13 @@ impl SlackService {
                 .iter()
                 .filter_map(|value| Message::from_slack(value, Some(thread)))
             {
-                if message.ts == thread {
+                if message.ts == thread && message.thread_ts.is_none() {
                     root = Some(message);
-                } else if before.is_none_or(|before| timestamp(&message.ts) < timestamp(before)) {
+                } else if message.thread_ts.as_deref() == Some(thread)
+                    && before.is_none_or(|before| timestamp(&message.ts) < timestamp(before))
+                    && last_reply.is_none_or(|last| timestamp(&message.ts) > Some(last))
+                {
+                    last_reply = timestamp(&message.ts);
                     count += 1;
                     if window.len() == limit {
                         window.pop_front();
@@ -379,13 +522,22 @@ impl SlackService {
             let next = response["response_metadata"]["next_cursor"]
                 .as_str()
                 .unwrap_or_default();
-            if next.is_empty() {
+            if !next.is_empty() {
+                if !seen_cursors.insert(next.to_owned()) {
+                    return Err(Error::Upstream);
+                }
+                cursor = next.to_owned();
+            } else if response["has_more"] == true {
+                let latest_reply = window.back().ok_or(Error::Upstream)?;
+                if oldest.as_deref().and_then(timestamp) >= timestamp(&latest_reply.ts) {
+                    return Err(Error::Upstream);
+                }
+                oldest = Some(latest_reply.ts.clone());
+                cursor.clear();
+                seen_cursors.clear();
+            } else {
                 break;
             }
-            if next == cursor {
-                return Err(Error::Upstream);
-            }
-            cursor = next.to_owned();
         }
         let root = root.ok_or(Error::Thread)?;
         let items: Vec<_> = window.into_iter().collect();
@@ -483,6 +635,41 @@ impl SlackService {
             return Err(Error::Invalid);
         }
         let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(text.as_bytes()));
+        let mut verified_root = false;
+        if let Some(thread) = &thread {
+            let needs_lookup = {
+                let state = self.state.lock().await;
+                state.account(session)?;
+                let cache = &state.cache;
+                if cache.sends.contains_key(&key) {
+                    false
+                } else {
+                    let conversation = cache.conversations.get(&id).ok_or(Error::Conversation)?;
+                    if conversation.deleted.contains(thread) {
+                        return Err(Error::Thread);
+                    }
+                    !conversation.messages.contains_key(thread)
+                }
+            };
+            if needs_lookup {
+                let response = self
+                    .slack_get(
+                        session,
+                        "conversations.replies",
+                        &[("channel", &id), ("ts", thread), ("limit", "1")],
+                    )
+                    .await?;
+                verified_root = response["messages"]
+                    .as_array()
+                    .ok_or(Error::Upstream)?
+                    .iter()
+                    .filter_map(|value| Message::from_slack(value, Some(thread)))
+                    .any(|message| message.ts == *thread && message.thread_ts.is_none());
+                if !verified_root {
+                    return Err(Error::Thread);
+                }
+            }
+        }
         let result = self
             .update_cache(session, move |cache, _| {
                 if let Some(record) = cache.sends.get(&key) {
@@ -496,10 +683,11 @@ impl SlackService {
                 }
                 let conversation = cache.conversations.get(&id).ok_or(Error::Conversation)?;
                 if let Some(thread) = &thread
-                    && !conversation
-                        .messages
-                        .get(thread)
-                        .is_some_and(|root| root.thread_ts.is_none())
+                    && (conversation.deleted.contains(thread)
+                        || !conversation
+                            .messages
+                            .get(thread)
+                            .map_or(verified_root, |root| root.thread_ts.is_none()))
                 {
                     return Err(Error::Thread);
                 }

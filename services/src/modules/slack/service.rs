@@ -15,15 +15,18 @@ use tokio::sync::{Mutex, Notify, watch};
 use url::Url;
 use uuid::Uuid;
 
-use crate::modules::notification::NotificationService;
+use crate::modules::{
+    config::service::ConfigService, notification::NotificationService,
+    password::service::PasswordService,
+};
 
 use super::{
     client::SlackClient,
-    password::SlackPasswords,
+    mailbox::UserDirectory,
     projects::{Backend, SlackTeam},
     protocol::{Error, Identity, valid_id},
     status::ProjectsStatus,
-    store::{Account, Cache, Keychain, Secrets, SendState, local_token, random},
+    store::{Account, Cache, Keychain, Secrets, SendState, random},
 };
 
 pub(super) struct Authorization {
@@ -52,7 +55,6 @@ impl Authorization {
 
 #[derive(Default)]
 pub(super) struct State {
-    pub local_token: Option<String>,
     pub initialized: bool,
     pub credentials_locked: bool,
     pub storage_unavailable: bool,
@@ -81,7 +83,7 @@ impl State {
         if account.identity.session_id != session {
             return Err(Error::Session);
         }
-        if account.revoked {
+        if account.revoked || account.access.is_empty() {
             return Err(Error::Authorization);
         }
         Ok(account)
@@ -97,15 +99,16 @@ pub struct SlackService {
     pub(super) sync: Notify,
     pub(super) alerts: Notify,
     pub(super) refresh_lock: Mutex<()>,
+    pub(super) user_directory: Mutex<Option<UserDirectory>>,
     client_id: Option<&'static str>,
     keychain: Arc<dyn Keychain>,
     cache_path: Option<PathBuf>,
-    token_path: Option<PathBuf>,
     port: std::sync::OnceLock<u16>,
     project: Option<(String, SlackTeam, Uuid, Arc<ProjectsStatus>)>,
-    password: Option<(Arc<SlackPasswords>, String)>,
+    password: Option<(Arc<PasswordService>, String)>,
     password_operation: Mutex<()>,
-    authorization_changed: Notify,
+    imported_token: Option<Arc<ConfigService>>,
+    imported_token_lock: Mutex<()>,
 }
 
 impl fmt::Debug for SlackService {
@@ -124,6 +127,7 @@ impl SlackService {
         generation: Uuid,
         reporter: Arc<ProjectsStatus>,
         backend: &Backend,
+        config: Arc<ConfigService>,
     ) -> Self {
         let namespace = format!(
             "{id}-{}-{}",
@@ -145,6 +149,9 @@ impl SlackService {
             .as_ref()
             .zip(settings.password_id.as_ref())
             .map(|(passwords, id)| (Arc::clone(passwords), id.clone()));
+        if settings.token.is_some() {
+            service.imported_token = Some(config);
+        }
         service.project = Some((id, settings, generation, reporter));
         service
     }
@@ -168,36 +175,35 @@ impl SlackService {
             sync: Notify::new(),
             alerts: Notify::new(),
             refresh_lock: Mutex::new(()),
+            user_directory: Mutex::default(),
             client_id,
             keychain,
             cache_path: service_path
                 .as_ref()
                 .map(|path| path.with_file_name("slack-cache.json")),
-            token_path: service_path.map(|path| path.with_file_name("slack-api-token")),
             port: std::sync::OnceLock::new(),
             project: None,
             password: None,
             password_operation: Mutex::new(()),
-            authorization_changed: Notify::new(),
+            imported_token: None,
+            imported_token_lock: Mutex::new(()),
         }
     }
 
     pub(super) async fn initialize(&self) -> Result<(), Error> {
         let keychain = Arc::clone(&self.keychain);
         let cache_path = self.cache_path.clone();
-        let token_path = self.token_path.clone();
         let mut state = Arc::clone(&self.state).lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            if state.initialized && !state.credentials_locked {
+                return Ok(());
+            }
+
             if !state.initialized {
-                let token = token_path
-                    .as_deref()
-                    .ok_or(Error::Storage)
-                    .and_then(local_token);
                 let cache = cache_path
                     .as_deref()
                     .ok_or(Error::Storage)
                     .and_then(Cache::load);
-                state.local_token = token.ok();
                 match cache {
                     Ok(cache) => state.cache = cache,
                     Err(_) => state.storage_unavailable = true,
@@ -256,9 +262,7 @@ impl SlackService {
     }
 
     pub(super) fn notification_path(&self) -> Option<String> {
-        self.project
-            .as_ref()
-            .map(|(project, _, _, _)| format!("/slack/teams/{project}/open"))
+        self.project.as_ref().map(|_| "/slack/open".to_owned())
     }
 
     pub(super) async fn update_cache<T: Send + 'static>(
@@ -299,7 +303,13 @@ impl SlackService {
             }
             let mut next = state.secrets.clone();
             let result = operation(&mut next, &state)?;
-            keychain.save(&next)?;
+            let mut stored = next.clone();
+            if let Some(account) = &mut stored.account
+                && account.imported_token_hash.is_some()
+            {
+                account.access.clear();
+            }
+            keychain.save(&stored)?;
             let session = next
                 .account
                 .as_ref()
@@ -318,59 +328,41 @@ impl SlackService {
         .map_err(|_| Error::Credentials)?
     }
 
-    pub(super) async fn verify_local(&self, token: Option<&str>) -> Result<(), Error> {
-        let state = self.state.lock().await;
-        if state.retired {
-            return Err(Error::Project);
-        }
-        let expected = state.local_token.as_deref().ok_or(Error::Storage)?;
-        if token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(expected.as_bytes()))) {
-            Ok(())
-        } else {
-            Err(Error::LocalAuth)
-        }
-    }
-
-    fn authorization_state(state: &State, configured: bool) -> &'static str {
+    fn authorization_state(state: &State) -> &'static str {
         let account = state.secrets.account.as_ref();
         match account {
             _ if state.credentials_locked => "credentials_unavailable",
             Some(account) if account.revoked => "reauthorization_required",
-            Some(_) => "authorized",
-            None if !configured || state.app_token.is_none() => "unconfigured",
-            None => "authorization_required",
+            Some(account) if !account.access.is_empty() => "authorized",
+            _ if state.app_token.is_none() => "unconfigured",
+            _ => "authorization_required",
         }
     }
 
-    pub(super) async fn public_status(&self) -> Value {
-        let configured = self.client_id.is_some();
+    pub(super) async fn session_id(&self) -> Option<Uuid> {
         let state = self.state.lock().await;
-        let account = state
-            .secrets
-            .account
-            .as_ref()
-            .filter(|account| !state.credentials_locked && !account.revoked);
-        let (id, name, team_id) = self
-            .project
-            .as_ref()
-            .map(|(id, settings, _, _)| {
-                (
-                    id.as_str(),
-                    settings.name.as_str(),
-                    settings.team_id.as_deref(),
-                )
-            })
-            .unwrap_or(("default", "Slack", None));
+        let session = state.secrets.account.as_ref()?.identity.session_id;
+        state.account(session).ok().map(|_| session)
+    }
+
+    pub(super) async fn public_status(&self) -> Value {
+        let state = self.state.lock().await;
+        let account = state.secrets.account.as_ref().filter(|account| {
+            !state.credentials_locked && !account.revoked && !account.access.is_empty()
+        });
+        let (team_id, settings, _, _) = self.project.as_ref().expect("Slack 工作区配置");
         let issue = if state.storage_unavailable {
             Some(Error::Storage)
         } else {
             state.issue
         };
-        json!({"id":id,"name":name,"team_id":team_id.or_else(|| account.map(|account| account.identity.team_id.as_str())),
+        json!({"team_id":team_id,"name":settings.name,
                "team_name":account.map(|account| &account.identity.team_name),
-               "password_id":self.project.as_ref().and_then(|(_, settings, _, _)| settings.password_id.as_ref()),
+               "session_id":account.map(|account| account.identity.session_id),
+               "user_id":account.map(|account| format!("{team_id}.{}", account.identity.user_id)),
+               "password_id":settings.password_id,
                "app_token_set":state.app_token.is_some(),
-               "authorization_state":Self::authorization_state(&state, configured),
+               "authorization_state":Self::authorization_state(&state),
                "socket_state":state.socket_state,
                "issue_code":issue.map(|error| error.object()["code"].clone())})
     }
@@ -379,20 +371,6 @@ impl SlackService {
         if let Some((id, _, generation, reporter)) = &self.project {
             reporter.update(id, *generation, self.public_status().await);
         }
-    }
-
-    pub(super) async fn status(&self) -> Value {
-        let configured = self.client_id.is_some();
-        let state = self.state.lock().await;
-        let account = state.secrets.account.as_ref();
-        let issue = if state.storage_unavailable {
-            Some(Error::Storage)
-        } else {
-            state.issue
-        };
-        json!({"api_version":"1", "authorization_state":Self::authorization_state(&state, configured),"socket_state":state.socket_state,
-               "session":account.filter(|account| !account.revoked && !state.credentials_locked).map(|account| &account.identity),
-               "issue":issue.map(Error::object)})
     }
 
     pub(super) fn valid_app_token(token: &str) -> bool {
@@ -517,7 +495,7 @@ impl SlackService {
             ("scope", ""),
             (
                 "user_scope",
-                "im:read,im:history,mpim:read,mpim:history,chat:write,users:read",
+                "im:read,im:history,mpim:read,mpim:history,channels:read,channels:history,groups:read,groups:history,chat:write,users:read",
             ),
             ("redirect_uri", &redirect),
             ("state", &csrf),
@@ -565,19 +543,7 @@ impl SlackService {
         result["authorization_url"] = json!(url.as_str());
         state.authorizations.insert(id, record);
         state.active_authorization = Some(id);
-        self.authorization_changed.notify_waiters();
         Ok((id, result))
-    }
-
-    pub(super) async fn credential_id(&self) -> Option<String> {
-        self.state
-            .lock()
-            .await
-            .secrets
-            .account
-            .as_ref()
-            .filter(|account| !account.revoked)
-            .map(|account| account.identity.team_id.clone())
     }
 
     pub(super) async fn authorization(&self, id: Uuid) -> Result<Value, Error> {
@@ -588,47 +554,6 @@ impl SlackService {
             .filter(|record| record.expires.saturating_add(600) > now())
             .ok_or(Error::AuthorizationRecord)?;
         Ok(record.json(id))
-    }
-
-    pub(super) async fn authorization_result(&self, id: Uuid) -> Option<Result<(), Error>> {
-        let state = self.state.lock().await;
-        let Some(record) = state.authorizations.get(&id) else {
-            return Some(Err(Error::OAuthState));
-        };
-        match record.state {
-            "succeeded" => Some(Ok(())),
-            "pending" if record.expires > now() => None,
-            "pending" => Some(Err(Error::AuthorizationTimeout)),
-            _ => Some(Err(record.failure.unwrap_or(Error::OAuthState))),
-        }
-    }
-
-    pub(super) async fn wait_authorization(&self, id: Uuid) -> Result<(), Error> {
-        tokio::time::timeout(std::time::Duration::from_secs(600), async {
-            loop {
-                let changed = self.authorization_changed.notified();
-                if let Some(result) = self.authorization_result(id).await {
-                    return result;
-                }
-                changed.await;
-            }
-        })
-        .await
-        .unwrap_or(Err(Error::AuthorizationTimeout))
-    }
-
-    pub(super) async fn cancel_authorization(&self, id: Uuid) {
-        let mut state = self.state.lock().await;
-        if state.active_authorization == Some(id)
-            && state
-                .authorizations
-                .get(&id)
-                .is_some_and(|record| record.state == "pending")
-        {
-            state.active_authorization = None;
-            state.authorizations.remove(&id);
-        }
-        self.authorization_changed.notify_waiters();
     }
 
     pub(super) async fn callback(
@@ -685,7 +610,6 @@ impl SlackService {
             };
             record.failure = result.err();
         }
-        self.authorization_changed.notify_waiters();
         Ok(())
     }
 
@@ -710,7 +634,37 @@ impl SlackService {
         let token = value["authed_user"]["access_token"]
             .as_str()
             .ok_or(Error::Upstream)?;
+        let grant = &value["authed_user"];
+        self.save_user(
+            self.verify_identity(token).await?,
+            token.to_owned(),
+            grant["refresh_token"].as_str().map(str::to_owned),
+            grant["expires_in"]
+                .as_u64()
+                .map(|seconds| now().saturating_add(seconds)),
+            Some(id),
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn verify_user_token(&self, token: &str) -> Result<Identity, Error> {
+        if !token.starts_with("xoxp-")
+            || !(6..=4096).contains(&token.len())
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(Error::UserToken);
+        }
+        self.verify_identity(token).await
+    }
+
+    async fn verify_identity(&self, token: &str) -> Result<Identity, Error> {
         let identity = self.client.test_identity(token).await?;
+        if identity["bot_id"].as_str().is_some() {
+            return Err(Error::UserToken);
+        }
         let team = identity["team_id"]
             .as_str()
             .filter(|id| valid_id(id))
@@ -730,24 +684,82 @@ impl SlackService {
             .ok_or(Error::Upstream)?
             .to_owned();
         let name = identity["team"].as_str().unwrap_or(&team).to_owned();
-        let grant = &value["authed_user"];
+        Ok(Identity {
+            session_id: Uuid::new_v4(),
+            team_id: team,
+            user_id: user,
+            team_name: name,
+        })
+    }
+
+    pub(super) async fn use_imported_token(
+        &self,
+        token: String,
+        identity: Identity,
+    ) -> Result<(), Error> {
+        let _lock = self.imported_token_lock.lock().await;
+        self.initialize().await?;
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        self.save_user(identity, token, None, None, None, Some(hash))
+            .await
+    }
+
+    pub(super) async fn restore_imported_token(&self) -> Result<(), Error> {
+        let Some(config) = &self.imported_token else {
+            return Ok(());
+        };
+        let _lock = self.imported_token_lock.lock().await;
+        let (id, _, _, _) = self.project.as_ref().ok_or(Error::Configuration)?;
+        let token = config
+            .read_record_password("slack", "teams", id, "token")
+            .await
+            .map_err(|_| Error::PasswordRead)?
+            .trim_end_matches('\n')
+            .to_owned();
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let identity = {
+            let state = self.state.lock().await;
+            if state.secrets.disabled_token.as_deref() == Some(&hash) {
+                return Ok(());
+            }
+            let previous = state
+                .secrets
+                .account
+                .as_ref()
+                .filter(|account| account.imported_token_hash.as_deref() == Some(&hash));
+            if previous.is_some_and(|account| account.revoked || !account.access.is_empty()) {
+                return Ok(());
+            }
+            previous.map(|account| account.identity.clone())
+        };
+        let identity = match identity {
+            Some(identity) => identity,
+            None => self.verify_user_token(&token).await?,
+        };
+        self.save_user(identity, token, None, None, None, Some(hash))
+            .await
+    }
+
+    async fn save_user(
+        &self,
+        identity: Identity,
+        token: String,
+        refresh: Option<String>,
+        expires_at: Option<u64>,
+        authorization: Option<Uuid>,
+        imported_token_hash: Option<String>,
+    ) -> Result<(), Error> {
         let mut account = Account {
-            identity: Identity {
-                session_id: Uuid::new_v4(),
-                team_id: team,
-                user_id: user,
-                team_name: name,
-            },
-            access: token.to_owned(),
-            refresh: grant["refresh_token"].as_str().map(str::to_owned),
-            expires_at: grant["expires_in"]
-                .as_u64()
-                .map(|seconds| now().saturating_add(seconds)),
+            identity,
+            access: token,
+            refresh,
+            expires_at,
             baseline: now(),
+            imported_token_hash,
             revoked: false,
         };
         self.update_secrets(move |secrets, state| {
-            if state.active_authorization != Some(id) {
+            if authorization.is_some() && state.active_authorization != authorization {
                 return Err(Error::OAuthState);
             }
             if let Some(previous) = &secrets.account
@@ -758,9 +770,11 @@ impl SlackService {
                 account.baseline = previous.baseline;
             }
             secrets.account = Some(account);
+            secrets.disabled_token = None;
             Ok(())
         })
         .await?;
+        self.state.lock().await.issue = None;
         self.signal_change();
         self.publish_status().await;
         Ok(())
@@ -774,6 +788,13 @@ impl SlackService {
                 .is_some_and(|account| account.identity.session_id != session)
             {
                 return Err(Error::Session);
+            }
+            if let Some(hash) = secrets
+                .account
+                .as_ref()
+                .and_then(|account| account.imported_token_hash.clone())
+            {
+                secrets.disabled_token = Some(hash);
             }
             secrets.account = None;
             Ok(())

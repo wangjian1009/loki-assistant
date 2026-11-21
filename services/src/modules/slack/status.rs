@@ -17,34 +17,41 @@ fn slack_status_metadata() -> StatusModuleMetadata {
     StatusModuleMetadata {
         id: "slack".into(),
         name: "Slack".into(),
-        description: "Slack 项目、工作区及连接状态。".into(),
+        description: "Slack 授权和连接状态。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         items: vec![StatusItemMetadata {
-            key: "projects".into(),
-            name: "Slack 项目".into(),
-            description: "各项目的授权和连接状态。".into(),
+            key: "connections".into(),
+            name: "Slack 连接".into(),
+            description: "各工作区的授权和连接状态。".into(),
             remote_access: false,
             schema: StatusSchema::Array {
                 items: Box::new(StatusSchema::Object {
                     fields: vec![
                         Field::new(
-                            "id",
-                            "项目标识",
-                            "配置中的项目标识。",
-                            StatusSchema::string(),
-                        ),
-                        Field::new("name", "项目", "项目显示名称。", StatusSchema::string()),
-                        Field::new(
                             "team_id",
                             "工作区 ID",
                             "Slack Team 标识。",
                             StatusSchema::string(),
-                        )
-                        .nullable(),
+                        ),
+                        Field::new("name", "名称", "本地显示名称。", StatusSchema::string()),
                         Field::new(
                             "team_name",
                             "工作区",
                             "已授权工作区名称。",
+                            StatusSchema::string(),
+                        )
+                        .nullable(),
+                        Field::new(
+                            "session_id",
+                            "会话 ID",
+                            "当前本机授权会话的标识。",
+                            StatusSchema::string(),
+                        )
+                        .nullable(),
+                        Field::new(
+                            "user_id",
+                            "用户 ID",
+                            "由工作区 ID 和授权用户的 Slack ID 组成。",
                             StatusSchema::string(),
                         )
                         .nullable(),
@@ -64,13 +71,13 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         Field::new(
                             "authorization_state",
                             "授权状态",
-                            "项目的 Slack OAuth 状态。",
+                            "当前工作区的 Slack OAuth 状态。",
                             StatusSchema::string(),
                         ),
                         Field::new(
                             "socket_state",
                             "连接状态",
-                            "项目的 Socket Mode 状态。",
+                            "当前工作区的 Socket Mode 状态。",
                             StatusSchema::string(),
                         ),
                         Field::new(
@@ -127,6 +134,6 @@ impl ProjectsStatus {
 
     fn publish(&self, entries: &BTreeMap<String, (Uuid, Value)>) {
         let value = json!(entries.values().map(|(_, data)| data).collect::<Vec<_>>());
-        let _ = self.status.publish("slack", "projects", value);
+        let _ = self.status.publish("slack", "connections", value);
     }
 }

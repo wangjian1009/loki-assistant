@@ -20,6 +20,7 @@ impl SlackService {
         self.set_port(port);
         let _ = self.initialize().await;
         self.restore_app_token().await;
+        self.restore_user_token().await;
         self.publish_status().await;
         tokio::join!(
             self.sockets(),
@@ -27,6 +28,12 @@ impl SlackService {
             self.synchronizing(),
             self.notifications()
         );
+    }
+
+    async fn restore_user_token(&self) {
+        if let Err(error) = self.restore_imported_token().await {
+            self.state.lock().await.issue = Some(error);
+        }
     }
 
     async fn notifications(&self) {
@@ -86,20 +93,22 @@ impl SlackService {
                         .secrets
                         .account
                         .as_ref()
-                        .filter(|account| !account.revoked)
+                        .filter(|account| !account.revoked && !account.access.is_empty())
                         .map(|account| account.identity.session_id),
                     state.credentials_locked,
                 )
             };
             let has_token = token.is_some();
+            let has_session = session.is_some();
             let (Some(token), Some(session), false) = (token, session, locked) else {
                 self.state.lock().await.socket_state = "stopped";
                 self.publish_status().await;
                 tokio::select! {
                     _ = changes.changed() => { backoff = 1; }
-                    _ = tokio::time::sleep(Duration::from_secs(15)), if locked || !has_token => {
+                    _ = tokio::time::sleep(Duration::from_secs(15)), if locked || !has_token || !has_session => {
                         if locked && self.initialize().await.is_ok() { self.signal_change(); }
                         if !has_token { self.restore_app_token().await; }
+                        if !has_session || locked { self.restore_user_token().await; }
                         self.publish_status().await;
                     }
                 }
@@ -315,7 +324,7 @@ impl SlackService {
                     .secrets
                     .account
                     .as_ref()
-                    .filter(|account| !account.revoked)
+                    .filter(|account| !account.revoked && !account.access.is_empty())
                     .map(|account| account.identity.session_id)
             };
             let Some(session) = session else {
@@ -337,6 +346,7 @@ impl SlackService {
                     .cache
                     .conversations
                     .values()
+                    .filter(|item| matches!(item.kind.as_str(), "im" | "mpim"))
                     .map(|item| {
                         let latest = item
                             .messages
@@ -423,6 +433,7 @@ impl SlackService {
                 .cache
                 .conversations
                 .values()
+                .filter(|item| matches!(item.kind.as_str(), "im" | "mpim"))
                 .flat_map(|item| item.participants.iter().cloned())
                 .collect::<std::collections::BTreeSet<_>>()
         };
@@ -463,7 +474,7 @@ impl SlackService {
                         .filter(|id| *id != &account.identity.user_id)
                         .filter_map(|id| names.get(id).cloned())
                         .collect();
-                    if !labels.is_empty() {
+                    if !labels.is_empty() && matches!(conversation.kind.as_str(), "im" | "mpim") {
                         conversation.title = labels.join("、");
                     }
                     for message in conversation.messages.values_mut() {
@@ -488,7 +499,7 @@ impl SlackService {
                     .secrets
                     .account
                     .as_ref()
-                    .filter(|account| !account.revoked)
+                    .filter(|account| !account.revoked && !account.access.is_empty())
                     .and_then(|account| {
                         state
                             .cache
@@ -506,7 +517,7 @@ impl SlackService {
                     _ = changes.changed() => {}
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         let current = self.state.lock().await.secrets.account.as_ref()
-                            .filter(|account| !account.revoked)
+                            .filter(|account| !account.revoked && !account.access.is_empty())
                             .map(|account| account.identity.session_id);
                         if let Some(session) = current { let _ = self.access(session).await; }
                     }

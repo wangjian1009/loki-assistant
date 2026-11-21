@@ -1,6 +1,5 @@
 mod client;
 mod mailbox;
-mod password;
 mod projects;
 mod protocol;
 mod routes;
@@ -34,8 +33,8 @@ pub use projects::Projects;
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "slack",
-    name: "Slack 私信",
-    description: "后台接收 Slack 私信，供 Emacs 阅读会话与回复。",
+    name: "Slack",
+    description: "后台接收 Slack 私信，供 Emacs 阅读和回复私信及频道消息。",
     version: env!("CARGO_PKG_VERSION"),
 };
 
@@ -65,7 +64,7 @@ impl projects::SlackTeam {
                         description: "请输入以 T 开头的 Slack Team ID。".into(),
                     }),
                     read_only: false,
-                    handle_creation: true,
+                    password_path: None,
                     options: None,
                 },
                 StructureField {
@@ -76,7 +75,7 @@ impl projects::SlackTeam {
                     default_template: None,
                     checker: None,
                     read_only: false,
-                    handle_creation: false,
+                    password_path: None,
                     options: None,
                 },
                 StructureField {
@@ -87,11 +86,22 @@ impl projects::SlackTeam {
                     default_template: Some("loki-assistant/slack/{team_id}/app-token.gpg".into()),
                     checker: None,
                     read_only: false,
-                    handle_creation: false,
+                    password_path: None,
                     options: Some(FieldOptions {
                         path: "/password/entries".into(),
                         items_field: "files".into(),
                     }),
+                },
+                StructureField {
+                    key: "token".into(),
+                    label: "Slack 用户令牌引用".into(),
+                    data_type: ConfigDataType::Password,
+                    required: false,
+                    read_only: true,
+                    default_template: None,
+                    checker: None,
+                    password_path: Some("loki-assistant/slack/{id}/user-token.gpg".into()),
+                    options: None,
                 },
                 StructureField {
                     key: "oauth_credential_id".into(),
@@ -99,9 +109,9 @@ impl projects::SlackTeam {
                     data_type: ConfigDataType::String,
                     required: false,
                     read_only: true,
-                    handle_creation: false,
                     default_template: None,
                     checker: None,
+                    password_path: None,
                     options: None,
                 },
             ],
@@ -136,7 +146,7 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             },
             ConfigAction {
                 id: "authorize".into(),
-                label: "重新授权".into(),
+                label: "更换用户令牌".into(),
                 interaction: ActionInteraction::Request,
             },
         ],
@@ -148,7 +158,7 @@ fn slack_configuration() -> ConfigModuleMetadata {
     ConfigModuleMetadata {
         id: "slack".into(),
         name: "Slack".into(),
-        description: "Slack 内部应用设置。访问凭据由 macOS Keychain 管理。".into(),
+        description: "Slack 工作区、用户令牌和应用令牌设置。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         items: vec![
             ConfigItemMetadata {

@@ -223,6 +223,10 @@ async fn post_value(
 ) -> Result<Json<ValueResponse>, Response> {
     check_access(&service, &headers, &module_id, &key, true).await?;
     service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    service
         .partial(&module_id, &key, value)
         .await
         .map(|value| {
@@ -280,11 +284,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     module = "config",
     mount = "Arc<ConfigService>",
     id = "set-record",
-    mount = "Arc<ConfigService>",
     method = "PUT",
     path = "/data/{module_id}/{key}/{instance}",
     summary = "保存一条配置记录",
-    description = "保存工作流集合中的单条记录；携带 If-None-Match: * 时仅允许新增。"
+    description = "保存结构数组中的单条记录；携带 If-None-Match: * 时仅允许新增。"
 )]
 async fn put_record(
     State(service): State<Arc<ConfigService>>,
@@ -306,7 +309,7 @@ async fn put_record(
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
-    let value = if create_only && service.creation_field(&module_id, &key).await.is_some() {
+    let value = if create_only && service.has_record_creation_handler(&module_id, &key) {
         let config = Arc::clone(&service);
         let (module, key, instance) = (module_id.clone(), key.clone(), instance.clone());
         tokio::spawn(async move { config.prepare_record(&module, &key, &instance, value).await })
@@ -332,6 +335,32 @@ async fn put_record(
         value,
     })
     .into_response())
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "delete-record",
+    method = "DELETE",
+    path = "/data/{module_id}/{key}/{instance}",
+    summary = "删除一条配置记录",
+    description = "按结构数组元数据声明的主键删除记录。"
+)]
+async fn delete_record(
+    State(service): State<Arc<ConfigService>>,
+    Path((module_id, key, instance)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Response> {
+    check_access(&service, &headers, &module_id, &key, true).await?;
+    service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    service
+        .remove_record(module_id, key, instance)
+        .await
+        .map_err(error_response)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[loki_api(
