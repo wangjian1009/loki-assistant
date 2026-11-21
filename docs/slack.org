@@ -49,6 +49,7 @@ Slack 业务接口和工作区配置只接受本机调用，客户端可直接�
 | 方法 | 路径                                                          | 请求与结果                                                                                                                     |
 |------+---------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------|
 | GET  | ~/status/slack/connections~                                   | 从通用状态中心读取 ~authorization_state~、~socket_state~ 和 ~session_id~                                                       |
+| GET  | ~/slack/users/{id}~                                            | 查询单个 Slack 用户的资料（计划）。 |
 | GET  | ~/slack/conversations~                                        | 筛选参数为 ~team_id~ 、~kind~ 和 ~unread~ 。分页参数为 ~limit~ 和 ~cursor~ 。~limit~ 默认 50，范围 1–100。返回 ~id~ 、~session_id~ 和 ~next_cursor~ 。会话 ~id~ 格式为 ~team_id.聊天ID~ 。 |
 | GET  | ~/slack/conversations/{id}/messages~                          | 支持 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。 |
 | GET  | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | ~thread_ts~ 取根消息的 ~ts~ 。返回 ~root~ 、分页回复 ~items~ 和 ~next_cursor~ 。 |
