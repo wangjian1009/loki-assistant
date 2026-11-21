@@ -6,6 +6,7 @@ use serde_json::Value;
 #[serde(rename_all = "snake_case")]
 pub enum ConfigDataType {
     String,
+    Key,
     Password,
     Integer,
     Number,
@@ -65,6 +66,10 @@ pub struct ConfigItemMetadata {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ConfigItemOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_endpoint: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub create_fields: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<StructureMetadata>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

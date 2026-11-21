@@ -9,6 +9,7 @@
 (require 'loki-assistant)
 (require 'cus-edit)
 (require 'wid-edit)
+(require 'seq)
 
 (defcustom loki-assistant-config-save-timeout 120
   "配置保存等待的最长秒数，包含服务端配置处理器执行时间。
@@ -384,6 +385,9 @@
                                                (loki-assistant-config--valid-value-p (cdr entry)))
                                              values))
                         (error "%s" (loki-assistant-config--error response)))
+                      (dolist (entry (alist-get 'pending body))
+                        (when-let ((value (assq (car entry) values)))
+                          (push (cons 'pending (cdr entry)) (cdr value))))
                       (push (cons id values) data)
                       (when (zerop (cl-decf pending))
                         (setq loki-assistant-config--loading nil)
@@ -685,10 +689,12 @@
                  (or (loki-assistant-config--record-field (alist-get 'label_field record-meta) record)
                      (unless (string-empty-p id) id) (alist-get 'title metadata))
                  'face 'bold)
-                (if (equal id "") "" (concat "  [" id "]")) "\n")
+                (if (equal id "") "" (concat "  [" id "]"))
+                (if (alist-get 'pending record) "  待确认" "") "\n")
         (dolist (field (append (alist-get 'fields record-meta) nil))
           (when-let ((value (loki-assistant-config--record-field (alist-get 'key field) record)))
-            (unless (equal (alist-get 'key field) (alist-get 'label_field record-meta))
+            (unless (or (equal (alist-get 'key field) (alist-get 'label_field record-meta))
+                        (equal (alist-get 'data_type field) "password"))
               (insert "  " (alist-get 'label field) "  " (format "%s" value) "\n"))))
         (insert "  ")
         (when (or (alist-get 'single metadata) (alist-get 'id_field record-meta))
@@ -704,6 +710,14 @@
           (insert "\n  " message))
         (insert "\n\n")))))
 
+(defun loki-assistant-config--record-allowed-field-p (section field existing)
+  "判断 FIELD 是否用于 SECTION 当前的新增或 EXISTING 记录。"
+  (let ((create-fields (alist-get 'create_fields
+                                  (loki-assistant-config--record-section-metadata section))))
+    (and (not (eq (alist-get 'read_only field) t))
+         (or existing (seq-empty-p create-fields)
+             (seq-contains-p create-fields (alist-get 'key field) #'equal)))))
+
 (defun loki-assistant-config--record-form (section)
   "在 SECTION 中显示当前记录的内嵌表单。"
   (when-let ((form (loki-assistant-config--record-section-form section)))
@@ -714,11 +728,12 @@
                 (or (alist-get 'add_label record) "新增")) "\n")
       (dolist (field (append (alist-get 'fields record) nil))
         (let ((key (alist-get 'key field)))
-          (unless (or (eq (alist-get 'read_only field) t)
+          (unless (or (not (loki-assistant-config--record-allowed-field-p section field id))
                       (and id (equal key (alist-get 'id_field record))))
             (insert "  " (alist-get 'label field) "  ")
             (let ((widget (widget-create 'editable-field :format "%v"
-                                         :size 45 :value (or (cdr (assoc key form)) ""))))
+                                         :size 45 :value (or (cdr (assoc key form)) "")
+                                         :secret (when (equal (alist-get 'data_type field) "password") ?*))))
               (push widget (loki-assistant-config--record-section-widgets section))
               (push (cons key widget) (loki-assistant-config--record-section-inputs section))
               (when saving (widget-apply widget :deactivate))
@@ -791,7 +806,8 @@
             (mapcar (lambda (field)
                       (let ((key (alist-get 'key field)))
                         (let ((value (loki-assistant-config--record-field key record)))
-                          (cons key (cond ((null value) "") ((stringp value) value)
+                          (cons key (cond ((or (null value) (equal (alist-get 'data_type field) "password")) "")
+                                          ((stringp value) value)
                                           (t (loki-assistant-config--json value)))))))
                     (append fields nil)))))
   (loki-assistant-config--record-render section))
@@ -839,8 +855,9 @@
          (inputs (loki-assistant-config--record-section-form section))
          (body (make-hash-table :test #'equal))
          fields)
-    (dolist (field (cl-remove-if (lambda (field) (eq (alist-get 'read_only field) t))
-                                (append (alist-get 'fields record) nil)))
+    (dolist (field (seq-filter (lambda (field)
+                                (loki-assistant-config--record-allowed-field-p section field existing))
+                              (append (alist-get 'fields record) nil)))
       (let* ((key (alist-get 'key field))
              (input (string-trim (or (cdr (assoc key inputs)) "")))
              (value (or (and (equal key id-field) existing)
@@ -854,7 +871,7 @@
           (push (cons key value) fields)
           (puthash key
                    (if (member (alist-get 'data_type field)
-                               '(nil "string" "password_reference" "file_path" "executable"))
+                               '(nil "string" "key" "password_reference" "file_path" "executable"))
                        value
                      (condition-case nil
                          (json-parse-string value :object-type 'hash-table :false-object :false :null-object :null)
@@ -889,7 +906,10 @@
                  (progn
                    (if id
                        (setf (alist-get id (loki-assistant-config--record-section-records section)
-                                        nil nil #'equal) value)
+                                        nil nil #'equal)
+                             (if (equal (alist-get 'status stored) "pending")
+                                 (cons '(pending . t) value)
+                               value))
                      (setf (loki-assistant-config--record-section-records section)
                            (loki-assistant-config--record-records value record single)))
                    (when id (remhash id (loki-assistant-config--record-section-operations section)))
@@ -964,11 +984,17 @@
     (setf (loki-assistant-config--record-section-metadata section)
           `((title . ,(alist-get 'name item)) (record . ,record) (actions . ,(alist-get 'actions item)) (single . ,single)
             (save_timeout_seconds . ,(alist-get 'save_timeout_seconds item))
-            (requires_local_auth . ,(alist-get 'requires_local_auth item)))
+            (requires_local_auth . ,(alist-get 'requires_local_auth item))
+            (create_fields . ,(alist-get 'create_fields item)))
           (loki-assistant-config--record-section-records section)
           (loki-assistant-config--record-records (alist-get 'value data) record single)
           (loki-assistant-config--record-section-start section) (copy-marker position)
           (loki-assistant-config--record-section-end section) (copy-marker position))
+    (dolist (pending (append (alist-get 'pending data) nil))
+      (when-let ((id (alist-get 'key pending))
+                 (value (alist-get 'value pending)))
+        (setf (alist-get id (loki-assistant-config--record-section-records section) nil nil #'equal)
+              (cons '(pending . t) value))))
     (loki-assistant-config--record-render section)))
 
 (provide 'loki-assistant-config)

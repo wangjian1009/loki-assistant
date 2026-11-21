@@ -10,6 +10,38 @@ use super::protocol::Error;
 
 pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WebSession {
+    pub token: String,
+    pub d_cookie: String,
+}
+
+impl WebSession {
+    pub fn parse(secret: &str) -> Result<Self, Error> {
+        let mut session: Self = serde_json::from_str(secret).map_err(|_| Error::UserToken)?;
+        if let Some(value) = session.d_cookie.strip_prefix("d=") {
+            session.d_cookie = value.to_owned();
+        }
+        if !session.token.starts_with("xoxc-")
+            || session.token.len() <= 5
+            || session.token.len() > 4096
+            || !session
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || session.d_cookie.is_empty()
+            || session.d_cookie.len() > 8192
+            || !session.d_cookie.bytes().all(
+                |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+            )
+        {
+            return Err(Error::UserToken);
+        }
+        Ok(session)
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct SlackClient {
     http: Client,
@@ -38,23 +70,46 @@ impl SlackClient {
         token: &str,
         params: &[(&str, &str)],
     ) -> Result<Value, Error> {
-        self.call(method, Method::GET, Some(token), params, None)
+        self.call(method, Method::GET, Some(token), params, None, None)
             .await
     }
 
     pub async fn post(&self, method: &str, token: &str, body: &Value) -> Result<Value, Error> {
-        self.call(method, Method::POST, Some(token), &[], Some(body))
+        self.call(method, Method::POST, Some(token), &[], Some(body), None)
             .await
     }
 
     pub async fn oauth(&self, params: &[(&str, &str)]) -> Result<Value, Error> {
-        self.call("oauth.v2.access", Method::POST, None, params, None)
+        self.call("oauth.v2.access", Method::POST, None, params, None, None)
             .await
     }
 
     pub async fn test_identity(&self, token: &str) -> Result<Value, Error> {
-        self.call("auth.test", Method::POST, Some(token), &[], None)
+        self.call("auth.test", Method::POST, Some(token), &[], None, None)
             .await
+    }
+
+    pub async fn web_call(
+        &self,
+        method: &str,
+        session: &WebSession,
+        params: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<Value, Error> {
+        let verb = if body.is_some() || method == "auth.test" {
+            Method::POST
+        } else {
+            Method::GET
+        };
+        self.call(
+            method,
+            verb,
+            Some(&session.token),
+            params,
+            body,
+            Some(&session.d_cookie),
+        )
+        .await
     }
 
     async fn call(
@@ -64,6 +119,7 @@ impl SlackClient {
         token: Option<&str>,
         params: &[(&str, &str)],
         body: Option<&Value>,
+        cookie: Option<&str>,
     ) -> Result<Value, Error> {
         if let Some(until) = self.limits.lock().await.get(name)
             && let Some(delay) = until.checked_duration_since(Instant::now())
@@ -75,6 +131,9 @@ impl SlackClient {
             .request(method.clone(), format!("{}/{name}", self.api));
         if let Some(token) = token {
             request = request.bearer_auth(token);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, format!("d={cookie}"));
         }
         if let Some(body) = body {
             request = request.json(body);
@@ -132,6 +191,7 @@ impl SlackClient {
                 Method::POST,
                 Some(token),
                 &[],
+                None,
                 None,
             )
             .await?;

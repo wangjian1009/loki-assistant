@@ -28,6 +28,8 @@
   "打开 services 配置管理界面。" t)
 (autoload 'loki-assistant-devices "loki-assistant-devices"
   "打开已绑定设备管理界面。" t)
+(autoload 'loki-assistant-slack-select-chat "loki-assistant-slack-chat"
+  "通过 Consult 选择 Slack 聊天。" t)
 
 (defvar loki-assistant-command-map
   (let ((map (make-sparse-keymap)))
@@ -36,7 +38,9 @@
     map)
   "Loki Assistant 命令的前缀键映射，由用户配置绑定入口键。")
 
+(defalias 'loki-assistant-command-map loki-assistant-command-map)
 (define-key loki-assistant-command-map (kbd "d") #'loki-assistant-devices)
+(define-key loki-assistant-command-map (kbd "s") #'loki-assistant-slack-select-chat)
 
 (defcustom loki-assistant-service-file "~/.assistant/service"
   "services 地址信息文件；每次请求重新读取。"

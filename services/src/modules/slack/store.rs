@@ -25,6 +25,8 @@ pub(super) struct Secrets {
 pub(super) struct Account {
     pub identity: Identity,
     pub access: String,
+    #[serde(default)]
+    pub web_session: bool,
     pub refresh: Option<String>,
     pub expires_at: Option<u64>,
     pub baseline: u64,

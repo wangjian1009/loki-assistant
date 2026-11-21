@@ -1,0 +1,75 @@
+#+TITLE: Slack 接入开发过程
+#+SETUPFILE: .setup.org
+#+STARTUP: latexpreview
+#+LATEX_COMPILER: xelatex
+#+LATEX_HEADER: \usepackage[UTF8]{ctex}
+#+LATEX_HEADER: \usepackage{tikz}
+#+LATEX_HEADER: \usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+
+* 网页会话接入流程
+** Team 注册流程图
+
+首次新增只填写 Team ID。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=7mm,
+  every node/.style={font=\small},
+  action box/.style={draw, rounded corners=2pt, align=center,
+    text width=64mm, minimum height=9mm, inner sep=3mm},
+  decision diamond/.style={diamond, draw, align=center, aspect=2, inner sep=1mm},
+  outcome/.style={action box, text width=28mm},
+  wait box/.style={action box, text width=32mm},
+  flow arrow/.style={-{Stealth[length=2mm]}, semithick}
+]
+  \node[action box] (create)
+    {通过配置模块新增 \texttt{SlackTeam}\\只提交 Team ID};
+  \node[action box, below=of create] (save)
+    {配置模块校验并保存待确认记录};
+  \node[action box, below=of save] (notify)
+    {配置模块向通知接入点发送 \texttt{POST}\\Slack 返回 \texttt{202}};
+  \node[action box, below=of notify] (credentials)
+    {补充网页会话凭据后\\Slack 校验用户和 Team ID};
+  \node[decision diamond, below=of credentials] (result)
+    {处理结果};
+  \node[outcome, below=14mm of result, xshift=-42mm] (confirmed)
+    {标记为已确认};
+  \node[wait box, below=14mm of result] (waiting)
+    {保留待确认状态\\每 30 秒 \texttt{GET} 状态};
+  \node[outcome, below=14mm of result, xshift=42mm] (failed)
+    {回退本次新增};
+
+  \draw[flow arrow] (create) -- (save);
+  \draw[flow arrow] (save) -- (notify);
+  \draw[flow arrow] (notify) -- (credentials);
+  \draw[flow arrow] (credentials) -- (result);
+  \draw[flow arrow] (result.west) -| node[pos=0.24, above] {成功} (confirmed.north);
+  \draw[flow arrow] (result.south) -- node[left] {处理中} (waiting.north);
+  \draw[flow arrow] (result.east) -| node[pos=0.24, above] {失败} (failed.north);
+  \draw[flow arrow] (waiting.north east) to[bend right=18] (result.south east);
+\end{tikzpicture}
+\end{center}
+
+** 接入步骤
+
+1. 登录 Slack 网页，从目标工作区取得 Team ID。
+2. 通过配置模块仅提交 Team ID。配置模块保存待确认记录，以 ~team_id~ 为 ~Key~ ，向 ~POST /slack/config/teams/{key}~ 发送创建通知。Slack 返回 ~202~ 。
+3. 编辑待确认记录，补充同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie，配置值为包含 ~token~ 和 ~d_cookie~ 的 JSON 对象。配置模块每 30 秒查询通知接入点。Slack 通过 ~auth.test~ 校验凭据和 Team ID，配置模块根据结果确认或回退。
+4. 会话失效时，重新登录 Slack 网页，通过配置模块更新凭据。
+
+配置模块向同一接入点发送 ~DELETE~ 并等待结果，确认后移除记录。Slack 随后停止该 Team 的后台任务并清理连接状态。 [[file:config-module.org::*配置项通知接入点][通知与确认协议]]
+
+* 验证与实现进度
+
+- 目标流程完成保存后，通过 ~GET /status/slack/connections~ 核对 ~authorization_state~ 为 ~authorized~ ，再用 ~GET /slack/conversations?team_id={team_id}~ 验证会话读取。
+- 已用 Emacs ~slack.el~ 配置的 X-Tech 网页会话凭据调用 Slack ~auth.test~ ，确认身份有效且 Team ID 匹配。
+- 已通过 services 设置 API 发起 X-Tech 工作区新增，确认本机导入页可访问，且请求等待导入结果。
+- 新增 Team 由配置模块的通知接入点处理，真实 Team 由用户在配置界面手动添加。
+
+* 当前工作区配置
+
+配置界面按 ~SlackTeam~ 元数据生成表单，新增时只显示 Team ID。待确认记录可继续编辑凭据。 [[file:slack.org::*Team 配置][SlackTeam 字段与配置接口]]
+
+后台 Socket Mode 通知使用独立的 app-level token 和事件订阅配置。
+
+现有 API 契约见 [[file:slack.org::*services RESTful 接口][services RESTful 接口]]。

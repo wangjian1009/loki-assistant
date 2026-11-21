@@ -9,6 +9,12 @@
 (require 'ert)
 (require 'loki-assistant)
 
+(ert-deftest loki-assistant-test-symbolic-prefix-keymap ()
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-x a") 'loki-assistant-command-map)
+    (should (eq (symbol-function 'loki-assistant-command-map) loki-assistant-command-map))
+    (should (eq (lookup-key map (kbd "C-x a s")) #'loki-assistant-slack-select-chat))))
+
 (defun loki-assistant-test--filter (handler process chunk)
   "收集 PROCESS 的 HTTP 请求，将完整请求交给 HANDLER；CHUNK 为新数据。"
   (let ((request (concat (process-get process 'request) chunk)))

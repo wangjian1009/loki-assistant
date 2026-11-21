@@ -52,6 +52,8 @@ impl From<ConfigModuleMetadata> for ModuleMetaResponse {
 pub struct ModuleDataResponse {
     pub module_id: String,
     pub values: BTreeMap<String, ConfigValue>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending: BTreeMap<String, Vec<Value>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -60,6 +62,8 @@ pub struct ValueResponse {
     pub key: String,
     #[serde(flatten)]
     pub data: ConfigValue,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +72,8 @@ pub struct RecordResponse {
     pub key: String,
     pub instance: String,
     pub value: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

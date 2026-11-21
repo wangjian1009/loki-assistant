@@ -19,7 +19,6 @@ use crate::{
             ActionFuture, ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService,
             ConfigServiceError,
         },
-        emacs::service::EmacsService,
         notification::NotificationService,
         password::service::{PasswordService, validate_file},
         status::StatusService,
@@ -44,12 +43,12 @@ pub(super) struct Backend {
     pub client_id: Option<&'static str>,
     pub keychain: Arc<dyn Fn(String) -> Arc<dyn Keychain> + Send + Sync>,
     pub passwords: Option<Arc<PasswordService>>,
-    pub emacs: Option<Arc<EmacsService>>,
     pub open_browser: Arc<dyn Fn(String) -> BrowserFuture + Send + Sync>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub(super) struct SlackTeam {
+    #[serde(default)]
     pub name: String,
     #[serde(default, rename = "id")]
     pub legacy_id: Option<String>,
@@ -86,7 +85,10 @@ fn parse_projects(value: &Value) -> Result<BTreeMap<String, SlackTeam>, String> 
             .filter(|team| valid_team_id(team))
             .ok_or("Slack Team ID 无效。")?
             .clone();
-        if settings.name.trim().is_empty() || settings.name.chars().count() > 80 {
+        if settings.name.trim().is_empty() {
+            settings.name.clone_from(&id);
+        }
+        if settings.name.chars().count() > 80 {
             return Err("请核对工作区显示名称。".into());
         }
         let password = settings.password_id.get_or_insert_with(|| {
@@ -158,7 +160,6 @@ impl Projects {
         notification: Arc<NotificationService>,
         status: Arc<StatusService>,
         passwords: Arc<PasswordService>,
-        emacs: Arc<EmacsService>,
     ) -> Self {
         Self::with_backend(
             config,
@@ -179,7 +180,6 @@ impl Projects {
                 }),
                 keychain: Arc::new(|account| Arc::new(LoginKeychain(account))),
                 passwords: Some(passwords),
-                emacs: Some(emacs),
                 open_browser: Arc::new(|url| {
                     Box::pin(async move {
                         let mut opener = tokio::process::Command::new("/usr/bin/open");
@@ -561,7 +561,36 @@ impl Projects {
         )
     }
 
-    async fn sync_projects(&self) -> Result<(), String> {
+    pub(super) async fn registration_status(&self, id: Uuid, team: &str) -> &'static str {
+        let secret = match self
+            .config
+            .notification_password(id, "slack", "teams", team, "token")
+            .await
+        {
+            Ok(secret) => secret,
+            Err(ConfigServiceError::ActionNotFound) => return "processing",
+            Err(_) => return "failed",
+        };
+        let Ok(session) = super::client::WebSession::parse(&secret) else {
+            return "failed";
+        };
+        match super::client::SlackClient::new(&self.backend.api)
+            .web_call("auth.test", &session, &[], None)
+            .await
+        {
+            Ok(identity)
+                if identity["team_id"] == team
+                    && identity["user_id"].as_str().is_some()
+                    && identity["bot_id"].as_str().is_none() =>
+            {
+                "confirmed"
+            }
+            Err(Error::Unavailable | Error::RateLimited(_)) => "processing",
+            _ => "failed",
+        }
+    }
+
+    pub(super) async fn sync_projects(&self) -> Result<(), String> {
         let _sync = self.reconcile.lock().await;
         let Some(port) = self.port.get().copied() else {
             return Ok(());
@@ -645,6 +674,14 @@ impl ConfigChangeHandler for Projects {
         config: std::sync::Weak<ConfigService>,
     ) -> ActionFuture<'a> {
         Box::pin(async move {
+            if value["name"]
+                .as_str()
+                .is_none_or(|name| name.trim().is_empty())
+            {
+                return Err(ConfigServiceError::InvalidValue(
+                    "请输入工作区显示名称。".into(),
+                ));
+            }
             let settings = parse_projects(&serde_json::json!([value]))
                 .map_err(|message| Self::rejected("teams", message))?
                 .remove(instance)
@@ -761,26 +798,5 @@ impl ConfigChangeHandler for Projects {
                     .to_owned()
             })
         })
-    }
-}
-
-impl Projects {
-    pub(super) async fn open(&self) -> Result<(), Error> {
-        let emacs = self.backend.emacs.as_ref().ok_or(Error::Unavailable)?;
-        let script = r#"(progn
- (require 'seq)
- (when (require 'loki-assistant-slack nil t)
-   (let ((frame (or (and (display-graphic-p (selected-frame)) (selected-frame))
-                    (seq-find #'display-graphic-p (frame-list))
-                    (make-frame '((window-system . ns))))))
-     (select-frame frame)
-     (make-frame-visible frame)
-     (select-frame-set-input-focus frame)
-     (run-at-time 0 nil #'loki-assistant-slack)
-     t)))"#;
-        match emacs.eval(script).await {
-            Ok(value) if value == "t" => Ok(()),
-            _ => Err(Error::Unavailable),
-        }
     }
 }

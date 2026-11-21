@@ -14,7 +14,6 @@ pub struct ExtensionContext<'a> {
     pub config: &'a Arc<config::service::ConfigService>,
     pub notification: &'a Arc<NotificationService>,
     pub status: &'a Arc<StatusService>,
-    pub emacs: &'a emacs::Module,
     pub password: &'a password::Module,
 }
 
@@ -25,6 +24,9 @@ pub trait ServiceExtension: std::fmt::Debug + Send + Sync {
         &self,
     ) -> Option<(&'static str, Arc<dyn config::service::ConfigChangeHandler>)>;
     fn router(&self) -> Router;
+    fn config_notification_router(&self) -> Router {
+        Router::new()
+    }
     fn run(self: Arc<Self>, port: u16) -> ExtensionFuture<'static>;
     fn stop(&self) -> ExtensionFuture<'_>;
 }
@@ -49,6 +51,7 @@ pub struct Services {
     pub network: Arc<network::NetworkService>,
     pub password: password::Module,
     extensions: Vec<Arc<dyn ServiceExtension>>,
+    _config_notification_router: Arc<Router>,
 }
 
 /// 与需求文档中的 CoreService 名称兼容的别名。
@@ -93,7 +96,6 @@ impl Services {
             config: &base_config,
             notification: &notification,
             status: &status,
-            emacs: &emacs,
             password: &password,
         };
         let extensions: Vec<_> = EXTENSIONS
@@ -109,6 +111,13 @@ impl Services {
             }
         }
         let config = config::Module::from_service(config);
+        let config_notification_router =
+            Arc::new(extensions.iter().fold(Router::new(), |router, extension| {
+                router.merge(extension.config_notification_router())
+            }));
+        config
+            .service()
+            .attach_notifications(&config_notification_router);
 
         Self {
             health,
@@ -121,6 +130,7 @@ impl Services {
             network,
             password,
             extensions,
+            _config_notification_router: config_notification_router,
         }
     }
 

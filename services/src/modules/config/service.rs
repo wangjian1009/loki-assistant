@@ -18,6 +18,9 @@ use super::{
     storage::{FileStorage, StoredValues},
 };
 
+mod notifications;
+pub(crate) use notifications::NotificationRequest;
+
 #[derive(Clone, Debug)]
 pub struct ConfigService {
     metadata: Arc<RwLock<HashMap<String, ConfigModuleMetadata>>>,
@@ -28,6 +31,7 @@ pub struct ConfigService {
     passwords: Option<Arc<PasswordService>>,
     storage: Option<FileStorage>,
     executable_search_path: Vec<PathBuf>,
+    notification_router: Arc<std::sync::OnceLock<std::sync::Weak<axum::Router>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +161,8 @@ pub enum ConfigServiceError {
     RecordExists,
     #[error("请先完成配置记录的授权。")]
     RecordAuthorizationRequired,
+    #[error("该配置已有待确认的变更。")]
+    ChangePending,
     #[error("配置文件读写失败：{0}")]
     Storage(String),
     #[error("配置变化处理失败：{module_id}/{key}：{message}")]
@@ -259,6 +265,7 @@ impl ConfigService {
             handlers: HashMap::new(),
             passwords: None,
             storage: None,
+            notification_router: Arc::default(),
             executable_search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
@@ -437,6 +444,13 @@ impl ConfigService {
                 key: key.to_owned(),
             })?;
         let value = self.normalize_value(module_id, item, &value).await?;
+        if self.notifications_attached()
+            && item_options(module_id, key).notification_endpoint.is_some()
+        {
+            return Err(ConfigServiceError::InvalidValue(
+                "请使用带通知的配置写入接口。".into(),
+            ));
+        }
         let secret = item.data_type == ConfigDataType::Password;
         let service = self.clone();
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
@@ -617,20 +631,22 @@ impl ConfigService {
             .as_ref()
             .and_then(|value| value.id_field.as_ref())
             .ok_or(ConfigServiceError::ActionNotFound)?;
-        let path = options.password_path(field, instance)?;
         let data = self.value(module, key).await?;
-        if !data.value.as_array().is_some_and(|records| {
-            records.iter().any(|record| {
-                record[id_field].as_str() == Some(instance)
-                    && record[field].as_str() == Some(path.as_str())
+        let path = data
+            .value
+            .as_array()
+            .and_then(|records| {
+                records
+                    .iter()
+                    .find(|record| record[id_field].as_str() == Some(instance))
             })
-        }) {
-            return Err(ConfigServiceError::ActionNotFound);
-        }
+            .and_then(|record| record[field].as_str())
+            .filter(|path| options.matches_password_path(field, instance, path))
+            .ok_or(ConfigServiceError::ActionNotFound)?;
         self.passwords
             .as_ref()
             .ok_or_else(|| ConfigServiceError::Storage("密码模块不可用。".into()))?
-            .fetch(&path)
+            .fetch(path)
             .await
             .map_err(|error| ConfigServiceError::Storage(error.to_string()))
     }
@@ -1112,6 +1128,15 @@ impl ConfigService {
             .await?
             .map(|data| data.value);
         let options = item_options(module_id, key);
+        if options.notification_endpoint.is_some()
+            && self.notifications_attached()
+            && value.is_array()
+            && operation != ConfigChangeOperation::AuthorizedCreate
+        {
+            return Err(ConfigServiceError::InvalidValue(
+                "请逐条提交带通知的配置记录。".into(),
+            ));
+        }
         if operation != ConfigChangeOperation::AuthorizedCreate
             && self.has_record_creation_handler(module_id, key)
             && let Some(id_field) = options
@@ -1381,6 +1406,42 @@ impl ModuleSubscription {
 }
 
 impl ConfigItemOptions {
+    fn notification_key_field(&self) -> Result<&str, ConfigServiceError> {
+        let structure = self
+            .structure
+            .as_ref()
+            .ok_or(ConfigServiceError::ActionNotFound)?;
+        let mut keys = structure
+            .fields
+            .iter()
+            .filter(|field| field.data_type == ConfigDataType::Key);
+        match (keys.next(), keys.next()) {
+            (Some(field), None)
+                if field.required && structure.id_field.as_deref() == Some(&field.key) =>
+            {
+                Ok(&field.key)
+            }
+            _ => Err(ConfigServiceError::InvalidValue(
+                "通知记录需要一个必填的 Key 主键字段。".into(),
+            )),
+        }
+    }
+
+    fn matches_password_path(&self, field: &str, instance: &str, path: &str) -> bool {
+        let Ok(base) = self.password_path(field, instance) else {
+            return false;
+        };
+        if path == base {
+            return true;
+        }
+        self.notification_endpoint.is_some()
+            && path
+                .strip_prefix(base.trim_end_matches(".gpg"))
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .and_then(|suffix| suffix.strip_suffix(".gpg"))
+                .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+    }
+
     fn password_path(&self, key: &str, instance: &str) -> Result<String, ConfigServiceError> {
         let template =
             self.structure
@@ -1496,8 +1557,9 @@ impl ConfigItemMetadata {
                             .ok_or_else(|| {
                                 ConfigServiceError::InvalidValue("密码字段需要记录标识。".into())
                             })?;
-                        let path = options.password_path(&field.key, instance)?;
-                        if value.as_str() != Some(path.as_str()) {
+                        if !value.as_str().is_some_and(|path| {
+                            options.matches_password_path(&field.key, instance, path)
+                        }) {
                             return Err(ConfigServiceError::InvalidValue(
                                 "密码字段需要有效的存储引用。".into(),
                             ));
@@ -1558,6 +1620,7 @@ fn matches_type(
     match data_type {
         ConfigDataType::Password => value.is_string() || value.is_object(),
         ConfigDataType::String
+        | ConfigDataType::Key
         | ConfigDataType::PasswordReference
         | ConfigDataType::FilePath
         | ConfigDataType::Executable => value.is_string(),

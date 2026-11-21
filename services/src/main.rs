@@ -27,6 +27,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
     services.attach_remote(&runtime);
     let extensions = services.start_extensions(listener.local_addr()?.port());
+    let notifications_config = services.config.service();
+    let config_notifications = tokio::spawn(async move {
+        notifications_config.monitor_notifications().await;
+    });
     let network = Arc::clone(&services.network);
     let config = services.config.service();
     let network_start = tokio::spawn(async move {
@@ -50,9 +54,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
     network_start.abort();
     network_pairings.abort();
+    config_notifications.abort();
     services.stop_extensions(extensions).await;
     let _ = network_start.await;
     let _ = network_pairings.await;
+    let _ = config_notifications.await;
     services.network.shutdown().await;
     service_pfile.remove_if_owner()?;
     result?;

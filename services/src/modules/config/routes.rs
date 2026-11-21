@@ -132,11 +132,25 @@ async fn module_data(
     State(service): State<Arc<ConfigService>>,
     headers: HeaderMap,
 ) -> Result<Json<ModuleDataResponse>, Response> {
-    service
-        .module_values_for(&module_id, is_remote(&headers))
+    let remote = is_remote(&headers);
+    let values = service
+        .module_values_for(&module_id, remote)
         .await
-        .map(|values| Json(ModuleDataResponse { module_id, values }))
-        .map_err(error_response)
+        .map_err(error_response)?;
+    let mut pending = service.module_pending_notifications(&module_id).await;
+    if remote {
+        let metadata = visible_metadata(&service, &headers).await;
+        pending.retain(|key, _| {
+            metadata
+                .iter()
+                .any(|module| module.id == module_id && module.item(key).is_some())
+        });
+    }
+    Ok(Json(ModuleDataResponse {
+        module_id,
+        values,
+        pending,
+    }))
 }
 
 #[loki_api(
@@ -155,17 +169,21 @@ async fn get_value(
     headers: HeaderMap,
 ) -> Result<Json<ValueResponse>, Response> {
     check_access(&service, &headers, &module_id, &key, false).await?;
-    service
-        .value(&module_id, &key)
-        .await
-        .map(|value| {
-            Json(ValueResponse {
-                module_id,
-                key,
-                data: value,
-            })
-        })
-        .map_err(error_response)
+    let pending = service.pending_notifications(&module_id, &key).await;
+    let data = match service.value(&module_id, &key).await {
+        Ok(data) => data,
+        Err(ConfigServiceError::ValueNotSet { .. }) if !pending.is_empty() => ConfigValue {
+            value: Value::Null,
+            source: ConfigValueSource::User,
+        },
+        Err(error) => return Err(error_response(error)),
+    };
+    Ok(Json(ValueResponse {
+        module_id,
+        key,
+        data,
+        pending,
+    }))
 }
 
 #[loki_api(
@@ -183,12 +201,27 @@ async fn put_value(
     State(service): State<Arc<ConfigService>>,
     headers: HeaderMap,
     Json(value): Json<Value>,
-) -> Result<Json<ValueResponse>, Response> {
+) -> Result<Response, Response> {
     check_access(&service, &headers, &module_id, &key, true).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if service.has_notification(&module_id, &key) {
+        let (value, pending) = service
+            .notify_write(module_id.clone(), key.clone(), None, Some(value), false)
+            .await
+            .map_err(error_response)?
+            .expect("写入值已有处理结果");
+        return Ok((
+            write_status(pending),
+            Json(serde_json::json!({
+                "module_id": module_id, "key": key, "value": value, "source": "user",
+                "status": if pending { "pending" } else { "confirmed" },
+            })),
+        )
+            .into_response());
+    }
     service
         .replace(&module_id, &key, value)
         .await
@@ -200,7 +233,9 @@ async fn put_value(
                     value,
                     source: ConfigValueSource::User,
                 },
+                pending: Vec::new(),
             })
+            .into_response()
         })
         .map_err(error_response)
 }
@@ -226,6 +261,11 @@ async fn post_value(
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if service.has_notification(&module_id, &key) && service.notifications_attached() {
+        return Err(error_response(ConfigServiceError::InvalidValue(
+            "请逐条提交带通知的配置记录。".into(),
+        )));
+    }
     service
         .partial(&module_id, &key, value)
         .await
@@ -237,6 +277,7 @@ async fn post_value(
                     value,
                     source: ConfigValueSource::User,
                 },
+                pending: Vec::new(),
             })
         })
         .map_err(error_response)
@@ -283,6 +324,40 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 #[loki_api(
     module = "config",
     mount = "Arc<ConfigService>",
+    id = "delete-value",
+    method = "DELETE",
+    path = "/data/{module_id}/{key}",
+    access = "paired",
+    summary = "删除通知型单值配置",
+    description = "通过配置项的通知接入点确认删除。"
+)]
+async fn delete_value(
+    Path((module_id, key)): Path<(String, String)>,
+    State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Response> {
+    check_access(&service, &headers, &module_id, &key, true).await?;
+    if !service.has_notification(&module_id, &key) {
+        return Err(error_response(ConfigServiceError::ActionNotFound));
+    }
+    service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    let result = service
+        .notify_write(module_id, key, None, None, false)
+        .await
+        .map_err(error_response)?;
+    Ok(if result.is_some_and(|(_, pending)| pending) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::NO_CONTENT
+    })
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
     id = "set-record",
     method = "PUT",
     path = "/data/{module_id}/{key}/{instance}",
@@ -309,6 +384,30 @@ async fn put_record(
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if service.has_notification(&module_id, &key) && service.notifications_attached() {
+        let (value, pending) = service
+            .notify_write(
+                module_id.clone(),
+                key.clone(),
+                Some(instance.clone()),
+                Some(value),
+                create_only,
+            )
+            .await
+            .map_err(error_response)?
+            .expect("写入记录已有处理结果");
+        return Ok((
+            write_status(pending),
+            Json(RecordResponse {
+                module_id,
+                key,
+                instance,
+                value,
+                status: Some(if pending { "pending" } else { "confirmed" }),
+            }),
+        )
+            .into_response());
+    }
     let value = if create_only && service.has_record_creation_handler(&module_id, &key) {
         let config = Arc::clone(&service);
         let (module, key, instance) = (module_id.clone(), key.clone(), instance.clone());
@@ -333,6 +432,7 @@ async fn put_record(
         key,
         instance,
         value,
+        status: None,
     })
     .into_response())
 }
@@ -356,6 +456,17 @@ async fn delete_record(
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if service.has_notification(&module_id, &key) && service.notifications_attached() {
+        let result = service
+            .notify_write(module_id, key, Some(instance), None, false)
+            .await
+            .map_err(error_response)?;
+        return Ok(if result.is_some_and(|(_, pending)| pending) {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::NO_CONTENT
+        });
+    }
     service
         .remove_record(module_id, key, instance)
         .await
@@ -385,6 +496,14 @@ async fn start_action(
     Ok(([(CACHE_CONTROL, "no-store")], Json(data)).into_response())
 }
 
+fn write_status(pending: bool) -> StatusCode {
+    if pending {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    }
+}
+
 fn error_response(error: ConfigServiceError) -> Response {
     let status = match &error {
         ConfigServiceError::ModuleNotFound(_) | ConfigServiceError::ItemNotFound { .. } => {
@@ -393,7 +512,9 @@ fn error_response(error: ConfigServiceError) -> Response {
         ConfigServiceError::ValueNotSet { .. } => StatusCode::NOT_FOUND,
         ConfigServiceError::ActionNotFound => StatusCode::NOT_FOUND,
         ConfigServiceError::RecordExists => StatusCode::PRECONDITION_FAILED,
-        ConfigServiceError::RecordAuthorizationRequired => StatusCode::CONFLICT,
+        ConfigServiceError::RecordAuthorizationRequired | ConfigServiceError::ChangePending => {
+            StatusCode::CONFLICT
+        }
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
         ConfigServiceError::RemoteAccessForbidden { .. } => StatusCode::FORBIDDEN,
         ConfigServiceError::SecretUnauthorized => StatusCode::UNAUTHORIZED,
@@ -419,6 +540,7 @@ fn error_code(error: &ConfigServiceError) -> &'static str {
         ConfigServiceError::SecretUnauthorized => "config-secret-auth-required",
         ConfigServiceError::ActionNotFound => "config-action-not-found",
         ConfigServiceError::RecordExists => "config-record-exists",
+        ConfigServiceError::ChangePending => "config-change-pending",
         ConfigServiceError::RecordAuthorizationRequired => "config-record-authorization-required",
         ConfigServiceError::Storage(_) => "config-storage-error",
         ConfigServiceError::ChangeRejected { .. } => "config-change-rejected",

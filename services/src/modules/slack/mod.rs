@@ -34,12 +34,13 @@ pub use projects::Projects;
 static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "slack",
     name: "Slack",
-    description: "后台接收 Slack 私信，供 Emacs 阅读和回复私信及频道消息。",
+    description: "提供 Slack 私信通知、会话查询和消息收发。",
     version: env!("CARGO_PKG_VERSION"),
 };
 
 // 所有工作区共用 Loki Assistant Slack App 的公开标识。
 const APP_CLIENT_ID: Option<&str> = option_env!("LOKI_SLACK_CLIENT_ID");
+const TEAM_NOTIFICATION_ENDPOINT: &str = "/slack/config/teams";
 
 impl projects::SlackTeam {
     fn metadata() -> StructureMetadata {
@@ -56,7 +57,7 @@ impl projects::SlackTeam {
                 StructureField {
                     key: "team_id".into(),
                     label: "Slack Team ID".into(),
-                    data_type: ConfigDataType::String,
+                    data_type: ConfigDataType::Key,
                     required: true,
                     default_template: None,
                     checker: Some(CheckerMetadata {
@@ -71,7 +72,7 @@ impl projects::SlackTeam {
                     key: "name".into(),
                     label: "本地显示名称".into(),
                     data_type: ConfigDataType::String,
-                    required: true,
+                    required: false,
                     default_template: None,
                     checker: None,
                     read_only: false,
@@ -94,10 +95,10 @@ impl projects::SlackTeam {
                 },
                 StructureField {
                     key: "token".into(),
-                    label: "Slack 用户令牌引用".into(),
+                    label: "Slack 网页会话凭据（JSON 对象，包含 token 和 d_cookie）".into(),
                     data_type: ConfigDataType::Password,
                     required: false,
-                    read_only: true,
+                    read_only: false,
                     default_template: None,
                     checker: None,
                     password_path: Some("loki-assistant/slack/{id}/user-token.gpg".into()),
@@ -125,6 +126,8 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     key: "teams",
     options: || ConfigItemOptions {
         structure: Some(projects::SlackTeam::metadata()),
+        notification_endpoint: Some(TEAM_NOTIFICATION_ENDPOINT),
+        create_fields: vec!["team_id"],
         save_timeout_seconds: Some(650),
         requires_local_auth: true,
         actions: vec![
@@ -211,7 +214,6 @@ static EXTENSION: crate::services::ExtensionRegistration = crate::services::Exte
             Arc::clone(context.notification),
             Arc::clone(context.status),
             context.password.service(),
-            context.emacs.service(),
         ))))
     },
 };
@@ -228,6 +230,10 @@ impl crate::services::ServiceExtension for Module {
 
     fn router(&self) -> Router {
         self.0.router()
+    }
+
+    fn config_notification_router(&self) -> Router {
+        routes::config_notification_router(Arc::clone(&self.0))
     }
 
     fn run(self: Arc<Self>, port: u16) -> crate::services::ExtensionFuture<'static> {

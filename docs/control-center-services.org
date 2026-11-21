@@ -14,14 +14,14 @@
 | ~services~ | 业务模块组合和路由组合 | 已实现 |
 | ~http~ | loopback HTTP server | 已实现 |
 | ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
-| ~modules/config~ | 配置模型、提交前处理、数据读写和变化订阅 | 已实现基础能力 |
+| [[file:config-module.org][modules/config]] | 配置模型、数据读写和变更通知 | 已实现基础能力及元数据通知接入点 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
-| [[file:slack.org][modules/slack]] | 令牌导入、后台私信接收、系统通知与 Emacs 消息查询和回复 | 已实现首期，目标工作区待验证 |
+| [[file:slack.org][modules/slack]] | 工作区注册、后台私信接收、系统通知与消息查询和发送 | 已实现首期与网页会话接入 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |

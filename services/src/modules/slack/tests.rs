@@ -281,7 +281,6 @@ async fn pkce_socket_notifications_threads_and_idempotent_sends() {
                 client_id: Some("123.456"),
                 keychain: Arc::new(move |_| keychain.clone()),
                 passwords: None,
-                emacs: None,
                 open_browser: Arc::new(|_| unreachable!()),
             },
         ));
@@ -586,6 +585,14 @@ impl crate::modules::password::service::CommandRunner for FakePass {
         args: &'a [String],
     ) -> crate::modules::password::service::CommandFuture<'a> {
         Box::pin(async move {
+            if args[0] == "rm" {
+                assert_eq!(&args[..3], ["rm", "--force", "--"]);
+                fs::remove_file(store.join(format!("{}.gpg", args[3]))).unwrap();
+                return Ok(crate::modules::password::service::CommandOutput {
+                    status: Some(0),
+                    stdout: Vec::new(),
+                });
+            }
             assert_eq!(&args[..2], ["show", "--"]);
             let stdout = fs::read(store.join(format!("{}.gpg", args[2]))).unwrap();
             Ok(crate::modules::password::service::CommandOutput {
@@ -681,14 +688,16 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .route(
             "/auth.test",
             post(|headers: HeaderMap| async move {
-                let team = headers["authorization"]
-                    .to_str()
-                    .unwrap()
-                    .strip_prefix("Bearer xoxp-")
-                    .unwrap()
-                    .split('-')
-                    .next()
-                    .unwrap();
+                let authorization = headers["authorization"].to_str().unwrap();
+                let team = if let Some(web) = authorization.strip_prefix("Bearer xoxc-") {
+                    assert_eq!(headers["cookie"], "d=test-web-cookie");
+                    web
+                } else {
+                    authorization.strip_prefix("Bearer xoxp-").unwrap()
+                }
+                .split('-')
+                .next()
+                .unwrap();
                 Json(json!({"ok":true,"team_id":team,"user_id":"U1"}))
             }),
         );
@@ -719,7 +728,6 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
                     .clone()
             }),
             passwords: Some(passwords.clone()),
-            emacs: None,
             open_browser: Arc::new(move |url| {
                 let browser = browser.clone();
                 Box::pin(async move {
@@ -737,7 +745,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             }),
         },
     ));
-    let config = config::Module::from_service(
+    let config_module = config::Module::from_service(
         (*base)
             .clone()
             .with_change_handler("slack", projects.clone()),
@@ -750,7 +758,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
                 .any(|item| item.key == "connections" && !item.remote_access)
     }));
     let app = Router::new()
-        .merge(config.router())
+        .merge(config_module.router())
         .merge(projects.router());
     let worker = tokio::spawn(Arc::clone(&projects).run(47321));
     let token = timeout(Duration::from_secs(4), async {
@@ -1247,6 +1255,55 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert!(projects.service("TALPHA").await.is_err());
     assert!(projects.service("TBETA").await.is_ok());
 
+    let notification_router = Arc::new(super::routes::config_notification_router(projects.clone()));
+    config_module
+        .service()
+        .attach_notifications(&notification_router);
+    let team_path = "/data/slack/teams/TWEB";
+    let (status, _, created) =
+        invoke(&app, "PUT", team_path, auth, None, None, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(created["status"], "pending");
+    assert_eq!(created["value"], json!({"team_id":"TWEB"}));
+    config_module.service().poll_notifications().await;
+    let (_, _, pending) = invoke(&app, "GET", "/data/slack/teams", None, None, None, None).await;
+    assert_eq!(pending["pending"][0]["key"], "TWEB");
+    assert!(!pending["value"].to_string().contains("TWEB"));
+    let (status, _, staged) = invoke(
+        &app,
+        "PUT",
+        team_path,
+        auth,
+        None,
+        None,
+        Some(json!({"token":{"token":"xoxc-TWEB","d_cookie":"test-web-cookie"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(!staged.to_string().contains("xoxc-"));
+    config_module.service().poll_notifications().await;
+    let (_, _, confirmed) = invoke(&app, "GET", "/data/slack/teams", None, None, None, None).await;
+    assert!(confirmed["pending"].is_null());
+    assert!(confirmed["value"].to_string().contains("TWEB"));
+    let web_entry = confirmed["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["team_id"] == "TWEB")
+        .unwrap();
+    let password_path = web_entry["token"].as_str().unwrap();
+    assert!(directory.0.join(password_path).exists());
+    let (status, _, _) = invoke(&app, "DELETE", team_path, auth, None, None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    timeout(Duration::from_secs(2), async {
+        while projects.service("TWEB").await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!directory.0.join(password_path).exists());
+
     projects.stop().await;
     worker.await.unwrap();
     upstream.abort();
@@ -1268,11 +1325,10 @@ async fn composition_mounts_flat_slack_routes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(meta["apis"].as_array().unwrap().iter().any(|api| {
-        api["method"] == "POST" && api["path"] == "/slack/open" && api["access"] == "local"
+        api["method"] == "GET" && api["path"] == "/slack/conversations" && api["access"] == "local"
     }));
-    let (status, _, body) = invoke(&app, "GET", "/slack/open", None, None, None, None).await;
-    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(body["error"]["code"], "method-not-allowed");
+    let (status, _, _) = invoke(&app, "POST", "/slack/open", None, None, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(meta["apis"].as_array().unwrap().iter().all(|api| {
         let path = api["path"].as_str().unwrap();
         path != "/slack/status" && !path.starts_with("/slack/teams/")

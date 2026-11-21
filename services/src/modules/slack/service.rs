@@ -21,7 +21,7 @@ use crate::modules::{
 };
 
 use super::{
-    client::SlackClient,
+    client::{SlackClient, WebSession},
     mailbox::UserDirectory,
     projects::{Backend, SlackTeam},
     protocol::{Error, Identity, valid_id},
@@ -83,7 +83,7 @@ impl State {
         if account.identity.session_id != session {
             return Err(Error::Session);
         }
-        if account.revoked || account.access.is_empty() {
+        if account.revoked || (account.access.is_empty() && !account.web_session) {
             return Err(Error::Authorization);
         }
         Ok(account)
@@ -261,10 +261,6 @@ impl SlackService {
         self.signal_change();
     }
 
-    pub(super) fn notification_path(&self) -> Option<String> {
-        self.project.as_ref().map(|_| "/slack/open".to_owned())
-    }
-
     pub(super) async fn update_cache<T: Send + 'static>(
         &self,
         session: Uuid,
@@ -333,7 +329,7 @@ impl SlackService {
         match account {
             _ if state.credentials_locked => "credentials_unavailable",
             Some(account) if account.revoked => "reauthorization_required",
-            Some(account) if !account.access.is_empty() => "authorized",
+            Some(account) if !account.access.is_empty() || account.web_session => "authorized",
             _ if state.app_token.is_none() => "unconfigured",
             _ => "authorization_required",
         }
@@ -348,7 +344,9 @@ impl SlackService {
     pub(super) async fn public_status(&self) -> Value {
         let state = self.state.lock().await;
         let account = state.secrets.account.as_ref().filter(|account| {
-            !state.credentials_locked && !account.revoked && !account.access.is_empty()
+            !state.credentials_locked
+                && !account.revoked
+                && (!account.access.is_empty() || account.web_session)
         });
         let (team_id, settings, _, _) = self.project.as_ref().expect("Slack 工作区配置");
         let issue = if state.storage_unavailable {
@@ -644,6 +642,7 @@ impl SlackService {
                 .map(|seconds| now().saturating_add(seconds)),
             Some(id),
             None,
+            false,
         )
         .await
     }
@@ -662,6 +661,10 @@ impl SlackService {
 
     async fn verify_identity(&self, token: &str) -> Result<Identity, Error> {
         let identity = self.client.test_identity(token).await?;
+        self.identity_from_response(identity)
+    }
+
+    fn identity_from_response(&self, identity: Value) -> Result<Identity, Error> {
         if identity["bot_id"].as_str().is_some() {
             return Err(Error::UserToken);
         }
@@ -700,7 +703,7 @@ impl SlackService {
         let _lock = self.imported_token_lock.lock().await;
         self.initialize().await?;
         let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-        self.save_user(identity, token, None, None, None, Some(hash))
+        self.save_user(identity, token, None, None, None, Some(hash), false)
             .await
     }
 
@@ -727,17 +730,35 @@ impl SlackService {
                 .account
                 .as_ref()
                 .filter(|account| account.imported_token_hash.as_deref() == Some(&hash));
-            if previous.is_some_and(|account| account.revoked || !account.access.is_empty()) {
+            if previous.is_some_and(|account| {
+                account.revoked || !account.access.is_empty() || account.web_session
+            }) {
                 return Ok(());
             }
             previous.map(|account| account.identity.clone())
         };
-        let identity = match identity {
-            Some(identity) => identity,
-            None => self.verify_user_token(&token).await?,
-        };
-        self.save_user(identity, token, None, None, None, Some(hash))
-            .await
+        if token.starts_with('{') {
+            let session = WebSession::parse(&token)?;
+            let identity = match identity {
+                Some(identity) => identity,
+                None => {
+                    let response = self
+                        .client
+                        .web_call("auth.test", &session, &[], None)
+                        .await?;
+                    self.identity_from_response(response)?
+                }
+            };
+            self.save_user(identity, String::new(), None, None, None, Some(hash), true)
+                .await
+        } else {
+            let identity = match identity {
+                Some(identity) => identity,
+                None => self.verify_user_token(&token).await?,
+            };
+            self.save_user(identity, token, None, None, None, Some(hash), false)
+                .await
+        }
     }
 
     async fn save_user(
@@ -748,10 +769,12 @@ impl SlackService {
         expires_at: Option<u64>,
         authorization: Option<Uuid>,
         imported_token_hash: Option<String>,
+        web_session: bool,
     ) -> Result<(), Error> {
         let mut account = Account {
             identity,
             access: token,
+            web_session,
             refresh,
             expires_at,
             baseline: now(),
@@ -886,12 +909,45 @@ impl SlackService {
         .await
     }
 
+    async fn web_session(&self, session: Uuid) -> Result<Option<WebSession>, Error> {
+        if !self.state.lock().await.account(session)?.web_session {
+            return Ok(None);
+        }
+        let config = self.imported_token.as_ref().ok_or(Error::Configuration)?;
+        let (team, _, _, _) = self.project.as_ref().ok_or(Error::Configuration)?;
+        let secret = config
+            .read_record_password("slack", "teams", team, "token")
+            .await
+            .map_err(|_| Error::PasswordRead)?;
+        Ok(Some(WebSession::parse(&secret)?))
+    }
+
+    pub(super) async fn slack_post(
+        &self,
+        session: Uuid,
+        method: &str,
+        body: &Value,
+    ) -> Result<Value, Error> {
+        if let Some(web) = self.web_session(session).await? {
+            return self.client.web_call(method, &web, &[], Some(body)).await;
+        }
+        let token = self.access(session).await?;
+        self.client.post(method, &token, body).await
+    }
+
     pub(super) async fn slack_get(
         &self,
         session: Uuid,
         method: &str,
         params: &[(&str, &str)],
     ) -> Result<Value, Error> {
+        if let Some(web) = self.web_session(session).await? {
+            let result = self.client.web_call(method, &web, params, None).await;
+            if result == Err(Error::Authorization) {
+                self.revoke(session, "").await;
+            }
+            return result;
+        }
         let token = self.access(session).await?;
         let result = self.client.get(method, &token, params).await;
         if result == Err(Error::Authorization) {

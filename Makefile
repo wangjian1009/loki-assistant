@@ -62,13 +62,13 @@ emacs-load:
 	"$(EMACSCLIENT)" --eval "(let ((command-map (and (boundp 'loki-assistant-command-map) loki-assistant-command-map))) \
 	  (let ((directory \"$(PROJECT_ROOT)/emacs\")) \
 	    (setq load-path (cons directory (delete directory load-path)))) \
-	  (dolist (feature '(loki-assistant-slack-tests loki-assistant-slack loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
+	  (dolist (feature '(loki-assistant-slack-chat-tests loki-assistant-slack-chat loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
 	  (when command-map (setq loki-assistant-command-map command-map)) \
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config) \
 	  (require 'loki-assistant-devices) \
-	  (require 'loki-assistant-slack))"
+	  (require 'loki-assistant-slack-chat))"
 
 emacs-config: emacs-load
 	"$(EMACSCLIENT)" --eval "(progn \
@@ -90,8 +90,8 @@ emacs-test: emacs-load
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-devices-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-monitor-tests.el\" nil t) \
-	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-slack-tests.el\" nil t) \
-	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-devices-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-capture-test-\" \"^loki-assistant-slack-test-\"))) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-slack-chat-tests.el\" nil t) \
+	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-devices-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-capture-test-\" \"^loki-assistant-slack-chat-test-\"))) \
 	              (edna-stats \
 	               (when (require 'org-edna nil t) \
 	                 (load \"$(PROJECT_ROOT)/emacs/loki-assistant-edna-tests.el\" nil t) \

@@ -46,6 +46,58 @@ pub(super) fn router(service: Arc<Projects>) -> Router {
         .with_state(service)
 }
 
+pub(super) fn config_notification_router(projects: Arc<Projects>) -> Router {
+    use axum::routing::post;
+    Router::new()
+        .route(
+            "/slack/config/teams/{team_id}",
+            post(team_config_changed)
+                .get(team_config_status)
+                .delete(team_config_changed),
+        )
+        .with_state(projects)
+}
+
+async fn team_config_changed(
+    State(projects): Service,
+    axum::Extension(request): axum::Extension<crate::modules::config::service::NotificationRequest>,
+    Path(team_id): Path<String>,
+) -> Result<StatusCode, Error> {
+    validate_team_id(&team_id)?;
+    if request.deleted {
+        sync_after_confirmation(projects, request);
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Ok(StatusCode::ACCEPTED)
+    }
+}
+
+async fn team_config_status(
+    State(projects): Service,
+    axum::Extension(request): axum::Extension<crate::modules::config::service::NotificationRequest>,
+    Path(team_id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    validate_team_id(&team_id)?;
+    let status = projects.registration_status(request.id, &team_id).await;
+    if status == "confirmed" {
+        sync_after_confirmation(projects, request);
+    }
+    Ok(Json(json!({"status": status})))
+}
+
+fn sync_after_confirmation(
+    projects: Arc<Projects>,
+    request: crate::modules::config::service::NotificationRequest,
+) {
+    tokio::spawn(async move {
+        if request.confirmed().await
+            && let Err(error) = projects.sync_projects().await
+        {
+            eprintln!("同步 Slack 工作区失败：{error}");
+        }
+    });
+}
+
 async fn require_local(
     State(service): Service,
     request: Request,
@@ -198,26 +250,11 @@ fn messages_result(mut value: Value, team_id: &str) -> Value {
     module = "slack",
     mount = "Arc<Projects>",
     mount_group = "slack-local",
-    id = "open",
-    method = "POST",
-    path = "/slack/open",
-    summary = "在 Emacs 打开 Slack",
-    description = "从本机通知唤起 Emacs 聊天选择。"
-)]
-async fn open(State(projects): Service) -> Result<Json<Value>, Error> {
-    projects.open().await?;
-    Ok(Json(json!({"api_version":"1","opened":true})))
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
-    mount_group = "slack-local",
     id = "token-import-page",
     method = "GET",
     path = "/slack/token-import",
     summary = "打开 Slack 令牌导入页面",
-    description = "显示已有 Slack 用户令牌的获取和导入入口。"
+    description = "显示已有 Slack 用户令牌的导入说明。"
 )]
 async fn token_import_page() -> Response {
     (
@@ -226,9 +263,7 @@ async fn token_import_page() -> Response {
         Html(concat!(
             "<!doctype html><html lang=zh-CN><meta charset=utf-8>",
             "<title>导入 Slack 用户令牌</title><h1>导入 Slack 用户令牌</h1>",
-            "<p>在 Slack 应用的 OAuth &amp; Permissions 中取得当前工作区的 User OAuth Token。",
-            "<a href=https://api.slack.com/apps target=_blank rel=noopener>打开 Slack 应用管理</a></p>",
-            "<p>回到本页，打开 Loki Assistant Chrome 插件，粘贴用户令牌并点击「接受」。</p>"
+            "<p>打开 Loki Assistant Chrome 插件，粘贴目标工作区已有的 xoxp- 用户令牌并点击「接受」。</p>"
         )),
     ).into_response()
 }

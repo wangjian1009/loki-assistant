@@ -11,21 +11,25 @@
 (require 'loki-assistant)
 #+end_src
 
-包内的 ~loki-assistant-command-map~ 统一提供命令快捷键，~c~ 打开服务配置管理界面，~d~ 打开设备管理。入口键由个人配置指定，例如：
+包内的 ~loki-assistant-command-map~ 提供一个前缀键映射。入口键由个人配置指定，例如：
 
 #+begin_src emacs-lisp
 (global-set-key (kbd "C-x a") loki-assistant-command-map)
 #+end_src
 
-配置后使用 ~C-x a c~ 打开配置界面，~C-x a d~ 打开设备管理。
+配置后使用 ~C-x a c~ 打开配置界面，~C-x a d~ 打开设备管理，~C-x a s~ 选择 Slack 会话。使用 ~use-package~ 延迟加载时，用 ~:bind-keymap~ 绑定该前缀。
 
 每次请求重新读取 ~loki-assistant-service-file~ ，默认为 ~~/.assistant/service~ 。仅接受 IPv4/IPv6 loopback 地址和有效端口，不缓存端口；文件缺失、格式错误和连接失败均通过回调反馈。 ~loki-assistant-request-timeout~ 默认为 10 秒，可在单次调用中用 ~:timeout~ 覆盖。
 
+* Slack 工作区配置
+
+在 ~M-x loki-assistant-config~ 的 Slack 分组选择「新增工作区」，填写 Team ID 并保存。该行显示「待确认」。可编辑该行补充 Slack 网页会话凭据，按 ~g~ 刷新配置状态。 [[file:slack-development.org::*当前工作区配置][Slack 工作区配置]]
+
 * Slack 聊天
 
-~M-x loki-assistant-config~ 在 Slack 分组内按 Metadata 显示工作区列表、表单和操作按钮。保存新工作区时会打开浏览器授权。授权成功后，可在该行检查已有 pass 令牌或录入应用令牌。授权和连接状态由状态中心提供。 [[file:slack.org::*工作区配置][Slack 配置与使用]]
+~M-x loki-assistant-slack-select-chat~ 使用 Consult 选择会话。每个会话使用独立的 Emacs 窗口和 shell-maker 输入区。再次选择同一会话时会切回它的窗口。
 
-~M-x loki-assistant-slack~ 或前缀键映射中的 ~s~ 使用 Consult 搜索联系人和频道。按 ~RET~ 打开所选聊天。聊天中按 ~t~ 打开线程，~r~ 起草，~C-c C-c~ 发送，~m~ 更新本机已读位置。
+在根消息下选择「展开回复」或「折叠回复」。选择「回复」后，光标移到同一窗口的「线程回复>」提示符，可直接输入。~RET~ 激活按钮或发送草稿，~S-RET~ 插入换行，~C-c C-k~ 将输入目标切回主会话，~C-c C-r~ 刷新主会话和已展开的 Thread。
 
 * 设备管理
 

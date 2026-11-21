@@ -1,62 +1,33 @@
 #+TITLE: Slack 模块
+#+SETUPFILE: .setup.org
 
-* 职责
+* 技术选型
+工作区接入沿用 Emacs ~slack.el~ 的做法，使用登录 Slack 网页后同一会话的 ~xoxc-~ 用户令牌和 ~d~ Cookie。services 通过 Slack ~auth.test~ 核对用户和 Team ID。
 
-services 使用已有的 Slack 用户令牌接入多个工作区，各工作区分别保存用户令牌和 Socket Mode 应用令牌。Emacs 通过本机 API 浏览、发送私信和已加入频道的消息。后台通知覆盖一对一和多人私信，点击通知打开 Emacs 聊天选择。
+* Team 配置
 
-* 工作区配置
+~slack/teams~ 的配置类型为 ~Vec<SlackTeam>~ 。元数据声明 ~notification_endpoint~ 为 ~/slack/config/teams~ ，以 ~team_id~ 作为 ~Key~ 字段。首次新增只填 Team ID。配置模块通过该接入点通知新增和删除，并查询待确认记录的处理结果。 [[file:config-module.org::*配置项通知接入点][配置项通知接入点]] · [[file:slack-development.org::*Team 注册流程图][Team 注册流程图]]
 
-Slack 向配置中心注册 ~slack/teams~ ，类型为 ~SlackTeam~ 数组。配置界面按元数据生成表单，填写必填项后提交。 [[file:config-module.org::*结构化配置][配置模块设计]]
+下表为网页会话接入所需的 ~SlackTeam~ 字段。
 
-| 字段 | 类型 | 约束与用途 |
-|------+------|------------|
-| ~team_id~ | ~string~ | 必填主键，可从 Slack 网页 ~/client/~ 后取得，格式为 ~^T[A-Z0-9]{1,47}$~ |
-| ~name~ | ~string~ | 必填，本地显示名称 |
-| ~password_id~ | ~password_reference~ | 可选，引用 pass 条目，默认 ~loki-assistant/slack/{team_id}/app-token.gpg~ |
-| ~token~ | ~password~ | 由导入流程填写，~password_path~ 为 ~loki-assistant/slack/{id}/user-token.gpg~ ，~{id}~ 取自 ~team_id~ |
+| 字段      | 配置类型   | 用途 |
+|-----------+------------+------|
+| ~team_id~ | ~Key~      | 必填且不可变的主键，从 Slack 网页的 ~/client/~ 路径取得，格式为 ~^T[A-Z0-9]{1,47}$~ 。 |
+| ~name~    | ~string~   | 可选，本地显示名称，最多 80 个字符。默认显示 Team ID。 |
+| ~token~   | ~Password~ | 后续补充，包含同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie。 |
 
-新增记录通过 ~If-None-Match: *~ 提交。填写工作区后，services 打开本机令牌导入页，原保存请求等待导入结果。提交失败时保留原配置。删除工作区后，services 停止对应的后台任务并移除连接状态。
+新增使用 ~PUT /data/slack/teams/{team_id}~ 和 ~If-None-Match: *~ ，请求体为空 JSON 对象。待确认记录通过同一路径补充网页会话凭据。删除使用 ~DELETE /data/slack/teams/{team_id}~ ，由配置模块发送 ~DELETE~ 通知，确认后移除记录。
 
-* 令牌导入
+* services RESTful 接口
 
-1. 在导入页打开 Slack 应用管理，在目标工作区取得已有的 ~xoxp-~ 用户令牌。
-2. 返回导入页，打开 Loki Assistant Chrome 插件，粘贴令牌并点击「接受」。导入页使用本机 services 默认端口 ~47321~ 。
-3. services 通过 Slack ~auth.test~ 核对用户和 Team ID。配置中心按 ~password_path~ 调用密码模块将原文存入 pass，并在 ~SlackTeam.token~ 保存条目引用。后台读取该字段时由配置中心调用密码模块取出令牌。
-4. 在配置页用「更换用户令牌」重新导入。Slack 读写权限取决于已有令牌的 scopes。后台实时通知还需要在该工作区配置带 ~connections:write~ 的 app-level token 和 ~message.im~、~message.mpim~ 用户事件。
-
-* RESTful 接口
-
-| 方法 | 路径 | 请求与结果 |
-|------+------|------------|
-| 通用 | 本机 HTTP | Bearer 取自 ~~/.assistant/slack-api-token~ 。聊天会话请求另带 ~X-Loki-Slack-Session~ ，值取自聊天记录或连接状态的 ~session_id~ |
-| 分页 | 用户、聊天和消息 | ~limit~ 默认 50，范围 1–100。用 ~next_cursor~ 作为下一次的 ~cursor~ ，返回 ~null~ 表示当前查询结束 |
-| 标识 | 聊天与用户 | 聊天 ID 为 ~team_id.聊天ID~ ，用户 ID 为 ~team_id.user_id~ 。~thread_ts~ 是顶层根消息的 ~ts~ ，时间戳均为字符串 |
-| GET | ~/meta/slack~ | 读取 Slack 配置元数据 |
-| GET | ~/data/slack/teams~ | 读取工作区配置 |
-| PUT | ~/data/slack/teams/{team_id}~ | Bearer。新增带 ~If-None-Match: *~ ，导入成功后返回 ~200~ 和已保存记录，主键已存在返回 ~412~ 。修改已有记录返回 ~200~ |
-| DELETE | ~/data/slack/teams/{team_id}~ | Bearer。删除工作区配置，返回 ~204~ |
-| POST | ~/config/actions/slack/check_app_token/{team_id}~ | Bearer。检查工作区引用的 app-level token |
-| PUT | ~/data/slack/app_token~ | Bearer。请求体包含 ~project~（Team ID）和 ~token~ ，返回保存标记 |
-| POST | ~/config/actions/slack/authorize/{team_id}~ | Bearer。打开导入页面更换用户令牌，等待并返回结果 |
-| GET | ~/status/slack/connections~ | 从通用状态中心读取 ~authorization_state~、~socket_state~ 和 ~session_id~ |
-| GET | ~/slack/users~ | Bearer。跨工作区分页读取用户，记录返回 ~id~、~team_id~、~name~ 和 ~is_bot~ |
-| GET | ~/slack/conversations~ | Bearer。跨工作区分页读取私信和频道，可按 ~team_id~、~kind~、~unread~ 筛选，记录返回聊天 ~id~ 和 ~session_id~ |
-| GET | ~/slack/conversations/{id}/messages~ | Bearer 和会话头。读取顶层消息，下一页返回更早消息 |
-| GET | ~/slack/conversations/{id}/threads/{thread_ts}/messages~ | Bearer 和会话头。返回根消息 ~root~ 及分页回复 ~items~ |
-| POST | ~/slack/conversations/{id}/messages~ | Bearer 和会话头。用 ~Idempotency-Key~（UUID）及 ~text~ 发送顶层消息，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录 |
-| POST | ~/slack/conversations/{id}/threads/{thread_ts}/messages~ | Bearer 和会话头。用 ~Idempotency-Key~（UUID）及 ~text~ 发送线程回复，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录 |
-| PUT | ~/slack/conversations/{id}/read-position~ | Bearer 和会话头。用 ~through_ts~ 推进顶层聊天的本机已读位置 |
-| PUT | ~/slack/conversations/{id}/threads/{thread_ts}/read-position~ | Bearer 和会话头。用 ~through_ts~ 推进线程的本机已读位置 |
-| GET | ~/slack/send-requests/{request_id}~ | Bearer 和会话头。查询参数 ~team_id~ 必填，返回 ~pending~、~sent~、~failed~ 或 ~unknown~ |
-| GET | ~/slack/token-import~ | 显示用户令牌获取和导入入口 |
-| POST | ~/slack/token-import~ | 使用一次性导入标识作为 Bearer，提交 ~team_id~ 和 ~token~ ，成功返回 ~204~ |
-| POST | ~/slack/oauth/authorizations~ | OAuth 兼容接口。Bearer。查询参数 ~team_id~ 必填，返回 ~201~、授权 URL 和记录 ~Location~ |
-| GET | ~/slack/oauth/authorizations/{id}~ | Bearer。查询参数 ~team_id~ 必填，返回授权进度和结果 |
-| GET | ~/slack/oauth/callback~ | 校验一次性 ~state~ 并处理 Slack 授权结果，返回 ~303~ |
-| GET | ~/slack/oauth/result~ | 显示浏览器授权提示 |
-| DELETE | ~/slack/session~ | Bearer 和会话头。查询参数 ~team_id~ 必填，断开本机授权会话，返回 ~204~ |
-| POST | ~/slack/open~ | 通知点击后唤起 Emacs 聊天选择 |
-
-* Emacs
-
-在 ~M-x loki-assistant-config~ 的 Slack 分组中添加工作区。安装 Consult 后，用 ~M-x loki-assistant-slack~ 搜索联系人或频道，按 ~RET~ 进入聊天。聊天内用 ~t~ 打开线程、~o~ 读取更早消息、~g~ 刷新、~m~ 更新本机已读位置、~r~ 起草，草稿内用 ~C-c C-c~ 发送。
+| 方法 | 路径                                                          | 请求与结果                                                                                                                     |
+|------+---------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------|
+| GET  | ~/status/slack/connections~                                   | 从通用状态中心读取 ~authorization_state~、~socket_state~ 和 ~session_id~                                                       |
+| GET  | ~/slack/conversations~                                        | Bearer 取自 ~~/.assistant/slack-api-token~ 。筛选参数为 ~team_id~ 、~kind~ 和 ~unread~ 。分页参数为 ~limit~ 和 ~cursor~ 。~limit~ 默认 50，范围 1–100。返回 ~id~ 、~session_id~ 和 ~next_cursor~ 。会话 ~id~ 格式为 ~team_id.聊天ID~ 。 |
+| GET  | ~/slack/conversations/{id}/messages~                          | Bearer，~X-Loki-Slack-Session~ 取会话的 ~session_id~ 。支持 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。 |
+| GET  | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | Bearer 和 ~X-Loki-Slack-Session~ 。~thread_ts~ 取根消息的 ~ts~ 。返回 ~root~ 、分页回复 ~items~ 和 ~next_cursor~ 。 |
+| POST | ~/slack/conversations/{id}/messages~                          | Bearer 和会话头。用 ~Idempotency-Key~（UUID）及 ~text~ 发送顶层消息，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
+| POST | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | Bearer 和会话头。用 ~Idempotency-Key~（UUID）及 ~text~ 发送线程回复，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
+| PUT  | ~/slack/conversations/{id}/read-position~                     | Bearer 和会话头。用 ~through_ts~ 推进顶层聊天的本机已读位置                                                                    |
+| PUT  | ~/slack/conversations/{id}/threads/{thread_ts}/read-position~ | Bearer 和会话头。用 ~through_ts~ 推进线程的本机已读位置                                                                        |
+| GET  | ~/slack/send-requests/{request_id}~                           | Bearer 和会话头。查询参数 ~team_id~ 必填，返回 ~pending~、~sent~、~failed~ 或 ~unknown~                                        |

@@ -75,4 +75,4 @@ npm test
 
 * 导入 Slack 用户令牌
 
-在 Loki Assistant 配置中保存 Slack 工作区后，services 会打开导入页。返回该页后打开插件，粘贴已有的用户令牌，点击「接受」。插件提交到本机 services，令牌保存由配置中心处理。 [[file:../docs/slack.org::*令牌导入][Slack 令牌导入]]
+新工作区通过 Loki Assistant 配置模块注册。Chrome 插件的令牌导入入口用于旧导入页。 [[file:../docs/slack-development.org][Slack 接入开发过程]]

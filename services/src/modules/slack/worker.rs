@@ -63,7 +63,7 @@ impl SlackService {
                     title: "Slack 新消息".into(),
                     body: None,
                     app: None,
-                    callback_url: self.notification_path(),
+                    callback_url: None,
                 })
                 .await;
             if delivered.is_ok() {
@@ -528,7 +528,6 @@ impl SlackService {
 
     async fn send_one(&self, session: Uuid, id: Uuid, changes: &mut watch::Receiver<u64>) {
         let _ = changes.borrow_and_update();
-        let token = self.access(session).await;
         let record = self
             .update_cache(session, move |cache, _| {
                 let record = cache.sends.get_mut(&id).ok_or(Error::SendRecord)?;
@@ -543,28 +542,25 @@ impl SlackService {
             tokio::time::sleep(Duration::from_secs(1)).await;
             return;
         };
-        let outcome = match token {
-            Ok(token) => {
-                let mut body = json!({"channel":record.conversation, "text":record.text,
+        let outcome = {
+            let mut body = json!({"channel":record.conversation, "text":record.text,
                     "mrkdwn":false,"unfurl_links":false,"unfurl_media":false});
-                if let Some(thread) = &record.thread {
-                    body["thread_ts"] = json!(thread);
-                }
-                tokio::select! {
-                    _ = changes.changed() => Err(Error::DeliveryUnknown),
-                    result = self.client.post("chat.postMessage", &token, &body) => {
-                        match result {
-                            Ok(value) => value["ts"].as_str().filter(|ts| timestamp(ts).is_some()).map(|ts| {
-                                let message = Message::from_slack(&value["message"], record.thread.as_deref());
-                                (ts.to_owned(), message)
-                            }).ok_or(Error::DeliveryUnknown),
-                            Err(Error::Upstream | Error::Unavailable) => Err(Error::DeliveryUnknown),
-                            Err(error) => Err(error)
-                        }
+            if let Some(thread) = &record.thread {
+                body["thread_ts"] = json!(thread);
+            }
+            tokio::select! {
+                _ = changes.changed() => Err(Error::DeliveryUnknown),
+                result = self.slack_post(session, "chat.postMessage", &body) => {
+                    match result {
+                        Ok(value) => value["ts"].as_str().filter(|ts| timestamp(ts).is_some()).map(|ts| {
+                            let message = Message::from_slack(&value["message"], record.thread.as_deref());
+                            (ts.to_owned(), message)
+                        }).ok_or(Error::DeliveryUnknown),
+                        Err(Error::Upstream | Error::Unavailable) => Err(Error::DeliveryUnknown),
+                        Err(error) => Err(error)
                     }
                 }
             }
-            Err(error) => Err(error),
         };
         let _ = self
             .update_cache(session, move |cache, _| {
