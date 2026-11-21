@@ -54,9 +54,6 @@ kbd { display: inline-block; min-width: 19px; padding: 2px 4px; border: 1px soli
 .empty, .loading { padding: 18px 8px; text-align: center; color: var(--muted); font-size: 12px; line-height: 1.8; }
 .empty p { margin: 0 0 8px; }
 .notice { margin-bottom: 16px; border: 1px solid var(--line); background: var(--soft); border-radius: 7px; padding: 10px; font-size: 12px; line-height: 1.6; }
-#slack-token-import label { display: block; margin-top: 8px; font-weight: 600; }
-#slack-token-import input { box-sizing: border-box; width: 100%; margin: 4px 0 8px; padding: 8px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: var(--surface); }
-#slack-token-import .status:not(:empty) { margin-top: 8px; }
 .notice p { margin: 0; overflow-wrap: anywhere; }
 /* 工具页采用桌面图标网格，四列可直接容纳后续已接入能力。 */
 .tool-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 4px; }

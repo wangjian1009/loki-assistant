@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt::Debug, future::Future, pin::Pin};
@@ -12,14 +12,15 @@ use crate::modules::password::service::{PasswordError, PasswordService, validate
 use super::{
     model::{
         ConfigDataType, ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata, ConfigValue,
-        ConfigValueSource,
+        ConfigValueSource, StructureField,
     },
     registry::item_options,
     storage::{FileStorage, StoredValues},
 };
 
 mod notifications;
-pub(crate) use notifications::NotificationRequest;
+pub use notifications::NotificationValidationError;
+pub(crate) use notifications::{NotificationConfirmedFields, NotificationRequest};
 
 #[derive(Clone, Debug)]
 pub struct ConfigService {
@@ -143,6 +144,8 @@ pub enum ConfigServiceError {
     ValueNotSet { module_id: String, key: String },
     #[error("配置项 {module_id}/{key} 不允许此远端操作")]
     RemoteAccessForbidden { module_id: String, key: String },
+    #[error("配置项 {module_id}/{key} 为只读。")]
+    ReadOnly { module_id: String, key: String },
     #[error("配置值无效：{0}")]
     InvalidValue(String),
     #[error("此配置项需要有效的本机凭据。")]
@@ -157,6 +160,8 @@ pub enum ConfigServiceError {
     ChangePending,
     #[error("此资源没有待确认变更。")]
     PendingNotFound,
+    #[error("{}", .0.message)]
+    PendingValidation(NotificationValidationError),
     #[error("此配置的通知请求正在处理。")]
     RetryInProgress,
     #[error("配置文件读写失败：{0}")]
@@ -188,7 +193,7 @@ fn patch_fields(options: &ConfigItemOptions, patch: &Value) -> Result<(), Config
                 "部分更新不能修改主键或只读字段。".into(),
             ));
         }
-        if field.data_type == ConfigDataType::Password {
+        if field.data_type.is_password() {
             return Err(ConfigServiceError::InvalidValue(
                 "结构中的密码字段需通过凭据提交接口更新。".into(),
             ));
@@ -264,7 +269,7 @@ impl ConfigService {
                 entries.retain(|key, _| {
                     module
                         .item(key)
-                        .is_none_or(|item| item.data_type != ConfigDataType::Password)
+                        .is_none_or(|item| !item.data_type.is_password())
                 });
                 for item in &module.items {
                     let options = item_options(module_id, &item.key);
@@ -277,6 +282,12 @@ impl ConfigService {
                     {
                         entries.insert(item.key.clone(), options.migrate_dictionary(previous)?);
                     }
+                    if let Some(records) = entries.get_mut(&item.key).and_then(Value::as_array_mut)
+                    {
+                        for record in records {
+                            options.clear_retired_password_references(record, false);
+                        }
+                    }
                 }
                 for (key, value) in entries.iter() {
                     if let Some(item) = module.item(key) {
@@ -285,6 +296,7 @@ impl ConfigService {
                 }
             }
         }
+        notifications::clear_retired_pending_password_references(&mut values);
         let mut service = Self::with_metadata(metadata);
         service.values = Arc::new(RwLock::new(values));
         service.storage = Some(storage);
@@ -363,7 +375,7 @@ impl ConfigService {
             .into_iter()
             .filter(|item| !remote || item.remote_access.allows_read())
         {
-            let value = if item.data_type == ConfigDataType::Password {
+            let value = if item.data_type.is_password() {
                 Some(self.secret_value(module_id, &item.key).await)
             } else {
                 self.resolve_value(&item, user_values.get(&item.key))
@@ -374,6 +386,64 @@ impl ConfigService {
             }
         }
         Ok(resolved)
+    }
+
+    pub(super) async fn omit_missing_password_entries(
+        &self,
+        module: &str,
+        item: &str,
+        effective: Option<&mut Value>,
+        pending: &mut [Value],
+    ) {
+        let options = item_options(module, item);
+        let (Some(store), Some(structure)) = (&self.passwords, options.structure.as_ref()) else {
+            return;
+        };
+        let fields: Vec<_> = structure
+            .fields
+            .iter()
+            .filter(|field| field.data_type.is_password())
+            .map(|field| &field.key)
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        let mut records: Vec<_> = effective
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .chain(
+                pending
+                    .iter_mut()
+                    .filter_map(|entry| entry.get_mut("value")),
+            )
+            .filter_map(Value::as_object_mut)
+            .collect();
+        let paths = records
+            .iter()
+            .flat_map(|record| {
+                fields
+                    .iter()
+                    .filter_map(|field| record.get(*field).and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        if paths.is_empty() {
+            return;
+        }
+        if let Ok(missing) = store.missing_entries(paths).await {
+            for record in &mut records {
+                for field in &fields {
+                    if record
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| missing.contains(path))
+                    {
+                        record.remove(*field);
+                    }
+                }
+            }
+        }
     }
 
     pub(super) async fn require_remote_access(
@@ -410,7 +480,7 @@ impl ConfigService {
                 module_id: module_id.to_owned(),
                 key: key.to_owned(),
             })?;
-        if item.data_type == ConfigDataType::Password {
+        if item.data_type.is_password() {
             return Ok(self.secret_value(module_id, key).await);
         }
         let user_value = self
@@ -482,7 +552,7 @@ impl ConfigService {
                 "请使用带通知的配置写入接口。".into(),
             ));
         }
-        let secret = item.data_type == ConfigDataType::Password;
+        let secret = item.data_type.is_password();
         let service = self.clone();
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
         // HTTP 请求取消后仍完成已接受的落盘事务，避免内存与文件版本分离。
@@ -678,38 +748,15 @@ impl ConfigService {
         .await
     }
 
-    /// 将已经由所属模块验证的凭据写入此字段注册的密码条目。
-    pub(crate) async fn save_record_password(
+    /// 从同一份生效记录读取多个密码字段，防止并发提交清理仍在读取的条目。
+    pub(crate) async fn read_record_passwords<const N: usize>(
         &self,
         module: &str,
         key: &str,
         instance: &str,
-        field: &str,
-        new_record: Option<Value>,
-        secret: String,
-    ) -> Result<Value, ConfigServiceError> {
-        let create_only = new_record.is_some();
-        self.replace_record_inner(
-            module.to_owned(),
-            key.to_owned(),
-            instance.to_owned(),
-            new_record,
-            create_only,
-            true,
-            Some((field.to_owned(), secret)),
-            false,
-        )
-        .await
-    }
-
-    /// 从已保存记录对应的密码条目读取凭据，供模块内部使用。
-    pub(crate) async fn read_record_password(
-        &self,
-        module: &str,
-        key: &str,
-        instance: &str,
-        field: &str,
-    ) -> Result<String, ConfigServiceError> {
+        fields: [&str; N],
+    ) -> Result<[Option<String>; N], ConfigServiceError> {
+        let _commit = self.commits.lock().await;
         let options = item_options(module, key);
         let id_field = options
             .structure
@@ -717,7 +764,7 @@ impl ConfigService {
             .and_then(|value| value.id_field.as_ref())
             .ok_or(ConfigServiceError::ActionNotFound)?;
         let data = self.value(module, key).await?;
-        let path = data
+        let record = data
             .value
             .as_array()
             .and_then(|records| {
@@ -725,15 +772,42 @@ impl ConfigService {
                     .iter()
                     .find(|record| record[id_field].as_str() == Some(instance))
             })
-            .and_then(|record| record[field].as_str())
-            .filter(|path| options.matches_password_path(field, instance, path))
             .ok_or(ConfigServiceError::ActionNotFound)?;
-        self.passwords
-            .as_ref()
-            .ok_or_else(|| ConfigServiceError::Storage("密码模块不可用。".into()))?
-            .fetch(path)
+        self.load_record_passwords(&options, record, instance, fields)
             .await
-            .map_err(|error| ConfigServiceError::Storage(error.to_string()))
+    }
+
+    async fn load_record_passwords<const N: usize>(
+        &self,
+        options: &ConfigItemOptions,
+        record: &Value,
+        instance: &str,
+        fields: [&str; N],
+    ) -> Result<[Option<String>; N], ConfigServiceError> {
+        let mut passwords = std::array::from_fn(|_| None);
+        let mut entries = BTreeMap::<&str, Option<String>>::new();
+        for (field, password) in fields.into_iter().zip(&mut passwords) {
+            if let Some(path) = record[field].as_str() {
+                if !options.matches_password_path(field, instance, path) {
+                    return Err(ConfigServiceError::ActionNotFound);
+                }
+                if !entries.contains_key(path) {
+                    entries.insert(path, self.load_password_entry(path).await?);
+                }
+                if let Some(contents) = &entries[path] {
+                    *password = Some(options.read_password_line(field, contents)?);
+                }
+            }
+        }
+        Ok(passwords)
+    }
+
+    async fn load_password_entry(&self, path: &str) -> Result<Option<String>, ConfigServiceError> {
+        match self.passwords()?.fetch(path).await {
+            Ok(contents) => Ok(Some(contents)),
+            Err(PasswordError::EntryNotFound) => Ok(None),
+            Err(error) => Err(ConfigServiceError::Storage(error.to_string())),
+        }
     }
 
     async fn replace_record_inner(
@@ -1056,7 +1130,7 @@ impl ConfigService {
                 key: key.to_owned(),
             })?;
         let value = self.normalize_value(module_id, item, value).await?;
-        if item.data_type == ConfigDataType::Password {
+        if item.data_type.is_password() {
             if let Some(handler) = self.handlers.get(module_id) {
                 handler
                     .validate_secret(key, &value)
@@ -1077,8 +1151,7 @@ impl ConfigService {
     ) -> Result<(), ConfigServiceError> {
         let metadata = self.module_metadata(module_id).await?;
         if metadata.item(key).is_some_and(|item| {
-            item.data_type == ConfigDataType::Password
-                || item_options(module_id, key).requires_local_auth
+            item.data_type.is_password() || item_options(module_id, key).requires_local_auth
         }) {
             let handler = self
                 .handlers
@@ -1278,7 +1351,7 @@ impl ConfigService {
             .insert(key.to_owned(), value.clone());
         let mut module_values = BTreeMap::new();
         for item in self.module_metadata(module_id).await?.items {
-            if item.data_type == ConfigDataType::Password {
+            if item.data_type.is_password() {
                 module_values.insert(
                     item.key.clone(),
                     self.secret_value(module_id, &item.key).await.value,
@@ -1499,6 +1572,82 @@ impl ModuleSubscription {
 }
 
 impl ConfigItemOptions {
+    fn password_entry_fields<'a>(
+        &'a self,
+        instance: &'a str,
+        path: &'a str,
+    ) -> impl Iterator<Item = &'a StructureField> + 'a {
+        self.structure
+            .iter()
+            .flat_map(|structure| &structure.fields)
+            .filter(move |field| {
+                field.data_type.is_password()
+                    && self
+                        .password_path(&field.key, instance)
+                        .is_ok_and(|base| base == path)
+            })
+    }
+
+    fn clear_retired_password_references(&self, record: &mut Value, pending: bool) -> bool {
+        let Some(structure) = &self.structure else {
+            return false;
+        };
+        let Some(record) = record.as_object_mut() else {
+            return false;
+        };
+        let Some(instance) = structure
+            .id_field
+            .as_ref()
+            .and_then(|key| record.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for field in structure
+            .fields
+            .iter()
+            .filter(|field| field.data_type.is_password())
+        {
+            if let Some(path) = record.get(&field.key).and_then(Value::as_str)
+                && self.password_path(&field.key, &instance).is_ok_and(|base| {
+                    path != base
+                        && (!pending || !self.matches_password_path(&field.key, &instance, path))
+                })
+            {
+                record.remove(&field.key);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn password_field(&self, key: &str) -> Option<&StructureField> {
+        self.structure
+            .as_ref()?
+            .fields
+            .iter()
+            .find(|field| field.key == key && field.data_type.is_password())
+    }
+
+    fn read_password_line(&self, key: &str, contents: &str) -> Result<String, ConfigServiceError> {
+        let field = self
+            .password_field(key)
+            .ok_or(ConfigServiceError::ActionNotFound)?;
+        let value = match field.data_type.password_key() {
+            None => contents.lines().next(),
+            Some(name) => contents.lines().skip(1).find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key == name).then(|| value.trim_start())
+            }),
+        };
+        value
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ConfigServiceError::Storage("密码条目缺少配置字段。".into()))
+    }
+
     fn notification_key_field(&self) -> Result<&str, ConfigServiceError> {
         let structure = self
             .structure
@@ -1536,17 +1685,12 @@ impl ConfigItemOptions {
     }
 
     fn password_path(&self, key: &str, instance: &str) -> Result<String, ConfigServiceError> {
-        let template =
-            self.structure
-                .as_ref()
-                .and_then(|structure| {
-                    structure.fields.iter().find(|field| {
-                        field.key == key && field.data_type == ConfigDataType::Password
-                    })
-                })
-                .and_then(|field| field.password_path.as_deref())
-                .ok_or(ConfigServiceError::ActionNotFound)?;
-        if !template.contains("{id}")
+        let Some(ConfigDataType::Password { path: template, .. }) =
+            self.password_field(key).map(|field| &field.data_type)
+        else {
+            return Err(ConfigServiceError::ActionNotFound);
+        };
+        if !template.contains("{key}")
             || instance.is_empty()
             || !instance
                 .bytes()
@@ -1556,7 +1700,7 @@ impl ConfigItemOptions {
                 "密码字段存储路径无效。".into(),
             ));
         }
-        let path = template.replace("{id}", instance);
+        let path = template.replace("{key}", instance);
         validate_file(&path)
             .map_err(|error| ConfigServiceError::InvalidValue(error.to_string()))?;
         Ok(path)
@@ -1640,7 +1784,7 @@ impl ConfigItemMetadata {
                 for field in structure
                     .fields
                     .iter()
-                    .filter(|field| field.password_path.is_some())
+                    .filter(|field| field.data_type.is_password())
                 {
                     if let Some(value) = record.get(&field.key) {
                         let instance = structure
@@ -1711,7 +1855,7 @@ fn matches_type(
     list: Option<&super::model::ListMetadata>,
 ) -> bool {
     match data_type {
-        ConfigDataType::Password => value.is_string() || value.is_object(),
+        ConfigDataType::Password { .. } => value.is_string() || value.is_object(),
         ConfigDataType::String
         | ConfigDataType::Key
         | ConfigDataType::PasswordReference

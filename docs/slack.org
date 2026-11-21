@@ -2,23 +2,45 @@
 #+SETUPFILE: .setup.org
 
 * 技术选型
-工作区接入沿用 Emacs ~slack.el~ 的做法，使用登录 Slack 网页后同一会话的 ~xoxc-~ 用户令牌和 ~d~ Cookie。services 通过 Slack ~auth.test~ 核对用户和 Team ID。
+工作区接入沿用 Emacs ~slack.el~ 的做法，使用同一网页会话的 ~xoxc-~ 用户令牌和 ~d~ Cookie。services 用 ~auth.test~ 核对用户和 Team ID，通过 ~rtm.connect~ 获取并管理 WebSocket 连接地址。
 
 * Team 配置
 
 ~slack/teams~ 的配置类型为 ~Vec<SlackTeam>~ 。元数据声明 ~notification_endpoint~ 为 ~/slack/config/teams~ ，以 ~team_id~ 作为 ~Key~ 字段。首次新增只填 Team ID。配置模块通过该接入点通知新增和删除，并查询待确认记录的处理结果。 [[file:config-module.org::*配置项通知接入点][配置项通知接入点]] · [[file:slack-development.org::*Team 注册流程图][Team 注册流程图]]
 
-下表为网页会话接入所需的 ~SlackTeam~ 字段。
+| 字段 | 类型 | 用途 |
+|------+------|------|
+| ~team_id~ | ~Key~ | 从工作区 URL 的 ~/client/~ 路径取得，格式为 ~^T[A-Z0-9]{1,47}$~ 。 |
+| ~name~ | ~string~ | 本地显示名称，可选，默认显示 Team ID。 |
+| ~team_name~ | ~string~ | Slack 返回的工作区名称，校验成功后写入，只读。 |
+| ~user_id~ | ~string~ | Slack 返回的用户 ID，校验成功后写入，只读。 |
+| ~token~ | ~Password~ | 网页会话的 ~xoxc-~ 用户令牌。 |
+| ~d_cookie~ | ~Password~ | 同一网页会话的 ~d~ Cookie。 |
 
-| 字段      | 配置类型   | 用途                                                                                   |
-|-----------+------------+----------------------------------------------------------------------------------------|
-| ~team_id~ | ~Key~      | 必填且不可变的主键，从 Slack 网页的 ~/client/~ 路径取得，格式为 ~^T[A-Z0-9]{1,47}$~ 。 |
-| ~name~    | ~string~   | 可选，本地显示名称，最多 80 个字符。默认显示 Team ID。                                 |
-| ~token~   | ~Password~ | 后续补充，包含同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie。                               |
+每个 Team 的两项已确认凭据共用一个 pass 条目。~Password.path~ 声明为 ~loki-assistant/slack/{key}.gpg~ ，其中 ~{key}~ 展开为这条记录的 ~team_id~ 。~token~ 省略 ~Password.key~ ，保存于首行。~d_cookie~ 指定同名的 ~Password.key~ ，保存于后续的 ~d_cookie:~ 行。配置和查询结果只包含条目引用。
 
-新增使用 ~PUT /data/slack/teams/{team_id}~ 和 ~If-None-Match: *~ ，请求体为空 JSON 对象。待确认记录可用同一路径的 ~PATCH~ 补充网页会话凭据，或发空请求体的 ~PUT~ 手动重试。删除使用 ~DELETE /data/slack/teams/{team_id}~ ，由配置模块发送 ~DELETE~ 通知，确认后移除记录。
+通过 ~PATCH~ 将 ~token~ 设为 ~null~ 时，配置模块删除整个 pass 条目并清除两个凭据字段。工作区记录保留。
 
-缺少凭据时，在配置界面点击「重试」，配置模块将同一变更重新发送到 ~POST /slack/config/teams/{team_id}~ 。Slack 模块用默认浏览器打开本机配置指引 ~/slack/team-setup/{team_id}~ ，并返回 ~202~ 。指引提供目标 Slack 工作区入口和凭据填写示例。回到配置界面补齐凭据后，Slack 模块调用 ~auth.test~ 校验，配置模块在校验成功后确认记录。
+#+begin_example
+xoxc-…
+d_cookie: …
+#+end_example
+
+** 配置模块交互
+
+| 操作 | 接口 | 响应 |
+|------+------|------|
+| 新增 | ~PUT /data/slack/teams/{team_id}~ ，带 ~If-None-Match: *~ ，请求体为 ~{}~ | ~202~ 和 ~status: pending~ 。Slack 模块打开配置页。 |
+| 保存 | ~PATCH /data/slack/teams/{team_id}~ ，以 ~application/merge-patch+json~ 发送更改的字段 | 数据不全或 Slack 暂不可达时返回 ~202~ 。校验成功返回 ~200~ 和 ~status: confirmed~ 。明确失败返回 ~422~ 和错误。 |
+| 重试 | ~PUT /data/slack/teams/{team_id}~ ，零字节请求体 | 重新通知 Slack 处理同一份待确认数据，按当前结果返回 ~200~、~202~ 或 ~422~ 。 |
+| 查询 | ~GET /data/slack/teams~ | ~value~ 为生效记录，~pending~ 为可编辑的待确认记录。失败记录的 ~status~ 为 ~invalid~ ，~error~ 包含错误代码和说明。 |
+| 删除 | ~DELETE /data/slack/teams/{team_id}~ | 配置模块等待 Slack 结果，确认后移除记录与对应的 pass 条目。 |
+
+配置模块暂存更新后，调用内部 ~POST /slack/config/teams/{team_id}~ 通知 Slack，密码值通过 Rust API 单独读取。待确认凭据缺项时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 并返回 ~202~ 。用户按页面提示在目标 Slack 工作区获取凭据，回到配置页填写并保存。
+
+用户令牌和 Cookie d 齐全后，Slack 通过 ~auth.test~ 核对身份。校验成功后，配置模块将 ~team_name~ 和 ~user_id~ 与候选记录一起保存，设置界面可查看这两个只读字段。旧工作区会在下次成功校验凭据时补齐。明确失败时配置模块保留错误提示，清除候选记录中的 ~token~ 和 ~d_cookie~ ，并删除暂存条目。下一次校验需要重新填写这两项。已有的生效记录继续服务。 [[file:config-module.org::*配置项通知接入点][配置项通知协议]]
+
+工作区配置生效后，services 使用同一凭据启动实时连接。连接结果通过 ~socket_state~ 和 ~issue_code~ 查询。
 
 * services RESTful 接口
 

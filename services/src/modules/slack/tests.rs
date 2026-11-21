@@ -15,15 +15,20 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
 };
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::{
+        Message,
+        handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
+    },
+};
 use tower::ServiceExt;
-use url::Url;
 use uuid::Uuid;
 
 use crate::{
@@ -158,11 +163,14 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         posts: AtomicUsize::default(),
     });
     let slack = Router::new()
-        .route("/apps.connections.open", post(|State(mock): State<Arc<Mock>>| async move {
+        .route("/rtm.connect", post(|State(mock): State<Arc<Mock>>, headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
+            assert_eq!(headers["cookie"], "d=first");
             Json(json!({"ok":true,"url":mock.socket}))
         }))
         .route("/auth.test", post(|headers: HeaderMap| async move {
-            assert_eq!(headers["authorization"], "Bearer xoxp-test-user");
+            assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
+            assert_eq!(headers["cookie"], "d=first");
             Json(json!({"ok":true,"team_id":"TTEAM","user_id":"UME","team":"工作区"}))
         }))
         .route("/users.conversations", get(|| async {
@@ -196,7 +204,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             Json(response)
         }))
         .route("/chat.postMessage", post(|State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json<Value>| async move {
-            assert_eq!(headers["authorization"], "Bearer xoxp-test-user");
+            assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
+            assert_eq!(headers["cookie"], "d=first");
             assert_eq!(body["thread_ts"], mock.root);
             assert_eq!(body["text"], "收到");
             mock.posts.fetch_add(1, Ordering::SeqCst);
@@ -206,42 +215,36 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let http = tokio::spawn(async {
         axum::serve(web, slack).await.unwrap();
     });
-    let (done, acked) = tokio::sync::oneshot::channel();
+    let (done, messages_sent) = tokio::sync::oneshot::channel();
     let socket_mock = Arc::clone(&mock);
     let socket = tokio::spawn(async move {
-        let mut stream = accept_async(sockets.accept().await.unwrap().0)
-            .await
-            .unwrap();
+        let mut stream = accept_hdr_async(
+            sockets.accept().await.unwrap().0,
+            |request: &WebSocketRequest, response: WebSocketResponse| {
+                assert_eq!(request.headers()["cookie"], "d=first");
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
         stream
             .send(Message::Text(r#"{"type":"hello"}"#.into()))
             .await
             .unwrap();
-        for envelope in ["first", "retry"] {
-            stream
-                .send(Message::Text(
-                    json!({"type":"events_api","envelope_id":envelope,"payload":{
-                "team_id":"TTEAM", "event_id":"EvDuplicate",
-                "authorizations":[{"user_id":"UME","is_bot":false}],"event":{
-                    "type":"message","channel_type":"im","channel":"DDIRECT","ts":socket_mock.root,
-                    "user":"UYOU","text":"问候"}}})
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            let answer = stream.next().await.unwrap().unwrap().into_text().unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&answer).unwrap()["envelope_id"],
-                envelope
-            );
-        }
+        let message = Message::Text(
+            json!({"type":"message","channel":"DDIRECT","ts":socket_mock.root,
+                   "user":"UYOU","text":"问候"})
+            .to_string()
+            .into(),
+        );
+        stream.send(message.clone()).await.unwrap();
+        stream.send(message).await.unwrap();
         let _ = done.send(());
         std::future::pending::<()>().await;
     });
 
     let previous_session = Uuid::new_v4();
     let secrets = serde_json::from_value(json!({
-        "app_token": "xapp-test",
         "account": {
             "identity": {
                 "session_id": previous_session,
@@ -263,14 +266,19 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         Duration::from_secs(1),
     ));
     let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0).await;
+    let credentials = "loki-assistant/slack/TTEAM.gpg";
+    passwords
+        .save_multiline(credentials, "xoxc-test-user\nd_cookie: first")
+        .await
+        .unwrap();
     config
-        .save_record_password(
-            "slack",
-            "teams",
-            "TTEAM",
-            "token",
-            Some(json!({"name":"工作区"})),
-            "xoxp-test-user".into(),
+        .replace_record(
+            "slack".into(),
+            "teams".into(),
+            "TTEAM".into(),
+            json!({"name":"工作区","token":credentials,"d_cookie":credentials}),
+            true,
+            true,
         )
         .await
         .unwrap();
@@ -285,7 +293,6 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 path: Some(directory.0.join("service")),
                 api: api.clone(),
                 keychain: Arc::new(move |_| keychain.clone()),
-                passwords: Some(passwords.clone()),
                 open_browser: Arc::new(|_| unreachable!()),
             },
         ));
@@ -299,16 +306,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         invoke(&app, "GET", "/slack/conversations", None, None, None).await;
     assert_eq!(status_code, StatusCode::OK);
     assert_eq!(headers["cache-control"], "no-store");
-    timeout(Duration::from_secs(5), acked)
+    timeout(Duration::from_secs(5), messages_sent)
         .await
         .unwrap()
         .unwrap();
-    let data = invoke(&app, "GET", "/status/slack/connections", None, None, None)
-        .await
-        .2;
-    assert_eq!(data["value"][0]["authorization_state"], "authorized");
-    let session = Some(Uuid::parse_str(data["value"][0]["session_id"].as_str().unwrap()).unwrap());
-    assert_ne!(session, Some(previous_session));
     timeout(Duration::from_secs(5), async {
         while alerts.0.lock().unwrap().is_empty() {
             sleep(Duration::from_millis(10)).await;
@@ -317,6 +318,14 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await
     .unwrap();
     assert_eq!(alerts.0.lock().unwrap().len(), 1);
+
+    let data = invoke(&app, "GET", "/status/slack/connections", None, None, None)
+        .await
+        .2;
+    assert_eq!(data["value"][0]["authorization_state"], "authorized");
+    assert_eq!(data["value"][0]["socket_state"], "connected");
+    let session = Some(Uuid::parse_str(data["value"][0]["session_id"].as_str().unwrap()).unwrap());
+    assert_ne!(session, Some(previous_session));
 
     let timeline = "/slack/conversations/TTEAM.DDIRECT/messages";
     let thread = format!(
@@ -628,15 +637,18 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             }),
         )
         .route(
-            "/apps.connections.open",
-            post(|| async { Json(json!({"ok":true,"url":"ws://127.0.0.1:1"})) }),
+            "/rtm.connect",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
         )
         .route(
             "/auth.test",
             post(|headers: HeaderMap| async move {
                 let authorization = headers["authorization"].to_str().unwrap();
                 let team = if let Some(web) = authorization.strip_prefix("Bearer xoxc-") {
-                    assert_eq!(headers["cookie"], "d=test-web-cookie");
+                    assert!(matches!(
+                        headers["cookie"].to_str().unwrap(),
+                        "d=test-web-cookie" | "d=refreshed-web-cookie"
+                    ));
                     web
                 } else {
                     authorization.strip_prefix("Bearer xoxp-").unwrap()
@@ -644,19 +656,12 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
                 .split('-')
                 .next()
                 .unwrap();
-                Json(json!({"ok":true,"team_id":team,"user_id":"U1"}))
+                Json(json!({"ok":true,"team_id":team,"team":"网页协作","user_id":"U1"}))
             }),
         );
     let upstream = tokio::spawn(async move {
         axum::serve(listener, slack).await.unwrap();
     });
-    for (team, token) in [("TALPHA", "xapp-alpha\n"), ("TBETA", "xapp-beta\n")] {
-        let path = directory
-            .0
-            .join(format!("loki-assistant/slack/{team}/app-token.gpg"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, token).unwrap();
-    }
     let status = Arc::new(StatusService::new());
     let keychains = Arc::new(Mutex::new(std::collections::BTreeMap::<
         String,
@@ -678,20 +683,11 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
                     .or_insert_with(|| Arc::new(MemoryKeychain::default()))
                     .clone()
             }),
-            passwords: Some(passwords.clone()),
             open_browser: Arc::new(move |url| {
                 let browser = browser.clone();
                 Box::pin(async move {
-                    let fail = Url::parse(&url)
-                        .unwrap()
-                        .query_pairs()
-                        .any(|(key, value)| key == "team" && value == "TCANCEL");
                     browser.send(url).unwrap();
-                    if fail {
-                        Err("无法打开测试浏览器。".into())
-                    } else {
-                        Ok(())
-                    }
+                    Ok(())
                 })
             }),
         },
@@ -711,6 +707,10 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let app = Router::new()
         .merge(config_module.router())
         .merge(projects.router());
+    let notification_router = Arc::new(super::routes::config_notification_router(projects.clone()));
+    config_module
+        .service()
+        .attach_notifications(&notification_router);
     let worker = tokio::spawn(Arc::clone(&projects).run(47321));
     let meta = invoke(&app, "GET", "/meta", None, None, None).await.2;
     assert!(meta.get("workflows").is_none());
@@ -730,6 +730,22 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(teams["save_timeout_seconds"], 650);
     assert_eq!(teams["list"]["item_type"], "structure");
     assert_eq!(teams["structure"]["type_name"], "SlackTeam");
+    assert_eq!(teams["structure"]["show_all_fields"], true);
+    let fields = teams["structure"]["fields"].as_array().unwrap();
+    for (name, data_type) in [
+        (
+            "token",
+            json!({"password":{"path":"loki-assistant/slack/{key}.gpg"}}),
+        ),
+        (
+            "d_cookie",
+            json!({"password":{"path":"loki-assistant/slack/{key}.gpg","key":"d_cookie"}}),
+        ),
+    ] {
+        let field = fields.iter().find(|field| field["key"] == name).unwrap();
+        assert_eq!(field["data_type"], data_type);
+        assert!(field.get("password_path").is_none() && field.get("password_line").is_none());
+    }
     assert_eq!(
         teams["structure"]["fields"][0]["checker"]["pattern"],
         "^T[A-Z0-9]{1,47}$"
@@ -762,145 +778,91 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(teams["structure"]["id_field"], "team_id");
     assert_eq!(teams["structure"]["fields"][0]["required"], true);
     for request in [
-        create("TALPHA", json!({})),
-        create("INVALID", json!({"name":"无效"})),
+        create("TALPHA", json!({"name":"首次新增只能提交 Team ID"})),
+        create("INVALID", json!({})),
     ] {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let (status_code, _, error) = invoke(
-        &app,
-        "PUT",
-        "/data/slack/teams/TALPHA",
-        None,
-        None,
-        Some(json!({"name":"绕过新增处理"})),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::CONFLICT);
-    assert_eq!(
-        error["error"]["code"],
-        "config-record-authorization-required"
-    );
     assert!(opened.try_recv().is_err());
-    for (team, supplied, expected) in [
-        ("TCANCEL", None, StatusCode::NOT_FOUND),
-        ("TDENIED", Some("invalid"), StatusCode::UNPROCESSABLE_ENTITY),
-        ("TERROR", Some("xoxp-TWRONG"), StatusCode::CONFLICT),
-        ("TALPHA", Some("xoxp-TALPHA"), StatusCode::NO_CONTENT),
-        ("TBETA", Some("xoxp-TBETA"), StatusCode::NO_CONTENT),
+    for (team, first_field, second_field) in [
+        ("TALPHA", "d_cookie", "token"),
+        ("TBETA", "token", "d_cookie"),
     ] {
-        let request = create(team, json!({"name":team}));
-        let client = app.clone();
-        let save = tokio::spawn(async move { client.oneshot(request).await.unwrap() });
-        let url = Url::parse(
-            &timeout(Duration::from_secs(2), opened.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(url.path(), "/slack/token-import");
-        assert_eq!(url.query(), Some(format!("team={team}").as_str()));
-        assert!(url.fragment().is_none());
-        let payload = json!({"team_id":team, "token":supplied.unwrap_or("xoxp-TCANCEL")});
-        if team == "TCANCEL" {
-            assert_eq!(
-                timeout(Duration::from_secs(2), save)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .status(),
-                StatusCode::INTERNAL_SERVER_ERROR
-            );
-            assert_eq!(
-                invoke(
-                    &app,
-                    "POST",
-                    "/slack/token-import",
-                    None,
-                    None,
-                    Some(payload)
-                )
-                .await
-                .0,
-                StatusCode::NOT_FOUND
-            );
-            continue;
-        }
-        let current = invoke(&app, "GET", "/data/slack/teams", None, None, None)
-            .await
-            .2;
-        assert!(!current.to_string().contains(team));
-        let (status, _, _) = invoke(
+        let team_path = format!("/data/slack/teams/{team}");
+        let setup_url = format!("http://127.0.0.1:47321/slack/team-setup/{team}");
+        let token = format!("xoxc-{team}");
+        let cookie = "test-web-cookie";
+        let created = app.clone().oneshot(create(team, json!({}))).await.unwrap();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        assert_eq!(opened.try_recv().unwrap(), setup_url);
+        let credentials = json!({"token":token,"d_cookie":cookie});
+        let (status, _, partial) = invoke(
             &app,
-            "POST",
-            "/slack/token-import",
+            "PATCH",
+            &team_path,
             None,
             None,
-            Some(payload.clone()),
+            Some(json!({(first_field): credentials[first_field]})),
         )
         .await;
-        assert_eq!(status, expected);
-        let response = timeout(Duration::from_secs(2), save)
-            .await
-            .unwrap()
-            .unwrap();
-        let (parts, body) = response.into_parts();
-        let outcome: Value =
-            serde_json::from_slice(&to_bytes(body, 1_048_576).await.unwrap()).unwrap();
-        let file = format!("loki-assistant/slack/{team}/user-token.gpg");
-        let data = invoke(&app, "GET", "/data/slack/teams", None, None, None)
-            .await
-            .2;
-        assert!(!data.to_string().contains("xoxp-"));
-        assert!(!fs::read_to_string(&config_path).unwrap().contains("xoxp-"));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(partial["status"], "pending");
+        assert_eq!(opened.try_recv().unwrap(), setup_url);
+        assert!(partial["value"].get(second_field).is_none());
+        let staged_path = partial["value"][first_field].as_str().unwrap();
+        let confirmed_path = format!("loki-assistant/slack/{team}.gpg");
+        assert!(!directory.0.join(&confirmed_path).exists());
         assert_eq!(
-            invoke(
-                &app,
-                "POST",
-                "/slack/token-import",
-                None,
-                None,
-                Some(payload)
-            )
-            .await
-            .0,
-            StatusCode::NOT_FOUND
+            passwords.fetch(staged_path).await.unwrap(),
+            if first_field == "d_cookie" {
+                format!("\nd_cookie: {cookie}\n")
+            } else {
+                format!("{token}\n")
+            }
         );
-        if matches!(team, "TALPHA" | "TBETA") {
-            assert_eq!(parts.status, StatusCode::OK, "{outcome:?}");
-            assert_eq!(outcome["value"]["token"], file);
-            assert_eq!(
-                passwords.fetch(&file).await.unwrap().trim_end(),
-                supplied.unwrap()
-            );
-            assert!(data.to_string().contains(team));
-            let duplicate = app
-                .clone()
-                .oneshot(create(team, json!({"name":"duplicate"})))
-                .await
-                .unwrap();
-            assert_eq!(duplicate.status(), StatusCode::PRECONDITION_FAILED);
-        } else {
-            assert_eq!(parts.status, StatusCode::INTERNAL_SERVER_ERROR);
-            assert!(!data.to_string().contains(team));
-            assert!(!directory.0.join(file).exists());
-        }
+        let (status, _, outcome) = invoke(
+            &app,
+            "PATCH",
+            &team_path,
+            None,
+            None,
+            Some(json!({(second_field): credentials[second_field]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(outcome["status"], "confirmed");
+        assert!(!directory.0.join(staged_path).exists());
+        let path = outcome["value"]["token"].as_str().unwrap();
+        assert_eq!(path, confirmed_path);
+        assert_eq!(outcome["value"]["d_cookie"], path);
+        assert_eq!(
+            passwords.fetch(path).await.unwrap(),
+            format!("{token}\nd_cookie: test-web-cookie\n")
+        );
+        assert!(!outcome.to_string().contains("xoxc-"));
+        assert!(!fs::read_to_string(&config_path).unwrap().contains("xoxc-"));
+        let duplicate = app.clone().oneshot(create(team, json!({}))).await.unwrap();
+        assert_eq!(duplicate.status(), StatusCode::PRECONDITION_FAILED);
     }
-    let duplicate_password = app
-        .clone()
-        .oneshot(create(
-            "TTHIRD",
-            json!({"name":"第三工作区",
-        "password_id":"loki-assistant/slack/TALPHA/app-token.gpg"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        duplicate_password.status(),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
+    timeout(Duration::from_secs(4), async {
+        loop {
+            let connections = status.value("slack", "connections").unwrap().value;
+            if connections
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|project| project["authorization_state"] == "authorized")
+                .count()
+                == 2
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let invalid = invoke(
         &app,
         "POST",
@@ -911,18 +873,12 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     )
     .await;
     assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
-    assert!(invalid.2.to_string().contains("请输入以 T 开头"));
-    let config_text = fs::read_to_string(config_path).unwrap();
-    assert!(!config_text.contains("xapp-alpha"));
-    assert!(!config_text.contains("app_token:"));
+    assert_eq!(invalid.2["error"]["code"], "invalid-config");
     let public = status.value("slack", "connections").unwrap().value;
     assert_eq!(public[0]["team_id"], "TALPHA");
-    assert_eq!(public[0]["app_token_set"], true);
     assert_eq!(public[1]["team_id"], "TBETA");
     assert_eq!(public[0]["user_id"], "TALPHA.U1");
     assert_eq!(public[1]["user_id"], "TBETA.U1");
-    assert_eq!(public[1]["app_token_set"], true);
-    assert!(!public.to_string().contains("xapp-alpha"));
 
     let (_, _, users) = invoke(&app, "GET", "/slack/users?limit=1", None, None, None).await;
     assert_eq!(users["items"][0]["id"], "TALPHA.U1");
@@ -990,7 +946,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    assert_eq!(messages["items"][0]["text"], "Bearer xoxp-TBETA");
+    assert_eq!(messages["items"][0]["text"], "Bearer xoxc-TBETA");
     assert_eq!(messages["items"][0]["author"]["id"], "TBETA.U2");
     let (code, _, error) = invoke(
         &app,
@@ -1015,10 +971,53 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert!(projects.service("TALPHA").await.is_err());
     assert!(projects.service("TBETA").await.is_ok());
 
-    let notification_router = Arc::new(super::routes::config_notification_router(projects.clone()));
-    config_module
-        .service()
-        .attach_notifications(&notification_router);
+    let pending_path = "/data/slack/teams/TPENDING";
+    let created = app
+        .clone()
+        .oneshot(create("TPENDING", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        opened.try_recv().unwrap(),
+        "http://127.0.0.1:47321/slack/team-setup/TPENDING"
+    );
+    let (status, _, partial) = invoke(
+        &app,
+        "PATCH",
+        pending_path,
+        None,
+        None,
+        Some(json!({"d_cookie":"test-web-cookie"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        opened.try_recv().unwrap(),
+        "http://127.0.0.1:47321/slack/team-setup/TPENDING"
+    );
+    let reference = partial["value"]["d_cookie"].as_str().unwrap();
+    assert_eq!(
+        passwords.fetch(reference).await.unwrap(),
+        "\nd_cookie: test-web-cookie\n"
+    );
+    assert!(directory.0.join(reference).is_file());
+    fs::remove_file(directory.0.join(reference)).unwrap();
+    let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    assert_eq!(config["pending"][0]["value"], json!({"team_id":"TPENDING"}));
+    let (status, _, retry) = invoke(&app, "PUT", pending_path, None, None, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(retry["status"], "pending");
+    assert_eq!(
+        opened.try_recv().unwrap(),
+        "http://127.0.0.1:47321/slack/team-setup/TPENDING"
+    );
+    let (status, _, _) = invoke(&app, "DELETE", pending_path, None, None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!directory.0.join(reference).exists());
+    let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    assert!(config["pending"].is_null());
+
     let team_path = "/data/slack/teams/TWEB";
     let created = app
         .clone()
@@ -1030,53 +1029,90 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         serde_json::from_slice(&to_bytes(created.into_body(), 1_048_576).await.unwrap()).unwrap();
     assert_eq!(created["status"], "pending");
     assert_eq!(created["value"], json!({"team_id":"TWEB"}));
-    assert!(opened.try_recv().is_err());
-    let setup_path = "/slack/team-setup/TWEB";
-    for _ in 0..2 {
-        let (status, _, retry) = invoke(&app, "PUT", team_path, None, None, None).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(retry["status"], "pending");
-        assert_eq!(
-            opened.try_recv().unwrap(),
-            format!("http://127.0.0.1:47321{setup_path}")
-        );
-    }
-    let setup = app
+    let setup_url = "http://127.0.0.1:47321/slack/team-setup/TWEB";
+    assert_eq!(opened.try_recv().unwrap(), setup_url);
+    let page = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(setup_path)
+                .uri("/slack/team-setup/TWEB")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(setup.status(), StatusCode::OK);
-    assert_eq!(setup.headers()["cache-control"], "no-store");
-    let html = to_bytes(setup.into_body(), 1_048_576).await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = to_bytes(page.into_body(), 1_048_576).await.unwrap();
     let html = std::str::from_utf8(&html).unwrap();
-    assert!(html.contains("https://app.slack.com/client/TWEB"));
-    assert!(html.contains(r#"{"token":"xoxc-…","d_cookie":"…"}"#));
-    assert_eq!(
-        invoke(&app, "GET", "/slack/team-setup/invalid", None, None, None)
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
+    for field in super::projects::SlackTeam::PASSWORD_FIELDS {
+        assert!(html.contains(&format!("name=\"{field}\" type=\"password\"")));
+    }
+    assert_eq!(html.matches(r#"type="password""#).count(), 2);
+    let (status, _, retry) = invoke(&app, "PUT", team_path, None, None, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(retry["status"], "pending");
+    assert_eq!(opened.try_recv().unwrap(), setup_url);
+    let (status, _, partial) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"token":"not-a-token"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(partial["status"], "pending");
+    assert_eq!(opened.try_recv().unwrap(), setup_url);
     let (_, _, pending) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
     assert_eq!(pending["pending"][0]["key"], "TWEB");
     assert!(!pending["value"].to_string().contains("TWEB"));
+    let (invalid, headers, error) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"d_cookie":"test-web-cookie"})),
+    )
+    .await;
+    assert_eq!(invalid, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(headers["x-loki-config-cleared-fields"], "token, d_cookie");
+    assert_eq!(error["error"]["code"], "slack-invalid-web-user-token");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("xoxc-")
+    );
+    let (_, _, rejected) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    assert_eq!(rejected["pending"][0]["status"], "invalid");
+    assert_eq!(rejected["pending"][0]["value"], json!({"team_id":"TWEB"}));
+    assert!(!rejected["value"].to_string().contains("TWEB"));
+    let (status, _, error) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"token":"xoxc-TWEB","d_cookie":"test-web-cookie; Path=/"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error["error"]["code"], "slack-invalid-web-cookie");
     let (status, _, staged) = invoke(
         &app,
         "PATCH",
         team_path,
         None,
         None,
-        Some(json!({"token":{"token":"xoxc-TWEB","d_cookie":"test-web-cookie"}})),
+        Some(json!({"token":"xoxc-TWEB","d_cookie":"test-web-cookie"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!staged.to_string().contains("xoxc-"));
+    assert_eq!(staged["value"]["team_name"], "网页协作");
+    assert_eq!(staged["value"]["user_id"], "U1");
     let (status, _, error) = invoke(&app, "PUT", team_path, None, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["error"]["code"], "config-pending-not-found");
@@ -1090,7 +1126,21 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .iter()
         .find(|team| team["team_id"] == "TWEB")
         .unwrap();
+    assert_eq!(web_entry["team_name"], "网页协作");
+    assert_eq!(web_entry["user_id"], "U1");
+    let (status, _, _) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"user_id":"UOTHER"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let password_path = web_entry["token"].as_str().unwrap();
+    assert_eq!(password_path, "loki-assistant/slack/TWEB.gpg");
+    assert_eq!(web_entry["d_cookie"], password_path);
     assert!(directory.0.join(password_path).exists());
     for (patch, expected_name) in [
         (json!({"name":"网页工作区"}), json!("网页工作区")),
@@ -1111,6 +1161,30 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let current_project = Arc::downgrade(&projects.service("TWEB").await.unwrap());
+    let (status, _, response) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"d_cookie":"refreshed-web-cookie"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["value"]["token"], password_path);
+    assert_eq!(response["value"]["d_cookie"], password_path);
+    assert_eq!(
+        passwords.fetch(password_path).await.unwrap(),
+        "xoxc-TWEB\nd_cookie: refreshed-web-cookie\n"
+    );
+    timeout(Duration::from_secs(2), async {
+        while current_project.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     for (token, expected) in [
         ("xoxc-TWRONG", "xoxc-TWEB"),
         ("xoxc-TWEB-renewed", "xoxc-TWEB-renewed"),
@@ -1121,7 +1195,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             team_path,
             None,
             None,
-            Some(json!({"token":{"token":token,"d_cookie":"test-web-cookie"}})),
+            Some(json!({"token":token,"d_cookie":"refreshed-web-cookie"})),
         )
         .await;
         assert_eq!(
@@ -1129,18 +1203,43 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             if token == expected {
                 StatusCode::OK
             } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+                StatusCode::UNPROCESSABLE_ENTITY
             }
         );
         assert!(!staged.to_string().contains("xoxc-"));
-        let saved = base
-            .read_record_password("slack", "teams", "TWEB", "token")
+        let [saved] = base
+            .read_record_passwords("slack", "teams", "TWEB", ["token"])
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&saved).unwrap()["token"],
-            expected
-        );
+        assert_eq!(saved.as_deref().map(str::trim_end), Some(expected));
+        let (_, _, current) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+        if token == expected {
+            assert!(current["pending"].is_null());
+        } else {
+            assert_eq!(current["pending"][0]["status"], "invalid");
+            assert_eq!(
+                current["pending"][0]["error"]["code"],
+                "slack-team-mismatch"
+            );
+            assert!(current["pending"][0]["value"].get("token").is_none());
+            assert!(current["pending"][0]["value"].get("d_cookie").is_none());
+            assert_eq!(
+                passwords.fetch(password_path).await.unwrap(),
+                "xoxc-TWEB\nd_cookie: refreshed-web-cookie\n"
+            );
+            let pass_dir = directory.0.join("loki-assistant/slack");
+            assert!(!fs::read_dir(pass_dir).unwrap().any(|file| {
+                file.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("TWEB-")
+            }));
+            let restarted = ConfigService::load(&config_path).unwrap();
+            let restarted_app = config::Module::from_service(restarted).router();
+            let (_, _, after_restart) =
+                invoke(&restarted_app, "GET", "/data/slack/teams", None, None, None).await;
+            assert_eq!(after_restart["pending"], current["pending"]);
+        }
     }
     let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
     let password_path = config["value"]
@@ -1151,6 +1250,90 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .unwrap()["token"]
         .as_str()
         .unwrap();
+    fs::remove_file(directory.0.join(password_path)).unwrap();
+    for (path, pointer) in [
+        ("/data/slack/teams", "/value"),
+        ("/data/slack", "/values/teams/value"),
+    ] {
+        let (status, _, config) = invoke(&app, "GET", path, None, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let team = config
+            .pointer(pointer)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["team_id"] == "TWEB")
+            .unwrap();
+        assert!(team.get("token").is_none());
+        assert!(team.get("d_cookie").is_none());
+    }
+    let (status, _, partial) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"token":"xoxc-TWEB"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(partial["value"].get("d_cookie").is_none());
+    assert_eq!(opened.try_recv().unwrap(), setup_url);
+    let (status, _, restored) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"d_cookie":"test-web-cookie"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored["value"]["token"], password_path);
+    assert_eq!(restored["value"]["d_cookie"], password_path);
+    let (status, _, pending) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"d_cookie":null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(opened.try_recv().unwrap(), setup_url);
+    let staged = pending["value"]["token"].as_str().unwrap();
+    assert_ne!(staged, password_path);
+    assert!(directory.0.join(staged).is_file());
+    assert!(directory.0.join(password_path).is_file());
+    let (status, _, cleared) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        None,
+        None,
+        Some(json!({"token":null,"d_cookie":"test-web-cookie"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["status"], "confirmed");
+    assert_eq!(cleared["value"]["team_id"], "TWEB");
+    assert!(cleared["value"].get("token").is_none());
+    assert!(cleared["value"].get("d_cookie").is_none());
+    assert!(!directory.0.join(staged).exists());
+    assert!(!directory.0.join(password_path).exists());
+    assert!(opened.try_recv().is_err());
+    let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    assert!(config.get("pending").is_none());
+    let team = config["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["team_id"] == "TWEB")
+        .unwrap();
+    assert!(team.get("token").is_none() && team.get("d_cookie").is_none());
+
     let (status, _, _) = invoke(&app, "DELETE", team_path, None, None, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     timeout(Duration::from_secs(2), async {

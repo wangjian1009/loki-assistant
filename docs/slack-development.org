@@ -29,7 +29,7 @@
   \node[action box, below=of save] (notify)
     {配置模块向通知接入点发送 \texttt{POST}\\Slack 返回 \texttt{202}};
   \node[action box, below=of notify] (guide)
-    {手动重试时配置模块再次发送 \texttt{POST}\\Slack 打开网页会话配置指引};
+    {缺少凭据时打开工作区配置页\\在页面填写凭据并保存};
   \node[action box, below=of guide] (validate)
     {补充网页会话凭据后\\Slack 校验用户和 Team ID};
   \node[decision diamond, below=of validate] (result)
@@ -39,7 +39,7 @@
   \node[wait box, below=14mm of result] (waiting)
     {保留待确认状态\\手动重试};
   \node[outcome, below=14mm of result, xshift=42mm] (failed)
-    {回退本次新增};
+    {清除候选凭据并保留\\和校验错误};
 
   \draw[flow arrow] (create) -- (save);
   \draw[flow arrow] (save) -- (notify);
@@ -57,8 +57,8 @@
 
 1. 登录 Slack 网页，从目标工作区取得 Team ID。
 2. 通过配置模块仅提交 Team ID。配置模块保存待确认记录，以 ~team_id~ 为 ~Key~ ，向 ~POST /slack/config/teams/{key}~ 发送创建通知。Slack 返回 ~202~ 。
-3. 在配置界面点击「重试」。配置模块重新发送创建通知，Slack 模块打开本机网页会话配置指引，提供目标工作区入口和凭据填写示例。
-4. 编辑待确认记录，补充同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie，配置值为包含 ~token~ 和 ~d_cookie~ 的 JSON 对象。保存使用 ~PATCH~ 。Slack 通过 ~auth.test~ 校验凭据和 Team ID，配置模块根据结果确认或回退。仍待确认时，可在配置界面手动「重试」。
+3. Slack 模块发现凭据不全时会打开本机工作区配置页。也可在配置界面点击「重试」再次打开该页面。
+4. 在提示页或配置界面填写同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie，点击保存。两项齐全后，Slack 核对用户和 Team ID。配置确认后，services 管理 WebSocket 连接。校验失败后，配置模块清除本次填写的两项凭据并保留错误提示，用户可重新填写。
 5. 会话失效时，重新登录 Slack 网页，通过配置模块更新凭据。
 
 配置模块向同一接入点发送 ~DELETE~ 并等待结果，确认后移除记录。Slack 随后停止该 Team 的后台任务并清理连接状态。 [[file:config-module.org::*配置项通知接入点][通知与确认协议]]
@@ -67,13 +67,12 @@
 
 - 目标流程完成保存后，通过 ~GET /status/slack/connections~ 核对 ~authorization_state~ 为 ~authorized~ ，再用 ~GET /slack/conversations?team_id={team_id}~ 验证会话读取。
 - 已用 Emacs ~slack.el~ 配置的 X-Tech 网页会话凭据调用 Slack ~auth.test~ ，确认身份有效且 Team ID 匹配。
-- 已通过 services 设置 API 发起 X-Tech 工作区新增，确认本机导入页可访问，且请求等待导入结果。
 - 新增 Team 由配置模块的通知接入点处理，真实 Team 由用户在配置界面手动添加。
 
 * 当前工作区配置
 
 配置界面按 ~SlackTeam~ 元数据生成表单，新增时只显示 Team ID。待确认记录可继续编辑凭据。 [[file:slack.org::*Team 配置][SlackTeam 字段与配置接口]]
 
-后台 Socket Mode 通知使用独立的应用令牌和事件订阅配置。需要启用时，可在工作区记录中选择已存入 pass 的应用令牌条目。
+后台实时通知通过 Slack RTM WebSocket 接收私信。连接使用与 HTTP API 相同的工作区凭据，状态通过 ~socket_state~ 查询。模拟集成测试覆盖 WebSocket 握手、重复消息去重、私信通知和网页会话发送。
 
 现有 API 契约见 [[file:slack.org::*services RESTful 接口][services RESTful 接口]]。

@@ -1,4 +1,3 @@
-import { slackTokenImport, showSlackTokenImport } from "../features/slack-token/import.js";
 import { CAPTURE_FULL, CAPTURE_SNAPSHOT, PASSWORD_FILL, PAGE_CONTEXT, PASSWORD_BADGE_REFRESH } from "../shared/messages.js";
 import { convertPage } from "../features/org-capture/capture.js";
 import { listEntries } from "../features/password-query/api.js";
@@ -406,10 +405,7 @@ async function initialize() {
     $("hostname").title = origin?.hostname || "仍可搜索和复制密码";
     $("org-capture").disabled = !origin;
     if (!origin) $("org-capture").title = "当前页面不支持全文保存";
-    const slackImport = slackTokenImport(state.tab?.url);
-    showSlackTokenImport($("slack-token-import"), slackImport);
-    if (!state.manualView) showView(!slackImport && context.hasPasswordInput ? "password" : "tools");
-    if (slackImport) $("slack-user-token").focus();
+    if (!state.manualView) showView(context.hasPasswordInput ? "password" : "tools");
     if (context.detectionError) setStatus(context.detectionError, true);
   } catch (error) {
     state.contextReady = true;

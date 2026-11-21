@@ -67,6 +67,7 @@ impl EmacsConfig {
                     checker: Some(CheckerMetadata {
                         pattern: r"^[^\x00]*[^\x00\s][^\x00]*$".to_owned(),
                         description: "路径不能为空或包含 NUL。".to_owned(),
+                        emacs_pattern: Some("\\`[^\0]*[^\0[:space:]][^\0]*\\'".to_owned()),
                     }),
                     file_path: Some(crate::modules::config::model::FilePathMetadata {
                         default: None,
@@ -94,6 +95,7 @@ impl EmacsConfig {
                     checker: Some(CheckerMetadata {
                         pattern: r"^[^\x00]*[^\x00\s][^\x00]*$".to_owned(),
                         description: "socket 名称不能为空或包含 NUL。".to_owned(),
+                        emacs_pattern: Some("\\`[^\0]*[^\0[:space:]][^\0]*\\'".to_owned()),
                     }),
                     file_path: None,
                     executable: None,

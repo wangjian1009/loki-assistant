@@ -14,7 +14,6 @@ use super::protocol::{Error, Identity, Message, timestamp};
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct Secrets {
-    pub app_token: Option<String>,
     pub account: Option<Account>,
     #[serde(default)]
     pub disabled_token: Option<String>,

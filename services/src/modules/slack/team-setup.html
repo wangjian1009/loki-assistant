@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>配置 Slack 工作区</title>
+  <style nonce="{{nonce}}">
+    :root {
+      color-scheme: light dark;
+      font: 16px/1.55 system-ui, "PingFang SC", sans-serif;
+      --background: #f5f2f4;
+      --surface: #fff;
+      --subtle: #f7f3f7;
+      --text: #241b25;
+      --muted: #605461;
+      --line: #e3dbe3;
+      --input-line: #938493;
+      --accent: #5a2e57;
+      --accent-strong: #452144;
+      --button-text: #fff;
+      --success: #206445;
+      --error: #a5293d;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --background: #181419;
+        --surface: #221c24;
+        --subtle: #2d2330;
+        --text: #f7eef7;
+        --muted: #cbbdcb;
+        --line: #453848;
+        --input-line: #928193;
+        --accent: #efbbee;
+        --accent-strong: #ffd7fc;
+        --button-text: #361933;
+        --success: #9bddb6;
+        --error: #ffb0b7;
+      }
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+    }
+    main {
+      width: min(35rem, calc(100% - 2rem));
+      margin: clamp(1.5rem, 9vh, 6rem) auto 2rem;
+      padding: clamp(1.25rem, 5vw, 2.5rem);
+      border: 1px solid var(--line);
+      border-radius: 1.25rem;
+      background: var(--surface);
+      box-shadow: 0 14px 38px #3f254510;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(1.55rem, 5vw, 2rem);
+      line-height: 1.25;
+    }
+    header p { margin: .6rem 0 0; color: var(--muted); }
+    .workspace {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem 1rem;
+      margin: 1.5rem 0;
+      padding: .85rem 1rem;
+      border-radius: .75rem;
+      background: var(--subtle);
+    }
+    .workspace p { margin: 0; }
+    .workspace .caption { color: var(--muted); font-size: .8125rem; }
+    code { overflow-wrap: anywhere; font: .9em ui-monospace, monospace; }
+    a { color: var(--accent); font-weight: 650; text-underline-offset: .2em; }
+    form { display: grid; gap: 1.15rem; }
+    .credential {
+      display: grid;
+      min-width: 0;
+      gap: .65rem;
+      padding: .9rem 1rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: .75rem;
+      background: var(--subtle);
+    }
+    .credential label { font-size: .9375rem; font-weight: 650; }
+    .credential-guide {
+      display: grid;
+      gap: .45rem;
+      color: var(--muted);
+      font-size: .875rem;
+    }
+    .credential-guide p { margin: 0; }
+    .console-command {
+      display: block;
+      padding: .4rem .55rem;
+      border-radius: .35rem;
+      background: var(--surface);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    input, button {
+      min-height: 2.75rem;
+      border-radius: .625rem;
+      font: inherit;
+    }
+    input {
+      width: 100%;
+      padding: .55rem .8rem;
+      border: 1px solid var(--input-line);
+      background: var(--surface);
+      color: var(--text);
+      font-weight: 400;
+    }
+    input::placeholder { color: var(--muted); opacity: 1; }
+    input[aria-invalid="true"] { border-color: var(--error); }
+    :is(a, input, button):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    button {
+      width: 100%;
+      padding: .55rem 1rem;
+      border: 1px solid transparent;
+      background: var(--accent);
+      color: var(--button-text);
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-strong); }
+    button:disabled { cursor: wait; opacity: .72; }
+    .actions {
+      display: grid;
+      gap: .85rem;
+      margin-top: .15rem;
+      padding-top: 1.1rem;
+      border-top: 1px solid var(--line);
+    }
+    #status { margin: 0; color: var(--muted); font-size: .875rem; overflow-wrap: anywhere; }
+    #status[data-kind="success"] { color: var(--success); }
+    #status[data-kind="error"] { color: var(--error); }
+  </style>
+</head>
+<body>
+  <main data-team="{{team_id}}">
+    <header>
+      <h1>配置 Slack 工作区</h1>
+      <p>填写同一 Slack 网页会话的两项凭据。</p>
+    </header>
+    <section class="workspace" aria-label="目标工作区">
+      <div>
+        <p class="caption">Team ID</p>
+        <p><code>{{team_id}}</code></p>
+      </div>
+      <a href="https://app.slack.com/client/{{team_id}}" target="_blank" rel="noopener noreferrer">打开 Slack 工作区 <span aria-hidden="true">↗</span></a>
+    </section>
+    <form method="post" autocomplete="off">
+      <div class="credential">
+        <label for="token">Slack 用户令牌</label>
+        <div class="credential-guide" id="token-guide">
+          <p>在 Chrome 打开 <a href="https://my.slack.com/customize" target="_blank" rel="noopener noreferrer">Slack 自定义页面</a>，登录目标工作区。在该页右键选择「检查」，切到「控制台」（Console），输入下面的命令并按回车。</p>
+          <code class="console-command">window.prompt("your api token is: ", TS.boot_data.api_token)</code>
+          <p>复制弹窗中以 <code>xoxc-</code> 开头的完整令牌。</p>
+        </div>
+        <input name="token" type="password" id="token" aria-describedby="token-guide" spellcheck="false" maxlength="4096" placeholder="粘贴以 xoxc- 开头的令牌">
+      </div>
+      <div class="credential">
+        <label for="d-cookie">Cookie d</label>
+        <div class="credential-guide" id="d-cookie-guide">
+          <p>在同一标签页切到「应用」（Application），在左侧展开「Cookie」并选择当前 Slack 站点。找到名称为 <code>d</code> 的条目，复制「值」（Value）列中的原始编码值。</p>
+        </div>
+        <input name="d_cookie" type="password" id="d-cookie" aria-describedby="d-cookie-guide" spellcheck="false" maxlength="8192" placeholder="粘贴名为 d 的 Cookie 值">
+      </div>
+      <div class="actions">
+        <button type="submit">保存配置</button>
+        <p id="status" role="status">正在读取工作区配置…</p>
+      </div>
+    </form>
+  </main>
+  <script nonce="{{nonce}}">
+    const form = document.querySelector("form");
+    const status = document.querySelector("#status");
+    const button = form.querySelector("button");
+    const inputs = [...form.querySelectorAll("input")];
+    const hints = inputs.map((input) => input.placeholder);
+    const team = document.querySelector("main").dataset.team;
+    const collection = "/data/slack/teams";
+
+    function showStatus(message, kind = "") {
+      status.dataset.kind = kind;
+      status.textContent = message;
+    }
+
+    let statusRevision = 0;
+    async function refreshStatus() {
+      const revision = ++statusRevision;
+      const response = await fetch(collection, { cache: "no-store", redirect: "error" });
+      if (!response.ok) throw new Error();
+      const data = await response.json();
+      if (revision !== statusRevision) return;
+      const draft = data.pending?.find((record) => record.key === team);
+      const confirmed = data.value?.find((record) => record.team_id === team);
+      const record = draft?.value ?? confirmed;
+      const invalidField = {
+        "slack-invalid-web-user-token": "token",
+        "slack-invalid-web-cookie": "d_cookie",
+      }[draft?.error?.code];
+      for (const [index, input] of inputs.entries()) {
+        const invalid = input.name === invalidField;
+        input.setAttribute("aria-invalid", String(invalid));
+        input.placeholder = record?.[input.name] && !invalid ? "已保存，留空保留" : hints[index];
+      }
+      if (draft?.error) {
+        showStatus(draft.error.message, "error");
+      } else if (draft) {
+        const complete = inputs.every((input) => draft.value?.[input.name]);
+        showStatus(complete ? "凭据已保存，等待 Slack 校验。" : "可以分次保存，两项齐全后校验。");
+      } else if (record) {
+        showStatus("工作区已确认，可以返回 Loki Assistant。", "success");
+      } else {
+        showStatus("找不到工作区，请在 Loki Assistant 中新增后再打开此页。", "error");
+      }
+    }
+
+    let saving = false;
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const fields = Object.fromEntries(
+        Array.from(new FormData(form), ([key, value]) => [key, value.trim()])
+          .filter(([, value]) => value)
+      );
+      if (saving) return;
+      if (!Object.keys(fields).length) {
+        showStatus("请填写要新增或更新的凭据。", "error");
+        return;
+      }
+      saving = true;
+      statusRevision += 1;
+      button.disabled = true;
+      for (const input of inputs) input.disabled = true;
+      showStatus("正在保存…");
+      try {
+        const response = await fetch(collection + "/" + team, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/merge-patch+json" },
+          body: JSON.stringify(fields),
+          cache: "no-store",
+          redirect: "error",
+        });
+        const result = await response.json();
+        if (response.ok || response.status === 422) {
+          form.reset();
+          await refreshStatus();
+        } else {
+          showStatus(result.error?.message ?? "保存失败，请稍后重试。", "error");
+        }
+      } catch {
+        showStatus("无法确认保存结果，请刷新页面核对。", "error");
+      } finally {
+        saving = false;
+        button.disabled = false;
+        for (const input of inputs) input.disabled = false;
+      }
+    });
+    refreshStatus().catch(() => { showStatus("无法读取工作区配置，请刷新页面重试。", "error"); });
+    window.addEventListener("focus", () => {
+      if (!saving) void refreshStatus().catch(() => {});
+    });
+  </script>
+</body>
+</html>

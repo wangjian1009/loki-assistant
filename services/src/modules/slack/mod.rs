@@ -20,7 +20,7 @@ use crate::modules::{
     config::{
         model::{
             CheckerMetadata, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
-            ConfigModuleMetadata, ConfigRemoteAccess, FieldOptions, LegacyDictionary, ListMetadata,
+            ConfigModuleMetadata, ConfigRemoteAccess, LegacyDictionary, ListMetadata,
             StructureField, StructureMetadata,
         },
         registry::ConfigItemRegistration,
@@ -47,6 +47,7 @@ impl projects::SlackTeam {
             label_field: Some("name".into()),
             add_label: Some("新增工作区".into()),
             type_name: "SlackTeam".into(),
+            show_all_fields: true,
             legacy_dictionary: Some(LegacyDictionary {
                 key: "projects".into(),
                 previous_id_field: Some("id".into()),
@@ -61,9 +62,9 @@ impl projects::SlackTeam {
                     checker: Some(CheckerMetadata {
                         pattern: "^T[A-Z0-9]{1,47}$".into(),
                         description: "请输入以 T 开头的 Slack Team ID。".into(),
+                        emacs_pattern: Some(r"\`T[A-Z0-9]\{1,47\}\'".into()),
                     }),
                     read_only: false,
-                    password_path: None,
                     options: None,
                 },
                 StructureField {
@@ -74,35 +75,48 @@ impl projects::SlackTeam {
                     default_template: None,
                     checker: None,
                     read_only: false,
-                    password_path: None,
                     options: None,
                 },
-                StructureField {
-                    key: "password_id".into(),
-                    label: "应用令牌条目".into(),
-                    data_type: ConfigDataType::PasswordReference,
+            ]
+            .into_iter()
+            .chain(
+                [
+                    ("team_name", "Slack 工作区名称"),
+                    ("user_id", "Slack 用户 ID"),
+                ]
+                .into_iter()
+                .map(|(key, label)| StructureField {
+                    key: key.into(),
+                    label: label.into(),
+                    data_type: ConfigDataType::String,
                     required: false,
-                    default_template: Some("loki-assistant/slack/{team_id}/app-token.gpg".into()),
+                    read_only: true,
+                    default_template: None,
                     checker: None,
-                    read_only: false,
-                    password_path: None,
-                    options: Some(FieldOptions {
-                        path: "/password/entries".into(),
-                        items_field: "files".into(),
-                    }),
-                },
-                StructureField {
-                    key: "token".into(),
-                    label: "Slack 网页会话凭据（JSON 对象，包含 token 和 d_cookie）".into(),
-                    data_type: ConfigDataType::Password,
+                    options: None,
+                }),
+            )
+            .chain(
+                [
+                    ("token", "Slack 用户令牌（xoxc-）", None),
+                    ("d_cookie", "Cookie d", Some("d_cookie".into())),
+                ]
+                .into_iter()
+                .map(|(key, label, password_key)| StructureField {
+                    key: key.into(),
+                    label: label.into(),
+                    data_type: ConfigDataType::Password {
+                        path: "loki-assistant/slack/{key}.gpg".into(),
+                        key: password_key,
+                    },
                     required: false,
                     read_only: false,
                     default_template: None,
                     checker: None,
-                    password_path: Some("loki-assistant/slack/{id}/user-token.gpg".into()),
                     options: None,
-                },
-            ],
+                }),
+            )
+            .collect(),
         }
     }
 }
@@ -117,6 +131,7 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
         create_fields: vec!["team_id"],
         save_timeout_seconds: Some(650),
         requires_local_auth: false,
+        read_only: false,
     },
 };
 
@@ -125,7 +140,7 @@ fn slack_configuration() -> ConfigModuleMetadata {
     ConfigModuleMetadata {
         id: "slack".into(),
         name: "Slack".into(),
-        description: "Slack 工作区及网页会话凭据设置。".into(),
+        description: "新增或重试待确认的工作区会打开配置提示页。可在提示页或 Emacs 配置界面填写同一 Slack 网页会话的用户令牌和 Cookie d。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         items: vec![ConfigItemMetadata {
             key: "teams".into(),
@@ -158,7 +173,6 @@ static EXTENSION: crate::services::ExtensionRegistration = crate::services::Exte
             Arc::clone(context.config),
             Arc::clone(context.notification),
             Arc::clone(context.status),
-            context.password.service(),
         ))))
     },
 };

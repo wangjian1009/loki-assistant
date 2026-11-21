@@ -18,6 +18,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::modules::config::service::{NotificationConfirmedFields, NotificationValidationError};
+
 use super::{
     projects::{Projects, RegistrationStatus},
     protocol::{Error, Page},
@@ -57,37 +59,67 @@ async fn team_config_changed(
     State(projects): Service,
     axum::Extension(request): axum::Extension<crate::modules::config::service::NotificationRequest>,
     Path(team_id): Path<String>,
-) -> Result<StatusCode, Error> {
+) -> Result<Response, Error> {
     validate_team_id(&team_id)?;
-    if request.deleted {
-        sync_after_confirmation(projects, request);
-        return Ok(StatusCode::NO_CONTENT);
+    if request.deleted || request.password_entry_removed {
+        sync_after_confirmation(projects, request, None);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
     match projects.registration_status(request.id, &team_id).await {
-        RegistrationStatus::Confirmed => {
-            sync_after_confirmation(projects, request);
-            Ok(StatusCode::NO_CONTENT)
-        }
-        RegistrationStatus::Rejected => Ok(StatusCode::UNPROCESSABLE_ENTITY),
-        RegistrationStatus::NeedsCredentials if request.retry => {
-            if let Err(error) = projects.open_team_setup(&team_id).await {
-                eprintln!("打开 Slack 工作区配置指引失败：{error}");
+        RegistrationStatus::Confirmed(identity) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            let reload_team = identity.is_some().then_some(team_id);
+            if let Some(identity) = identity {
+                let fields = serde_json::to_value(identity).map_err(|_| Error::Storage)?;
+                let Value::Object(fields) = fields else {
+                    return Err(Error::Storage);
+                };
+                response
+                    .extensions_mut()
+                    .insert(NotificationConfirmedFields(fields));
             }
-            Ok(StatusCode::ACCEPTED)
+            sync_after_confirmation(projects, request, reload_team);
+            Ok(response)
         }
-        RegistrationStatus::NeedsCredentials | RegistrationStatus::Pending => {
-            Ok(StatusCode::ACCEPTED)
+        RegistrationStatus::Invalid(error) => {
+            let error = error.object();
+            let mut response = StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            response
+                .extensions_mut()
+                .insert(NotificationValidationError {
+                    code: error["code"]
+                        .as_str()
+                        .unwrap_or("slack-validation-failed")
+                        .into(),
+                    message: error["message"]
+                        .as_str()
+                        .unwrap_or("Slack 凭据校验失败。")
+                        .into(),
+                    clear_password_fields: super::projects::SlackTeam::PASSWORD_FIELDS
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                });
+            Ok(response)
         }
+        RegistrationStatus::NeedsCredentials => {
+            if let Err(error) = projects.open_team(&team_id).await {
+                eprintln!("打开 Slack 工作区配置页失败：{error}");
+            }
+            Ok(StatusCode::ACCEPTED.into_response())
+        }
+        RegistrationStatus::Pending => Ok(StatusCode::ACCEPTED.into_response()),
     }
 }
 
 fn sync_after_confirmation(
     projects: Arc<Projects>,
     request: crate::modules::config::service::NotificationRequest,
+    reload_team: Option<String>,
 ) {
     tokio::spawn(async move {
         if request.confirmed().await
-            && let Err(error) = projects.sync_projects().await
+            && let Err(error) = projects.sync_projects(reload_team.as_deref()).await
         {
             eprintln!("同步 Slack 工作区失败：{error}");
         }
@@ -246,90 +278,26 @@ fn messages_result(mut value: Value, team_id: &str) -> Value {
     id = "team-setup",
     method = "GET",
     path = "/slack/team-setup/{team_id}",
-    summary = "查看 Slack 工作区配置指引",
-    description = "显示指定工作区的网页入口及会话凭据填写说明。"
+    summary = "打开 Slack 工作区配置",
+    description = "填写网页会话凭据并提交到配置模块。"
 )]
 async fn team_setup(team: Segment<String>) -> Result<Response, Error> {
     let Path(team) = team.map_err(|_| Error::Invalid)?;
     validate_team_id(&team)?;
-    Ok(slack_instruction_page(format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>配置 Slack 工作区</title>
-<main>
-  <h1>配置 Slack 工作区 {team}</h1>
-  <ol>
-    <li><a href="https://app.slack.com/client/{team}" target="_blank" rel="noopener noreferrer">打开 Slack 工作区</a>并登录。</li>
-    <li>获取同一网页会话的 <code>xoxc-</code> 用户令牌和名为 <code>d</code> 的 Cookie 值。</li>
-    <li>回到 Loki Assistant 配置界面，编辑待确认的工作区 <code>{team}</code>，按下列格式填写「Slack 网页会话凭据」并保存。</li>
-  </ol>
-  <pre><code>{{"token":"xoxc-…","d_cookie":"…"}}</code></pre>
-</main>
-</html>"#
-    )))
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
-    mount_group = "slack-local",
-    id = "token-import-page",
-    method = "GET",
-    path = "/slack/token-import",
-    summary = "打开 Slack 令牌导入页面",
-    description = "显示已有 Slack 用户令牌的导入说明。"
-)]
-async fn token_import_page() -> Response {
-    slack_instruction_page(concat!(
-        "<!doctype html><html lang=zh-CN><meta charset=utf-8>",
-        "<title>导入 Slack 用户令牌</title><h1>导入 Slack 用户令牌</h1>",
-        "<p>打开 Loki Assistant Chrome 插件，粘贴目标工作区已有的 xoxp- 用户令牌并点击「接受」。</p>"
-    ))
-}
-
-fn slack_instruction_page(html: impl Into<String>) -> Response {
-    (
+    let nonce = Uuid::new_v4().simple().to_string();
+    let page = include_str!("team-setup.html")
+        .replace("{{team_id}}", &team)
+        .replace("{{nonce}}", &nonce);
+    Ok((
         [
-            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer".to_owned()),
             (
                 axum::http::header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                format!("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"),
             ),
         ],
-        Html(html.into()),
-    )
-        .into_response()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenImport {
-    team_id: String,
-    token: String,
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
-    mount_group = "slack-local",
-    id = "accept-token-import",
-    method = "POST",
-    path = "/slack/token-import",
-    summary = "接受 Slack 用户令牌",
-    description = "提交正在导入的工作区的用户令牌，校验所属工作区后保存配置。"
-)]
-async fn accept_token_import(
-    State(projects): Service,
-    input: JsonInput<TokenImport>,
-) -> Result<StatusCode, Error> {
-    let Json(TokenImport { team_id, token }) = input.map_err(|_| Error::Invalid)?;
-    validate_team_id(&team_id)?;
-    tokio::spawn(async move { projects.accept_token(&team_id, token).await })
-        .await
-        .map_err(|_| Error::Unavailable)??;
-    Ok(StatusCode::NO_CONTENT)
+        Html(page),
+    ).into_response())
 }
 
 #[loki_api(

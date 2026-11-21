@@ -10,10 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
-use crate::modules::{
-    config::service::ConfigService, notification::NotificationService,
-    password::service::PasswordService,
-};
+use crate::modules::{config::service::ConfigService, notification::NotificationService};
 
 use super::{
     client::{SlackClient, WebSession},
@@ -30,7 +27,6 @@ pub(super) struct State {
     pub credentials_locked: bool,
     pub storage_unavailable: bool,
     pub secrets: Secrets,
-    pub app_token: Option<String>,
     pub cache: Cache,
     pub socket_state: &'static str,
     pub issue: Option<Error>,
@@ -71,8 +67,6 @@ pub struct SlackService {
     keychain: Arc<dyn Keychain>,
     cache_path: Option<PathBuf>,
     project: Option<(String, SlackTeam, Uuid, Arc<ProjectsStatus>)>,
-    password: Option<(Arc<PasswordService>, String)>,
-    password_operation: Mutex<()>,
     imported_token: Option<Arc<ConfigService>>,
     imported_token_lock: Mutex<()>,
 }
@@ -106,11 +100,6 @@ impl SlackService {
         service.cache_path = service
             .cache_path
             .map(|path| path.with_file_name(format!("slack-cache-{namespace}.json")));
-        service.password = backend
-            .passwords
-            .as_ref()
-            .zip(settings.password_id.as_ref())
-            .map(|(passwords, id)| (Arc::clone(passwords), id.clone()));
         if settings.token.is_some() {
             service.imported_token = Some(config);
         }
@@ -141,8 +130,6 @@ impl SlackService {
                 .as_ref()
                 .map(|path| path.with_file_name("slack-cache.json")),
             project: None,
-            password: None,
-            password_operation: Mutex::new(()),
             imported_token: None,
             imported_token_lock: Mutex::new(()),
         }
@@ -194,9 +181,6 @@ impl SlackService {
                             record.failure = Some(Error::DeliveryUnknown);
                             record.text = None;
                         }
-                    }
-                    if state.app_token.is_none() {
-                        state.app_token.clone_from(&secrets.app_token);
                     }
                     state.secrets = secrets;
                     if !state.storage_unavailable && state.cache.save(cache_path.as_ref()).is_err()
@@ -295,8 +279,7 @@ impl SlackService {
             _ if state.credentials_locked => "credentials_unavailable",
             Some(account) if account.revoked => "reauthorization_required",
             Some(account) if !account.access.is_empty() || account.web_session => "authorized",
-            _ if state.app_token.is_none() => "unconfigured",
-            _ => "authorization_required",
+            _ => "unconfigured",
         }
     }
 
@@ -323,8 +306,6 @@ impl SlackService {
                "team_name":account.map(|account| &account.identity.team_name),
                "session_id":account.map(|account| account.identity.session_id),
                "user_id":account.map(|account| format!("{team_id}.{}", account.identity.user_id)),
-               "password_id":settings.password_id,
-               "app_token_set":state.app_token.is_some(),
                "authorization_state":Self::authorization_state(&state),
                "socket_state":state.socket_state,
                "issue_code":issue.map(|error| error.object()["code"].clone())})
@@ -336,41 +317,7 @@ impl SlackService {
         }
     }
 
-    pub(super) fn valid_app_token(token: &str) -> bool {
-        token.len() <= 512
-            && token.len() > 5
-            && token.starts_with("xapp-")
-            && token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }
-
-    pub(super) async fn restore_app_token(&self) {
-        let Some((passwords, id)) = &self.password else {
-            return;
-        };
-        let _operation = self.password_operation.lock().await;
-        let result = passwords.fetch(id).await;
-        let mut state = self.state.lock().await;
-        if state.retired {
-            return;
-        }
-        match result {
-            Ok(secret) if Self::valid_app_token(secret.trim()) => {
-                state.app_token = Some(secret.trim().to_owned());
-                state.issue = None;
-                drop(state);
-                self.signal_change();
-            }
-            Err(crate::modules::password::service::PasswordError::EntryNotFound) => {}
-            _ if state.app_token.is_none() => {
-                state.issue = Some(Error::PasswordRead);
-            }
-            _ => {}
-        }
-    }
-
-    pub(super) async fn verify_user_token(&self, token: &str) -> Result<Identity, Error> {
+    async fn verify_user_token(&self, token: &str) -> Result<Identity, Error> {
         if !token.starts_with("xoxp-")
             || !(6..=4096).contains(&token.len())
             || !token
@@ -418,30 +365,29 @@ impl SlackService {
         })
     }
 
-    pub(super) async fn use_imported_token(
-        &self,
-        token: String,
-        identity: Identity,
-    ) -> Result<(), Error> {
-        let _lock = self.imported_token_lock.lock().await;
-        self.initialize().await?;
-        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-        self.save_user(identity, token, hash, false).await
-    }
-
     pub(super) async fn restore_imported_token(&self) -> Result<(), Error> {
-        let Some(config) = &self.imported_token else {
+        if self.imported_token.is_none() {
             return Ok(());
-        };
+        }
         let _lock = self.imported_token_lock.lock().await;
-        let (id, _, _, _) = self.project.as_ref().ok_or(Error::Configuration)?;
-        let token = config
-            .read_record_password("slack", "teams", id, "token")
-            .await
-            .map_err(|_| Error::PasswordRead)?
-            .trim_end_matches('\n')
-            .to_owned();
-        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let passwords = self.read_passwords().await?;
+        let token = passwords[0]
+            .as_deref()
+            .ok_or(Error::PasswordRead)?
+            .trim_end_matches('\n');
+        let mut digest = Sha256::new();
+        digest.update(token.as_bytes());
+        for secret in &passwords[1..] {
+            digest.update([0]);
+            if let Some(secret) = secret {
+                digest.update(secret.trim().as_bytes());
+            }
+        }
+        let hash = if passwords[1..].iter().all(Option::is_none) {
+            format!("{:x}", Sha256::digest(token.as_bytes()))
+        } else {
+            format!("{:x}", digest.finalize())
+        };
         let identity = {
             let state = self.state.lock().await;
             if state.secrets.disabled_token.as_deref() == Some(&hash) {
@@ -459,8 +405,9 @@ impl SlackService {
             }
             previous.map(|account| account.identity.clone())
         };
-        if token.starts_with('{') {
-            let session = WebSession::parse(&token)?;
+        if token.starts_with("xoxc-") {
+            let session =
+                WebSession::from_passwords(&passwords)?.ok_or(Error::WebSessionIncomplete)?;
             let identity = match identity {
                 Some(identity) => identity,
                 None => {
@@ -475,9 +422,10 @@ impl SlackService {
         } else {
             let identity = match identity {
                 Some(identity) => identity,
-                None => self.verify_user_token(&token).await?,
+                None => self.verify_user_token(token).await?,
             };
-            self.save_user(identity, token, hash, false).await
+            self.save_user(identity, token.to_owned(), hash, false)
+                .await
         }
     }
 
@@ -561,17 +509,22 @@ impl SlackService {
         }
     }
 
-    async fn web_session(&self, session: Uuid) -> Result<Option<WebSession>, Error> {
+    pub(super) async fn web_session(&self, session: Uuid) -> Result<Option<WebSession>, Error> {
         if !self.state.lock().await.account(session)?.web_session {
             return Ok(None);
         }
+        let web = WebSession::from_passwords(&self.read_passwords().await?)?
+            .ok_or(Error::WebSessionIncomplete)?;
+        Ok(Some(web))
+    }
+
+    async fn read_passwords(&self) -> Result<[Option<String>; 2], Error> {
         let config = self.imported_token.as_ref().ok_or(Error::Configuration)?;
         let (team, _, _, _) = self.project.as_ref().ok_or(Error::Configuration)?;
-        let secret = config
-            .read_record_password("slack", "teams", team, "token")
+        config
+            .read_record_passwords("slack", "teams", team, SlackTeam::PASSWORD_FIELDS)
             .await
-            .map_err(|_| Error::PasswordRead)?;
-        Ok(Some(WebSession::parse(&secret)?))
+            .map_err(|_| Error::PasswordRead)
     }
 
     pub(super) async fn slack_post(

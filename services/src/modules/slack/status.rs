@@ -56,19 +56,6 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         )
                         .nullable(),
                         Field::new(
-                            "password_id",
-                            "密码条目 ID",
-                            "应用级令牌在 pass 中的相对路径。",
-                            StatusSchema::string(),
-                        )
-                        .nullable(),
-                        Field::new(
-                            "app_token_set",
-                            "应用令牌已配置",
-                            "本机已保存应用令牌。",
-                            StatusSchema::Boolean,
-                        ),
-                        Field::new(
                             "authorization_state",
                             "授权状态",
                             "当前工作区的用户凭据状态。",
@@ -77,7 +64,7 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         Field::new(
                             "socket_state",
                             "连接状态",
-                            "当前工作区的 Socket Mode 状态。",
+                            "当前工作区的 Slack WebSocket 连接状态。",
                             StatusSchema::string(),
                         ),
                         Field::new(

@@ -134,7 +134,7 @@ async fn module_data(
     headers: HeaderMap,
 ) -> Result<Json<ModuleDataResponse>, Response> {
     let remote = is_remote(&headers);
-    let values = service
+    let mut values = service
         .module_values_for(&module_id, remote)
         .await
         .map_err(error_response)?;
@@ -146,6 +146,26 @@ async fn module_data(
                 .iter()
                 .any(|module| module.id == module_id && module.item(key).is_some())
         });
+    }
+    for (key, value) in &mut values {
+        service
+            .omit_missing_password_entries(
+                &module_id,
+                key,
+                Some(&mut value.value),
+                pending
+                    .get_mut(key)
+                    .map(Vec::as_mut_slice)
+                    .unwrap_or_default(),
+            )
+            .await;
+    }
+    for (key, records) in &mut pending {
+        if !values.contains_key(key) {
+            service
+                .omit_missing_password_entries(&module_id, key, None, records)
+                .await;
+        }
     }
     Ok(Json(ModuleDataResponse {
         module_id,
@@ -170,8 +190,8 @@ async fn get_value(
     headers: HeaderMap,
 ) -> Result<Json<ValueResponse>, Response> {
     check_access(&service, &headers, &module_id, &key, false).await?;
-    let pending = service.pending_notifications(&module_id, &key).await;
-    let data = match service.value(&module_id, &key).await {
+    let mut pending = service.pending_notifications(&module_id, &key).await;
+    let mut data = match service.value(&module_id, &key).await {
         Ok(data) => data,
         Err(ConfigServiceError::ValueNotSet { .. }) if !pending.is_empty() => ConfigValue {
             value: Value::Null,
@@ -179,6 +199,9 @@ async fn get_value(
         },
         Err(error) => return Err(error_response(error)),
     };
+    service
+        .omit_missing_password_entries(&module_id, &key, Some(&mut data.value), &mut pending)
+        .await;
     Ok(Json(ValueResponse {
         module_id,
         key,
@@ -314,6 +337,12 @@ async fn check_access(
             .require_remote_access(module_id, key, write)
             .await
             .map_err(error_response)?;
+    }
+    if write && super::registry::item_options(module_id, key).read_only {
+        return Err(error_response(ConfigServiceError::ReadOnly {
+            module_id: module_id.to_owned(),
+            key: key.to_owned(),
+        }));
     }
     Ok(())
 }
@@ -656,32 +685,46 @@ fn error_response(error: ConfigServiceError) -> Response {
             StatusCode::CONFLICT
         }
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
-        ConfigServiceError::RemoteAccessForbidden { .. } => StatusCode::FORBIDDEN,
+        ConfigServiceError::PendingValidation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        ConfigServiceError::RemoteAccessForbidden { .. } | ConfigServiceError::ReadOnly { .. } => {
+            StatusCode::FORBIDDEN
+        }
         ConfigServiceError::SecretUnauthorized => StatusCode::UNAUTHORIZED,
         ConfigServiceError::Storage(_) | ConfigServiceError::ChangeRejected { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    api_error_response(
+    let mut response = api_error_response(
         status,
         ErrorSource::Business,
         error_code(&error),
         error.to_string(),
-    )
+    );
+    if let ConfigServiceError::PendingValidation(detail) = error
+        && !detail.clear_password_fields.is_empty()
+        && let Ok(fields) = detail.clear_password_fields.join(", ").parse()
+    {
+        response
+            .headers_mut()
+            .insert("x-loki-config-cleared-fields", fields);
+    }
+    response
 }
 
-fn error_code(error: &ConfigServiceError) -> &'static str {
+fn error_code(error: &ConfigServiceError) -> &str {
     match error {
         ConfigServiceError::ModuleNotFound(_) => "module-not-found",
         ConfigServiceError::ItemNotFound { .. } => "config-not-found",
         ConfigServiceError::ValueNotSet { .. } => "config-not-set",
         ConfigServiceError::InvalidValue(_) => "invalid-config",
         ConfigServiceError::RemoteAccessForbidden { .. } => "remote-config-forbidden",
+        ConfigServiceError::ReadOnly { .. } => "config-read-only",
         ConfigServiceError::SecretUnauthorized => "config-secret-auth-required",
         ConfigServiceError::ActionNotFound => "config-action-not-found",
         ConfigServiceError::RecordExists => "config-record-exists",
         ConfigServiceError::ChangePending => "config-change-pending",
         ConfigServiceError::PendingNotFound => "config-pending-not-found",
+        ConfigServiceError::PendingValidation(error) => &error.code,
         ConfigServiceError::RetryInProgress => "config-retry-in-progress",
         ConfigServiceError::RecordAuthorizationRequired => "config-record-authorization-required",
         ConfigServiceError::Storage(_) => "config-storage-error",
@@ -844,6 +887,47 @@ mod tests {
             body["values"]["config_a"],
             json!({"value":"用户值","source":"user"})
         );
+    }
+
+    #[tokio::test]
+    async fn relay_token_metadata_and_routes_are_read_only() {
+        let service = Arc::new(ConfigService::from_registry());
+        let metadata = json_request(service.clone(), "GET", "/meta/network", Value::Null).await;
+        let fields = metadata["items"].as_array().unwrap();
+        assert!(
+            fields
+                .iter()
+                .any(|field| { field["key"] == "relay_token" && field["read_only"] == true })
+        );
+        assert_eq!(
+            json_request(
+                service.clone(),
+                "GET",
+                "/data/network/relay_token",
+                Value::Null
+            )
+            .await["value"],
+            ""
+        );
+        for method in ["PUT", "PATCH", "POST", "DELETE"] {
+            let response = router(service.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/data/network/relay_token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#""replacement""#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+                "config-read-only"
+            );
+        }
     }
 
     #[tokio::test]

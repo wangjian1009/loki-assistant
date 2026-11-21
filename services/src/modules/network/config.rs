@@ -1,7 +1,20 @@
 use loki_services_macros::loki_config;
 use serde_json::Value;
 
-use crate::modules::config::model::{ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata};
+use crate::modules::config::{
+    model::{ConfigDataType, ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata},
+    registry::ConfigItemRegistration,
+};
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static RELAY_TOKEN_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: "network",
+    key: "relay_token",
+    options: || ConfigItemOptions {
+        read_only: true,
+        ..ConfigItemOptions::default()
+    },
+};
 
 #[loki_config]
 fn network_config_metadata() -> ConfigModuleMetadata {
@@ -30,8 +43,7 @@ fn network_config_metadata() -> ConfigModuleMetadata {
             ConfigItemMetadata {
                 key: "relay_token".to_owned(),
                 name: "中转令牌".to_owned(),
-                description: "与中转服务器约定的共享访问令牌；与地址一起生效，留空断开中转连接。"
-                    .to_owned(),
+                description: "从本机配置文件读取的共享访问令牌，与中转地址一起生效。".to_owned(),
                 data_type: ConfigDataType::String,
                 remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                 required: false,

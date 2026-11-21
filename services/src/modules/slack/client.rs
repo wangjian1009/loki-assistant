@@ -3,7 +3,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use reqwest::{Client, Method, StatusCode, header::RETRY_AFTER};
 use serde_json::Value;
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::client::IntoClientRequest,
+};
 use url::Url;
 
 use super::protocol::Error;
@@ -11,34 +13,52 @@ use super::protocol::Error;
 pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct WebSession {
     pub token: String,
     pub d_cookie: String,
 }
 
 impl WebSession {
-    pub fn parse(secret: &str) -> Result<Self, Error> {
-        let mut session: Self = serde_json::from_str(secret).map_err(|_| Error::UserToken)?;
-        if let Some(value) = session.d_cookie.strip_prefix("d=") {
-            session.d_cookie = value.to_owned();
+    pub fn from_passwords(passwords: &[Option<String>; 2]) -> Result<Option<Self>, Error> {
+        let [token, d_cookie] = passwords
+            .each_ref()
+            .map(|value| value.as_deref().map(str::trim));
+        let (Some(token), Some(d_cookie)) = (token, d_cookie) else {
+            return Ok(None);
+        };
+        Self {
+            token: token.into(),
+            d_cookie: d_cookie.into(),
         }
-        if !session.token.starts_with("xoxc-")
-            || session.token.len() <= 5
-            || session.token.len() > 4096
-            || !session
+        .validate()
+        .map(Some)
+    }
+
+    fn validate(mut self) -> Result<Self, Error> {
+        if let Some(value) = self.d_cookie.strip_prefix("d=") {
+            self.d_cookie = value.to_owned();
+        }
+        let valid_cookie = |cookie: &str| {
+            !cookie.is_empty()
+                && cookie.len() <= 8192
+                && cookie.bytes().all(
+                    |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+                )
+        };
+        if !self.token.starts_with("xoxc-")
+            || self.token.len() <= 5
+            || self.token.len() > 4096
+            || !self
                 .token
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || session.d_cookie.is_empty()
-            || session.d_cookie.len() > 8192
-            || !session.d_cookie.bytes().all(
-                |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
-            )
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         {
-            return Err(Error::UserToken);
+            return Err(Error::WebUserToken);
         }
-        Ok(session)
+        if !valid_cookie(&self.d_cookie) {
+            return Err(Error::WebCookie);
+        }
+        Ok(self)
     }
 }
 
@@ -174,39 +194,57 @@ impl SlackClient {
         })
     }
 
-    async fn socket_url(&self, token: &str) -> Result<Url, Error> {
+    pub async fn connect(&self, token: &str, web: Option<&WebSession>) -> Result<Socket, Error> {
         let value = self
             .call(
-                "apps.connections.open",
+                "rtm.connect",
                 Method::POST,
-                Some(token),
+                Some(web.map_or(token, |session| &session.token)),
                 &[],
                 None,
-                None,
+                web.map(|session| session.d_cookie.as_str()),
             )
             .await?;
         let url = Url::parse(value["url"].as_str().ok_or(Error::Upstream)?)
             .map_err(|_| Error::Upstream)?;
-        if url.scheme() == "wss" {
-            return Ok(url);
+        if !self.trusted_socket(&url) || !url.username().is_empty() || url.password().is_some() {
+            return Err(Error::Upstream);
         }
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| Error::Upstream)?;
+        if let Some(session) = web {
+            let value = format!("d={}", session.d_cookie)
+                .parse()
+                .map_err(|_| Error::WebCookie)?;
+            request.headers_mut().insert("cookie", value);
+        }
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(request))
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if matches!(response.status().as_u16(), 401 | 403) =>
+                {
+                    Error::Authorization
+                }
+                _ => Error::Unavailable,
+            })?;
+        Ok(socket)
+    }
+
+    fn trusted_socket(&self, url: &Url) -> bool {
         #[cfg(test)]
         if self.api.starts_with("http://127.0.0.1:")
             && url.scheme() == "ws"
             && url.host_str() == Some("127.0.0.1")
         {
-            return Ok(url);
+            return true;
         }
-        Err(Error::Upstream)
-    }
-
-    pub async fn connect(&self, token: &str) -> Result<Socket, Error> {
-        let url = self.socket_url(token).await?;
-        let (socket, _) =
-            tokio::time::timeout(Duration::from_secs(10), connect_async(url.as_str()))
-                .await
-                .map_err(|_| Error::Unavailable)?
-                .map_err(|_| Error::Unavailable)?;
-        Ok(socket)
+        url.scheme() == "wss"
+            && url
+                .host_str()
+                .is_some_and(|host| host == "slack.com" || host.ends_with(".slack.com"))
     }
 }

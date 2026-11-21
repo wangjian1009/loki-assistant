@@ -180,10 +180,28 @@ impl PasswordService {
         })
     }
     pub(crate) async fn save(&self, file: &str, secret: &str) -> Result<(), PasswordError> {
-        validate_file(file)?;
         if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control) {
             return Err(PasswordError::InvalidRequest);
         }
+        self.write_entry(file, secret).await
+    }
+
+    pub(crate) async fn save_multiline(
+        &self,
+        file: &str,
+        contents: &str,
+    ) -> Result<(), PasswordError> {
+        if contents.is_empty()
+            || contents.len() > 16 * 1024
+            || contents.chars().any(|ch| ch.is_control() && ch != '\n')
+        {
+            return Err(PasswordError::InvalidRequest);
+        }
+        self.write_entry(file, contents).await
+    }
+
+    async fn write_entry(&self, file: &str, contents: &str) -> Result<(), PasswordError> {
+        validate_file(file)?;
         let (program, store) = self.settings().await?;
         let (checked_store, checked_file) = (store.clone(), file.to_owned());
         tokio::task::spawn_blocking(move || check_write_path(&checked_store, &checked_file))
@@ -199,7 +217,7 @@ impl PasswordService {
             "--".into(),
             entry.into(),
         ];
-        let input = format!("{secret}\n");
+        let input = format!("{contents}\n");
         let output = timeout(self.timeout, (self.writer)(&program, &store, &args, &input))
             .await
             .map_err(|_| PasswordError::Timeout)??;
@@ -215,9 +233,19 @@ impl PasswordService {
         validate_file(file)?;
         let (program, store) = self.settings().await?;
         let (checked_store, checked_file) = (store.clone(), file.to_owned());
-        tokio::task::spawn_blocking(move || check_write_path(&checked_store, &checked_file))
-            .await
-            .map_err(|_| PasswordError::StoreUnavailable)??;
+        let exists = tokio::task::spawn_blocking(move || {
+            check_write_path(&checked_store, &checked_file)?;
+            match check_file(&checked_store, &checked_file) {
+                Ok(()) => Ok(true),
+                Err(PasswordError::EntryNotFound) => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|_| PasswordError::StoreUnavailable)??;
+        if !exists {
+            return Ok(());
+        }
         let entry = file
             .strip_suffix(".gpg")
             .ok_or(PasswordError::InvalidPath)?;
@@ -314,6 +342,23 @@ impl PasswordService {
             &["show".to_owned(), "--".to_owned(), entry.to_owned()],
         )
         .await
+    }
+
+    pub(crate) async fn missing_entries(
+        &self,
+        paths: HashSet<String>,
+    ) -> Result<HashSet<String>, PasswordError> {
+        let (_, store) = self.settings().await?;
+        tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .filter(|path| {
+                    matches!(check_file(&store, path), Err(PasswordError::EntryNotFound))
+                })
+                .collect()
+        })
+        .await
+        .map_err(|_| PasswordError::StoreUnavailable)
     }
 }
 

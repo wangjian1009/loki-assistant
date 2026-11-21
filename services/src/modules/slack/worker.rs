@@ -18,7 +18,6 @@ use super::{
 impl SlackService {
     pub async fn run(self: Arc<Self>) {
         let _ = self.initialize().await;
-        self.restore_app_token().await;
         self.restore_user_token().await;
         self.publish_status().await;
         tokio::join!(
@@ -84,30 +83,15 @@ impl SlackService {
         let mut changes = self.change.subscribe();
         let mut backoff = 1;
         loop {
-            let (token, session, locked) = {
-                let state = self.state.lock().await;
-                (
-                    state.app_token.clone(),
-                    state
-                        .secrets
-                        .account
-                        .as_ref()
-                        .filter(|account| !account.revoked && !account.access.is_empty())
-                        .map(|account| account.identity.session_id),
-                    state.credentials_locked,
-                )
-            };
-            let has_token = token.is_some();
-            let has_session = session.is_some();
-            let (Some(token), Some(session), false) = (token, session, locked) else {
+            let Some(session) = self.session_id().await else {
                 self.state.lock().await.socket_state = "stopped";
                 self.publish_status().await;
                 tokio::select! {
                     _ = changes.changed() => { backoff = 1; }
-                    _ = tokio::time::sleep(Duration::from_secs(15)), if locked || !has_token || !has_session => {
-                        if locked && self.initialize().await.is_ok() { self.signal_change(); }
-                        if !has_token { self.restore_app_token().await; }
-                        if !has_session || locked { self.restore_user_token().await; }
+                    _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                        if self.initialize().await.is_ok() {
+                            self.restore_user_token().await;
+                        }
                         self.publish_status().await;
                     }
                 }
@@ -120,7 +104,9 @@ impl SlackService {
             };
             self.publish_status().await;
             let connection = async {
-                let socket = self.client.connect(&token).await?;
+                let web = self.web_session(session).await?;
+                let token = self.state.lock().await.account(session)?.access.clone();
+                let socket = self.client.connect(&token, web.as_ref()).await?;
                 self.socket_loop(session, socket).await
             };
             let started = tokio::time::Instant::now();
@@ -149,9 +135,20 @@ impl SlackService {
 
     async fn socket_loop(&self, session: Uuid, mut socket: Socket) -> Result<(), Error> {
         loop {
-            let incoming = tokio::time::timeout(Duration::from_secs(90), socket.next())
-                .await
-                .map_err(|_| Error::Unavailable)?
+            let incoming = match tokio::time::timeout(Duration::from_secs(30), socket.next()).await
+            {
+                Ok(incoming) => incoming,
+                Err(_) => {
+                    socket
+                        .send(Frame::Ping(Vec::new().into()))
+                        .await
+                        .map_err(|_| Error::Unavailable)?;
+                    tokio::time::timeout(Duration::from_secs(15), socket.next())
+                        .await
+                        .map_err(|_| Error::Unavailable)?
+                }
+            };
+            let incoming = incoming
                 .ok_or(Error::Unavailable)?
                 .map_err(|_| Error::Unavailable)?;
             let content = match incoming {
@@ -178,72 +175,24 @@ impl SlackService {
                     self.sync.notify_one();
                     self.outgoing.notify_one();
                 }
-                Some("disconnect") => return Ok(()),
+                Some("disconnect" | "goodbye") => return Ok(()),
+                Some("message") => {
+                    if self.accept_message(session, &event).await? {
+                        self.alerts.notify_one();
+                    }
+                }
                 _ => {}
-            }
-            let notify = if event["type"] == "events_api" {
-                self.accept_event(session, &event["payload"]).await?
-            } else {
-                false
-            };
-            if notify {
-                self.alerts.notify_one();
-            }
-            if let Some(envelope) = event["envelope_id"].as_str() {
-                socket
-                    .send(Frame::Text(
-                        json!({"envelope_id":envelope}).to_string().into(),
-                    ))
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
             }
         }
     }
 
-    pub(super) async fn accept_event(&self, session: Uuid, payload: &Value) -> Result<bool, Error> {
-        let event = &payload["event"];
-        let event_type = event["type"].as_str().unwrap_or_default();
-        if matches!(event_type, "app_uninstalled" | "tokens_revoked") {
-            let state = self.state.lock().await;
-            let account = state.account(session)?;
-            let revoked_user = event["tokens"]["oauth"].as_array().is_some_and(|users| {
-                users
-                    .iter()
-                    .any(|user| user.as_str() == Some(&account.identity.user_id))
-            });
-            let revoked = payload["team_id"].as_str() == Some(&account.identity.team_id)
-                && (event_type == "app_uninstalled" || revoked_user);
-            let access = account.access.clone();
-            drop(state);
-            if revoked {
-                self.revoke(session, &access).await;
-            }
-            return Ok(false);
-        }
-        if event_type != "message" {
-            return Ok(false);
-        }
+    async fn accept_message(&self, session: Uuid, event: &Value) -> Result<bool, Error> {
         let Some(id) = event["channel"].as_str().filter(|id| valid_id(id)) else {
             return Ok(false);
         };
-        let kind = match event["channel_type"].as_str() {
-            Some("im") => "im",
-            Some("mpim") => "mpim",
-            _ => return Ok(false),
-        };
-        let Some(event_id) = payload["event_id"].as_str().filter(|id| valid_id(id)) else {
-            return Ok(false);
-        };
         let id = id.to_owned();
-        let event_id = event_id.to_owned();
-        let team = payload["team_id"].as_str().unwrap_or_default().to_owned();
-        let authorized_users: Vec<_> = payload["authorizations"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|authorization| authorization["is_bot"] == false)
-            .filter_map(|authorization| authorization["user_id"].as_str().map(str::to_owned))
-            .collect();
+        let team = event["team"].as_str().map(str::to_owned);
+        let channel_type = event["channel_type"].as_str().map(str::to_owned);
         let subtype = event["subtype"].as_str().unwrap_or_default().to_owned();
         let message = Message::from_slack(
             if subtype == "message_changed" {
@@ -262,11 +211,36 @@ impl SlackService {
                 subtype.as_str(),
                 "bot_message" | "file_share" | "thread_broadcast"
             );
+        let event_ts = event["event_ts"]
+            .as_str()
+            .or_else(|| event["message"]["edited"]["ts"].as_str())
+            .or_else(|| event["ts"].as_str())
+            .or_else(|| deleted.as_deref())
+            .or_else(|| message.as_ref().map(|message| message.ts.as_str()));
+        let Some(event_ts) = event_ts.filter(|ts| timestamp(ts).is_some()) else {
+            return Ok(false);
+        };
+        let event_id = format!("{id}.{subtype}.{event_ts}");
         self.update_cache(session, move |cache, account| {
-            if team != account.identity.team_id
-                || !authorized_users.contains(&account.identity.user_id)
-                || !cache.events.insert(event_id.clone())
+            if team
+                .as_deref()
+                .is_some_and(|team| team != account.identity.team_id)
             {
+                return Ok(false);
+            }
+            let kind = if id.starts_with('D') || channel_type.as_deref() == Some("im") {
+                "im"
+            } else if channel_type.as_deref() == Some("mpim")
+                || cache
+                    .conversations
+                    .get(&id)
+                    .is_some_and(|room| room.kind == "mpim")
+            {
+                "mpim"
+            } else {
+                return Ok(false);
+            };
+            if !cache.events.insert(event_id.clone()) {
                 return Ok(false);
             }
             if cache.events.len() > 10_000 {
@@ -317,16 +291,7 @@ impl SlackService {
                 _ = self.sync.notified() => true,
                 _ = tokio::time::sleep(Duration::from_secs(120)) => false,
             };
-            let session = {
-                let state = self.state.lock().await;
-                state
-                    .secrets
-                    .account
-                    .as_ref()
-                    .filter(|account| !account.revoked && !account.access.is_empty())
-                    .map(|account| account.identity.session_id)
-            };
-            let Some(session) = session else {
+            let Some(session) = self.session_id().await else {
                 continue;
             };
             if self.refresh_directory(session).await.is_err() {
@@ -498,7 +463,7 @@ impl SlackService {
                     .secrets
                     .account
                     .as_ref()
-                    .filter(|account| !account.revoked && !account.access.is_empty())
+                    .filter(|account| state.account(account.identity.session_id).is_ok())
                     .and_then(|account| {
                         state
                             .cache

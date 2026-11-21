@@ -7,7 +7,11 @@ use serde_json::Value;
 pub enum ConfigDataType {
     String,
     Key,
-    Password,
+    Password {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     Integer,
     Number,
     Boolean,
@@ -17,6 +21,19 @@ pub enum ConfigDataType {
     List,
     FilePath,
     Executable,
+}
+
+impl ConfigDataType {
+    pub fn is_password(&self) -> bool {
+        matches!(self, Self::Password { .. })
+    }
+
+    pub fn password_key(&self) -> Option<&str> {
+        match self {
+            Self::Password { key, .. } => key.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -76,6 +93,8 @@ pub struct ConfigItemOptions {
     pub save_timeout_seconds: Option<u64>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub requires_local_auth: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -121,6 +140,8 @@ pub struct ListMetadata {
 pub struct CheckerMetadata {
     pub pattern: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emacs_pattern: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -146,6 +167,8 @@ pub struct StructureMetadata {
     #[serde(skip_serializing, default)]
     pub legacy_dictionary: Option<LegacyDictionary>,
     pub type_name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_all_fields: bool,
     pub fields: Vec<StructureField>,
 }
 
@@ -165,8 +188,6 @@ pub struct StructureField {
     pub checker: Option<CheckerMetadata>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password_path: Option<String>,
     pub options: Option<FieldOptions>,
 }
 

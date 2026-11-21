@@ -54,6 +54,7 @@ impl PasswordConfig {
                     checker: Some(CheckerMetadata {
                         pattern: r"^/[^\x00\r\n]*$".to_owned(),
                         description: "请使用不含 NUL 和换行的绝对目录。".to_owned(),
+                        emacs_pattern: Some("\\`/[^\0\r\n]*\\'".to_owned()),
                     }),
                     file_path: Some(FilePathMetadata {
                         default: None,

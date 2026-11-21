@@ -116,7 +116,7 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 
 配置模型、数组操作、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
-Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块负责打开本机配置指引 ~GET /slack/team-setup/{team_id}~ 。 [[file:slack.org::*Team 配置][Slack 工作区配置]]
+Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /data/slack/teams/{team_id}~ 保存凭据。 [[file:slack.org::*Team 配置][Slack 工作区配置]]
 
 * 控制中心模块
 
@@ -128,7 +128,7 @@ Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直
 
 * 网络模块
 
-~network~ 的 ~relay_url~ （中转地址）和 ~relay_token~ （中转令牌）均为非必填字符串，默认空字符串。两项都通过通用配置接口读取和保存，由 Emacs 配置界面的“网络”分组编辑，保存于权限为 ~0600~ 的 ~~/.assistant/config.yml~ 。令牌使用服务器已有的共享访问令牌；客户端不生成 relay 访问令牌，也不再从环境变量或 Homebrew 服务环境文件读取令牌。
+~network~ 的 ~relay_url~ （中转地址）和 ~relay_token~ （中转令牌）均为非必填字符串，默认空字符串。中转地址可通过 Emacs 配置界面或通用配置接口保存。中转令牌从权限为 ~0600~ 的 ~~/.assistant/config.yml~ 加载，在 Emacs 和配置 HTTP 接口中为只读。填写本机文件时使用中转服务器已有的共享访问令牌，重启 services 后加载。
 
 ** 本地身份
 
@@ -138,7 +138,7 @@ Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直
 
 ** 注册和生命周期
 
-只有地址和令牌都非空、且不全为空白时才开始注册；缺少任意一项均视为未配置，可以先后保存两项，第一项保存不连接、不发出注册失败通知。配置处理器使用包含本次候选值的模块快照判断，第二项提交时使用第一项已保存的值。完整配置中的地址须为 HTTP(S) URL，不接受账号、密码、查询或片段；TLS 验证保持启用，没有固定对端或备用 relay。
+地址和令牌均非空白时开始注册。未配齐时状态为未配置。修改中转地址时，配置处理器从候选配置快照读取地址及本机已加载的令牌。地址须为 HTTP(S) URL，且仅包含主机、端口和路径。连接启用 TLS 验证。
 
 “注册”表示使用本地持久化身份与指定 iroh-relay 建立中转连接，确认 relay 已接受节点。端点同时声明绑定协议 ~loki-assistant/pair/1~ 、兼容设备状态协议 ~loki-assistant/device-status/1~ 和通用请求协议 ~loki-assistant/services/1~ ，由进程入口显式调度接收任务；当前接收绑定与已绑定设备的通用 HTTP 请求。HTTP listener 只监听 loopback。注册最多等待 10 秒，认证拒绝提前失败。地址或令牌变化均重新注册，成功后才允许落盘，并在 ~committed~ 中替换旧连接、作废未完成邀请并发送成功通知；失败发送失败通知，返回 ~config-change-rejected~ ，保留原配置、连接和邀请。相同配置已连接时不重复注册，失败后重新提交可以重试。
 
