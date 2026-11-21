@@ -71,7 +71,7 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         Field::new(
                             "authorization_state",
                             "授权状态",
-                            "当前工作区的 Slack OAuth 状态。",
+                            "当前工作区的用户凭据状态。",
                             StatusSchema::string(),
                         ),
                         Field::new(

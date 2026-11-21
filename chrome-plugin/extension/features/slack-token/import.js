@@ -4,10 +4,8 @@ export function slackTokenImport(tabUrl) {
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" ||
       url.port !== "47321" || url.pathname !== "/slack/token-import" || url.username || url.password) return null;
   const teamId = url.searchParams.get("team");
-  const attempt = url.hash.slice(1);
-  if (!/^T[A-Z0-9]{1,47}$/u.test(teamId ?? "") ||
-      !/^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/u.test(attempt)) return null;
-  return { endpoint: url.origin + url.pathname, teamId, attempt };
+  if (!/^T[A-Z0-9]{1,47}$/u.test(teamId ?? "")) return null;
+  return { endpoint: url.origin + url.pathname, teamId };
 }
 
 export async function acceptSlackToken(target, token, request = globalThis.fetch) {
@@ -15,10 +13,7 @@ export async function acceptSlackToken(target, token, request = globalThis.fetch
   try {
     response = await request(target.endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + target.attempt,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ team_id: target.teamId, token }),
       cache: "no-store",
       credentials: "omit",

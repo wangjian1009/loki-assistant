@@ -28,9 +28,11 @@
     {配置模块校验并保存待确认记录};
   \node[action box, below=of save] (notify)
     {配置模块向通知接入点发送 \texttt{POST}\\Slack 返回 \texttt{202}};
-  \node[action box, below=of notify] (credentials)
+  \node[action box, below=of notify] (guide)
+    {手动重试时配置模块再次发送 \texttt{POST}\\Slack 打开网页会话配置指引};
+  \node[action box, below=of guide] (validate)
     {补充网页会话凭据后\\Slack 校验用户和 Team ID};
-  \node[decision diamond, below=of credentials] (result)
+  \node[decision diamond, below=of validate] (result)
     {处理结果};
   \node[outcome, below=14mm of result, xshift=-42mm] (confirmed)
     {标记为已确认};
@@ -41,8 +43,9 @@
 
   \draw[flow arrow] (create) -- (save);
   \draw[flow arrow] (save) -- (notify);
-  \draw[flow arrow] (notify) -- (credentials);
-  \draw[flow arrow] (credentials) -- (result);
+  \draw[flow arrow] (notify) -- (guide);
+  \draw[flow arrow] (guide) -- (validate);
+  \draw[flow arrow] (validate) -- (result);
   \draw[flow arrow] (result.west) -| node[pos=0.24, above] {成功} (confirmed.north);
   \draw[flow arrow] (result.south) -- node[left] {处理中} (waiting.north);
   \draw[flow arrow] (result.east) -| node[pos=0.24, above] {失败} (failed.north);
@@ -54,8 +57,9 @@
 
 1. 登录 Slack 网页，从目标工作区取得 Team ID。
 2. 通过配置模块仅提交 Team ID。配置模块保存待确认记录，以 ~team_id~ 为 ~Key~ ，向 ~POST /slack/config/teams/{key}~ 发送创建通知。Slack 返回 ~202~ 。
-3. 编辑待确认记录，补充同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie，配置值为包含 ~token~ 和 ~d_cookie~ 的 JSON 对象。保存使用 ~PATCH~ 。Slack 通过 ~auth.test~ 校验凭据和 Team ID，配置模块根据结果确认或回退。仍待确认时，可在配置界面手动「重试」。
-4. 会话失效时，重新登录 Slack 网页，通过配置模块更新凭据。
+3. 在配置界面点击「重试」。配置模块重新发送创建通知，Slack 模块打开本机网页会话配置指引，提供目标工作区入口和凭据填写示例。
+4. 编辑待确认记录，补充同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie，配置值为包含 ~token~ 和 ~d_cookie~ 的 JSON 对象。保存使用 ~PATCH~ 。Slack 通过 ~auth.test~ 校验凭据和 Team ID，配置模块根据结果确认或回退。仍待确认时，可在配置界面手动「重试」。
+5. 会话失效时，重新登录 Slack 网页，通过配置模块更新凭据。
 
 配置模块向同一接入点发送 ~DELETE~ 并等待结果，确认后移除记录。Slack 随后停止该 Team 的后台任务并清理连接状态。 [[file:config-module.org::*配置项通知接入点][通知与确认协议]]
 

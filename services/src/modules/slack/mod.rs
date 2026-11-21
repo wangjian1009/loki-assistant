@@ -38,8 +38,6 @@ static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
     version: env!("CARGO_PKG_VERSION"),
 };
 
-// 所有工作区共用 Loki Assistant Slack App 的公开标识。
-const APP_CLIENT_ID: Option<&str> = option_env!("LOKI_SLACK_CLIENT_ID");
 const TEAM_NOTIFICATION_ENDPOINT: &str = "/slack/config/teams";
 
 impl projects::SlackTeam {
@@ -104,17 +102,6 @@ impl projects::SlackTeam {
                     password_path: Some("loki-assistant/slack/{id}/user-token.gpg".into()),
                     options: None,
                 },
-                StructureField {
-                    key: "oauth_credential_id".into(),
-                    label: "OAuth 凭据引用".into(),
-                    data_type: ConfigDataType::String,
-                    required: false,
-                    read_only: true,
-                    default_template: None,
-                    checker: None,
-                    password_path: None,
-                    options: None,
-                },
             ],
         }
     }
@@ -129,7 +116,7 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
         notification_endpoint: Some(TEAM_NOTIFICATION_ENDPOINT),
         create_fields: vec!["team_id"],
         save_timeout_seconds: Some(650),
-        requires_local_auth: true,
+        requires_local_auth: false,
     },
 };
 

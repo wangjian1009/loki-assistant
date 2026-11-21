@@ -16,8 +16,7 @@ use super::{
 };
 
 impl SlackService {
-    pub async fn run(self: Arc<Self>, port: u16) {
-        self.set_port(port);
+    pub async fn run(self: Arc<Self>) {
         let _ = self.initialize().await;
         self.restore_app_token().await;
         self.restore_user_token().await;
@@ -515,12 +514,6 @@ impl SlackService {
                 tokio::select! {
                     _ = self.outgoing.notified() => {}
                     _ = changes.changed() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        let current = self.state.lock().await.secrets.account.as_ref()
-                            .filter(|account| !account.revoked && !account.access.is_empty())
-                            .map(|account| account.identity.session_id);
-                        if let Some(session) = current { let _ = self.access(session).await; }
-                    }
                 }
             }
         }

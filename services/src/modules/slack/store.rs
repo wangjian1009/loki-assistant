@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -27,8 +26,6 @@ pub(super) struct Account {
     pub access: String,
     #[serde(default)]
     pub web_session: bool,
-    pub refresh: Option<String>,
-    pub expires_at: Option<u64>,
     pub baseline: u64,
     #[serde(default)]
     pub imported_token_hash: Option<String>,
@@ -77,12 +74,6 @@ impl Keychain for LoginKeychain {
     }
 }
 
-pub(super) fn random() -> Result<String, Error> {
-    let mut bytes = [0; 32];
-    getrandom::fill(&mut bytes).map_err(|_| Error::Storage)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
 fn read_private(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
@@ -100,7 +91,7 @@ fn read_private(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn write_private(path: &Path, data: &[u8], replace: bool) -> io::Result<()> {
+fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::other("缺少数据目录"))?;
@@ -114,40 +105,11 @@ fn write_private(path: &Path, data: &[u8], replace: bool) -> io::Result<()> {
             .open(&temporary)?;
         file.write_all(data)?;
         file.sync_all()?;
-        if replace {
-            fs::rename(&temporary, path)?;
-        } else {
-            fs::hard_link(&temporary, path)?;
-        }
+        fs::rename(&temporary, path)?;
         File::open(directory)?.sync_all()
     })();
     let _ = fs::remove_file(temporary);
     result
-}
-
-pub(super) fn local_token(path: &Path) -> Result<String, Error> {
-    match read_private(path, 64) {
-        Ok(value) => {
-            let value = String::from_utf8(value).map_err(|_| Error::Storage)?;
-            if URL_SAFE_NO_PAD
-                .decode(&value)
-                .is_ok_and(|bytes| bytes.len() == 32)
-            {
-                Ok(value)
-            } else {
-                Err(Error::Storage)
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let token = random()?;
-            match write_private(path, token.as_bytes(), false) {
-                Ok(()) => Ok(token),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => local_token(path),
-                Err(_) => Err(Error::Storage),
-            }
-        }
-        Err(_) => Err(Error::Storage),
-    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -173,7 +135,7 @@ impl Cache {
     pub fn save(&self, path: Option<&PathBuf>) -> Result<(), Error> {
         if let Some(path) = path {
             let data = serde_json::to_vec(self).map_err(|_| Error::Storage)?;
-            write_private(path, &data, true).map_err(|_| Error::Storage)?;
+            write_private(path, &data).map_err(|_| Error::Storage)?;
         }
         Ok(())
     }

@@ -116,6 +116,8 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 
 配置模型、数组操作、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
+Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块负责打开本机配置指引 ~GET /slack/team-setup/{team_id}~ 。 [[file:slack.org::*Team 配置][Slack 工作区配置]]
+
 * 控制中心模块
 
 ~control-center~ 通过静态模块描述加入服务发现，配置元数据归属 ~modules/control_center/config.rs~ 。现有 ~center_auto_start~ 键保持兼容，类型为 ~boolean~ ，默认 ~false~ ，通过 ~GET /meta/control-center~ 和通用配置接口访问；没有独立业务 HTTP 路由。

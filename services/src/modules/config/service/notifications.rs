@@ -48,6 +48,7 @@ impl Drop for NotificationGuard {
 pub(crate) struct NotificationRequest {
     pub id: Uuid,
     pub deleted: bool,
+    pub retry: bool,
     completion: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -238,7 +239,7 @@ impl ConfigService {
             else {
                 return Ok(None);
             };
-            let processing = service.send_notification(&entry).await?;
+            let processing = service.send_notification(&entry, false).await?;
             Ok(Some((entry.value, processing)))
         })
         .await
@@ -263,14 +264,18 @@ impl ConfigService {
         let service = self.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            service.send_notification(&entry).await
+            service.send_notification(&entry, true).await
         })
         .await
         .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
     }
 
-    async fn send_notification(&self, entry: &Pending) -> Result<bool, ConfigServiceError> {
-        match self.deliver(entry).await? {
+    async fn send_notification(
+        &self,
+        entry: &Pending,
+        retry: bool,
+    ) -> Result<bool, ConfigServiceError> {
+        match self.deliver(entry, retry).await? {
             Outcome::Confirmed => Ok(false),
             Outcome::Processing => Ok(true),
             Outcome::Failed => Err(ConfigServiceError::ChangeRejected {
@@ -551,14 +556,17 @@ impl ConfigService {
         Ok(())
     }
 
-    async fn deliver(&self, entry: &Pending) -> Result<Outcome, ConfigServiceError> {
+    async fn deliver(&self, entry: &Pending, retry: bool) -> Result<Outcome, ConfigServiceError> {
         let method = if entry.delete {
             Method::DELETE
         } else {
             Method::POST
         };
         let (completion, listener) = tokio::sync::watch::channel(false);
-        let result = match self.dispatch_notification(entry, method, listener).await {
+        let result = match self
+            .dispatch_notification(entry, method, retry, listener)
+            .await
+        {
             Some(response) => match response.status() {
                 StatusCode::OK | StatusCode::NO_CONTENT => Outcome::Confirmed,
                 status if status.is_client_error() || status.is_server_error() => Outcome::Failed,
@@ -672,6 +680,7 @@ impl ConfigService {
         &self,
         entry: &Pending,
         method: Method,
+        retry: bool,
         completion: tokio::sync::watch::Receiver<bool>,
     ) -> Option<axum::response::Response> {
         let router = self.notification_router.get()?.upgrade()?;
@@ -704,6 +713,7 @@ impl ConfigService {
             .extension(NotificationRequest {
                 id: entry.id,
                 deleted: entry.delete,
+                retry,
                 completion,
             })
             .body(body)

@@ -3,14 +3,14 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, Request, State,
+        Path, Query, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, CACHE_CONTROL, HOST, LOCATION},
+        header::{CACHE_CONTROL, LOCATION},
     },
-    middleware::{self, Next},
+    middleware,
     response::{Html, IntoResponse, Response},
 };
 use loki_services_macros::loki_api;
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    projects::Projects,
+    projects::{Projects, RegistrationStatus},
     protocol::{Error, Page},
     service::SlackService,
 };
@@ -30,10 +30,7 @@ type Params<T> = Result<Query<T>, QueryRejection>;
 type Segment<T> = Result<Path<T>, PathRejection>;
 
 pub(super) fn router(service: Arc<Projects>) -> Router {
-    let protected = crate::http::mount_routes(Router::new(), "slack-authenticated").route_layer(
-        middleware::from_fn_with_state(Arc::clone(&service), require_local),
-    );
-    crate::http::mount_routes(protected, "slack-local")
+    crate::http::mount_routes(Router::new(), "slack-local")
         .method_not_allowed_fallback(|| async { Error::Method })
         .layer(middleware::map_response(
             |mut response: Response| async move {
@@ -67,12 +64,20 @@ async fn team_config_changed(
         return Ok(StatusCode::NO_CONTENT);
     }
     match projects.registration_status(request.id, &team_id).await {
-        "confirmed" => {
+        RegistrationStatus::Confirmed => {
             sync_after_confirmation(projects, request);
             Ok(StatusCode::NO_CONTENT)
         }
-        "failed" => Ok(StatusCode::UNPROCESSABLE_ENTITY),
-        _ => Ok(StatusCode::ACCEPTED),
+        RegistrationStatus::Rejected => Ok(StatusCode::UNPROCESSABLE_ENTITY),
+        RegistrationStatus::NeedsCredentials if request.retry => {
+            if let Err(error) = projects.open_team_setup(&team_id).await {
+                eprintln!("打开 Slack 工作区配置指引失败：{error}");
+            }
+            Ok(StatusCode::ACCEPTED)
+        }
+        RegistrationStatus::NeedsCredentials | RegistrationStatus::Pending => {
+            Ok(StatusCode::ACCEPTED)
+        }
     }
 }
 
@@ -89,20 +94,6 @@ fn sync_after_confirmation(
     });
 }
 
-async fn require_local(
-    State(service): Service,
-    request: Request,
-    next: Next,
-) -> Result<Response, Error> {
-    let token = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    service.verify_local(token)?;
-    Ok(next.run(request).await)
-}
-
 fn header_uuid(headers: &HeaderMap, name: &'static str) -> Result<Uuid, Error> {
     headers
         .get(name)
@@ -111,8 +102,19 @@ fn header_uuid(headers: &HeaderMap, name: &'static str) -> Result<Uuid, Error> {
         .ok_or(Error::Invalid)
 }
 
-fn session(headers: &HeaderMap) -> Result<Uuid, Error> {
-    header_uuid(headers, "x-loki-slack-session")
+fn session_header(headers: &HeaderMap) -> Result<Option<Uuid>, Error> {
+    const SESSION_HEADER: &str = "x-loki-slack-session";
+    headers
+        .contains_key(SESSION_HEADER)
+        .then(|| header_uuid(headers, SESSION_HEADER))
+        .transpose()
+}
+
+async fn session(headers: &HeaderMap, service: &SlackService) -> Result<Uuid, Error> {
+    match session_header(headers)? {
+        Some(session) => Ok(session),
+        None => service.session_id().await.ok_or(Error::Session),
+    }
 }
 
 fn location(status: StatusCode, path: String, value: Value) -> Response {
@@ -241,6 +243,38 @@ fn messages_result(mut value: Value, team_id: &str) -> Value {
     module = "slack",
     mount = "Arc<Projects>",
     mount_group = "slack-local",
+    id = "team-setup",
+    method = "GET",
+    path = "/slack/team-setup/{team_id}",
+    summary = "查看 Slack 工作区配置指引",
+    description = "显示指定工作区的网页入口及会话凭据填写说明。"
+)]
+async fn team_setup(team: Segment<String>) -> Result<Response, Error> {
+    let Path(team) = team.map_err(|_| Error::Invalid)?;
+    validate_team_id(&team)?;
+    Ok(slack_instruction_page(format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>配置 Slack 工作区</title>
+<main>
+  <h1>配置 Slack 工作区 {team}</h1>
+  <ol>
+    <li><a href="https://app.slack.com/client/{team}" target="_blank" rel="noopener noreferrer">打开 Slack 工作区</a>并登录。</li>
+    <li>获取同一网页会话的 <code>xoxc-</code> 用户令牌和名为 <code>d</code> 的 Cookie 值。</li>
+    <li>回到 Loki Assistant 配置界面，编辑待确认的工作区 <code>{team}</code>，按下列格式填写「Slack 网页会话凭据」并保存。</li>
+  </ol>
+  <pre><code>{{"token":"xoxc-…","d_cookie":"…"}}</code></pre>
+</main>
+</html>"#
+    )))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
     id = "token-import-page",
     method = "GET",
     path = "/slack/token-import",
@@ -248,15 +282,25 @@ fn messages_result(mut value: Value, team_id: &str) -> Value {
     description = "显示已有 Slack 用户令牌的导入说明。"
 )]
 async fn token_import_page() -> Response {
+    slack_instruction_page(concat!(
+        "<!doctype html><html lang=zh-CN><meta charset=utf-8>",
+        "<title>导入 Slack 用户令牌</title><h1>导入 Slack 用户令牌</h1>",
+        "<p>打开 Loki Assistant Chrome 插件，粘贴目标工作区已有的 xoxp- 用户令牌并点击「接受」。</p>"
+    ))
+}
+
+fn slack_instruction_page(html: impl Into<String>) -> Response {
     (
-        [(axum::http::header::REFERRER_POLICY, "no-referrer"),
-         (axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'none'; base-uri 'none'; frame-ancestors 'none'")],
-        Html(concat!(
-            "<!doctype html><html lang=zh-CN><meta charset=utf-8>",
-            "<title>导入 Slack 用户令牌</title><h1>导入 Slack 用户令牌</h1>",
-            "<p>打开 Loki Assistant Chrome 插件，粘贴目标工作区已有的 xoxp- 用户令牌并点击「接受」。</p>"
-        )),
-    ).into_response()
+        [
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+        ],
+        Html(html.into()),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -274,22 +318,15 @@ struct TokenImport {
     method = "POST",
     path = "/slack/token-import",
     summary = "接受 Slack 用户令牌",
-    description = "凭一次性导入标识提交令牌，校验所属工作区后保存配置。"
+    description = "提交正在导入的工作区的用户令牌，校验所属工作区后保存配置。"
 )]
 async fn accept_token_import(
     State(projects): Service,
-    headers: HeaderMap,
     input: JsonInput<TokenImport>,
 ) -> Result<StatusCode, Error> {
-    let attempt = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or(Error::ImportExpired)?;
     let Json(TokenImport { team_id, token }) = input.map_err(|_| Error::Invalid)?;
     validate_team_id(&team_id)?;
-    tokio::spawn(async move { projects.accept_token(&team_id, attempt, token).await })
+    tokio::spawn(async move { projects.accept_token(&team_id, token).await })
         .await
         .map_err(|_| Error::Unavailable)??;
     Ok(StatusCode::NO_CONTENT)
@@ -298,111 +335,7 @@ async fn accept_token_import(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
-    id = "create-authorization",
-    method = "POST",
-    path = "/slack/oauth/authorizations",
-    summary = "创建 Slack 授权记录",
-    description = "创建 Slack 授权记录"
-)]
-async fn authorize(State(projects): Service, scope: Params<Scope>) -> Result<Response, Error> {
-    let (team_id, service) = scoped(&projects, scope).await?;
-    let (id, value) = service.begin_authorization().await?;
-    Ok(location(
-        StatusCode::CREATED,
-        format!("/slack/oauth/authorizations/{id}?team_id={team_id}"),
-        identified(value, &team_id),
-    ))
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
-    id = "authorization",
-    method = "GET",
-    path = "/slack/oauth/authorizations/{id}",
-    summary = "读取 Slack 授权记录",
-    description = "读取 Slack 授权记录"
-)]
-async fn authorization(
-    State(projects): Service,
-    path: Segment<Uuid>,
-    scope: Params<Scope>,
-) -> Result<Json<Value>, Error> {
-    let (team_id, service) = scoped(&projects, scope).await?;
-    service
-        .authorization(path.map_err(|_| Error::Invalid)?.0)
-        .await
-        .map(|value| Json(identified(value, &team_id)))
-}
-
-#[derive(Deserialize)]
-struct OAuthQuery {
-    state: String,
-    code: Option<String>,
-    error: Option<String>,
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
     mount_group = "slack-local",
-    id = "oauth-callback",
-    method = "GET",
-    path = "/slack/oauth/callback",
-    summary = "接收 Slack OAuth 浏览器回调",
-    description = "接收 Slack OAuth 浏览器回调"
-)]
-async fn callback(
-    State(service): Service,
-    headers: HeaderMap,
-    query: Params<OAuthQuery>,
-) -> Result<Response, Error> {
-    let query = query.map_err(|_| Error::OAuthState)?.0;
-    let host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(Error::OAuthState)?
-        .to_owned();
-    // 浏览器关闭后仍需完成已经收到的一次性 OAuth 回调。
-    tokio::spawn(async move {
-        service
-            .callback(&host, &query.state, query.code, query.error.is_some())
-            .await
-    })
-    .await
-    .map_err(|_| Error::Unavailable)??;
-    Ok((
-        StatusCode::SEE_OTHER,
-        [
-            (LOCATION, "/slack/oauth/result"),
-            (axum::http::header::REFERRER_POLICY, "no-referrer"),
-        ],
-    )
-        .into_response())
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
-    mount_group = "slack-local",
-    id = "oauth-result",
-    method = "GET",
-    path = "/slack/oauth/result",
-    summary = "显示 Slack 浏览器授权提示",
-    description = "显示 Slack 浏览器授权提示"
-)]
-async fn oauth_result() -> Html<&'static str> {
-    Html(
-        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>Slack 授权</title><p>请返回配置界面或 Slack 客户端查看授权结果。</p></html>",
-    )
-}
-
-#[loki_api(
-    module = "slack",
-    mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
     id = "disconnect",
     method = "DELETE",
     path = "/slack/session",
@@ -415,14 +348,14 @@ async fn disconnect(
     scope: Params<Scope>,
 ) -> Result<StatusCode, Error> {
     let (_, service) = scoped(&projects, scope).await?;
-    service.disconnect(session(&headers)?).await?;
+    service.disconnect(session_header(&headers)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "conversations",
     method = "GET",
     path = "/slack/conversations",
@@ -443,7 +376,7 @@ async fn conversations(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "users",
     method = "GET",
     path = "/slack/users",
@@ -460,7 +393,7 @@ async fn users(State(projects): Service, query: Params<MessagePage>) -> Result<J
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "timeline",
     method = "GET",
     path = "/slack/conversations/{id}/messages",
@@ -476,7 +409,7 @@ async fn timeline(
     let page = query.map_err(|_| Error::Invalid)?.0.into();
     let (team_id, id, service) = conversation(&projects, id.map_err(|_| Error::Invalid)?.0).await?;
     service
-        .messages(session(&headers)?, id, None, page)
+        .messages(session(&headers, &service).await?, id, None, page)
         .await
         .map(|value| Json(messages_result(value, &team_id)))
 }
@@ -484,7 +417,7 @@ async fn timeline(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "thread",
     method = "GET",
     path = "/slack/conversations/{id}/threads/{thread_ts}/messages",
@@ -501,7 +434,7 @@ async fn thread(
     let (team_id, id, service) = conversation(&projects, id).await?;
     let page = query.map_err(|_| Error::Invalid)?.0.into();
     service
-        .messages(session(&headers)?, id, Some(thread), page)
+        .messages(session(&headers, &service).await?, id, Some(thread), page)
         .await
         .map(|value| Json(messages_result(value, &team_id)))
 }
@@ -515,7 +448,7 @@ struct ReadPosition {
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "read-timeline",
     method = "PUT",
     path = "/slack/conversations/{id}/read-position",
@@ -531,7 +464,7 @@ async fn read_timeline(
     let (team_id, id, service) = conversation(&projects, id.map_err(|_| Error::Invalid)?.0).await?;
     service
         .mark_read(
-            session(&headers)?,
+            session(&headers, &service).await?,
             id,
             None,
             input.map_err(|_| Error::Invalid)?.0.through_ts,
@@ -543,7 +476,7 @@ async fn read_timeline(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "read-thread",
     method = "PUT",
     path = "/slack/conversations/{id}/threads/{thread_ts}/read-position",
@@ -560,7 +493,7 @@ async fn read_thread(
     let (team_id, id, service) = conversation(&projects, id).await?;
     service
         .mark_read(
-            session(&headers)?,
+            session(&headers, &service).await?,
             id,
             Some(thread),
             input.map_err(|_| Error::Invalid)?.0.through_ts,
@@ -586,7 +519,7 @@ async fn submit(
     let key = header_uuid(&headers, "idempotency-key")?;
     let (pending, value) = service
         .enqueue(
-            session(&headers)?,
+            session(&headers, &service).await?,
             id,
             thread,
             key,
@@ -608,7 +541,7 @@ async fn submit(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "send-message",
     method = "POST",
     path = "/slack/conversations/{id}/messages",
@@ -628,7 +561,7 @@ async fn send_message(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "send-reply",
     method = "POST",
     path = "/slack/conversations/{id}/threads/{thread_ts}/messages",
@@ -649,7 +582,7 @@ async fn send_reply(
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
-    mount_group = "slack-authenticated",
+    mount_group = "slack-local",
     id = "send-record",
     method = "GET",
     path = "/slack/send-requests/{request_id}",
@@ -664,7 +597,10 @@ async fn send_record(
 ) -> Result<Json<Value>, Error> {
     let (team_id, service) = scoped(&projects, scope).await?;
     service
-        .send_record(session(&headers)?, path.map_err(|_| Error::Invalid)?.0)
+        .send_record(
+            session(&headers, &service).await?,
+            path.map_err(|_| Error::Invalid)?.0,
+        )
         .await
         .map(|value| Json(conversation_result(value, &team_id)))
 }

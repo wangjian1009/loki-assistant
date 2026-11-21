@@ -6,7 +6,6 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use tokio::{
     sync::{Mutex, Notify, RwLock, oneshot},
     task::JoinHandle,
@@ -32,15 +31,21 @@ use super::{
     routes,
     service::SlackService,
     status::ProjectsStatus,
-    store::{Keychain, LoginKeychain, local_token},
+    store::{Keychain, LoginKeychain},
 };
 
 pub(super) type BrowserFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
+pub(super) enum RegistrationStatus {
+    NeedsCredentials,
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
 pub(super) struct Backend {
     pub path: Option<PathBuf>,
     pub api: String,
-    pub client_id: Option<&'static str>,
     pub keychain: Arc<dyn Fn(String) -> Arc<dyn Keychain> + Send + Sync>,
     pub passwords: Option<Arc<PasswordService>>,
     pub open_browser: Arc<dyn Fn(String) -> BrowserFuture + Send + Sync>,
@@ -125,7 +130,7 @@ impl Drop for Project {
 }
 
 struct TeamDraft {
-    attempt: Uuid,
+    generation: Uuid,
     record: Option<Value>,
     processing: bool,
     config: std::sync::Weak<ConfigService>,
@@ -141,7 +146,6 @@ pub struct Projects {
     reconcile: Mutex<()>,
     drafts: Mutex<BTreeMap<String, TeamDraft>>,
     port: std::sync::OnceLock<u16>,
-    local_token: std::sync::OnceLock<String>,
     backend: Backend,
     shutdown: Notify,
 }
@@ -168,16 +172,6 @@ impl Projects {
             Backend {
                 path: ServicePfile::path().ok(),
                 api: "https://slack.com/api".into(),
-                client_id: super::APP_CLIENT_ID.filter(|id| {
-                    id.split_once('.').is_some_and(|(app, workspace)| {
-                        !app.is_empty()
-                            && !workspace.is_empty()
-                            && app
-                                .bytes()
-                                .chain(workspace.bytes())
-                                .all(|byte| byte.is_ascii_digit())
-                    }) && id.len() <= 80
-                }),
                 keychain: Arc::new(|account| Arc::new(LoginKeychain(account))),
                 passwords: Some(passwords),
                 open_browser: Arc::new(|url| {
@@ -192,7 +186,7 @@ impl Projects {
                         if status.is_some_and(|status| status.success()) {
                             Ok(())
                         } else {
-                            Err("无法打开 Slack 令牌导入页面。".into())
+                            Err("无法在浏览器中打开 Slack 页面。".into())
                         }
                     })
                 }),
@@ -214,7 +208,6 @@ impl Projects {
             reconcile: Mutex::default(),
             drafts: Mutex::default(),
             port: std::sync::OnceLock::new(),
-            local_token: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
         }
@@ -226,12 +219,6 @@ impl Projects {
 
     pub async fn run(self: Arc<Self>, port: u16) {
         let _ = self.port.set(port);
-        if let Some(path) = &self.backend.path {
-            let path = path.with_file_name("slack-api-token");
-            if let Ok(Ok(token)) = tokio::task::spawn_blocking(move || local_token(&path)).await {
-                let _ = self.local_token.set(token);
-            }
-        }
         let _ = self.sync_projects().await;
         self.shutdown.notified().await;
     }
@@ -246,15 +233,6 @@ impl Projects {
         }
         projects.clear();
         self.shutdown.notify_one();
-    }
-
-    pub(super) fn verify_local(&self, token: Option<&str>) -> Result<(), Error> {
-        let expected = self.local_token.get().ok_or(Error::Storage)?;
-        if token.is_some_and(|token| bool::from(token.as_bytes().ct_eq(expected.as_bytes()))) {
-            Ok(())
-        } else {
-            Err(Error::LocalAuth)
-        }
     }
 
     pub(super) async fn service(&self, team_id: &str) -> Result<Arc<SlackService>, Error> {
@@ -423,32 +401,12 @@ impl Projects {
         )
     }
 
-    pub(super) async fn callback(
-        &self,
-        host: &str,
-        state: &str,
-        code: Option<String>,
-        denied: bool,
-    ) -> Result<(), Error> {
-        let (team_id, _) = state.split_once('.').ok_or(Error::OAuthState)?;
-        self.service(team_id)
-            .await
-            .map_err(|_| Error::OAuthState)?
-            .callback(host, state, code, denied)
-            .await
-    }
-
-    pub(super) async fn accept_token(
-        &self,
-        team_id: &str,
-        attempt: Uuid,
-        token: String,
-    ) -> Result<(), Error> {
+    pub(super) async fn accept_token(&self, team_id: &str, token: String) -> Result<(), Error> {
         let (service, config, record) = {
             let mut drafts = self.drafts.lock().await;
             let draft = drafts
                 .get_mut(team_id)
-                .filter(|draft| draft.attempt == attempt && !draft.processing)
+                .filter(|draft| !draft.processing)
                 .ok_or(Error::ImportExpired)?;
             draft.processing = true;
             (
@@ -504,7 +462,7 @@ impl Projects {
             .copied()
             .ok_or(ConfigServiceError::ActionNotFound)?;
         let (sender, mut receiver) = oneshot::channel();
-        let attempt = Uuid::new_v4();
+        let generation = Uuid::new_v4();
         {
             let mut drafts = self.drafts.lock().await;
             if drafts.contains_key(team_id) {
@@ -513,7 +471,7 @@ impl Projects {
             drafts.insert(
                 team_id.into(),
                 TeamDraft {
-                    attempt,
+                    generation,
                     record,
                     processing: false,
                     config,
@@ -522,7 +480,7 @@ impl Projects {
                 },
             );
         }
-        let url = format!("http://127.0.0.1:{port}/slack/token-import?team={team_id}#{attempt}");
+        let url = format!("http://127.0.0.1:{port}/slack/token-import?team={team_id}");
         let failure = match (self.backend.open_browser)(url).await {
             Ok(()) => match tokio::time::timeout(Duration::from_secs(600), &mut receiver).await {
                 Ok(result) => return result.map_err(|_| ConfigServiceError::ActionNotFound)?,
@@ -533,7 +491,7 @@ impl Projects {
         let mut drafts = self.drafts.lock().await;
         if drafts
             .get(team_id)
-            .is_some_and(|draft| draft.attempt == attempt && !draft.processing)
+            .is_some_and(|draft| draft.generation == generation && !draft.processing)
         {
             drafts.remove(team_id);
             return Err(Self::rejected("teams", failure));
@@ -561,13 +519,19 @@ impl Projects {
         )
     }
 
-    pub(super) async fn registration_status(&self, id: Uuid, team: &str) -> &'static str {
+    pub(super) async fn open_team_setup(&self, team: &str) -> Result<(), String> {
+        let port = self.port.get().ok_or("Slack 模块尚未启动。")?;
+        (self.backend.open_browser)(format!("http://127.0.0.1:{port}/slack/team-setup/{team}"))
+            .await
+    }
+
+    pub(super) async fn registration_status(&self, id: Uuid, team: &str) -> RegistrationStatus {
         if self
             .config
             .notification_password_already_confirmed(id, "slack", "teams", team, "token")
             .await
         {
-            return "confirmed";
+            return RegistrationStatus::Confirmed;
         }
         let secret = match self
             .config
@@ -575,11 +539,11 @@ impl Projects {
             .await
         {
             Ok(secret) => secret,
-            Err(ConfigServiceError::ActionNotFound) => return "processing",
-            Err(_) => return "failed",
+            Err(ConfigServiceError::ActionNotFound) => return RegistrationStatus::NeedsCredentials,
+            Err(_) => return RegistrationStatus::Rejected,
         };
         let Ok(session) = super::client::WebSession::parse(&secret) else {
-            return "failed";
+            return RegistrationStatus::Rejected;
         };
         match super::client::SlackClient::new(&self.backend.api)
             .web_call("auth.test", &session, &[], None)
@@ -590,18 +554,18 @@ impl Projects {
                     && identity["user_id"].as_str().is_some()
                     && identity["bot_id"].as_str().is_none() =>
             {
-                "confirmed"
+                RegistrationStatus::Confirmed
             }
-            Err(Error::Unavailable | Error::RateLimited(_)) => "processing",
-            _ => "failed",
+            Err(Error::Unavailable | Error::RateLimited(_)) => RegistrationStatus::Pending,
+            _ => RegistrationStatus::Rejected,
         }
     }
 
     pub(super) async fn sync_projects(&self) -> Result<(), String> {
         let _sync = self.reconcile.lock().await;
-        let Some(port) = self.port.get().copied() else {
+        if self.port.get().is_none() {
             return Ok(());
-        };
+        }
         let configured = self.config.value("slack", "teams").await.ok();
         let settings = configured
             .as_ref()
@@ -638,7 +602,7 @@ impl Projects {
             ));
             self.status
                 .register(&id, generation, service.public_status().await);
-            let worker = tokio::spawn(Arc::clone(&service).run(port));
+            let worker = tokio::spawn(Arc::clone(&service).run());
             projects.insert(
                 id,
                 Project {
@@ -702,12 +666,5 @@ impl ConfigChangeHandler for Projects {
 
     fn committed(&self, _change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async { self.sync_projects().await })
-    }
-
-    fn authorize_secret<'a>(&'a self, bearer: Option<&'a str>) -> ChangeFuture<'a> {
-        Box::pin(async move {
-            self.verify_local(bearer)
-                .map_err(|_| "需要有效的本机凭据。".into())
-        })
     }
 }

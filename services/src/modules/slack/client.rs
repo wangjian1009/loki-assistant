@@ -79,11 +79,6 @@ impl SlackClient {
             .await
     }
 
-    pub async fn oauth(&self, params: &[(&str, &str)]) -> Result<Value, Error> {
-        self.call("oauth.v2.access", Method::POST, None, params, None, None)
-            .await
-    }
-
     pub async fn test_identity(&self, token: &str) -> Result<Value, Error> {
         self.call("auth.test", Method::POST, Some(token), &[], None, None)
             .await
@@ -169,13 +164,8 @@ impl SlackClient {
                 Error::Permission
             }
             Some(
-                "invalid_auth"
-                | "token_expired"
-                | "token_revoked"
-                | "account_inactive"
-                | "not_authed"
-                | "invalid_refresh_token"
-                | "invalid_grant",
+                "invalid_auth" | "token_expired" | "token_revoked" | "account_inactive"
+                | "not_authed",
             ) => Error::Authorization,
             Some("channel_not_found") => Error::Conversation,
             Some("thread_not_found") => Error::Thread,

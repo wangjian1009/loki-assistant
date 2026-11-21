@@ -1797,7 +1797,6 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.21",
- "time",
  "tokio",
  "tokio-tungstenite",
  "tower",

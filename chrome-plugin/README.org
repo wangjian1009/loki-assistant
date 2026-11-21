@@ -75,4 +75,4 @@ npm test
 
 * 导入 Slack 用户令牌
 
-新工作区通过 Loki Assistant 配置模块注册。Chrome 插件的令牌导入入口用于旧导入页。 [[file:../docs/slack-development.org][Slack 接入开发过程]]
+新工作区通过 Loki Assistant 配置模块注册。Chrome 插件在旧版导入页按 Team ID 提交用户令牌，services 只处理正在导入的工作区。 [[file:../docs/slack-development.org][Slack 接入开发过程]]

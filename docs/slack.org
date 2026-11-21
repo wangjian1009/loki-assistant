@@ -10,24 +10,28 @@
 
 下表为网页会话接入所需的 ~SlackTeam~ 字段。
 
-| 字段      | 配置类型   | 用途 |
-|-----------+------------+------|
+| 字段      | 配置类型   | 用途                                                                                   |
+|-----------+------------+----------------------------------------------------------------------------------------|
 | ~team_id~ | ~Key~      | 必填且不可变的主键，从 Slack 网页的 ~/client/~ 路径取得，格式为 ~^T[A-Z0-9]{1,47}$~ 。 |
-| ~name~    | ~string~   | 可选，本地显示名称，最多 80 个字符。默认显示 Team ID。 |
-| ~token~   | ~Password~ | 后续补充，包含同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie。 |
+| ~name~    | ~string~   | 可选，本地显示名称，最多 80 个字符。默认显示 Team ID。                                 |
+| ~token~   | ~Password~ | 后续补充，包含同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie。                               |
 
 新增使用 ~PUT /data/slack/teams/{team_id}~ 和 ~If-None-Match: *~ ，请求体为空 JSON 对象。待确认记录可用同一路径的 ~PATCH~ 补充网页会话凭据，或发空请求体的 ~PUT~ 手动重试。删除使用 ~DELETE /data/slack/teams/{team_id}~ ，由配置模块发送 ~DELETE~ 通知，确认后移除记录。
 
+缺少凭据时，在配置界面点击「重试」，配置模块将同一变更重新发送到 ~POST /slack/config/teams/{team_id}~ 。Slack 模块用默认浏览器打开本机配置指引 ~/slack/team-setup/{team_id}~ ，并返回 ~202~ 。指引提供目标 Slack 工作区入口和凭据填写示例。回到配置界面补齐凭据后，Slack 模块调用 ~auth.test~ 校验，配置模块在校验成功后确认记录。
+
 * services RESTful 接口
+
+Slack 业务接口和工作区配置只接受本机调用，客户端可直接发起请求。按会话或工作区操作时，services 使用当前会话。客户端也可用 ~X-Loki-Slack-Session~ 携带响应中的 ~session_id~ ，以便会话变更时收到冲突错误。
 
 | 方法 | 路径                                                          | 请求与结果                                                                                                                     |
 |------+---------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------|
 | GET  | ~/status/slack/connections~                                   | 从通用状态中心读取 ~authorization_state~、~socket_state~ 和 ~session_id~                                                       |
-| GET  | ~/slack/conversations~                                        | Bearer 取自 ~~/.assistant/slack-api-token~ 。筛选参数为 ~team_id~ 、~kind~ 和 ~unread~ 。分页参数为 ~limit~ 和 ~cursor~ 。~limit~ 默认 50，范围 1–100。返回 ~id~ 、~session_id~ 和 ~next_cursor~ 。会话 ~id~ 格式为 ~team_id.聊天ID~ 。 |
-| GET  | ~/slack/conversations/{id}/messages~                          | Bearer，~X-Loki-Slack-Session~ 取会话的 ~session_id~ 。支持 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。 |
-| GET  | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | Bearer 和 ~X-Loki-Slack-Session~ 。~thread_ts~ 取根消息的 ~ts~ 。返回 ~root~ 、分页回复 ~items~ 和 ~next_cursor~ 。 |
-| POST | ~/slack/conversations/{id}/messages~                          | Bearer 和会话头。用 ~Idempotency-Key~（UUID）及 ~text~ 发送顶层消息，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
-| POST | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | Bearer 和会话头。用 ~Idempotency-Key~（UUID）及 ~text~ 发送线程回复，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
-| PUT  | ~/slack/conversations/{id}/read-position~                     | Bearer 和会话头。用 ~through_ts~ 推进顶层聊天的本机已读位置                                                                    |
-| PUT  | ~/slack/conversations/{id}/threads/{thread_ts}/read-position~ | Bearer 和会话头。用 ~through_ts~ 推进线程的本机已读位置                                                                        |
-| GET  | ~/slack/send-requests/{request_id}~                           | Bearer 和会话头。查询参数 ~team_id~ 必填，返回 ~pending~、~sent~、~failed~ 或 ~unknown~                                        |
+| GET  | ~/slack/conversations~                                        | 筛选参数为 ~team_id~ 、~kind~ 和 ~unread~ 。分页参数为 ~limit~ 和 ~cursor~ 。~limit~ 默认 50，范围 1–100。返回 ~id~ 、~session_id~ 和 ~next_cursor~ 。会话 ~id~ 格式为 ~team_id.聊天ID~ 。 |
+| GET  | ~/slack/conversations/{id}/messages~                          | 支持 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。 |
+| GET  | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | ~thread_ts~ 取根消息的 ~ts~ 。返回 ~root~ 、分页回复 ~items~ 和 ~next_cursor~ 。 |
+| POST | ~/slack/conversations/{id}/messages~                          | 用 ~Idempotency-Key~（UUID）及 ~text~ 发送顶层消息，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
+| POST | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | 用 ~Idempotency-Key~（UUID）及 ~text~ 发送线程回复，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
+| PUT  | ~/slack/conversations/{id}/read-position~                     | 用 ~through_ts~ 推进顶层聊天的本机已读位置                                                                    |
+| PUT  | ~/slack/conversations/{id}/threads/{thread_ts}/read-position~ | 用 ~through_ts~ 推进线程的本机已读位置                                                                        |
+| GET  | ~/slack/send-requests/{request_id}~                           | 查询参数 ~team_id~ 必填，返回 ~pending~、~sent~、~failed~ 或 ~unknown~                                        |

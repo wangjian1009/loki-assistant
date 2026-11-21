@@ -13,11 +13,7 @@ use crate::http::error::{ErrorSource, response};
 pub(super) enum Error {
     Invalid,
     Cursor,
-    OAuthState,
-    AuthorizationTimeout,
-    LocalAuth,
     Permission,
-    AuthorizationRecord,
     Conversation,
     Project,
     TeamMismatch,
@@ -25,7 +21,6 @@ pub(super) enum Error {
     SendRecord,
     Authorization,
     Configuration,
-    AppClientId,
     Session,
     Conflict,
     ReadPosition,
@@ -51,25 +46,7 @@ impl Error {
                 "slack-invalid-cursor",
                 "分页游标已失效，请刷新第一页。",
             ),
-            Self::AuthorizationTimeout => {
-                (408, "slack-authorization-timeout", "等待 Slack 授权超时。")
-            }
-            Self::OAuthState => (
-                400,
-                "slack-oauth-invalid-state",
-                "Slack 授权已过期或失效，请重新发起。",
-            ),
-            Self::LocalAuth => (
-                401,
-                "slack-local-auth-required",
-                "需要有效的 Slack 本机访问凭据。",
-            ),
             Self::Permission => (403, "slack-permission-denied", "Slack 应用缺少所需权限。"),
-            Self::AuthorizationRecord => (
-                404,
-                "slack-authorization-not-found",
-                "找不到 Slack 授权记录。",
-            ),
             Self::Conversation => (404, "slack-conversation-not-found", "找不到 Slack 会话。"),
             Self::Project => (404, "slack-project-not-found", "请选择有效的 Slack 项目。"),
             Self::TeamMismatch => (
@@ -85,11 +62,6 @@ impl Error {
             ),
             Self::Method => (405, "method-not-allowed", "此 Slack 接口不支持该方法。"),
             Self::Authorization => (409, "slack-authorization-required", "请先授权 Slack。"),
-            Self::AppClientId => (
-                503,
-                "slack-app-unavailable",
-                "当前 services 构建缺少 Slack 应用 Client ID。",
-            ),
             Self::Configuration => (409, "slack-not-configured", "请配置工作区及其应用令牌。"),
             Self::Session => (
                 409,
@@ -149,7 +121,7 @@ impl Error {
 
     fn source(self) -> ErrorSource {
         match self {
-            Self::Invalid | Self::LocalAuth | Self::Method | Self::Storage => ErrorSource::Services,
+            Self::Invalid | Self::Method | Self::Storage => ErrorSource::Services,
             _ => ErrorSource::Business,
         }
     }

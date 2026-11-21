@@ -26,19 +26,12 @@
 
 (cl-defun loki-assistant-slack--request (method path callback &key room params body key)
   "通过 services 发起 Slack 请求。"
-  (let ((token (condition-case err (loki-assistant--module-api-token "slack")
-                 (error
-                  (funcall callback (loki-assistant--failure "slack-credentials-unavailable"
-                                                            (error-message-string err)))
-                  nil))))
-    (when token
-      (loki-assistant-request
-       method path :params params :body body :timeout 20
-       :headers (append (list (cons "Authorization" (concat "Bearer " token)))
-                        (when room
-                          (list (cons "X-Loki-Slack-Session" (alist-get 'session_id room))))
-                        (when key (list (cons "Idempotency-Key" key))))
-       :callback callback))))
+  (loki-assistant-request
+   method path :params params :body body :timeout 20
+   :headers (append (when-let ((session (alist-get 'session_id room)))
+                      (list (cons "X-Loki-Slack-Session" session)))
+                    (when key (list (cons "Idempotency-Key" key))))
+   :callback callback))
 
 (defun loki-assistant-slack--path (room thread)
   "构造 ROOM 的消息路径。THREAD 非空时指向回复。"
