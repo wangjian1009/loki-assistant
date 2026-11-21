@@ -193,6 +193,10 @@ impl SlackService {
     pub(super) async fn initialize(&self) -> Result<(), Error> {
         let keychain = Arc::clone(&self.keychain);
         let cache_path = self.cache_path.clone();
+        let has_imported_password = self
+            .project
+            .as_ref()
+            .is_none_or(|(_, settings, _, _)| settings.token.is_some());
         let mut state = Arc::clone(&self.state).lock_owned().await;
         tokio::task::spawn_blocking(move || {
             if state.initialized && !state.credentials_locked {
@@ -211,7 +215,15 @@ impl SlackService {
                 state.initialized = true;
             }
             match keychain.load() {
-                Ok(secrets) => {
+                Ok(mut secrets) => {
+                    if !has_imported_password
+                        && secrets
+                            .account
+                            .as_ref()
+                            .is_some_and(|account| account.imported_token_hash.is_some())
+                    {
+                        secrets.account = None;
+                    }
                     state.credentials_locked = false;
                     let session = secrets
                         .account

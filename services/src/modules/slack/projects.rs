@@ -562,6 +562,13 @@ impl Projects {
     }
 
     pub(super) async fn registration_status(&self, id: Uuid, team: &str) -> &'static str {
+        if self
+            .config
+            .notification_password_already_confirmed(id, "slack", "teams", team, "token")
+            .await
+        {
+            return "confirmed";
+        }
         let secret = match self
             .config
             .notification_password(id, "slack", "teams", team, "token")

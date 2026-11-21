@@ -1141,13 +1141,15 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(created["status"], "pending");
     assert_eq!(created["value"], json!({"team_id":"TWEB"}));
-    config_module.service().poll_notifications().await;
+    let (status, _, retry) = invoke(&app, "PUT", team_path, auth, None, None, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(retry["status"], "pending");
     let (_, _, pending) = invoke(&app, "GET", "/data/slack/teams", None, None, None, None).await;
     assert_eq!(pending["pending"][0]["key"], "TWEB");
     assert!(!pending["value"].to_string().contains("TWEB"));
     let (status, _, staged) = invoke(
         &app,
-        "PUT",
+        "PATCH",
         team_path,
         auth,
         None,
@@ -1155,9 +1157,8 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         Some(json!({"token":{"token":"xoxc-TWEB","d_cookie":"test-web-cookie"}})),
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(status, StatusCode::OK);
     assert!(!staged.to_string().contains("xoxc-"));
-    config_module.service().poll_notifications().await;
     let (_, _, confirmed) = invoke(&app, "GET", "/data/slack/teams", None, None, None, None).await;
     assert!(confirmed["pending"].is_null());
     assert!(confirmed["value"].to_string().contains("TWEB"));
@@ -1169,13 +1170,34 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .unwrap();
     let password_path = web_entry["token"].as_str().unwrap();
     assert!(directory.0.join(password_path).exists());
+    for (patch, expected_name) in [
+        (json!({"name":"网页工作区"}), json!("网页工作区")),
+        (json!({"name":null}), Value::Null),
+    ] {
+        let (status, _, response) =
+            invoke(&app, "PATCH", team_path, auth, None, None, Some(patch)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["value"]["name"], expected_name);
+        assert_eq!(response["value"]["token"], password_path);
+    }
+    let (status, _, _) = invoke(
+        &app,
+        "PATCH",
+        team_path,
+        auth,
+        None,
+        None,
+        Some(json!({"team_id":"TWEB"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     for (token, expected) in [
         ("xoxc-TWRONG", "xoxc-TWEB"),
         ("xoxc-TWEB-renewed", "xoxc-TWEB-renewed"),
     ] {
         let (status, _, staged) = invoke(
             &app,
-            "PUT",
+            "PATCH",
             team_path,
             auth,
             None,
@@ -1183,9 +1205,15 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             Some(json!({"token":{"token":token,"d_cookie":"test-web-cookie"}})),
         )
         .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            status,
+            if token == expected {
+                StatusCode::OK
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        );
         assert!(!staged.to_string().contains("xoxc-"));
-        config_module.service().poll_notifications().await;
         let saved = base
             .read_record_password("slack", "teams", "TWEB", "token")
             .await

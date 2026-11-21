@@ -16,7 +16,7 @@
 | ~name~    | ~string~   | 可选，本地显示名称，最多 80 个字符。默认显示 Team ID。 |
 | ~token~   | ~Password~ | 后续补充，包含同一网页会话的 ~xoxc-~ 令牌和 ~d~ Cookie。 |
 
-新增使用 ~PUT /data/slack/teams/{team_id}~ 和 ~If-None-Match: *~ ，请求体为空 JSON 对象。待确认记录通过同一路径补充网页会话凭据。删除使用 ~DELETE /data/slack/teams/{team_id}~ ，由配置模块发送 ~DELETE~ 通知，确认后移除记录。
+新增使用 ~PUT /data/slack/teams/{team_id}~ 和 ~If-None-Match: *~ ，请求体为空 JSON 对象。待确认记录可用同一路径的 ~PATCH~ 补充网页会话凭据，或发空请求体的 ~PUT~ 手动重试。删除使用 ~DELETE /data/slack/teams/{team_id}~ ，由配置模块发送 ~DELETE~ 通知，确认后移除记录。
 
 * services RESTful 接口
 

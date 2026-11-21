@@ -19,7 +19,8 @@
 
 (cl-defstruct (loki-assistant-config--entry
                (:constructor loki-assistant-config--entry-create))
-  module item value source field baseline status busy error result started-at buttons uncertain)
+  module item value source field baseline status busy error result started-at buttons uncertain
+  pending retry-point retry-button)
 
 (defvar-local loki-assistant-config--entries nil)
 (defvar-local loki-assistant-config--generation nil)
@@ -114,6 +115,9 @@
      ((equal (loki-assistant-config--entry-source entry) "user")
       (setq text "用户设置，已保存"))
      (t (setq text "未设置")))
+    (when (and (loki-assistant-config--entry-pending entry)
+               (not (loki-assistant-config--entry-busy entry)))
+      (setq text (concat "待确认 · " text)))
     (loki-assistant-config--set-widget-text
      (loki-assistant-config--entry-status entry) text face)))
 
@@ -205,7 +209,8 @@
          (value (if stored (alist-get 'value stored) :null))
          (type (alist-get 'data_type item))
          (entry (loki-assistant-config--entry-create
-                 :module module :item item :value value :source (alist-get 'source stored)))
+                 :module module :item item :value value :source (alist-get 'source stored)
+                 :pending (not (seq-empty-p (alist-get 'pending stored)))))
          (initial (loki-assistant-config--display-value item value)))
     (widget-insert (propertize (concat (alist-get 'name item) ": ") 'face 'bold))
     (setf (loki-assistant-config--entry-field entry)
@@ -241,12 +246,14 @@
       (push button (loki-assistant-config--entry-buttons entry)))
     (setf (loki-assistant-config--entry-status entry)
           (widget-create 'item :format "%v" "未设置"))
+    (setf (loki-assistant-config--entry-retry-point entry) (copy-marker (point)))
     (widget-insert "\n")
     (let ((description (alist-get 'description item)))
       (unless (or (null description) (string-empty-p description))
         (widget-insert (concat "    " description "\n"))))
     (widget-insert "\n")
     (push entry loki-assistant-config--entries)
+    (loki-assistant-config--entry-sync-retry entry)
     (loki-assistant-config--status entry)))
 
 (defun loki-assistant-config--choose-file (entry)
@@ -381,8 +388,9 @@
                                              values))
                         (error "%s" (loki-assistant-config--error response)))
                       (dolist (entry (alist-get 'pending body))
-                        (when-let ((value (assq (car entry) values)))
-                          (push (cons 'pending (cdr entry)) (cdr value))))
+                        (unless (assq (car entry) values)
+                          (push (list (car entry) (cons 'value :null)) values))
+                        (push (cons 'pending (cdr entry)) (cdr (assq (car entry) values))))
                       (push (cons id values) data)
                       (when (zerop (cl-decf pending))
                         (setq loki-assistant-config--loading nil)
@@ -501,6 +509,8 @@
                     (t
                      (setf (loki-assistant-config--entry-value entry) (alist-get 'value stored)
                            (loki-assistant-config--entry-source entry) (alist-get 'source stored)
+                           (loki-assistant-config--entry-pending entry)
+                           (equal (alist-get 'status stored) "pending")
                            (loki-assistant-config--entry-baseline entry)
                            (loki-assistant-config--display-value
                             (loki-assistant-config--entry-item entry) (alist-get 'value stored)))
@@ -508,12 +518,15 @@
                      (when (equal snapshot (widget-value (loki-assistant-config--entry-field entry)))
                        (widget-value-set (loki-assistant-config--entry-field entry)
                                          (loki-assistant-config--entry-baseline entry)))
-                     (finish t (if (loki-assistant-config--dirty-p entry)
-                                   "提交值已保存；仍有新的编辑尚未保存。"
-                                 "保存成功。")))))))))))
+                     (loki-assistant-config--entry-sync-retry entry)
+                     (finish t (cond ((loki-assistant-config--entry-pending entry) "提交已受理")
+                                     ((loki-assistant-config--dirty-p entry)
+                                      "提交值已保存；仍有新的编辑尚未保存。")
+                                     (t "保存成功。"))))))))))))
       (condition-case err
           (let ((value (loki-assistant-config--value entry)))
-            (when secret
+            (when (or secret (eq (alist-get 'requires_local_auth
+                                          (loki-assistant-config--entry-item entry)) t))
               (setq headers (list (cons "Authorization"
                                         (concat "Bearer " (loki-assistant--module-api-token module))))))
             (loki-assistant-config--begin entry 'validating)
@@ -592,12 +605,90 @@
       (loki-assistant-config--load))
     buffer))
 
+(defun loki-assistant-config--retry (path data-path headers timeout callback)
+  "向 PATH 发送空 PUT，再读取 DATA-PATH 的最新配置。"
+  (loki-assistant-request
+   "PUT" path :headers headers :timeout timeout
+   :callback
+   (lambda (result)
+     (loki-assistant-request "GET" data-path
+                             :callback (lambda (data) (funcall callback result data))))))
+
+(defun loki-assistant-config--retry-message (result)
+  "从 RESULT 生成重试结果。"
+  (cond ((not (plist-get result :ok)) (loki-assistant-config--error result))
+        ((equal (alist-get 'status (plist-get result :data)) "pending") "仍待确认")
+        (t "已确认")))
+
+(defun loki-assistant-config--entry-sync-retry (entry)
+  "按 ENTRY 的待确认状态更新重试按钮。"
+  (let ((button (loki-assistant-config--entry-retry-button entry))
+        (inhibit-read-only t))
+    (cond
+     ((and (loki-assistant-config--entry-pending entry) (not button))
+      (save-excursion
+        (goto-char (loki-assistant-config--entry-retry-point entry))
+        (setq button (widget-create 'push-button :format " %[%v%]"
+                                    :notify (lambda (&rest _) (loki-assistant-config--entry-retry entry))
+                                    "重试"))
+        (push button (loki-assistant-config--entry-buttons entry))
+        (setf (loki-assistant-config--entry-retry-button entry) button)
+        (widget-setup)))
+     ((and button (not (loki-assistant-config--entry-pending entry)))
+      (widget-delete button)
+      (setf (loki-assistant-config--entry-buttons entry)
+            (delq button (loki-assistant-config--entry-buttons entry))
+            (loki-assistant-config--entry-retry-button entry) nil)))))
+
+(defun loki-assistant-config--entry-retry (entry)
+  "重新触发 ENTRY 的待确认变更。"
+  (let* ((buffer (current-buffer))
+         (generation loki-assistant-config--generation)
+         (module (loki-assistant-config--entry-module entry))
+         (item (loki-assistant-config--entry-item entry))
+         (path (concat "/data/" (url-hexify-string module) "/"
+                       (url-hexify-string (alist-get 'key item))))
+         (headers (when (eq (alist-get 'requires_local_auth item) t)
+                    (list (cons "Authorization" (concat "Bearer " (loki-assistant--module-api-token module))))))
+         (snapshot (widget-value (loki-assistant-config--entry-field entry)))
+         (dirty (loki-assistant-config--dirty-p entry)))
+    (when (or (loki-assistant-config--entry-busy entry) (not (loki-assistant-config--entry-pending entry)))
+      (user-error "此配置项当前无法重试"))
+    (loki-assistant-config--begin entry 'saving)
+    (loki-assistant-config--retry
+     path path headers loki-assistant-config-save-timeout
+     (lambda (result data)
+       (loki-assistant-config--with-current
+        buffer generation
+        (lambda ()
+          (setf (loki-assistant-config--entry-busy entry) nil
+                (loki-assistant-config--entry-started-at entry) nil
+                (loki-assistant-config--entry-error entry)
+                (unless (plist-get result :ok) (loki-assistant-config--retry-message result))
+                (loki-assistant-config--entry-result entry)
+                (when (plist-get result :ok) (loki-assistant-config--retry-message result)))
+          (when (or (plist-get data :ok) (equal (plist-get data :error-code) "config-not-set"))
+            (let* ((stored (plist-get data :data))
+                   (value (if (assq 'value stored) (alist-get 'value stored) :null))
+                   (baseline (loki-assistant-config--display-value item value)))
+              (setf (loki-assistant-config--entry-value entry) value
+                    (loki-assistant-config--entry-source entry) (alist-get 'source stored)
+                    (loki-assistant-config--entry-baseline entry) baseline
+                    (loki-assistant-config--entry-pending entry) (not (seq-empty-p (alist-get 'pending stored))))
+              (when (and (not dirty)
+                         (equal snapshot (widget-value (loki-assistant-config--entry-field entry))))
+                (widget-value-set (loki-assistant-config--entry-field entry) baseline))))
+          (loki-assistant-config--entry-sync-retry entry)
+          (loki-assistant-config--status entry)
+          (unless (loki-assistant-config--busy-p) (loki-assistant-config--stop-wait-timer))
+          (loki-assistant-config--sync-controls)))))))
+
 ;;; 结构化配置项
 
 (cl-defstruct (loki-assistant-config--record-section
                (:constructor loki-assistant-config--record-create))
   buffer module metadata start end widgets records
-  form form-id form-generation inputs saving notice)
+  form form-baseline form-id form-generation inputs saving notice)
 
 (defvar-local loki-assistant-config--record-sections nil)
 
@@ -689,6 +780,11 @@
         (when (or (alist-get 'single metadata) (alist-get 'id_field record-meta))
           (loki-assistant-config--record-button
            section "编辑" (lambda () (loki-assistant-config--record-edit section id))
+           (loki-assistant-config--record-section-saving section)))
+        (when (alist-get 'pending record)
+          (insert "  ")
+          (loki-assistant-config--record-button
+           section "重试" (lambda () (loki-assistant-config--record-retry section id))
            (loki-assistant-config--record-section-saving section)))
         (insert "\n\n")))))
 
@@ -792,6 +888,8 @@
                                           ((stringp value) value)
                                           (t (loki-assistant-config--json value)))))))
                     (append fields nil)))))
+  (setf (loki-assistant-config--record-section-form-baseline section)
+        (copy-tree (loki-assistant-config--record-section-form section)))
   (loki-assistant-config--record-render section))
 
 (defun loki-assistant-config--record-choose (section key options)
@@ -827,51 +925,85 @@
                                  (number-to-string index))
                              item)))))
 
+(defun loki-assistant-config--record-retry (section id)
+  "重新触发 SECTION 中 ID 对应的待确认变更。"
+  (let* ((key (alist-get 'key (loki-assistant-config--record-record-meta section)))
+         (path (loki-assistant-config--record-data-path section key (unless (string-empty-p id) id)))
+         (data-path (loki-assistant-config--record-data-path section key))
+         (headers (when (eq (alist-get 'requires_local_auth
+                                      (loki-assistant-config--record-section-metadata section)) t)
+                    (loki-assistant-config--record-header section))))
+    (when (loki-assistant-config--record-section-saving section)
+      (user-error "请等待当前请求完成"))
+    (setf (loki-assistant-config--record-section-saving section) t
+          (loki-assistant-config--record-section-notice section) "正在重试…")
+    (loki-assistant-config--record-render section)
+    (loki-assistant-config--retry
+     path data-path headers (loki-assistant-config--record-timeout section)
+     (lambda (result data)
+       (when (loki-assistant-config--record-alive-p section)
+         (setf (loki-assistant-config--record-section-saving section) nil
+               (loki-assistant-config--record-section-notice section)
+               (loki-assistant-config--retry-message result))
+         (when (or (plist-get data :ok) (equal (plist-get data :error-code) "config-not-set"))
+           (loki-assistant-config--record-set-data section (plist-get data :data)))
+         (loki-assistant-config--record-render section))))))
+
+(defun loki-assistant-config--record-input-value (field value)
+  "将 FIELD 的表单 VALUE 转换为 JSON 值。"
+  (if (member (alist-get 'data_type field)
+              '(nil "string" "key" "password_reference" "file_path" "executable"))
+      value
+    (condition-case nil
+        (json-parse-string value :object-type 'hash-table :false-object :false :null-object :null)
+      (error (user-error "%s 需要有效的 JSON 值" (alist-get 'label field))))))
+
 (defun loki-assistant-config--record-save (section)
   "保存 SECTION 当前编辑的单条记录。"
   (loki-assistant-config--record-remember-form section)
-  (let* ((record (loki-assistant-config--record-record-meta section))
-         (single (alist-get 'single (loki-assistant-config--record-section-metadata section)))
+  (let* ((meta (loki-assistant-config--record-section-metadata section))
+         (record (loki-assistant-config--record-record-meta section))
+         (single (alist-get 'single meta))
          (id-field (alist-get 'id_field record))
          (existing (loki-assistant-config--record-section-form-id section))
+         (baseline (loki-assistant-config--record-section-form-baseline section))
          (inputs (loki-assistant-config--record-section-form section))
          (body (make-hash-table :test #'equal))
          fields)
-    (dolist (field (seq-filter (lambda (field)
-                                (loki-assistant-config--record-allowed-field-p section field existing))
-                              (append (alist-get 'fields record) nil)))
+    (dolist (field (append (alist-get 'fields record) nil))
       (let* ((key (alist-get 'key field))
              (input (string-trim (or (cdr (assoc key inputs)) "")))
-             (value (or (and (equal key id-field) existing)
-                        (if (string-empty-p input)
-                            (loki-assistant-config--record-default
-                             (alist-get 'default_template field) fields)
-                          input))))
-        (when (and (eq (alist-get 'required field) t) (string-empty-p (or value "")))
-          (user-error "%s不能为空" (alist-get 'label field)))
-        (when value
-          (push (cons key value) fields)
-          (puthash key
-                   (if (member (alist-get 'data_type field)
-                               '(nil "string" "key" "password_reference" "file_path" "executable"))
-                       value
-                     (condition-case nil
-                         (json-parse-string value :object-type 'hash-table :false-object :false :null-object :null)
-                       (error (user-error "%s 需要有效的 JSON 值" (alist-get 'label field)))))
-                   body))))
-    (let* ((id (and (not single) (cdr (assoc id-field fields))))
+             (before (string-trim (or (cdr (assoc key baseline)) ""))))
+        (when (and (loki-assistant-config--record-allowed-field-p section field existing)
+                   (or (not existing)
+                       (and (not (equal key id-field)) (not (equal input before)))))
+          (let ((value (if (and (not existing) (string-empty-p input))
+                           (loki-assistant-config--record-default
+                            (alist-get 'default_template field) fields)
+                         input)))
+            (when (and (eq (alist-get 'required field) t) (string-empty-p (or value "")))
+              (user-error "%s不能为空" (alist-get 'label field)))
+            (when value
+              (push (cons key value) fields)
+              (puthash key (if (and existing (string-empty-p value)) :null
+                             (loki-assistant-config--record-input-value field value))
+                       body))))))
+    (when (and existing (zerop (hash-table-count body)))
+      (user-error "没有修改的字段"))
+    (let* ((id (and (not single) (or existing (cdr (assoc id-field fields)))))
            (append-item (and (not single) (not id)))
            (path (loki-assistant-config--record-data-path section (alist-get 'key record) id))
-           (headers (append (when (and id (not existing)) '(("If-None-Match" . "*")))
-                            (when (eq (alist-get 'requires_local_auth
-                                                 (loki-assistant-config--record-section-metadata section)) t)
-                              (loki-assistant-config--record-header section)))))
+           (headers (append
+                     (when existing '(("Content-Type" . "application/merge-patch+json")))
+                     (when (and id (not existing)) '(("If-None-Match" . "*")))
+                     (when (eq (alist-get 'requires_local_auth meta) t)
+                       (loki-assistant-config--record-header section)))))
       (when id (remhash id-field body))
       (setf (loki-assistant-config--record-section-saving section) t
             (loki-assistant-config--record-section-notice section) nil)
       (loki-assistant-config--record-render section)
       (loki-assistant-request
-       (if append-item "POST" "PUT") path
+       (cond (existing "PATCH") (append-item "POST") (t "PUT")) path
        :headers headers
        :timeout (loki-assistant-config--record-timeout section)
        :body (if append-item (vector body) body)
@@ -892,8 +1024,10 @@
                              (if (equal (alist-get 'status stored) "pending")
                                  (cons '(pending . t) value)
                                value))
-                     (setf (loki-assistant-config--record-section-records section)
-                           (loki-assistant-config--record-records value record single)))
+                     (let ((records (loki-assistant-config--record-records value record single)))
+                       (when (and single (equal (alist-get 'status stored) "pending"))
+                         (setf (alist-get "" records nil nil #'equal) (cons '(pending . t) value)))
+                       (setf (loki-assistant-config--record-section-records section) records)))
                    (loki-assistant-config--record-edit section nil t))
                (setf (loki-assistant-config--record-section-notice section)
                      (loki-assistant-config--error response))))
@@ -926,16 +1060,22 @@
             (save_timeout_seconds . ,(alist-get 'save_timeout_seconds item))
             (requires_local_auth . ,(alist-get 'requires_local_auth item))
             (create_fields . ,(alist-get 'create_fields item)))
-          (loki-assistant-config--record-section-records section)
-          (loki-assistant-config--record-records (alist-get 'value data) record single)
           (loki-assistant-config--record-section-start section) (copy-marker position)
           (loki-assistant-config--record-section-end section) (copy-marker position))
-    (dolist (pending (append (alist-get 'pending data) nil))
-      (when-let ((id (alist-get 'key pending))
-                 (value (alist-get 'value pending)))
-        (setf (alist-get id (loki-assistant-config--record-section-records section) nil nil #'equal)
-              (cons '(pending . t) value))))
+    (loki-assistant-config--record-set-data section data)
     (loki-assistant-config--record-render section)))
+
+(defun loki-assistant-config--record-set-data (section data)
+  "将 DATA 中的生效记录和待确认记录填入 SECTION。"
+  (let* ((meta (loki-assistant-config--record-section-metadata section))
+         (single (alist-get 'single meta))
+         (records (loki-assistant-config--record-records
+                   (alist-get 'value data) (alist-get 'record meta) single)))
+    (dolist (pending (append (alist-get 'pending data) nil))
+      (when-let ((id (if single "" (alist-get 'key pending)))
+                 (value (alist-get 'value pending)))
+        (setf (alist-get id records nil nil #'equal) (cons '(pending . t) value))))
+    (setf (loki-assistant-config--record-section-records section) records)))
 
 (provide 'loki-assistant-config)
 ;;; loki-assistant-config.el ends here

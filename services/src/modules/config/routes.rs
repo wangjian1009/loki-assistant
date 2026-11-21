@@ -7,10 +7,11 @@ use crate::{
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::{
         HeaderMap, StatusCode,
-        header::{AUTHORIZATION, IF_NONE_MATCH},
+        header::{AUTHORIZATION, CONTENT_TYPE, IF_NONE_MATCH},
     },
     response::{IntoResponse, Response},
 };
@@ -200,13 +201,17 @@ async fn put_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
     headers: HeaderMap,
-    Json(value): Json<Value>,
+    body: Bytes,
 ) -> Result<Response, Response> {
     check_access(&service, &headers, &module_id, &key, true).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if body.is_empty() {
+        return retry_config(&service, &module_id, &key, None).await;
+    }
+    let value = config_body(&headers, &body, false)?;
     if service.has_notification(&module_id, &key) {
         let (value, pending) = service
             .notify_write(module_id.clone(), key.clone(), None, Some(value), false)
@@ -368,7 +373,7 @@ async fn put_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
     headers: HeaderMap,
-    Json(value): Json<Value>,
+    body: Bytes,
 ) -> Result<Response, Response> {
     let create_only = match headers.get(IF_NONE_MATCH) {
         None => false,
@@ -384,6 +389,15 @@ async fn put_record(
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if body.is_empty() {
+        if create_only {
+            return Err(error_response(ConfigServiceError::InvalidValue(
+                "新增配置记录需要 JSON 请求体。".into(),
+            )));
+        }
+        return retry_config(&service, &module_id, &key, Some(&instance)).await;
+    }
+    let value = config_body(&headers, &body, false)?;
     if service.has_notification(&module_id, &key) && service.notifications_attached() {
         let (value, pending) = service
             .notify_write(
@@ -474,6 +488,151 @@ async fn delete_record(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn config_body(headers: &HeaderMap, body: &[u8], patch: bool) -> Result<Value, Response> {
+    let accepted = headers
+        .get(CONTENT_TYPE)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.split(';').next())
+        .map(str::trim)
+        .is_some_and(|kind| {
+            kind == "application/json" || (patch && kind == "application/merge-patch+json")
+        });
+    if !accepted {
+        return Err(api_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorSource::Business,
+            "invalid-config-content-type",
+            "请求需要 JSON Content-Type。",
+        ));
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        error_response(ConfigServiceError::InvalidValue(
+            "请求需要有效的 JSON。".into(),
+        ))
+    })
+}
+
+async fn retry_config(
+    service: &ConfigService,
+    module: &str,
+    key: &str,
+    instance: Option<&str>,
+) -> Result<Response, Response> {
+    let pending = service
+        .retry_notification(module, key, instance)
+        .await
+        .map_err(error_response)?;
+    Ok((
+        write_status(pending),
+        Json(serde_json::json!({
+            "api_version": "1", "status": if pending { "pending" } else { "confirmed" }
+        })),
+    )
+        .into_response())
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "merge-structure",
+    method = "PATCH",
+    path = "/data/{module_id}/{key}",
+    access = "paired",
+    summary = "修改配置对象字段",
+    description = "合并 JSON 对象，对可选字段传 null 可清理。"
+)]
+async fn patch_value(
+    Path((module_id, key)): Path<(String, String)>,
+    State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    check_access(&service, &headers, &module_id, &key, true).await?;
+    service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    let patch = config_body(&headers, &body, true)?;
+    let (value, pending) = if service.has_notification(&module_id, &key) {
+        service
+            .notify_patch(module_id.clone(), key.clone(), None, patch)
+            .await
+            .map_err(error_response)?
+            .expect("字段修改已有处理结果")
+    } else {
+        (
+            service
+                .update_structure_fields(module_id.clone(), key.clone(), patch)
+                .await
+                .map_err(error_response)?,
+            false,
+        )
+    };
+    Ok((
+        write_status(pending),
+        Json(serde_json::json!({
+            "module_id": module_id, "key": key, "value": value, "source": "user",
+            "status": if pending { "pending" } else { "confirmed" },
+        })),
+    )
+        .into_response())
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "merge-record",
+    method = "PATCH",
+    path = "/data/{module_id}/{key}/{instance}",
+    summary = "修改配置记录字段",
+    description = "合并已有记录的字段，对可选字段传 null 可清理。"
+)]
+async fn patch_record(
+    State(service): State<Arc<ConfigService>>,
+    Path((module_id, key, instance)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    check_access(&service, &headers, &module_id, &key, true).await?;
+    service
+        .authorize_secret_request(&module_id, &key, bearer(&headers))
+        .await
+        .map_err(error_response)?;
+    let patch = config_body(&headers, &body, true)?;
+    let (value, pending) =
+        if service.has_notification(&module_id, &key) && service.notifications_attached() {
+            service
+                .notify_patch(
+                    module_id.clone(),
+                    key.clone(),
+                    Some(instance.clone()),
+                    patch,
+                )
+                .await
+                .map_err(error_response)?
+                .expect("字段修改已有处理结果")
+        } else {
+            (
+                service
+                    .update_record_fields(module_id.clone(), key.clone(), instance.clone(), patch)
+                    .await
+                    .map_err(error_response)?,
+                false,
+            )
+        };
+    Ok((
+        write_status(pending),
+        Json(RecordResponse {
+            module_id,
+            key,
+            instance,
+            value,
+            status: Some(if pending { "pending" } else { "confirmed" }),
+        }),
+    )
+        .into_response())
+}
+
 fn write_status(pending: bool) -> StatusCode {
     if pending {
         StatusCode::ACCEPTED
@@ -488,7 +647,10 @@ fn error_response(error: ConfigServiceError) -> Response {
             StatusCode::NOT_FOUND
         }
         ConfigServiceError::ValueNotSet { .. } => StatusCode::NOT_FOUND,
-        ConfigServiceError::ActionNotFound => StatusCode::NOT_FOUND,
+        ConfigServiceError::ActionNotFound | ConfigServiceError::PendingNotFound => {
+            StatusCode::NOT_FOUND
+        }
+        ConfigServiceError::RetryInProgress => StatusCode::CONFLICT,
         ConfigServiceError::RecordExists => StatusCode::PRECONDITION_FAILED,
         ConfigServiceError::RecordAuthorizationRequired | ConfigServiceError::ChangePending => {
             StatusCode::CONFLICT
@@ -519,6 +681,8 @@ fn error_code(error: &ConfigServiceError) -> &'static str {
         ConfigServiceError::ActionNotFound => "config-action-not-found",
         ConfigServiceError::RecordExists => "config-record-exists",
         ConfigServiceError::ChangePending => "config-change-pending",
+        ConfigServiceError::PendingNotFound => "config-pending-not-found",
+        ConfigServiceError::RetryInProgress => "config-retry-in-progress",
         ConfigServiceError::RecordAuthorizationRequired => "config-record-authorization-required",
         ConfigServiceError::Storage(_) => "config-storage-error",
         ConfigServiceError::ChangeRejected { .. } => "config-change-rejected",

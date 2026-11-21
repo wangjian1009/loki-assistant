@@ -51,9 +51,7 @@ pub(super) fn config_notification_router(projects: Arc<Projects>) -> Router {
     Router::new()
         .route(
             "/slack/config/teams/{team_id}",
-            post(team_config_changed)
-                .get(team_config_status)
-                .delete(team_config_changed),
+            post(team_config_changed).delete(team_config_changed),
         )
         .with_state(projects)
 }
@@ -66,23 +64,16 @@ async fn team_config_changed(
     validate_team_id(&team_id)?;
     if request.deleted {
         sync_after_confirmation(projects, request);
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Ok(StatusCode::ACCEPTED)
+        return Ok(StatusCode::NO_CONTENT);
     }
-}
-
-async fn team_config_status(
-    State(projects): Service,
-    axum::Extension(request): axum::Extension<crate::modules::config::service::NotificationRequest>,
-    Path(team_id): Path<String>,
-) -> Result<Json<Value>, Error> {
-    validate_team_id(&team_id)?;
-    let status = projects.registration_status(request.id, &team_id).await;
-    if status == "confirmed" {
-        sync_after_confirmation(projects, request);
+    match projects.registration_status(request.id, &team_id).await {
+        "confirmed" => {
+            sync_after_confirmation(projects, request);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        "failed" => Ok(StatusCode::UNPROCESSABLE_ENTITY),
+        _ => Ok(StatusCode::ACCEPTED),
     }
-    Ok(Json(json!({"status": status})))
 }
 
 fn sync_after_confirmation(

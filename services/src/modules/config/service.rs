@@ -32,6 +32,7 @@ pub struct ConfigService {
     storage: Option<FileStorage>,
     executable_search_path: Vec<PathBuf>,
     notification_router: Arc<std::sync::OnceLock<std::sync::Weak<axum::Router>>>,
+    notifications_in_flight: Arc<std::sync::Mutex<notifications::InFlight>>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +155,10 @@ pub enum ConfigServiceError {
     RecordAuthorizationRequired,
     #[error("该配置已有待确认的变更。")]
     ChangePending,
+    #[error("此资源没有待确认变更。")]
+    PendingNotFound,
+    #[error("此配置的通知请求正在处理。")]
+    RetryInProgress,
     #[error("配置文件读写失败：{0}")]
     Storage(String),
     #[error("配置变化处理失败：{module_id}/{key}：{message}")]
@@ -162,6 +167,70 @@ pub enum ConfigServiceError {
         key: String,
         message: String,
     },
+}
+
+fn patch_fields(options: &ConfigItemOptions, patch: &Value) -> Result<(), ConfigServiceError> {
+    let changes = patch
+        .as_object()
+        .ok_or_else(|| ConfigServiceError::InvalidValue("部分更新必须为 JSON object。".into()))?;
+    let structure = options
+        .structure
+        .as_ref()
+        .ok_or(ConfigServiceError::ActionNotFound)?;
+    for key in changes.keys() {
+        let field = structure
+            .fields
+            .iter()
+            .find(|field| &field.key == key)
+            .ok_or_else(|| ConfigServiceError::InvalidValue("部分更新包含未声明字段。".into()))?;
+        if field.read_only || structure.id_field.as_ref() == Some(key) {
+            return Err(ConfigServiceError::InvalidValue(
+                "部分更新不能修改主键或只读字段。".into(),
+            ));
+        }
+        if field.data_type == ConfigDataType::Password {
+            return Err(ConfigServiceError::InvalidValue(
+                "结构中的密码字段需通过凭据提交接口更新。".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merge_patch(target: &mut Value, patch: &Value) {
+    let Some(changes) = patch.as_object() else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target.as_object_mut().expect("目标为 JSON object");
+    for (key, value) in changes {
+        if value.is_null() {
+            target.remove(key);
+        } else {
+            merge_patch(target.entry(key.clone()).or_insert(Value::Null), value);
+        }
+    }
+}
+
+fn patch_structure(
+    item: &ConfigItemMetadata,
+    options: &ConfigItemOptions,
+    current: Option<Value>,
+    patch: &Value,
+) -> Result<Value, ConfigServiceError> {
+    if item.data_type != ConfigDataType::Structure {
+        return Err(ConfigServiceError::InvalidValue(
+            "只有结构对象支持字段更新。".into(),
+        ));
+    }
+    patch_fields(options, patch)?;
+    let mut current = current.ok_or(ConfigServiceError::ActionNotFound)?;
+    merge_patch(&mut current, patch);
+    item.validate_with(options, &current)?;
+    Ok(current)
 }
 
 impl ConfigService {
@@ -257,6 +326,7 @@ impl ConfigService {
             passwords: None,
             storage: None,
             notification_router: Arc::default(),
+            notifications_in_flight: Arc::default(),
             executable_search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
@@ -534,6 +604,58 @@ impl ConfigService {
             .await
     }
 
+    pub(super) async fn update_structure_fields(
+        &self,
+        module: String,
+        key: String,
+        patch: Value,
+    ) -> Result<Value, ConfigServiceError> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let metadata = service.module_metadata(&module).await?;
+            let item = metadata
+                .item(&key)
+                .ok_or_else(|| ConfigServiceError::ItemNotFound {
+                    module_id: module.clone(),
+                    key: key.clone(),
+                })?;
+            let _commit = service.commits.lock().await;
+            let values = service.values.read().await.clone();
+            let current = service
+                .resolve_value(
+                    item,
+                    values.get(&module).and_then(|entries| entries.get(&key)),
+                )
+                .await?
+                .map(|data| data.value);
+            let value = patch_structure(item, &item_options(&module, &key), current, &patch)?;
+            service
+                .commit(
+                    values,
+                    item,
+                    &module,
+                    &key,
+                    value,
+                    ConfigChangeOperation::Merge,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+    }
+
+    pub(super) async fn update_record_fields(
+        &self,
+        module: String,
+        key: String,
+        instance: String,
+        patch: Value,
+    ) -> Result<Value, ConfigServiceError> {
+        patch_fields(&item_options(&module, &key), &patch)?;
+        self.replace_record_inner(module, key, instance, Some(patch), false, false, None, true)
+            .await
+    }
+
     pub async fn replace_record(
         &self,
         module_id: String,
@@ -551,6 +673,7 @@ impl ConfigService {
             create_only,
             authorized,
             None,
+            false,
         )
         .await
     }
@@ -574,6 +697,7 @@ impl ConfigService {
             create_only,
             true,
             Some((field.to_owned(), secret)),
+            false,
         )
         .await
     }
@@ -621,6 +745,7 @@ impl ConfigService {
         create_only: bool,
         authorized: bool,
         password: Option<(String, String)>,
+        patch: bool,
     ) -> Result<Value, ConfigServiceError> {
         let preserve_record = value.is_none();
         let value = value.unwrap_or_else(|| serde_json::json!({}));
@@ -723,9 +848,16 @@ impl ConfigService {
                     record.insert(previous_id.0.to_owned(), previous_id.1);
                 }
                 let record = Value::Object(record);
-                *current = record;
+                if patch {
+                    merge_patch(current, &record);
+                } else {
+                    *current = record;
+                }
                 false
             } else {
+                if patch {
+                    return Err(ConfigServiceError::ActionNotFound);
+                }
                 if preserve_record {
                     return Err(ConfigServiceError::ItemNotFound { module_id, key });
                 }

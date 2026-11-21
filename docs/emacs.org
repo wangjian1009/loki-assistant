@@ -23,7 +23,7 @@
 
 * Slack 工作区配置
 
-在 ~M-x loki-assistant-config~ 的 Slack 分组选择「新增工作区」，填写 Team ID 并保存。该行显示「待确认」。可编辑该行补充 Slack 网页会话凭据，按 ~g~ 刷新配置状态。 [[file:slack-development.org::*当前工作区配置][Slack 工作区配置]]
+在 ~M-x loki-assistant-config~ 的 Slack 分组选择「新增工作区」，填写 Team ID 并保存。该行显示「待确认」。可编辑该行补充 Slack 网页会话凭据，也可通过「重试」重新触发当前变更。 [[file:slack-development.org::*当前工作区配置][Slack 工作区配置]]
 
 * Slack 聊天
 
