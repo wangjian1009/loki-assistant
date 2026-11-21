@@ -474,10 +474,11 @@
               (should-not loki-assistant-config--wait-timer))))
       (mapc #'cancel-timer timers))))
 
-(ert-deftest loki-assistant-config-test-workflow-uses-declared-fields-and-actions ()
+(ert-deftest loki-assistant-config-test-record-form-uses-declared-fields ()
   (let ((item
          '((key . "records") (data_type . "list") (name . "设置")
            (requires_local_auth . t) (save_timeout_seconds . 650)
+           (actions . [((id . "old-action") (label . "旧业务操作"))])
            (structure . ((id_field . "slug") (label_field . "name")
                          (add_label . "新增记录")
                          (fields . [((key . "team_id") (label . "工作区") (required . t))
@@ -499,6 +500,7 @@
         (widget-insert "其他配置之后\n")
         (let ((section (car loki-assistant-config--record-sections)))
           (should (string-match-p "现有记录" (buffer-string)))
+          (should-not (string-match-p "旧业务操作" (buffer-string)))
           (loki-assistant-config--record-edit section nil)
           (let ((inputs (loki-assistant-config--record-section-inputs section)))
             (widget-value-set (cdr (assoc "team_id" inputs)) "TBETA")

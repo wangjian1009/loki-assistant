@@ -210,16 +210,6 @@ impl SlackClient {
         Err(Error::Upstream)
     }
 
-    pub async fn verify_app_token(&self, token: &str) -> Result<(), Error> {
-        self.socket_url(token)
-            .await
-            .map(|_| ())
-            .map_err(|error| match error {
-                Error::Authorization | Error::Permission | Error::Invalid => Error::AppToken,
-                _ => error,
-            })
-    }
-
     pub async fn connect(&self, token: &str) -> Result<Socket, Error> {
         let url = self.socket_url(token).await?;
         let (socket, _) =

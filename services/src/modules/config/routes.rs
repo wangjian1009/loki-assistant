@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, State},
     http::{
         HeaderMap, StatusCode,
-        header::{AUTHORIZATION, CACHE_CONTROL, IF_NONE_MATCH},
+        header::{AUTHORIZATION, IF_NONE_MATCH},
     },
     response::{IntoResponse, Response},
 };
@@ -472,28 +472,6 @@ async fn delete_record(
         .await
         .map_err(error_response)?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[loki_api(
-    module = "config",
-    mount = "Arc<ConfigService>",
-    id = "start-action",
-    mount = "Arc<ConfigService>",
-    method = "POST",
-    path = "/config/actions/{module}/{action}/{instance}",
-    summary = "执行配置操作",
-    description = "按配置元数据启动指定实例的配置操作。"
-)]
-async fn start_action(
-    State(service): State<Arc<ConfigService>>,
-    headers: HeaderMap,
-    Path((module, action, instance)): Path<(String, String, String)>,
-) -> Result<Response, Response> {
-    let data = service
-        .action(&module, &action, &instance, bearer(&headers))
-        .await
-        .map_err(error_response)?;
-    Ok(([(CACHE_CONTROL, "no-store")], Json(data)).into_response())
 }
 
 fn write_status(pending: bool) -> StatusCode {

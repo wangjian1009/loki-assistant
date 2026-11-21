@@ -70,6 +70,6 @@
 
 配置界面按 ~SlackTeam~ 元数据生成表单，新增时只显示 Team ID。待确认记录可继续编辑凭据。 [[file:slack.org::*Team 配置][SlackTeam 字段与配置接口]]
 
-后台 Socket Mode 通知使用独立的 app-level token 和事件订阅配置。
+后台 Socket Mode 通知使用独立的应用令牌和事件订阅配置。需要启用时，可在工作区记录中选择已存入 pass 的应用令牌条目。
 
 现有 API 契约见 [[file:slack.org::*services RESTful 接口][services RESTful 接口]]。

@@ -19,9 +19,9 @@ use loki_services_macros::loki_config;
 use crate::modules::{
     config::{
         model::{
-            ActionInteraction, CheckerMetadata, ConfigAction, ConfigDataType, ConfigItemMetadata,
-            ConfigItemOptions, ConfigModuleMetadata, ConfigRemoteAccess, FieldOptions,
-            LegacyDictionary, ListMetadata, PasswordBinding, StructureField, StructureMetadata,
+            CheckerMetadata, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
+            ConfigModuleMetadata, ConfigRemoteAccess, FieldOptions, LegacyDictionary, ListMetadata,
+            StructureField, StructureMetadata,
         },
         registry::ConfigItemRegistration,
     },
@@ -130,29 +130,6 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
         create_fields: vec!["team_id"],
         save_timeout_seconds: Some(650),
         requires_local_auth: true,
-        actions: vec![
-            ConfigAction {
-                id: "check_app_token".into(),
-                label: "检查已有令牌".into(),
-                interaction: ActionInteraction::Request,
-            },
-            ConfigAction {
-                id: "save_app_token".into(),
-                label: "录入应用令牌".into(),
-                interaction: ActionInteraction::Password {
-                    binding: PasswordBinding {
-                        key: "app_token".into(),
-                        instance_parameter: "project".into(),
-                        value_parameter: "token".into(),
-                    },
-                },
-            },
-            ConfigAction {
-                id: "authorize".into(),
-                label: "更换用户令牌".into(),
-                interaction: ActionInteraction::Request,
-            },
-        ],
     },
 };
 
@@ -161,45 +138,26 @@ fn slack_configuration() -> ConfigModuleMetadata {
     ConfigModuleMetadata {
         id: "slack".into(),
         name: "Slack".into(),
-        description: "Slack 工作区、用户令牌和应用令牌设置。".into(),
+        description: "Slack 工作区及网页会话凭据设置。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        items: vec![
-            ConfigItemMetadata {
-                key: "teams".into(),
-                name: "Slack 工作区".into(),
-                description: "每个工作区保存固定的 Team ID 和本地显示名称。".into(),
-                data_type: ConfigDataType::List,
-                remote_access: ConfigRemoteAccess::Local,
-                required: false,
-                default: Some(serde_json::json!([])),
-                dictionary: None,
-                list: Some(ListMetadata {
-                    item_type: ConfigDataType::Structure,
-                    min_items: None,
-                    max_items: None,
-                }),
-                checker: None,
-                file_path: None,
-                executable: None,
-            },
-            ConfigItemMetadata {
-                key: "app_token".into(),
-                name: "项目应用级令牌".into(),
-                description: "输入项目标识与应用级令牌。凭据保存到项目所配置的 pass 条目。".into(),
-                data_type: ConfigDataType::Password,
-                remote_access: ConfigRemoteAccess::Local,
-                required: false,
-                default: None,
-                dictionary: Some(crate::modules::config::model::DictionaryMetadata {
-                    entries: vec![],
-                    allow_unknown: true,
-                }),
-                list: None,
-                checker: None,
-                file_path: None,
-                executable: None,
-            },
-        ],
+        items: vec![ConfigItemMetadata {
+            key: "teams".into(),
+            name: "Slack 工作区".into(),
+            description: "每个工作区保存固定的 Team ID 和本地显示名称。".into(),
+            data_type: ConfigDataType::List,
+            remote_access: ConfigRemoteAccess::Local,
+            required: false,
+            default: Some(serde_json::json!([])),
+            dictionary: None,
+            list: Some(ListMetadata {
+                item_type: ConfigDataType::Structure,
+                min_items: None,
+                max_items: None,
+            }),
+            checker: None,
+            file_path: None,
+            executable: None,
+        }],
     }
 }
 

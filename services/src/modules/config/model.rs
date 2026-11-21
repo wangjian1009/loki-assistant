@@ -72,8 +72,6 @@ pub struct ConfigItemOptions {
     pub create_fields: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<StructureMetadata>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub actions: Vec<ConfigAction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_timeout_seconds: Option<u64>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -176,28 +174,6 @@ pub struct StructureField {
 pub struct FieldOptions {
     pub path: String,
     pub items_field: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ConfigAction {
-    pub id: String,
-    pub label: String,
-    #[serde(flatten)]
-    pub interaction: ActionInteraction,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "interaction", rename_all = "snake_case")]
-pub enum ActionInteraction {
-    Request,
-    Password { binding: PasswordBinding },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct PasswordBinding {
-    pub key: String,
-    pub instance_parameter: String,
-    pub value_parameter: String,
 }
 
 /// 配置模块向业务模块提供元数据的接口。

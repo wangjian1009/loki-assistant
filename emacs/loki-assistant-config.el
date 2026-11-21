@@ -305,12 +305,7 @@
     (dolist (module modules)
       (let* ((id (alist-get 'id module))
              (items (append (alist-get 'items module) nil))
-             (values (cdr (assoc id data)))
-             (password-keys
-              (cl-loop for item in items append
-                       (cl-loop for action across (or (alist-get 'actions item) [])
-                                for binding = (alist-get 'binding action)
-                                when binding collect (alist-get 'key binding)))))
+             (values (cdr (assoc id data))))
         (widget-insert (propertize (concat (alist-get 'name module) "\n")
                                   'face 'custom-group-tag))
         (widget-insert (concat (or (alist-get 'description module) "") "\n\n"))
@@ -318,7 +313,7 @@
           (cond
            ((consp (alist-get 'structure item))
             (loki-assistant-config--record-insert id item values))
-           ((not (member (alist-get 'key item) password-keys))
+           (t
             (loki-assistant-config--render-entry id item values))))))))
   (setq loki-assistant-config--entries (nreverse loki-assistant-config--entries))
   (widget-setup)
@@ -602,11 +597,7 @@
 (cl-defstruct (loki-assistant-config--record-section
                (:constructor loki-assistant-config--record-create))
   buffer module metadata start end widgets records
-  form form-id form-generation inputs saving notice operations)
-
-(cl-defstruct (loki-assistant-config--record-operation
-               (:constructor loki-assistant-config--record-new-operation))
-  pending message)
+  form form-id form-generation inputs saving notice)
 
 (defvar-local loki-assistant-config--record-sections nil)
 
@@ -681,10 +672,8 @@
   (let* ((metadata (loki-assistant-config--record-section-metadata section))
          (record-meta (alist-get 'record metadata)))
     (dolist (entry (loki-assistant-config--record-section-records section))
-      (let* ((id (car entry))
-             (record (cdr entry))
-             (operation (gethash id (loki-assistant-config--record-section-operations section)))
-             (pending (and operation (loki-assistant-config--record-operation-pending operation))))
+      (let ((id (car entry))
+            (record (cdr entry)))
         (insert (propertize
                  (or (loki-assistant-config--record-field (alist-get 'label_field record-meta) record)
                      (unless (string-empty-p id) id) (alist-get 'title metadata))
@@ -700,14 +689,7 @@
         (when (or (alist-get 'single metadata) (alist-get 'id_field record-meta))
           (loki-assistant-config--record-button
            section "编辑" (lambda () (loki-assistant-config--record-edit section id))
-           (or pending (loki-assistant-config--record-section-saving section))))
-        (dolist (action (append (alist-get 'actions metadata) nil))
-          (insert "  ")
-          (loki-assistant-config--record-button
-           section (alist-get 'label action)
-           (lambda () (loki-assistant-config--record-action section id action)) pending))
-        (when-let ((message (and operation (loki-assistant-config--record-operation-message operation))))
-          (insert "\n  " message))
+           (loki-assistant-config--record-section-saving section)))
         (insert "\n\n")))))
 
 (defun loki-assistant-config--record-allowed-field-p (section field existing)
@@ -912,7 +894,6 @@
                                value))
                      (setf (loki-assistant-config--record-section-records section)
                            (loki-assistant-config--record-records value record single)))
-                   (when id (remhash id (loki-assistant-config--record-section-operations section)))
                    (loki-assistant-config--record-edit section nil t))
                (setf (loki-assistant-config--record-section-notice section)
                      (loki-assistant-config--error response))))
@@ -922,46 +903,6 @@
   "读取 SECTION 的保存等待时间。"
   (or (alist-get 'save_timeout_seconds (loki-assistant-config--record-section-metadata section))
       loki-assistant-config-save-timeout))
-
-(defun loki-assistant-config--record-operation-update (section operation pending message)
-  "更新 SECTION 中 OPERATION 的 PENDING 标记和 MESSAGE。"
-  (setf (loki-assistant-config--record-operation-pending operation) pending
-        (loki-assistant-config--record-operation-message operation) message)
-  (loki-assistant-config--record-render section))
-
-(defun loki-assistant-config--record-action (section id action)
-  "执行 SECTION 中记录 ID 的 Metadata ACTION。"
-  (let* ((headers (loki-assistant-config--record-header section))
-         (binding (alist-get 'binding action))
-         (body (when binding
-                 (let ((password (read-passwd (concat (alist-get 'label action) "："))))
-                   (when (string-empty-p password) (user-error "请输入凭据"))
-                   (list (cons (alist-get 'instance_parameter binding) id)
-                         (cons (alist-get 'value_parameter binding) password)))))
-         (path (if binding
-                   (loki-assistant-config--record-data-path section (alist-get 'key binding))
-                 (mapconcat #'url-hexify-string
-                            (list "" "config" "actions"
-                                  (loki-assistant-config--record-section-module section)
-                                  (alist-get 'id action) id) "/")))
-         (operation (loki-assistant-config--record-new-operation)))
-    (puthash id operation (loki-assistant-config--record-section-operations section))
-    (loki-assistant-config--record-operation-update section operation t "正在执行…")
-    (loki-assistant-request
-     (if binding "PUT" "POST") path :headers headers :body body :timeout (loki-assistant-config--record-timeout section)
-     :callback
-     (lambda (response)
-       (when (loki-assistant-config--record-alive-p section)
-         (cond
-          ((not (plist-get response :ok))
-           (loki-assistant-config--record-operation-update
-            section operation nil (loki-assistant-config--error response)))
-          (t
-           (loki-assistant-config--record-operation-update
-            section operation nil
-            (or (alist-get 'message (plist-get response :data))
-                (if binding "凭据已保存。" "操作已完成。")))
-           (loki-assistant-config--record-render section))))))))
 
 (defun loki-assistant-config--record-insert (module item values)
   "按 ITEM 的结构元数据在当前页面渲染 MODULE 的配置记录。"
@@ -977,12 +918,11 @@
          (position (point)))
     (unless section
       (setq section (loki-assistant-config--record-create
-                     :module module :buffer (current-buffer)
-                     :operations (make-hash-table :test #'equal)))
+                     :module module :buffer (current-buffer)))
       (push section loki-assistant-config--record-sections))
     (widget-insert "\n")
     (setf (loki-assistant-config--record-section-metadata section)
-          `((title . ,(alist-get 'name item)) (record . ,record) (actions . ,(alist-get 'actions item)) (single . ,single)
+          `((title . ,(alist-get 'name item)) (record . ,record) (single . ,single)
             (save_timeout_seconds . ,(alist-get 'save_timeout_seconds item))
             (requires_local_auth . ,(alist-get 'requires_local_auth item))
             (create_fields . ,(alist-get 'create_fields item)))

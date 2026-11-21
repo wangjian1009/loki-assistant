@@ -118,7 +118,7 @@ control-center:
 
 ~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /data/{module}/{key}~ 追加元素。
 
-配置项可声明 ~actions~、~requires_local_auth~ 和 ~save_timeout_seconds~ 。配置中心按模块 ID 和配置键合并 ~CONFIG_ITEMS~ 注册的元数据。服务端依据数组类型、元素类型和可选主键决定可执行的数据操作。客户端按字段声明填写必填值，并显示服务端返回的保存结果。
+配置项可声明 ~requires_local_auth~ 和 ~save_timeout_seconds~ 。配置中心按模块 ID 和配置键合并 ~CONFIG_ITEMS~ 注册的元数据。服务端依据数组类型、元素类型和可选主键决定可执行的数据操作。客户端按字段声明填写必填值，并显示服务端返回的保存结果。
 
 | 操作 | 请求 | 结果 |
 |------+-------+------|
@@ -128,7 +128,6 @@ control-center:
 | 删除带主键记录 | ~DELETE /data/{module}/{key}/{instance}~ | 返回 ~204~ 。记录已不存在时同样返回 ~204~ |
 | 追加无主键元素 | ~POST /data/{module}/{key}~ ，请求体是数组 | 返回保存后的完整数组 |
 | 修改或删除无主键元素 | ~PUT /data/{module}/{key}~ ，请求体是替换后的数组 | 返回保存后的完整数组 |
-| 执行配置操作 | ~POST /config/actions/{module}/{action}/{instance}~ | 返回已注册的操作结果 |
 
 * 结构中的密码字段
 

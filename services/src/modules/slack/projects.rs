@@ -645,22 +645,6 @@ impl Projects {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Credential {
-    project: String,
-    token: String,
-}
-
-fn credential(value: Value) -> Result<Credential, String> {
-    let input: Credential =
-        serde_json::from_value(value).map_err(|_| "凭据需要项目标识和应用级令牌。".to_owned())?;
-    if !valid_project(&input.project) || !SlackService::valid_app_token(&input.token) {
-        return Err("请核对项目标识和 Slack 应用级令牌格式。".into());
-    }
-    Ok(input)
-}
-
 impl ConfigChangeHandler for Projects {
     fn record_creation_keys(&self) -> &'static [&'static str] {
         &["teams"]
@@ -700,35 +684,6 @@ impl ConfigChangeHandler for Projects {
         })
     }
 
-    fn action<'a>(
-        &'a self,
-        action: &'a str,
-        instance: &'a str,
-        config: std::sync::Weak<ConfigService>,
-    ) -> ActionFuture<'a> {
-        Box::pin(async move {
-            let service = self
-                .projects
-                .read()
-                .await
-                .get(instance)
-                .map(|project| Arc::clone(&project.service))
-                .ok_or(ConfigServiceError::ActionNotFound)?;
-            let rejected = |error| Self::slack_rejected(action, error);
-            match action {
-                "check_app_token" => {
-                    service.check_app_token().await.map_err(rejected)?;
-                    Ok(serde_json::json!({"valid":true,"message":"应用令牌可用。"}))
-                }
-                "authorize" => {
-                    self.wait_import(instance, service, config, None).await?;
-                    Ok(serde_json::json!({"message":"Slack 用户令牌已保存。"}))
-                }
-                _ => Err(ConfigServiceError::ActionNotFound),
-            }
-        })
-    }
-
     fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
             if change.key == "teams" {
@@ -742,61 +697,10 @@ impl ConfigChangeHandler for Projects {
         Box::pin(async { self.sync_projects().await })
     }
 
-    fn secret_is_set<'a>(
-        &'a self,
-        _key: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(async {
-            let services: Vec<_> = self
-                .projects
-                .read()
-                .await
-                .values()
-                .map(|project| Arc::clone(&project.service))
-                .collect();
-            for service in services {
-                if service.state.lock().await.app_token.is_some() {
-                    return true;
-                }
-            }
-            false
-        })
-    }
-
     fn authorize_secret<'a>(&'a self, bearer: Option<&'a str>) -> ChangeFuture<'a> {
         Box::pin(async move {
             self.verify_local(bearer)
                 .map_err(|_| "需要有效的本机凭据。".into())
-        })
-    }
-
-    fn validate_secret<'a>(&'a self, _key: &'a str, value: &'a Value) -> ChangeFuture<'a> {
-        Box::pin(async move {
-            let input = credential(value.clone())?;
-            if self.projects.read().await.contains_key(&input.project) {
-                Ok(())
-            } else {
-                Err("请先在项目配置中保存该项目。".into())
-            }
-        })
-    }
-
-    fn write_secret<'a>(&'a self, _key: &'a str, value: Value) -> ChangeFuture<'a> {
-        Box::pin(async move {
-            let input = credential(value)?;
-            let service = self
-                .projects
-                .read()
-                .await
-                .get(&input.project)
-                .map(|project| Arc::clone(&project.service))
-                .ok_or("未找到 Slack 项目。")?;
-            service.app_token(input.token).await.map_err(|error| {
-                error.object()["message"]
-                    .as_str()
-                    .unwrap_or("Slack 凭据保存失败。")
-                    .to_owned()
-            })
         })
     }
 }

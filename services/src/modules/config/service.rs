@@ -11,8 +11,8 @@ use crate::modules::password::service::{PasswordError, PasswordService, validate
 
 use super::{
     model::{
-        ActionInteraction, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
-        ConfigModuleMetadata, ConfigValue, ConfigValueSource,
+        ConfigDataType, ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata, ConfigValue,
+        ConfigValueSource,
     },
     registry::item_options,
     storage::{FileStorage, StoredValues},
@@ -99,15 +99,6 @@ pub trait ConfigChangeHandler: Debug + Send + Sync {
 
     fn validate_secret<'a>(&'a self, _key: &'a str, _value: &'a Value) -> ChangeFuture<'a> {
         Box::pin(async { Ok(()) })
-    }
-
-    fn action<'a>(
-        &'a self,
-        _action: &'a str,
-        _instance: &'a str,
-        _config: std::sync::Weak<ConfigService>,
-    ) -> ActionFuture<'a> {
-        Box::pin(async { Err(ConfigServiceError::ActionNotFound) })
     }
 
     /// 注册需要由模块处理新增的配置项。
@@ -274,36 +265,6 @@ impl ConfigService {
 
     pub async fn metadata(&self) -> Vec<ConfigModuleMetadata> {
         self.metadata.read().await.values().cloned().collect()
-    }
-
-    pub async fn action(
-        self: &Arc<Self>,
-        module: &str,
-        action: &str,
-        instance: &str,
-        bearer: Option<&str>,
-    ) -> Result<Value, ConfigServiceError> {
-        let handler = self
-            .handlers
-            .get(module)
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        let metadata = self.module_metadata(module).await?;
-        let action = metadata
-            .items
-            .iter()
-            .flat_map(|item| item_options(module, &item.key).actions)
-            .find(|item| item.id == action)
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        if !matches!(action.interaction, ActionInteraction::Request) {
-            return Err(ConfigServiceError::ActionNotFound);
-        }
-        handler
-            .authorize_secret(bearer)
-            .await
-            .map_err(|_| ConfigServiceError::SecretUnauthorized)?;
-        handler
-            .action(&action.id, instance, Arc::downgrade(self))
-            .await
     }
 
     pub async fn module_values(

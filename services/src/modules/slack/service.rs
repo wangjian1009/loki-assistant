@@ -380,43 +380,6 @@ impl SlackService {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     }
 
-    pub(super) async fn app_token(&self, token: String) -> Result<(), Error> {
-        if !Self::valid_app_token(&token) {
-            return Err(Error::Invalid);
-        }
-        let _operation = self.password_operation.lock().await;
-        if self.password.is_none() && self.state.lock().await.app_token.as_ref() == Some(&token) {
-            return Ok(());
-        }
-        self.client.verify_app_token(&token).await?;
-        if let Some((passwords, id)) = &self.password {
-            passwords
-                .save(id, &token)
-                .await
-                .map_err(|_| Error::PasswordWrite)?;
-            let mut state = self.state.lock().await;
-            if state.retired {
-                return Err(Error::Project);
-            }
-            state.app_token = Some(token);
-            state.issue = None;
-            drop(state);
-            self.signal_change();
-            self.publish_status().await;
-            return Ok(());
-        }
-        let token = self
-            .update_secrets(move |secrets, _| {
-                secrets.app_token = Some(token.clone());
-                Ok(token)
-            })
-            .await?;
-        self.state.lock().await.app_token = Some(token);
-        self.signal_change();
-        self.publish_status().await;
-        Ok(())
-    }
-
     pub(super) async fn restore_app_token(&self) {
         let Some((passwords, id)) = &self.password else {
             return;
@@ -440,33 +403,6 @@ impl SlackService {
             }
             _ => {}
         }
-    }
-
-    pub(super) async fn check_app_token(&self) -> Result<(), Error> {
-        let (passwords, id) = self.password.as_ref().ok_or(Error::PasswordRead)?;
-        let _operation = self.password_operation.lock().await;
-        if self.state.lock().await.retired {
-            return Err(Error::Project);
-        }
-        let secret = passwords.fetch(id).await.map_err(|_| Error::PasswordRead)?;
-        let token = secret.trim();
-        if !Self::valid_app_token(token) {
-            return Err(Error::AppToken);
-        }
-        self.client.verify_app_token(token).await?;
-        let mut state = self.state.lock().await;
-        if state.retired {
-            return Err(Error::Project);
-        }
-        let changed = state.app_token.as_deref() != Some(token);
-        state.app_token = Some(token.to_owned());
-        state.issue = None;
-        drop(state);
-        if changed {
-            self.signal_change();
-        }
-        self.publish_status().await;
-        Ok(())
     }
 
     pub(super) async fn begin_authorization(&self) -> Result<(Uuid, Value), Error> {
