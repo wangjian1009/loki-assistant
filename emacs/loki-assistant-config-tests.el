@@ -613,6 +613,11 @@
           (should (string-match-p "Slack 工作区名称  项目协作" (buffer-string)))
           (should (string-match-p "Slack 用户 ID  U123" (buffer-string)))
           (loki-assistant-config--record-edit section "TTEAM")
+          (let* ((text (buffer-string))
+                 (form-end (string-match (regexp-quote "[保存记录]") text)))
+            (should form-end)
+            (should (string-match-p "Slack 工作区名称  项目协作" (substring text 0 form-end)))
+            (should (string-match-p "Slack 用户 ID  U123" (substring text 0 form-end))))
           (should-not (assoc "team_name" (loki-assistant-config--record-section-inputs section)))
           (should-not (assoc "user_id" (loki-assistant-config--record-section-inputs section))))))))
 

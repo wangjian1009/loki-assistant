@@ -811,6 +811,12 @@
   (dolist (section loki-assistant-config--record-sections)
     (setf (loki-assistant-config--record-section-buffer section) nil)))
 
+(defun loki-assistant-config--record-display-value (field value show-all)
+  "返回 FIELD 的可显示文本，密码字段只显示保存状态。"
+  (cond ((and show-all (or (null value) (equal value ""))) "未设置")
+        ((equal (loki-assistant-config--data-type field) "password") "已保存")
+        (t (format "%s" value))))
+
 (defun loki-assistant-config--record-rows (section)
   "在 SECTION 中显示配置记录、状态和操作。"
   (let* ((metadata (loki-assistant-config--record-section-metadata section))
@@ -839,9 +845,7 @@
             (when (or show-all
                       (and value (not password) (not (equal key (alist-get 'label_field record-meta)))))
               (insert "  " (alist-get 'label field) "  "
-                      (cond ((and show-all (or (null value) (equal value ""))) "未设置")
-                            (password "已保存")
-                            (t (format "%s" value)))
+                      (loki-assistant-config--record-display-value field value show-all)
                       "\n"))))
         (insert "  ")
         (when (and (not (alist-get 'delete_pending record))
@@ -876,13 +880,22 @@
   (when-let ((form (loki-assistant-config--record-section-form section)))
     (let* ((record (loki-assistant-config--record-record-meta section))
            (id (loki-assistant-config--record-section-form-id section))
+           (row (and id (cdr (assoc id (loki-assistant-config--record-section-records section)))))
            (saving (loki-assistant-config--record-section-saving section)))
       (insert (if id (concat "编辑" (unless (string-empty-p id) (concat "  " id)))
                 (or (alist-get 'add_label record) "新增")) "\n")
       (dolist (field (append (alist-get 'fields record) nil))
         (let ((key (alist-get 'key field)))
-          (unless (or (not (loki-assistant-config--record-allowed-field-p section field id))
-                      (and id (equal key (alist-get 'id_field record))))
+          (cond
+           ((and row (eq (alist-get 'show_all_fields record) t)
+                 (eq (alist-get 'read_only field) t)
+                 (not (equal key (alist-get 'id_field record))))
+            (insert "  " (alist-get 'label field) "  "
+                    (loki-assistant-config--record-display-value
+                     field (loki-assistant-config--record-field key row) t)
+                    "\n"))
+           ((and (loki-assistant-config--record-allowed-field-p section field id)
+                 (not (and id (equal key (alist-get 'id_field record)))))
             (insert "  " (alist-get 'label field) "  ")
             (let* ((value (or (cdr (assoc key form)) ""))
                    (widget (widget-create 'editable-field :format "%v"
@@ -903,7 +916,7 @@
               (when (stringp help) (insert "  " help)))
             (when (stringp (alist-get 'default_template field))
               (insert "  留空使用默认值"))
-            (insert "\n"))))
+            (insert "\n")))))
       (insert "  ")
       (loki-assistant-config--record-button
        section (if saving "正在保存…" "保存记录")

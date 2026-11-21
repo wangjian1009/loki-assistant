@@ -15,6 +15,27 @@ use super::*;
 
 const JOURNAL: &str = "_pending_config_notifications";
 
+pub(super) fn legacy_pending_password_id(base: &str, path: &str) -> Option<Uuid> {
+    let suffix = path.strip_prefix(base.strip_suffix(".gpg")?)?;
+    Uuid::parse_str(suffix.strip_prefix('-')?.strip_suffix(".gpg")?).ok()
+}
+
+fn pending_password_location(base: &str) -> (String, &str) {
+    match base.rsplit_once('/') {
+        Some((parent, name)) => (format!("{parent}/pending/"), name),
+        None => ("pending/".to_owned(), base),
+    }
+}
+
+pub(super) fn pending_password_id(base: &str, path: &str) -> Option<Uuid> {
+    let (prefix, name) = pending_password_location(base);
+    let (id, file) = path.strip_prefix(&prefix)?.split_once('/')?;
+    if file != name {
+        return None;
+    }
+    Uuid::parse_str(id).ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
     id: Uuid,
@@ -323,7 +344,7 @@ impl ConfigService {
             .map(|data| data.value);
         let id = Uuid::new_v4();
         let delete = input.is_none();
-        let mut secrets = Vec::new();
+        let mut password_changes = Vec::new();
         let mut removed_password_entries = Vec::new();
         let (key, value, previous) = if let Some(instance) = &instance {
             let structure = options
@@ -378,6 +399,9 @@ impl ConfigService {
                         let replacement = if patch && value.is_null() {
                             None
                         } else {
+                            if let Some(checker) = &field.checker {
+                                checker.validate(&field.label, value)?;
+                            }
                             Some(
                                 value
                                     .as_str()
@@ -436,7 +460,16 @@ impl ConfigService {
                         removed_password_entries.push(first.key.clone());
                         continue;
                     }
-                    let path = format!("{}-{id}.gpg", base.trim_end_matches(".gpg"));
+                    let (path, backup) = self
+                        .pending_password_destination(
+                            &options,
+                            instance,
+                            &base,
+                            id,
+                            &record,
+                            previous.as_ref(),
+                        )
+                        .await?;
                     if let Some(contents) = self
                         .stage_password_lines(
                             &options,
@@ -448,7 +481,11 @@ impl ConfigService {
                         )
                         .await?
                     {
-                        secrets.push((path, contents));
+                        password_changes.push(PasswordChange {
+                            path,
+                            contents: Some(contents),
+                            previous: backup,
+                        });
                     }
                 }
                 let value = Value::Object(record);
@@ -526,29 +563,12 @@ impl ConfigService {
             removed_password_entries,
             validation_error: None,
         };
-        let mut written: Vec<String> = Vec::new();
-        for (path, contents) in secrets {
-            let store = self.passwords()?;
-            if let Err(error) = store.save_multiline(&path, &contents).await {
-                for path in &written {
-                    let _ = store.remove(path).await;
-                }
-                return Err(ConfigServiceError::Storage(error.to_string()));
-            }
-            written.push(path);
-        }
         values
             .entry(JOURNAL.into())
             .or_default()
             .insert(id.to_string(), json!(entry));
-        if let Err(error) = self.persist_notifications(values).await {
-            if let Some(store) = &self.passwords {
-                for path in written {
-                    let _ = store.remove(&path).await;
-                }
-            }
-            return Err(error);
-        }
+        self.persist_password_changes(values, &password_changes)
+            .await?;
         if let Some(old) = existing {
             self.discard_notification_passwords(
                 &entry,
@@ -566,6 +586,124 @@ impl ConfigService {
         }
         *self.values.write().await = values;
         Ok(())
+    }
+
+    pub async fn migrate_pending_password_paths(&self) -> Result<(), ConfigServiceError> {
+        let _commit = self.commits.lock().await;
+        let mut values = self.values.read().await.clone();
+        let mut migrated = Vec::new();
+        let mut password_changes = Vec::new();
+        for mut entry in pending(&values).into_iter().filter(|entry| !entry.delete) {
+            let (Some(instance), Some(record)) =
+                (entry.instance.as_deref(), entry.value.as_object_mut())
+            else {
+                continue;
+            };
+            let options = item_options(&entry.module, &entry.item);
+            let mut bases = std::collections::BTreeSet::new();
+            for field in options
+                .structure
+                .iter()
+                .flat_map(|structure| &structure.fields)
+            {
+                if !field.data_type.is_password() {
+                    continue;
+                }
+                if let Some(path) = record.get(&field.key).and_then(Value::as_str) {
+                    let base = options.password_path(&field.key, instance)?;
+                    if legacy_pending_password_id(&base, path).is_some() {
+                        bases.insert(base);
+                    }
+                }
+            }
+            if bases.is_empty() {
+                continue;
+            }
+            let old_value = Value::Object(record.clone());
+            for base in bases {
+                let (path, previous) = self
+                    .pending_password_destination(
+                        &options,
+                        instance,
+                        &base,
+                        entry.id,
+                        record,
+                        entry.previous.as_ref(),
+                    )
+                    .await?;
+                if let Some(contents) = self
+                    .stage_password_lines(
+                        &options,
+                        instance,
+                        &base,
+                        &path,
+                        &BTreeMap::new(),
+                        record,
+                    )
+                    .await?
+                {
+                    password_changes.push(PasswordChange {
+                        path,
+                        contents: Some(contents),
+                        previous,
+                    });
+                }
+            }
+            values
+                .get_mut(JOURNAL)
+                .expect("待确认操作存在")
+                .insert(entry.id.to_string(), json!(entry));
+            migrated.push((entry, old_value));
+        }
+        if !migrated.is_empty() {
+            self.persist_password_changes(values, &password_changes)
+                .await?;
+            for (entry, old_value) in migrated {
+                self.discard_notification_passwords(
+                    &entry,
+                    &old_value,
+                    &[Some(&entry.value), entry.previous.as_ref()],
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn pending_password_destination(
+        &self,
+        options: &ConfigItemOptions,
+        instance: &str,
+        base: &str,
+        id: Uuid,
+        record: &serde_json::Map<String, Value>,
+        previous: Option<&Value>,
+    ) -> Result<(String, Option<String>), ConfigServiceError> {
+        let confirmed = previous.is_some_and(|previous| {
+            options
+                .password_entry_fields(instance, base)
+                .any(|field| previous[&field.key].as_str() == Some(base))
+        });
+        if !confirmed {
+            let owned = options
+                .password_entry_fields(instance, base)
+                .any(|field| record.get(&field.key).and_then(Value::as_str) == Some(base));
+            if owned {
+                return Ok((base.to_owned(), self.load_password_entry(base).await?));
+            }
+            let missing = self
+                .passwords()?
+                .missing_entries(HashSet::from([base.to_owned()]))
+                .await
+                .map_err(|error| ConfigServiceError::Storage(error.to_string()))?;
+            if missing.contains(base) {
+                return Ok((base.to_owned(), None));
+            }
+        }
+        let (prefix, name) = pending_password_location(base);
+        let path = format!("{prefix}{id}/{name}");
+        let backup = self.load_password_entry(&path).await?;
+        Ok((path, backup))
     }
 
     async fn stage_password_lines(

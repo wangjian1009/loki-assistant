@@ -23,12 +23,15 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(runtime_config.http_addr).await?;
     let service_pfile = ServicePfile::for_listener(listener.local_addr()?);
     let services = Arc::new(Services::load()?);
+    let config = services.config.service();
+    if let Err(error) = config.migrate_pending_password_paths().await {
+        eprintln!("迁移待确认配置的密码路径失败：{error}");
+    }
     let service_path = service_pfile.write()?;
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
     services.attach_remote(&runtime);
     let extensions = services.start_extensions(listener.local_addr()?.port());
     let network = Arc::clone(&services.network);
-    let config = services.config.service();
     let network_start = tokio::spawn(async move {
         if let Err(error) = network.start(config).await {
             eprintln!("网络初始化失败：{error}");

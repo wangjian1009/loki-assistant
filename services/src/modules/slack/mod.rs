@@ -112,7 +112,11 @@ impl projects::SlackTeam {
                     required: false,
                     read_only: false,
                     default_template: None,
-                    checker: None,
+                    checker: (key == "token").then(|| CheckerMetadata {
+                        pattern: client::WEB_TOKEN_PATTERN.into(),
+                        description: "请输入以 xoxc- 开头的完整 Slack 网页会话令牌。".into(),
+                        emacs_pattern: Some(r"\`xoxc-[A-Za-z0-9_-]\{1,4091\}\'".into()),
+                    }),
                     options: None,
                 }),
             )

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use reqwest::{Client, Method, StatusCode, header::RETRY_AFTER};
 use serde_json::Value;
@@ -11,6 +15,10 @@ use url::Url;
 use super::protocol::Error;
 
 pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub(super) const WEB_TOKEN_PATTERN: &str = r"^xoxc-[A-Za-z0-9_-]{1,4091}$";
+static WEB_TOKEN_REGEX: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(WEB_TOKEN_PATTERN).expect("Slack 网页令牌正则有效"));
 
 #[derive(serde::Deserialize)]
 pub(super) struct WebSession {
@@ -45,14 +53,7 @@ impl WebSession {
                     |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
                 )
         };
-        if !self.token.starts_with("xoxc-")
-            || self.token.len() <= 5
-            || self.token.len() > 4096
-            || !self
-                .token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !WEB_TOKEN_REGEX.is_match(&self.token) {
             return Err(Error::WebUserToken);
         }
         if !valid_cookie(&self.d_cookie) {

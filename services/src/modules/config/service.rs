@@ -21,6 +21,7 @@ use super::{
 mod notifications;
 pub use notifications::NotificationValidationError;
 pub(crate) use notifications::{NotificationConfirmedFields, NotificationRequest};
+use notifications::{legacy_pending_password_id, pending_password_id};
 
 #[derive(Clone, Debug)]
 pub struct ConfigService {
@@ -1673,15 +1674,10 @@ impl ConfigItemOptions {
         let Ok(base) = self.password_path(field, instance) else {
             return false;
         };
-        if path == base {
-            return true;
-        }
-        self.notification_endpoint.is_some()
-            && path
-                .strip_prefix(base.trim_end_matches(".gpg"))
-                .and_then(|suffix| suffix.strip_prefix('-'))
-                .and_then(|suffix| suffix.strip_suffix(".gpg"))
-                .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+        path == base
+            || (self.notification_endpoint.is_some()
+                && (legacy_pending_password_id(&base, path).is_some()
+                    || pending_password_id(&base, path).is_some()))
     }
 
     fn password_path(&self, key: &str, instance: &str) -> Result<String, ConfigServiceError> {
@@ -1768,7 +1764,10 @@ impl ConfigItemMetadata {
                                         .as_str()
                                         .is_some_and(|text| text.trim().is_empty())) =>
                         {
-                            if let Some(checker) = &field.checker {
+                            // 密码字段在记录中保存条目引用，明文在写入前校验。
+                            if !field.data_type.is_password()
+                                && let Some(checker) = &field.checker
+                            {
                                 checker.validate(&field.label, value)?;
                             }
                         }

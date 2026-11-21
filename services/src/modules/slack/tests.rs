@@ -599,6 +599,43 @@ async fn password_config(
 }
 
 #[tokio::test]
+async fn pending_team_passwords_migrate_to_team_id_filename() {
+    let directory = Directory::new();
+    let config_path = directory.0.join("config.yml");
+    let (_, passwords) = password_config(&config_path, &directory.0).await;
+    let id = uuid::Uuid::new_v4();
+    let path = "loki-assistant/slack/TLEGACY.gpg";
+    let legacy = format!("loki-assistant/slack/TLEGACY-{id}.gpg");
+    passwords
+        .save_multiline(&legacy, "xoxc-fixture")
+        .await
+        .unwrap();
+    let mut values: Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    values["_pending_config_notifications"] = json!({
+        (id.to_string()): {
+            "id":id,"module":"slack","item":"teams","instance":"TLEGACY","key":"TLEGACY",
+            "value":{"team_id":"TLEGACY","token":legacy},"previous":null,"delete":false
+        }
+    });
+    fs::write(&config_path, serde_yaml_ng::to_string(&values).unwrap()).unwrap();
+
+    let (config, _) = password_config(&config_path, &directory.0).await;
+    config.migrate_pending_password_paths().await.unwrap();
+    config.migrate_pending_password_paths().await.unwrap();
+
+    let app =
+        crate::modules::config::Module::from_service(ConfigService::load(&config_path).unwrap())
+            .router();
+    let (_, _, response) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    assert_eq!(response["pending"][0]["status"], "pending");
+    assert_eq!(response["pending"][0]["value"]["token"], path);
+    assert!(response["pending"][0]["value"].get("d_cookie").is_none());
+    assert_eq!(passwords.fetch(path).await.unwrap(), "xoxc-fixture\n");
+    assert!(!directory.0.join(legacy).exists());
+}
+
+#[tokio::test]
 async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation() {
     use crate::modules::config;
 
@@ -751,6 +788,12 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         "^T[A-Z0-9]{1,47}$"
     );
 
+    let token_field = fields.iter().find(|field| field["key"] == "token").unwrap();
+    assert_eq!(
+        token_field["checker"]["pattern"],
+        super::client::WEB_TOKEN_PATTERN
+    );
+
     assert!(teams.get("actions").is_none());
     assert_eq!(module["items"].as_array().unwrap().len(), 1);
     assert_eq!(
@@ -812,7 +855,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         assert!(partial["value"].get(second_field).is_none());
         let staged_path = partial["value"][first_field].as_str().unwrap();
         let confirmed_path = format!("loki-assistant/slack/{team}.gpg");
-        assert!(!directory.0.join(&confirmed_path).exists());
+        assert_eq!(staged_path, confirmed_path);
         assert_eq!(
             passwords.fetch(staged_path).await.unwrap(),
             if first_field == "d_cookie" {
@@ -832,7 +875,6 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(outcome["status"], "confirmed");
-        assert!(!directory.0.join(staged_path).exists());
         let path = outcome["value"]["token"].as_str().unwrap();
         assert_eq!(path, confirmed_path);
         assert_eq!(outcome["value"]["d_cookie"], path);
@@ -1052,43 +1094,43 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(retry["status"], "pending");
     assert_eq!(opened.try_recv().unwrap(), setup_url);
-    let (status, _, partial) = invoke(
-        &app,
-        "PATCH",
-        team_path,
-        None,
-        None,
-        Some(json!({"token":"not-a-token"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(partial["status"], "pending");
-    assert_eq!(opened.try_recv().unwrap(), setup_url);
-    let (_, _, pending) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
-    assert_eq!(pending["pending"][0]["key"], "TWEB");
-    assert!(!pending["value"].to_string().contains("TWEB"));
-    let (invalid, headers, error) = invoke(
-        &app,
-        "PATCH",
-        team_path,
-        None,
-        None,
-        Some(json!({"d_cookie":"test-web-cookie"})),
-    )
-    .await;
-    assert_eq!(invalid, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(headers["x-loki-config-cleared-fields"], "token, d_cookie");
-    assert_eq!(error["error"]["code"], "slack-invalid-web-user-token");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("xoxc-")
-    );
-    let (_, _, rejected) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
-    assert_eq!(rejected["pending"][0]["status"], "invalid");
-    assert_eq!(rejected["pending"][0]["value"], json!({"team_id":"TWEB"}));
-    assert!(!rejected["value"].to_string().contains("TWEB"));
+    let (_, _, pending_before) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    let stored_before = fs::read(&config_path).unwrap();
+    for token in [
+        json!("not-a-token"),
+        json!("xoxc-"),
+        json!("xoxc-contains space"),
+        json!(42),
+    ] {
+        let (status, _, error) = invoke(
+            &app,
+            "PATCH",
+            team_path,
+            None,
+            None,
+            Some(json!({"token":token})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid-config");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("xoxc-")
+        );
+    }
+    assert!(opened.try_recv().is_err());
+    let (_, _, pending_after) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+    assert_eq!(pending_before, pending_after);
+    assert_eq!(stored_before, fs::read(&config_path).unwrap());
+    let pass_dir = directory.0.join("loki-assistant/slack");
+    assert!(!fs::read_dir(pass_dir).unwrap().any(|file| {
+        file.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("TWEB")
+    }));
     let (status, _, error) = invoke(
         &app,
         "PATCH",
@@ -1304,7 +1346,16 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(opened.try_recv().unwrap(), setup_url);
     let staged = pending["value"]["token"].as_str().unwrap();
-    assert_ne!(staged, password_path);
+    let stage_dir = std::path::Path::new(staged).parent().unwrap();
+    assert_eq!(
+        stage_dir.parent().unwrap().to_str(),
+        Some("loki-assistant/slack/pending")
+    );
+    assert!(uuid::Uuid::parse_str(stage_dir.file_name().unwrap().to_str().unwrap()).is_ok());
+    assert_eq!(
+        std::path::Path::new(staged).file_name().unwrap(),
+        "TWEB.gpg"
+    );
     assert!(directory.0.join(staged).is_file());
     assert!(directory.0.join(password_path).is_file());
     let (status, _, cleared) = invoke(
