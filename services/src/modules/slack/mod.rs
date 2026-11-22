@@ -1,4 +1,5 @@
 mod client;
+mod disk;
 mod mailbox;
 mod picker;
 mod projects;
@@ -40,6 +41,8 @@ static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
 };
 
 const TEAM_NOTIFICATION_ENDPOINT: &str = "/slack/config/teams";
+const CACHE_RETENTION_DAYS: &str = "cache_retention_days";
+const DEFAULT_CACHE_RETENTION_DAYS: u64 = 30;
 
 impl projects::SlackTeam {
     fn metadata() -> StructureMetadata {
@@ -161,6 +164,19 @@ fn slack_configuration() -> ConfigModuleMetadata {
                 min_items: None,
                 max_items: None,
             }),
+            checker: None,
+            file_path: None,
+            executable: None,
+        }, ConfigItemMetadata {
+            key: CACHE_RETENTION_DAYS.into(),
+            name: "缓存保留天数".into(),
+            description: "Slack 消息和附件从最后写入起保留的天数。".into(),
+            data_type: ConfigDataType::Integer,
+            remote_access: ConfigRemoteAccess::Local,
+            required: false,
+            default: Some(serde_json::json!(DEFAULT_CACHE_RETENTION_DAYS)),
+            dictionary: None,
+            list: None,
             checker: None,
             file_path: None,
             executable: None,

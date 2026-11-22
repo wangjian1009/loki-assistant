@@ -117,7 +117,9 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 
 配置模型、数组操作、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
-Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /data/slack/teams/{team_id}~ 保存凭据。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
+Slack HTTP 接口和 ~slack~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /data/slack/teams/{team_id}~ 保存凭据。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
+
+~slack/cache_retention_days~ 通过通用配置接口读取和保存，适用于消息和附件。 [[file:slack.org::*缓存设计][缓存设计]]
 
 * 控制中心模块
 

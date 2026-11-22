@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,6 +14,7 @@ use crate::modules::{config::service::ConfigService, notification::NotificationS
 
 use super::{
     client::{SlackClient, WebSession},
+    disk::DiskCache,
     mailbox::UserDirectory,
     picker::PickerItem,
     projects::{Backend, SlackTeam},
@@ -50,7 +52,8 @@ impl State {
 }
 
 pub struct SlackService {
-    pub(super) state: Mutex<State>,
+    pub(super) state: Arc<Mutex<State>>,
+    cache_root: Option<PathBuf>,
     pub(super) client: SlackClient,
     pub(super) notification: Arc<NotificationService>,
     pub(super) change: watch::Sender<u64>,
@@ -84,10 +87,11 @@ impl SlackService {
     ) -> Self {
         let imported_token = settings.token.is_some().then_some(config);
         Self {
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 socket_state: "stopped",
                 ..State::default()
-            }),
+            })),
+            cache_root: backend.cache_root.clone(),
             client: SlackClient::new(&backend.api),
             notification,
             change: watch::channel(0).0,
@@ -113,18 +117,22 @@ impl SlackService {
         self.signal_change();
     }
 
-    pub(super) async fn update_cache<T>(
+    pub(super) async fn update_cache<T: Send + 'static>(
         &self,
         session: Uuid,
-        operation: impl FnOnce(&mut Cache, &Account) -> Result<T, Error>,
+        operation: impl FnOnce(&mut Cache, &Account) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.clone().lock_owned().await;
         state.account(session)?;
-        let State { cache, secrets, .. } = &mut *state;
-        let result = operation(
-            cache,
-            secrets.account.as_ref().expect("已验证的 Slack 会话"),
-        );
+        let result = tokio::task::spawn_blocking(move || {
+            let State { cache, secrets, .. } = &mut *state;
+            operation(
+                cache,
+                secrets.account.as_ref().expect("已验证的 Slack 会话"),
+            )
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?;
         if result.is_ok() {
             self.picker_changed.notify_one();
         }
@@ -135,22 +143,37 @@ impl SlackService {
         &self,
         operation: impl FnOnce(&mut Secrets) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.clone().lock_owned().await;
         if state.retired {
             return Err(Error::Project);
         }
         let result = operation(&mut state.secrets)?;
-        let session = state
+        let identity = state
             .secrets
             .account
             .as_ref()
-            .map(|account| account.identity.session_id);
+            .map(|account| account.identity.clone());
+        let session = identity.as_ref().map(|identity| identity.session_id);
         if state.cache.session_id != session {
             state.user_directory = None;
             state.picker_items = Arc::default();
             state.picker_failed = false;
+            state.cache.reset(session);
+            if let (Some(root), Some(identity)) = (self.cache_root.clone(), identity) {
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(disk) = DiskCache::open(&root, &identity.team_id, &identity.user_id) {
+                        state.user_directory = Some(UserDirectory::from_disk(
+                            identity.session_id,
+                            disk.users(&identity.team_id),
+                        ));
+                        state.cache.conversations = disk.rooms();
+                        state.cache.disk = Some(disk);
+                    }
+                })
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            }
         }
-        state.cache.reset(session);
         self.picker_changed.notify_one();
         Ok(result)
     }

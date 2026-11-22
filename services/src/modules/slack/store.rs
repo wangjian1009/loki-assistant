@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::disk::DiskCache;
 use super::protocol::{Error, Identity, Message, timestamp};
 
 #[derive(Default)]
@@ -22,6 +23,7 @@ pub(super) struct Account {
 
 #[derive(Default)]
 pub(super) struct Cache {
+    pub disk: Option<DiskCache>,
     pub session_id: Option<Uuid>,
     pub conversations: BTreeMap<String, Conversation>,
     pub directory_loaded: bool,
@@ -49,6 +51,7 @@ impl Cache {
 
 #[derive(Clone)]
 pub(super) struct Conversation {
+    pub disk: Option<DiskCache>,
     pub id: String,
     pub kind: String,
     pub title: String,
@@ -64,6 +67,7 @@ pub(super) struct ReadPositions(pub BTreeMap<String, String>);
 impl Conversation {
     pub fn new(id: &str, kind: &str, title: &str) -> Self {
         Self {
+            disk: None,
             id: id.into(),
             kind: kind.into(),
             title: title.into(),
@@ -129,6 +133,10 @@ impl Conversation {
         {
             return;
         }
+        if let Some(disk) = &self.disk {
+            disk.save_room(self);
+            disk.save_message(&self.id, &message);
+        }
         self.messages.insert(message.ts.clone(), message);
         if self.messages.len() > 1_000 {
             if let Some(oldest) = self
@@ -143,7 +151,16 @@ impl Conversation {
     }
 
     pub fn remove(&mut self, ts: &str) {
-        self.messages.remove(ts);
+        let removed = self.messages.remove(ts);
+        if let Some(disk) = &self.disk {
+            disk.remove_message(
+                &self.id,
+                ts,
+                removed
+                    .as_ref()
+                    .and_then(|message| message.thread_ts.as_deref()),
+            );
+        }
         self.deleted.insert(ts.into());
         if self.deleted.len() > 2_000 {
             self.deleted.pop_first();

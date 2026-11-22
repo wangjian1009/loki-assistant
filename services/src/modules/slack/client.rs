@@ -90,8 +90,73 @@ impl SlackClient {
         token: &str,
         web: Option<&WebSession>,
     ) -> Result<(String, Vec<u8>), Error> {
-        const MAX_BYTES: usize = 5 * 1024 * 1024;
-        if !slack_image_url(url) {
+        self.download(url, token, web, 5 * 1024 * 1024, false).await
+    }
+
+    pub async fn original(
+        &self,
+        url: &str,
+        token: &str,
+        web: Option<&WebSession>,
+    ) -> Result<(String, reqwest::Response), Error> {
+        self.download_response(url, token, web, false).await
+    }
+
+    pub async fn avatar(&self, url: &str) -> Result<Vec<u8>, Error> {
+        self.download(url, "", None, 512 * 1024, true)
+            .await
+            .map(|(_, bytes)| bytes)
+    }
+
+    async fn download(
+        &self,
+        url: &str,
+        token: &str,
+        web: Option<&WebSession>,
+        limit: usize,
+        avatar: bool,
+    ) -> Result<(String, Vec<u8>), Error> {
+        let (mime, mut response) = self.download_response(url, token, web, avatar).await?;
+        if super::disk::mime_extension(&mime)
+            .and_then(super::disk::preview_mime)
+            .is_none()
+            || response
+                .content_length()
+                .is_some_and(|size| size > limit as u64)
+        {
+            return Err(Error::Attachment);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+            if chunk.len() > limit - bytes.len() {
+                return Err(Error::Attachment);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((mime, bytes))
+    }
+
+    async fn download_response(
+        &self,
+        url: &str,
+        token: &str,
+        web: Option<&WebSession>,
+        avatar: bool,
+    ) -> Result<(String, reqwest::Response), Error> {
+        let approved_avatar = avatar
+            && Url::parse(url).ok().is_some_and(|url| {
+                url.scheme() == "https"
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port().is_none()
+                    && url.host_str().is_some_and(|host| {
+                        host == "slack.com"
+                            || host.ends_with(".slack.com")
+                            || host == "gravatar.com"
+                            || host.ends_with(".gravatar.com")
+                    })
+            });
+        if !slack_image_url(url) && !approved_avatar {
             return Err(Error::Attachment);
         }
         let url = Url::parse(url).map_err(|_| Error::Attachment)?;
@@ -100,18 +165,14 @@ impl SlackClient {
             Some("files.slack.com" | "files-origin.slack.com")
         );
         let mut request = self.http.get(url);
-        if private {
+        if private && !avatar {
             request = request.bearer_auth(web.map_or(token, |web| &web.token));
             if let Some(web) = web {
                 request = request.header(reqwest::header::COOKIE, format!("d={}", web.d_cookie));
             }
         }
-        let mut response = request.send().await.map_err(|_| Error::Unavailable)?;
-        if !response.status().is_success()
-            || response
-                .content_length()
-                .is_some_and(|size| size > MAX_BYTES as u64)
-        {
+        let response = request.send().await.map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success() {
             return Err(Error::Attachment);
         }
         let mime = response
@@ -119,22 +180,8 @@ impl SlackClient {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
-            .filter(|mime| {
-                matches!(
-                    *mime,
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                )
-            })
-            .ok_or(Error::Attachment)?
-            .to_owned();
-        let mut image = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
-            if image.len() + chunk.len() > MAX_BYTES {
-                return Err(Error::Attachment);
-            }
-            image.extend_from_slice(&chunk);
-        }
-        Ok((mime, image))
+            .unwrap_or("application/octet-stream");
+        Ok((mime.to_owned(), response))
     }
 
     pub fn new(api: &str) -> Self {

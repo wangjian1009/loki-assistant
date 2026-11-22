@@ -60,9 +60,41 @@
   "返回压成一行的 TEXT。"
   (when (stringp text) (string-trim (replace-regexp-in-string "[[:space:][:cntrl:]]+" " " text))))
 
+(defun loki-assistant-slack--local-file (path)
+  "若 PATH 指向可读的本机缓存文件，则返回 PATH。"
+  (when (and (stringp path) (file-name-absolute-p path) (not (file-remote-p path))
+             (file-regular-p path) (file-readable-p path))
+    path))
+
+(defun loki-assistant-slack--cached-record (entry key expected fields)
+  "用 ENTRY 对应的缓存记录更新 FIELDS，核对 KEY 等于 EXPECTED。"
+  (condition-case nil
+      (if-let ((path (loki-assistant-slack--local-file (alist-get 'cache_path entry))))
+          (with-temp-buffer
+            (let ((coding-system-for-read 'utf-8-unix)
+                  (read-circle nil))
+              (insert-file-contents path)
+              (goto-char (point-min))
+              (let ((record (read (current-buffer))))
+                (skip-chars-forward " \t\r\n")
+                (if (and (eobp) (equal (alist-get key record) expected))
+                    (let ((result (copy-sequence entry)))
+                      (dolist (field fields)
+                        (when-let ((value (assq field record)))
+                          (setq result (cons value (assq-delete-all field result)))))
+                      result)
+                  entry))))
+        entry)
+    (error entry)))
+
 (defun loki-assistant-slack--choice-for (room)
   "从 ROOM 的服务端候选资料生成显示内容。"
-  (let* ((private (member (alist-get 'kind room) '("im" "mpim")))
+  (let* ((id (alist-get 'id room))
+         (room (if (stringp id)
+                   (loki-assistant-slack--cached-record
+                    room 'id (car (last (split-string id "\\."))) '(kind))
+                 room))
+         (private (member (alist-get 'kind room) '("im" "mpim")))
          (mention (loki-assistant-slack--non-null (alist-get 'last_unread_mention_ts room)))
          (unread (or (alist-get 'unread_count room) 0))
          (last-message (loki-assistant-slack--non-null (alist-get 'last_message room)))
@@ -82,8 +114,7 @@
      :workspace (or (loki-assistant-slack--single-line (alist-get 'team_name room))
                     (alist-get 'team_id room) "")
      :search (append (alist-get 'search_terms room) nil)
-     :avatars (when private (or (mapcar (lambda (user) (alist-get 'avatar_url user))
-                                        (alist-get 'participants room)) '(nil)))
+     :avatars (when private (or (append (alist-get 'participants room) nil) '(nil)))
      :status (concat (when (> unread 0) (format "%d 未读" unread))
                      (when mention (propertize " @我" 'face 'warning)))
      :summary (propertize (string-join details " · ") 'face 'shadow))))
@@ -142,6 +173,43 @@
     (loki-assistant-slack--image url images update))
   (let ((image (gethash url images)))
     (if (consp image) (propertize "○" 'display image) (propertize "○" 'face 'shadow))))
+
+(defun loki-assistant-slack--file-image (path width height)
+  "以 WIDTH 和 HEIGHT 为上限读取 PATH 中的图片。"
+  (when (display-graphic-p)
+    (when-let ((path (loki-assistant-slack--local-file path)))
+      (ignore-errors (create-image path nil nil :max-width width :max-height height :ascent 'center)))))
+
+(defun loki-assistant-slack--media (endpoint params room images update width height)
+  "从 ENDPOINT 补取缓存图片，WIDTH 和 HEIGHT 限制显示大小。
+PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
+  (let ((key (cons endpoint (alist-get 'session_id room))))
+    (when (and (display-graphic-p) (eq (gethash key images 'missing) 'missing)
+               (< (cl-count 'loading (hash-table-values images)) 8))
+      (puthash key 'loading images)
+      (loki-assistant-slack--request
+       "GET" endpoint
+       (lambda (response)
+         (puthash key
+                  (and (plist-get response :ok)
+                       (loki-assistant-slack--file-image
+                        (alist-get 'cache_path (plist-get response :data)) width height))
+                  images)
+         (funcall update))
+       :params params :room room))
+    (gethash key images)))
+
+(defun loki-assistant-slack--profile-avatar (profile room images refresh)
+  "显示 PROFILE 的头像，并按需通过 ROOM 补取。"
+  (let* ((url (alist-get 'avatar_url profile))
+         (id (alist-get 'id profile))
+         (image (or (loki-assistant-slack--file-image (alist-get 'avatar_path profile) 20 20)
+                    (when (and (stringp id) (stringp url))
+                      (loki-assistant-slack--media (format "/slack/users/%s/avatar" (url-hexify-string id))
+                                                   nil room images refresh 20 20)))))
+    (cond ((consp image) (propertize "○" 'display image))
+          ((eq image 'loading) (propertize "○" 'face 'shadow))
+          (t (loki-assistant-slack--avatar url images refresh)))))
 
 (defun loki-assistant-slack--image (url images update &optional session)
   "异步读取 URL。SESSION 非空时加载本机服务提供的图片预览。"
@@ -210,7 +278,9 @@
                         ((equal kind "mpim") "群组私聊")
                         (t "主题聊天"))
                   (loki-assistant-slack--align-to 10)
-                  (mapconcat (lambda (url) (loki-assistant-slack--avatar url images refresh))
+                  (mapconcat (lambda (profile)
+                               (loki-assistant-slack--profile-avatar
+                                profile (loki-assistant-slack--choice-room choice) images refresh))
                              (seq-take avatars 2) "")
                   (when (cddr avatars) (propertize "…" 'face 'shadow))
                   (loki-assistant-slack--align-to title-column))
@@ -423,7 +493,11 @@
 
 (defun loki-assistant-slack--merge (previous data)
   "将 DATA 的已核对区间和新消息合并到 PREVIOUS。"
-  (let* ((incoming (append (alist-get 'items data) nil))
+  (let* ((incoming (seq-map
+                    (lambda (message)
+                      (loki-assistant-slack--cached-record
+                       message 'ts (alist-get 'ts message) '(text tables edited reply_count)))
+                    (alist-get 'items data)))
          (range (loki-assistant-slack--non-null (alist-get 'covered_range data)))
          (lower (loki-assistant-slack--non-null (alist-get 'from_ts range)))
          (upper (loki-assistant-slack--non-null (alist-get 'through_ts range)))
@@ -528,7 +602,9 @@
            (dolist (id batch) (puthash id 'unavailable profiles))
            (when (plist-get response :ok)
              (seq-doseq (profile (alist-get 'items (plist-get response :data)))
-               (puthash (alist-get 'id profile) profile profiles))
+               (let ((id (alist-get 'id profile)))
+                 (puthash id (loki-assistant-slack--cached-record
+                              profile 'id id '(name display_name username is_bot avatar_url)) profiles)))
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (when (eq profiles loki-assistant-slack--profiles)
@@ -640,9 +716,16 @@
         (url (alist-get 'url attachment))
         (size (alist-get 'size attachment))
         (text (alist-get 'text attachment))
-        (session (alist-get 'session_id room)))
+        (session (alist-get 'session_id room))
+        (endpoint (and (stringp ts)
+                       (format "%s/%s/attachments/%s" (loki-assistant-slack--path room nil)
+                               (url-hexify-string ts) index))))
     (insert (propertize "  │ " 'face 'shadow))
-    (loki-assistant-slack--link (propertize title 'face 'bold) url)
+    (if (and endpoint (eq (alist-get 'original_available attachment) t))
+        (insert-text-button title 'face 'link 'follow-link t
+                            'action (lambda (_)
+                                      (loki-assistant-slack--open-attachment attachment endpoint room)))
+      (loki-assistant-slack--link (propertize title 'face 'bold) url))
     (when (numberp size) (insert (propertize (format "  %s" (file-size-human-readable size)) 'face 'shadow)))
     (insert "\n")
     (when (and (stringp text) (not (string-empty-p text)))
@@ -650,12 +733,34 @@
         (loki-assistant-slack--markdown text (alist-get 'team_id room) (make-hash-table :test #'equal) nil)
         (add-text-properties start (point) '(face shadow))))
     (when (and (eq (alist-get 'image attachment) t) (stringp session) (stringp ts) (display-graphic-p))
-      (let* ((path (format "%s/%s/attachments/%s/preview" (loki-assistant-slack--path room nil)
-                           (url-hexify-string ts) index))
-             (image (loki-assistant-slack--image path images refresh session)))
+      (let* ((path (concat endpoint "/preview"))
+             (image (or (loki-assistant-slack--file-image (alist-get 'preview_path attachment) 560 320)
+                        (loki-assistant-slack--media path '((local_path . "true"))
+                                                     room images refresh 560 320)
+                        (loki-assistant-slack--image path images refresh session))))
         (insert "  " (cond ((consp image) (propertize title 'display image))
                             ((eq image 'loading) (propertize "正在加载图片…" 'face 'shadow))
                             (t (propertize "图片预览暂不可用" 'face 'shadow))) "\n")))))
+
+(defun loki-assistant-slack--open-attachment (attachment endpoint room)
+  "打开 ROOM 中 ENDPOINT 对应的 ATTACHMENT。"
+  (let ((open (lambda (path)
+                (when-let ((path (loki-assistant-slack--local-file path)))
+                  (let ((enable-local-variables nil)
+                        (enable-local-eval nil))
+                    (find-file path))
+                  t))))
+    (unless (funcall open (alist-get 'original_path attachment))
+      (loki-assistant-slack--request
+       "GET" (concat endpoint "/original")
+       (lambda (response)
+         (unless (and (plist-get response :ok)
+                      (funcall open (alist-get 'cache_path (plist-get response :data))))
+           (let ((url (alist-get 'url attachment)))
+             (if (loki-assistant-slack--web-link-p url)
+                 (browse-url url)
+               (message "%s" (or (plist-get response :error-message) "Slack 附件暂不可用"))))))
+       :room room))))
 
 (defun loki-assistant-slack--message (message room profiles images refresh)
   "渲染 ROOM 中的 MESSAGE 和发送者资料。"
@@ -668,7 +773,7 @@
          (name (or (alist-get 'name profile) (alist-get 'name author) "Slack"))
          (text (or (alist-get 'text message) ""))
          (tables (alist-get 'tables message)))
-    (insert (loki-assistant-slack--avatar (alist-get 'avatar_url profile) images refresh)
+    (insert (loki-assistant-slack--profile-avatar profile room images refresh)
             "  " (propertize name 'face 'bold)
             (if (stringp ts) (propertize (format-time-string "   %H:%M" (seconds-to-time (string-to-number ts))) 'face 'shadow) "")
             (if (eq (alist-get 'edited message) t) (propertize "  已编辑" 'face 'shadow) "") "\n")

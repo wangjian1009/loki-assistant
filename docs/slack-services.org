@@ -62,6 +62,8 @@ Slack 业务接口和工作区配置只接受本机调用，客户端可直接�
 
 ~GET /slack/users/{id}~ 计划按复合用户标识查询单条用户资料。响应字段待定。
 
+本机用户记录可带 ~cache_path~ 和 ~avatar_path~ ，分别指向资料和 PNG 头像。 ~GET /slack/users/{id}/avatar~ 按需下载头像并返回 ~cache_path~ ，其中 ~id~ 为复合用户 ID。
+
 ** 批量查询用户
 
 ~GET /slack/users~ 支持可重复的查询参数 ~id~ 。一次可传入 1 到 100 个复合用户 ID，格式为 ~team_id.用户ID~ ，同一请求可跨工作区。客户端可直接传入消息作者或私聊参与者的 ID。使用 ~id~ 时省略 ~limit~ 和 ~cursor~ 。空值、格式无效、超限或同时传入分页参数会返回 HTTP 400 ~invalid-request~ 。
@@ -134,6 +136,8 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 消息中可包含 ~attachments~ 和 ~tables~ 。附件包含 ~title~ 、 ~mimetype~ 、 ~size~ 、 ~url~ 、 ~text~ 和 ~image~ ，其中 ~url~ 是供用户打开的链接， ~image~ 表示可读取图片预览。 ~tables~ 以表格、行、单元格的数组返回 Slack 原生表格的文本。
 
 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/preview~ 读取当前会话消息中的单张图片。 ~index~ 是 ~attachments~ 中从零起算的位置。成功响应为 PNG、JPEG、GIF 或 WebP，最大 5 MiB。附件或预览不可用时返回 ~slack-attachment-not-found~ 。
+
+会话和消息记录可带 ~cache_path~ ，附件可带 ~original_path~ 、 ~preview_path~ 和 ~original_available~ 。预览接口传入 ~local_path=true~ 时按需缓存图片并返回 ~cache_path~ 。 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ 按需缓存原件并返回 ~cache_path~ 。路径均为本机绝对路径，文件格式和清理规则见 [[file:slack.org::*缓存设计][缓存设计]]。
 
 * 消息发送与发送记录
 

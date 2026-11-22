@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
+};
 
 use axum::Router;
 use futures_util::{StreamExt, stream};
@@ -19,6 +21,8 @@ use crate::modules::{
 };
 
 use super::{
+    CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS,
+    disk::DiskCache,
     mailbox::{next_cursor, read_cursor},
     protocol::{Error, Page, valid_id},
     routes,
@@ -37,6 +41,7 @@ pub(super) enum RegistrationStatus {
 
 pub(super) struct Backend {
     pub api: String,
+    pub cache_root: Option<PathBuf>,
     pub open_browser: Arc<dyn Fn(String) -> BrowserFuture + Send + Sync>,
 }
 
@@ -113,6 +118,7 @@ pub struct Projects {
     port: std::sync::OnceLock<u16>,
     backend: Backend,
     shutdown: Notify,
+    clean_cache: Notify,
 }
 
 impl std::fmt::Debug for Projects {
@@ -137,6 +143,10 @@ impl Projects {
             emacs,
             Backend {
                 api: "https://slack.com/api".into(),
+                cache_root: std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .map(|path| path.join(".cache/slack")),
                 open_browser: Arc::new(|url| {
                     Box::pin(async move {
                         let mut opener = tokio::process::Command::new("/usr/bin/open");
@@ -174,6 +184,7 @@ impl Projects {
             port: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
+            clean_cache: Notify::new(),
         }
     }
 
@@ -182,9 +193,47 @@ impl Projects {
     }
 
     pub async fn run(self: Arc<Self>, port: u16) {
+        self.prune_cache().await;
         let _ = self.port.set(port);
         let _ = self.sync_projects(None).await;
-        self.shutdown.notified().await;
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => break,
+                _ = self.clean_cache.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(86_400)) => {},
+            }
+            self.prune_cache().await;
+        }
+    }
+
+    async fn prune_cache(&self) {
+        let Some(root) = self.backend.cache_root.clone() else {
+            return;
+        };
+        let retention = self
+            .config
+            .value("slack", CACHE_RETENTION_DAYS)
+            .await
+            .ok()
+            .and_then(|value| retention(&value.value))
+            .unwrap_or(Duration::from_secs(DEFAULT_CACHE_RETENTION_DAYS * 86_400));
+        let _reconcile = self.reconcile.lock().await;
+        let states: Vec<_> = self
+            .projects
+            .read()
+            .await
+            .values()
+            .map(|project| Arc::clone(&project.service.state))
+            .collect();
+        let mut guards = Vec::with_capacity(states.len());
+        for state in states {
+            guards.push(state.lock_owned().await);
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            DiskCache::clean(&root, retention);
+            drop(guards);
+        })
+        .await;
     }
 
     pub async fn stop(&self) {
@@ -240,18 +289,18 @@ impl Projects {
         let target = format!("users:{fingerprint}");
         let anchor = read_cursor(&page, Uuid::nil(), &target)?;
         let anchor = anchor.as_deref().unwrap_or_default();
-        let results = futures_util::future::join_all(
-            sessions
-                .iter()
-                .map(|(id, service, session)| async move { (id, service.users(*session).await) }),
-        )
+        let results = futures_util::future::join_all(sessions.iter().map(
+            |(id, service, session)| async move {
+                (id, service, *session, service.users(*session).await)
+            },
+        ))
         .await;
         let mut directories = Vec::new();
         let mut issues = Vec::new();
         let mut first_error = None;
-        for (id, result) in results {
+        for (id, service, session, result) in results {
             match result {
-                Ok(users) => directories.push(users),
+                Ok(users) => directories.push((id, service, session, users)),
                 Err(error) => {
                     first_error.get_or_insert(error);
                     issues.push(json!({"team_id":id,"error":error.object()}));
@@ -265,14 +314,25 @@ impl Projects {
         }
         let mut users: Vec<_> = directories
             .iter()
-            .flat_map(|directory| directory.iter())
-            .filter(|user| user.id.as_str() > anchor)
+            .flat_map(|(id, service, session, directory)| {
+                directory
+                    .iter()
+                    .map(move |user| (user, id, *service, *session))
+            })
+            .filter(|(user, _, _, _)| user.id.as_str() > anchor)
             .collect();
-        users.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        users.sort_unstable_by(|left, right| left.0.id.cmp(&right.0.id));
         let next_cursor = (users.len() > limit)
-            .then(|| next_cursor(Uuid::nil(), target, users[limit - 1].id.clone()));
+            .then(|| next_cursor(Uuid::nil(), target, users[limit - 1].0.id.clone()));
         users.truncate(limit);
-        Ok(json!({"api_version":"1","items":users,"next_cursor":next_cursor,"issues":issues}))
+        let mut items = Vec::with_capacity(users.len());
+        for (user, team, service, session) in users {
+            match service.user_result(session, user).await {
+                Ok(item) => items.push(item),
+                Err(error) => issues.push(json!({"team_id":team,"error":error.object()})),
+            }
+        }
+        Ok(json!({"api_version":"1","items":items,"next_cursor":next_cursor,"issues":issues}))
     }
 
     pub(super) async fn lookup_users(&self, ids: Vec<(String, String)>) -> Value {
@@ -281,7 +341,8 @@ impl Projects {
                 let result = async {
                     let service = self.service(&team).await?;
                     let session = service.session_id().await.ok_or(Error::Authorization)?;
-                    service.lookup_user(session, &id).await
+                    let profile = service.lookup_user(session, &id).await?;
+                    service.user_result(session, &profile).await
                 }
                 .await;
                 (team, id, result)
@@ -528,11 +589,25 @@ impl ConfigChangeHandler for Projects {
             if change.key == "teams" {
                 parse_projects(&change.value)?;
             }
+            if change.key == CACHE_RETENTION_DAYS && retention(&change.value).is_none() {
+                return Err("缓存保留天数必须为可表示的正整数。".into());
+            }
             Ok(())
         })
     }
 
-    fn committed(&self, _change: ConfigChange) -> ChangeFuture<'_> {
-        Box::pin(async { self.sync_projects(None).await })
+    fn committed(&self, change: ConfigChange) -> ChangeFuture<'_> {
+        Box::pin(async move {
+            if change.key == CACHE_RETENTION_DAYS {
+                self.clean_cache.notify_one();
+                return Ok(());
+            }
+            self.sync_projects(None).await
+        })
     }
+}
+
+fn retention(value: &Value) -> Option<Duration> {
+    let days = value.as_u64().filter(|days| *days > 0)?;
+    days.checked_mul(86_400).map(Duration::from_secs)
 }

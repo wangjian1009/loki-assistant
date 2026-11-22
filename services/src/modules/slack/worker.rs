@@ -272,10 +272,11 @@ impl SlackService {
                 && message
                     .as_ref()
                     .is_some_and(|message| cache.positions(&id).unread(message, account));
-            let conversation = cache
-                .conversations
-                .entry(id.clone())
-                .or_insert_with(|| Conversation::new(&id, &kind, &id));
+            let conversation = cache.conversations.entry(id.clone()).or_insert_with(|| {
+                let mut room = Conversation::new(&id, &kind, &id);
+                room.disk.clone_from(&cache.disk);
+                room
+            });
             if subtype == "message_deleted" {
                 if let Some(deleted) = deleted {
                     conversation.remove(&deleted);
@@ -503,6 +504,9 @@ impl SlackService {
                         .collect();
                     if !labels.is_empty() && matches!(conversation.kind.as_str(), "im" | "mpim") {
                         conversation.title = labels.join("、");
+                        if let Some(disk) = &conversation.disk {
+                            disk.save_room(conversation);
+                        }
                     }
                     for message in conversation.messages.values_mut() {
                         if let Some(author) = &mut message.author

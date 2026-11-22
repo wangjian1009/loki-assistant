@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -127,6 +127,75 @@ struct Mock {
     reply: String,
     sent: String,
     posts: AtomicUsize,
+    history_unavailable: AtomicBool,
+}
+
+#[test]
+fn disk_cache_retains_active_threads_and_restores_message_records() {
+    use std::{io::Write, time::SystemTime};
+
+    use super::{disk::DiskCache, protocol::Message};
+
+    let directory = Directory::new();
+    let cache = DiskCache::open(&directory.0, "TTEAM", "UME").unwrap();
+    let room = super::store::Conversation::new("CROOM", "public_channel", "频道");
+    cache.save_room(&room);
+    let root = Message::from_slack(
+        &json!({
+            "ts":"10.000001", "text":"UTF-8 文本\n引号\"与反斜杠\\",
+            "files":[{"id":"F1","name":"报告.pdf","mimetype":"application/pdf",
+                      "url_private_download":"https://files.slack.com/download"}]
+        }),
+        None,
+    )
+    .unwrap();
+    let reply = Message::from_slack(
+        &json!({"ts":"11.000002","thread_ts":root.ts,"text":"回复"}),
+        None,
+    )
+    .unwrap();
+    let stale = Message::from_slack(&json!({"ts":"1.000003","text":"旧消息"}), None).unwrap();
+    for message in [&root, &reply, &stale] {
+        cache.save_message("CROOM", message);
+    }
+    let attachment = &root.attachments[0];
+    let (pending, mut file) = cache.begin_original(attachment, "application/pdf").unwrap();
+    assert!(cache.attachment(attachment, false).is_none());
+    file.write_all(b"original").unwrap();
+    drop(file);
+    let path = pending.commit().unwrap();
+    assert!(path.ends_with("F1.original.pdf"));
+    assert_eq!(cache.attachment(attachment, false), Some(path.clone()));
+    let loaded = cache.rooms().remove("CROOM").unwrap();
+    let saved = &loaded.messages[&root.ts];
+    assert_eq!(saved.text, root.text);
+    assert_eq!(saved.attachments[0].download_url, attachment.download_url);
+
+    let room_path = directory.0.join("TTEAM/conversations/CROOM");
+    let root_path = room_path.join("messages/10.000001.txt");
+    let reply_path = room_path.join("threads/10.000001/11.000002.txt");
+    let stale_path = room_path.join("messages/1.000003.txt");
+    let expire = |path: &std::path::Path| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 86_400))
+            .unwrap();
+    };
+    expire(&root_path);
+    expire(&stale_path);
+    expire(&path);
+    DiskCache::clean(&directory.0, Duration::from_secs(86_400));
+    assert!(root_path.is_file() && reply_path.is_file());
+    assert!(!stale_path.exists() && !path.exists());
+
+    expire(&reply_path);
+    DiskCache::clean(&directory.0, Duration::from_secs(86_400));
+    assert!(!root_path.exists() && !reply_path.exists());
+    assert!(cache.room_path("CROOM").is_file());
+    let other = DiskCache::open(&directory.0, "TTEAM", "UOTHER").unwrap();
+    assert!(other.rooms().is_empty());
 }
 
 async fn invoke(
@@ -196,6 +265,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         reply: format!("{now}.000002"),
         sent: format!("{now}.000003"),
         posts: AtomicUsize::default(),
+        history_unavailable: AtomicBool::default(),
     });
     let slack = Router::new()
         .route("/rtm.connect", post(|State(mock): State<Arc<Mock>>, headers: HeaderMap| async move {
@@ -216,6 +286,9 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         }))
         .route("/users.info", get(|| async { Json(json!({"ok":true,"user":{"real_name":"林舟"}})) }))
         .route("/conversations.history", get(|State(mock): State<Arc<Mock>>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
+            if mock.history_unavailable.load(Ordering::SeqCst) {
+                return Json(json!({"ok":false,"error":"internal_error"}));
+            }
             if query.get("channel").is_some_and(|channel| channel == "CWORK") {
                 return Json(json!({"ok":true,"messages":[]}));
             }
@@ -339,6 +412,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             )),
             Backend {
                 api: api.clone(),
+                cache_root: Some(directory.0.join("cache")),
                 open_browser: Arc::new(|_| unreachable!()),
             },
         ));
@@ -452,6 +526,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(view["root"]["ts"], mock.root);
     assert_eq!(view["root"]["author"]["id"], "TTEAM.UYOU");
     assert_eq!(view["items"][0]["ts"], mock.reply);
+    let reply_path = directory.0.join(format!(
+        "cache/TTEAM/conversations/DDIRECT/threads/{}/{}.txt",
+        mock.root, mock.reply
+    ));
+    assert_eq!(view["items"][0]["cache_path"], json!(reply_path));
+    assert!(fs::read_to_string(reply_path).unwrap().contains("线程回复"));
     let thread_cursor = view["next_cursor"].as_str().unwrap();
     let (_, _, view) = invoke(
         &app,
@@ -590,10 +670,20 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     projects.stop().await;
     worker.await.unwrap();
 
+    mock.history_unavailable.store(true, Ordering::SeqCst);
     let (projects, app, worker) = start();
     let service = ready_service(&projects, "TTEAM").await;
     let fresh_session = service.session_id().await;
     assert_ne!(fresh_session, session);
+    let (code, _, restored) = invoke(&app, "GET", timeline, fresh_session, None, None).await;
+    assert_eq!(code, StatusCode::OK, "{restored}");
+    assert_eq!(restored["sync_state"], "cached");
+    assert!(restored["items"].as_array().unwrap().iter().any(|item| {
+        item["ts"] == mock.root
+            && item["cache_path"]
+                .as_str()
+                .is_some_and(|path| std::path::Path::new(path).is_file())
+    }));
     assert_eq!(
         invoke(&app, "GET", send, session, None, None).await.0,
         StatusCode::CONFLICT
@@ -751,6 +841,18 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     use crate::modules::config;
 
     let directory = Directory::new();
+    let cache_root = directory.0.join("retention-test");
+    let cached = super::disk::DiskCache::open(&cache_root, "TOLD", "UME").unwrap();
+    let old = super::protocol::Message::from_slack(&json!({"ts":"1.000001","text":"旧消息"}), None)
+        .unwrap();
+    cached.save_message("CROOM", &old);
+    let old_path = cache_root.join("TOLD/conversations/CROOM/messages/1.000001.txt");
+    fs::File::options()
+        .write(true)
+        .open(&old_path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
+        .unwrap();
     let config_path = directory.0.join("config.yml");
     let (base, passwords) = password_config(&config_path, &directory.0).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -852,6 +954,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .service(),
         Backend {
             api,
+            cache_root: Some(cache_root),
             open_browser: Arc::new(move |url| {
                 let browser = browser.clone();
                 Box::pin(async move {
@@ -927,7 +1030,30 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     );
 
     assert!(teams.get("actions").is_none());
-    assert_eq!(module["items"].as_array().unwrap().len(), 1);
+    let items = module["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let retention = items
+        .iter()
+        .find(|item| item["key"] == "cache_retention_days")
+        .unwrap();
+    assert_eq!(retention["data_type"], "integer");
+    assert_eq!(retention["default"], 30);
+    let path = "/data/slack/cache_retention_days";
+    let (_, _, default) = invoke(&app, "GET", path, None, None, None).await;
+    assert_eq!(default["value"], 30);
+    let (_, _, invalid) = invoke(&app, "PUT", path, None, None, Some(json!(0))).await;
+    assert_eq!(invalid["error"]["code"], "config-change-rejected");
+    assert!(old_path.is_file());
+    let (code, _, saved) = invoke(&app, "PUT", path, None, None, Some(json!(1))).await;
+    assert_eq!(code, StatusCode::OK, "{saved}");
+    assert_eq!(saved["value"], 1);
+    timeout(Duration::from_secs(3), async {
+        while old_path.is_file() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         invoke(
             &app,

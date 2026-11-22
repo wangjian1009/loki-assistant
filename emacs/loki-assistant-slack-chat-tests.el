@@ -16,10 +16,12 @@
                                     (url . "https://workspace.slack.com/files/F1"))]))))
     (puthash "TTEST.U1" '((name . "林舟")) profiles)
     (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
-              ((symbol-function 'loki-assistant-slack--image)
-               (lambda (path _images _refresh session)
+              ((symbol-function 'loki-assistant-slack--media)
+               (lambda (path params room _images _refresh width height)
                  (should (equal path "/slack/conversations/TTEST.CCHAT/messages/104.0/attachments/0/preview"))
-                 (should (equal session "local"))
+                 (should (equal params '((local_path . "true"))))
+                 (should (equal (alist-get 'session_id room) "local"))
+                 (should (equal (list width height) '(560 320)))
                  image)))
       (with-temp-buffer
         (loki-assistant-slack--message message room profiles images #'ignore)
@@ -35,6 +37,21 @@
         (should-not (button-at (1- (point))))
         (search-forward "报告截图.png")
         (should (button-at (1- (point))))))))
+
+(ert-deftest loki-assistant-slack-chat-test-reads-local-message-cache ()
+  (let* ((path (make-temp-file "loki-slack-message-"))
+         (entry `((ts . "10.000001") (text . "HTTP 正文") (cache_path . ,path))))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert "((ts . \"10.000001\") (text . \"缓存正文\") (edited . :false))\n"))
+          (should (equal (alist-get 'text (loki-assistant-slack--cached-record entry 'ts "10.000001" '(text)))
+                         "缓存正文"))
+          (with-temp-file path (insert "((ts . \"10.000001\")"))
+          (should (equal (loki-assistant-slack--cached-record entry 'ts "10.000001" '(text)) entry))
+          (delete-file path)
+          (should (equal (loki-assistant-slack--cached-record entry 'ts "10.000001" '(text)) entry)))
+      (when (file-exists-p path) (delete-file path)))))
 
 (ert-deftest loki-assistant-slack-chat-test-inline-thread-and-reply ()
   (skip-unless (require 'shell-maker nil t))

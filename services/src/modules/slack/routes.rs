@@ -492,6 +492,70 @@ async fn timeline(
         .map(|value| Json(messages_result(value, &team_id)))
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachmentQuery {
+    #[serde(default)]
+    local_path: bool,
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "user-avatar",
+    method = "GET",
+    path = "/slack/users/{id}/avatar",
+    summary = "读取 Slack 用户头像路径",
+    description = "按需缓存头像并返回本机文件路径。"
+)]
+async fn user_avatar(
+    State(projects): Service,
+    headers: HeaderMap,
+    id: Segment<String>,
+) -> Result<Json<Value>, Error> {
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    let (team, user) = split_id(&id)?;
+    let service = projects.service(team).await?;
+    let path = service
+        .avatar(session(&headers, &service).await?, user)
+        .await?;
+    Ok(Json(json!({"cache_path":path})))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "attachment-original",
+    method = "GET",
+    path = "/slack/conversations/{id}/messages/{ts}/attachments/{index}/original",
+    summary = "读取 Slack 附件原件路径",
+    description = "按需缓存附件原件并返回本机文件路径。"
+)]
+async fn attachment_original(
+    State(projects): Service,
+    headers: HeaderMap,
+    path: Segment<(String, String, usize)>,
+) -> Result<Json<Value>, Error> {
+    let Path((id, ts, index)) = path.map_err(|_| Error::Invalid)?;
+    if super::protocol::timestamp(&ts).is_none() {
+        return Err(Error::Invalid);
+    }
+    let (_, id, service) = conversation(&projects, id).await?;
+    let (_, _, path) = service
+        .attachment(
+            session(&headers, &service).await?,
+            &id,
+            &ts,
+            index,
+            false,
+            true,
+        )
+        .await?;
+    Ok(Json(json!({"cache_path":path.ok_or(Error::Unavailable)?})))
+}
+
 #[loki_api(
     module = "slack",
     mount = "Arc<Projects>",
@@ -506,15 +570,27 @@ async fn attachment_preview(
     State(projects): Service,
     headers: HeaderMap,
     path: Segment<(String, String, usize)>,
+    query: Params<AttachmentQuery>,
 ) -> Result<Response, Error> {
+    let Query(query) = query.map_err(|_| Error::Invalid)?;
     let Path((id, ts, index)) = path.map_err(|_| Error::Invalid)?;
     if super::protocol::timestamp(&ts).is_none() {
         return Err(Error::Invalid);
     }
     let (_, id, service) = conversation(&projects, id).await?;
-    let (mime, image) = service
-        .attachment_preview(session(&headers, &service).await?, &id, &ts, index)
+    let (mime, image, path) = service
+        .attachment(
+            session(&headers, &service).await?,
+            &id,
+            &ts,
+            index,
+            true,
+            query.local_path,
+        )
         .await?;
+    if query.local_path {
+        return Ok(Json(json!({"cache_path":path.ok_or(Error::Unavailable)?})).into_response());
+    }
     Ok((
         [
             (CONTENT_TYPE, mime.as_str()),

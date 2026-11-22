@@ -49,7 +49,11 @@ impl Error {
             ),
             Self::Permission => (403, "slack-permission-denied", "Slack 应用缺少所需权限。"),
             Self::Conversation => (404, "slack-conversation-not-found", "找不到 Slack 会话。"),
-            Self::Attachment => (404, "slack-attachment-not-found", "找不到 Slack 图片预览。"),
+            Self::Attachment => (
+                404,
+                "slack-attachment-not-found",
+                "找不到可读取的 Slack 附件。",
+            ),
             Self::UserNotFound => (404, "slack-user-not-found", "找不到 Slack 用户。"),
             Self::Project => (404, "slack-project-not-found", "请选择有效的 Slack 项目。"),
             Self::TeamMismatch => (
@@ -203,6 +207,12 @@ pub(super) struct Attachment {
     pub image: bool,
     #[serde(skip)]
     pub image_url: Option<String>,
+    #[serde(skip)]
+    pub file_id: Option<String>,
+    #[serde(skip)]
+    pub filename: Option<String>,
+    #[serde(skip)]
+    pub download_url: Option<String>,
 }
 
 impl Attachment {
@@ -239,6 +249,16 @@ impl Attachment {
                 .as_deref()
                 .is_some_and(super::client::slack_image_url),
             image_url,
+            file_id: file
+                .then(|| field(&["id"]).filter(|id| valid_id(id)))
+                .flatten(),
+            filename: field(&["name"]),
+            download_url: if file {
+                field(&["url_private_download", "url_private"])
+            } else {
+                field(&["image_url", "thumb_url"])
+            }
+            .filter(|url| super::client::slack_image_url(url)),
         })
     }
 }

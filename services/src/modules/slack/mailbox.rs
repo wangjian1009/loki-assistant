@@ -4,9 +4,11 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use super::{
+    disk,
     protocol::{Error, Message, Page, timestamp, valid_id},
     service::{SlackService, now},
     store::{Account, Cache, Conversation, SendRecord, SendState},
@@ -49,7 +51,7 @@ pub(super) fn next_cursor(session: Uuid, target: String, anchor: String) -> Stri
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("Slack 游标可序列化"))
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct UserProfile {
     pub id: String,
     team_id: String,
@@ -95,6 +97,13 @@ pub(super) struct UserDirectory {
 }
 
 impl UserDirectory {
+    pub fn from_disk(session: Uuid, users: Vec<UserProfile>) -> Self {
+        Self {
+            session,
+            expires_at: None,
+            users: users.into(),
+        }
+    }
     pub fn complete(&self) -> bool {
         self.expires_at.is_some()
     }
@@ -150,13 +159,27 @@ impl SlackService {
         let mut seen = std::collections::BTreeSet::new();
         let mut users = BTreeMap::new();
         loop {
-            let response = self
+            let response = match self
                 .slack_get(
                     session,
                     "users.list",
                     &[("limit", "200"), ("cursor", &cursor)],
                 )
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error @ (Error::Unavailable | Error::Upstream | Error::RateLimited(_))) => {
+                    let state = self.state.lock().await;
+                    state.account(session)?;
+                    return state
+                        .user_directory
+                        .as_ref()
+                        .filter(|directory| !directory.users.is_empty())
+                        .map(|directory| directory.users.clone())
+                        .ok_or(error);
+                }
+                Err(error) => return Err(error),
+            };
             let members = response["members"].as_array().ok_or(Error::Upstream)?;
             for user in members {
                 let Some(id) = user["id"].as_str().filter(|id| valid_id(id)) else {
@@ -179,14 +202,38 @@ impl SlackService {
             }
             cursor = next.to_owned();
         }
-        let mut state = self.state.lock().await;
+        let mut state = self.state.clone().lock_owned().await;
         state.account(session)?;
         let users: std::sync::Arc<[UserProfile]> = users.into_values().collect();
-        state.user_directory = Some(UserDirectory {
-            session,
-            expires_at: Some(now() + 300),
-            users: users.clone(),
-        });
+        let saved = users.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(disk) = &state.cache.disk {
+                let previous = state.user_directory.as_ref();
+                for user in saved.iter() {
+                    disk.save_user(
+                        user,
+                        previous.and_then(|directory| directory.find(user.slack_id())),
+                    );
+                }
+                if let Some(previous) = previous {
+                    for user in previous.users.iter() {
+                        if saved
+                            .binary_search_by(|candidate| candidate.id.cmp(&user.id))
+                            .is_err()
+                        {
+                            disk.remove_user(user.slack_id());
+                        }
+                    }
+                }
+            }
+            state.user_directory = Some(UserDirectory {
+                session,
+                expires_at: Some(now() + 300),
+                users: saved,
+            });
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?;
         self.picker_changed.notify_one();
         Ok(users)
     }
@@ -206,16 +253,27 @@ impl SlackService {
         if user["id"].as_str() != Some(id) {
             return Err(Error::Upstream);
         }
-        let mut state = self.state.lock().await;
-        let account = state.account(session)?;
-        let profile = UserProfile::from_slack(&account.identity.team_id, id, user);
+        let mut state = self.state.clone().lock_owned().await;
+        let profile = UserProfile::from_slack(&state.account(session)?.identity.team_id, id, user);
         if user["deleted"] != true {
-            let directory = state.user_directory.get_or_insert_with(|| UserDirectory {
-                session,
-                expires_at: None,
-                users: Default::default(),
-            });
-            directory.update(profile.clone(), false);
+            let saved = profile.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Some(disk) = &state.cache.disk {
+                    disk.save_user(
+                        &saved,
+                        state
+                            .user_directory
+                            .as_ref()
+                            .and_then(|directory| directory.find(saved.slack_id())),
+                    );
+                }
+                state
+                    .user_directory
+                    .get_or_insert_with(|| UserDirectory::from_disk(session, Vec::new()))
+                    .update(saved, false);
+            })
+            .await
+            .map_err(|_| Error::Unavailable)?;
             self.picker_changed.notify_one();
         }
         Ok(profile)
@@ -237,19 +295,32 @@ impl SlackService {
             return;
         }
         let _fetch = self.user_fetch.lock().await;
-        let mut state = self.state.lock().await;
+        let mut state = self.state.clone().lock_owned().await;
         let Ok(account) = state.account(session) else {
             return;
         };
         let profile = UserProfile::from_slack(&account.identity.team_id, id, user);
-        let Some(directory) = state
-            .user_directory
-            .as_mut()
-            .filter(|current| current.session == session)
-        else {
-            return;
-        };
-        directory.update(profile, user["deleted"] == true);
+        let deleted = user["deleted"] == true;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(disk) = &state.cache.disk {
+                if deleted {
+                    disk.remove_user(profile.slack_id());
+                } else {
+                    disk.save_user(
+                        &profile,
+                        state
+                            .user_directory
+                            .as_ref()
+                            .and_then(|directory| directory.find(profile.slack_id())),
+                    );
+                }
+            }
+            state
+                .user_directory
+                .get_or_insert_with(|| UserDirectory::from_disk(session, Vec::new()))
+                .update(profile, deleted);
+        })
+        .await;
         self.picker_changed.notify_one();
     }
 
@@ -331,11 +402,21 @@ impl SlackService {
             result => result?,
         };
         self.update_cache(session, move |cache, _| {
+            if let Some(disk) = &cache.disk {
+                for id in cache
+                    .conversations
+                    .keys()
+                    .filter(|id| !directory.contains_key(*id))
+                {
+                    disk.remove_room(id);
+                }
+            }
             cache
                 .conversations
                 .retain(|id, _| directory.contains_key(id));
-            for (id, entry) in directory {
-                cache
+            for (id, mut entry) in directory {
+                entry.disk.clone_from(&cache.disk);
+                let room = cache
                     .conversations
                     .entry(id)
                     .and_modify(|current| {
@@ -349,6 +430,9 @@ impl SlackService {
                         }
                     })
                     .or_insert(entry);
+                if let Some(disk) = &cache.disk {
+                    disk.save_room(room);
+                }
             }
             cache.directory_loaded = true;
             Ok(())
@@ -392,6 +476,9 @@ impl SlackService {
                     && room.participants.is_empty()
                 {
                     room.participants = users;
+                    if let Some(disk) = &room.disk {
+                        disk.save_room(room);
+                    }
                 }
             }
             Ok(())
@@ -440,7 +527,14 @@ impl SlackService {
         kind: &str,
     ) -> Result<(Vec<ConversationRow>, bool), Error> {
         if !self.state.lock().await.cache.directory_loaded {
-            self.refresh_directory(session).await?;
+            let result = self.refresh_directory(session).await;
+            if !matches!(
+                result,
+                Err(Error::Unavailable | Error::Upstream | Error::RateLimited(_))
+            ) || self.state.lock().await.cache.conversations.is_empty()
+            {
+                result?;
+            }
         }
         let state = self.state.lock().await;
         let account = state.account(session)?;
@@ -476,6 +570,9 @@ impl SlackService {
         summary["team_id"] = json!(account.identity.team_id);
         summary["team_name"] = json!(account.identity.team_name);
         summary["session_id"] = json!(account.identity.session_id);
+        if let Some(disk) = &cache.disk {
+            disk::add_path(&mut summary, "cache_path", disk.room_path(&room.id));
+        }
         (latest, unread, summary)
     }
 
@@ -519,10 +616,15 @@ impl SlackService {
             }
             _ => None,
         };
-        self.update_cache(session, |cache, _| {
-            let room = cache.conversations.get_mut(id).ok_or(Error::Conversation)?;
-            for message in root.iter().chain(reply.iter()) {
-                room.ingest(message.clone());
+        let room_id = id.to_owned();
+        let messages: Vec<_> = root.iter().chain(reply.iter()).cloned().collect();
+        self.update_cache(session, move |cache, _| {
+            let room = cache
+                .conversations
+                .get_mut(&room_id)
+                .ok_or(Error::Conversation)?;
+            for message in messages {
+                room.ingest(message);
             }
             Ok(())
         })
@@ -538,31 +640,147 @@ impl SlackService {
             "thread_ts":anchored_thread,"message_ts":anchored_message}))
     }
 
-    pub(super) async fn attachment_preview(
+    pub(super) async fn attachment(
         &self,
         session: Uuid,
         id: &str,
         ts: &str,
         index: usize,
-    ) -> Result<(String, Vec<u8>), Error> {
-        let (url, token) = {
+        preview: bool,
+        local_path: bool,
+    ) -> Result<(String, Vec<u8>, Option<std::path::PathBuf>), Error> {
+        let (item, token, cache) = {
             let state = self.state.lock().await;
             let account = state.account(session)?;
-            let url = state
-                .cache
-                .conversations
-                .get(id)
-                .and_then(|room| room.messages.get(ts))
-                .and_then(|message| message.attachments.get(index))
-                .filter(|attachment| attachment.image)
-                .and_then(|attachment| attachment.image_url.clone())
+            let room = state.cache.conversations.get(id).ok_or(Error::Attachment)?;
+            if room.deleted.contains(ts) {
+                return Err(Error::Attachment);
+            }
+            let message = room
+                .messages
+                .get(ts)
+                .cloned()
+                .or_else(|| room.disk.as_ref()?.find_message(id, ts))
                 .ok_or(Error::Attachment)?;
-            (url, account.access.clone())
+            let item = message
+                .attachments
+                .into_iter()
+                .nth(index)
+                .filter(|item| !preview || item.image)
+                .ok_or(Error::Attachment)?;
+            (item, account.access.clone(), state.cache.disk.clone())
         };
+        if let Some(path) = cache
+            .as_ref()
+            .and_then(|cache| cache.attachment(&item, preview))
+        {
+            if local_path {
+                return Ok((String::new(), Vec::new(), Some(path)));
+            }
+            if let Some(mime) = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(disk::preview_mime)
+                && let Ok(bytes) = tokio::fs::read(&path).await
+            {
+                return Ok((mime.into(), bytes, Some(path)));
+            }
+        }
+        let url = if preview {
+            &item.image_url
+        } else {
+            &item.download_url
+        };
+        let url = url.as_deref().ok_or(Error::Attachment)?;
         let web = self.web_session(session).await?;
-        let result = self.client.image(&url, &token, web.as_ref()).await?;
-        self.state.lock().await.account(session)?;
-        Ok(result)
+        if !preview {
+            let cache = cache.ok_or(Error::Unavailable)?;
+            let (mime, mut response) = self.client.original(url, &token, web.as_ref()).await?;
+            let (pending, file) = {
+                let state = self.state.lock().await;
+                state.account(session)?;
+                cache
+                    .begin_original(&item, &mime)
+                    .map_err(|_| Error::Unavailable)?
+            };
+            let mut file = tokio::fs::File::from_std(file);
+            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|_| Error::Unavailable)?;
+            }
+            file.flush().await.map_err(|_| Error::Unavailable)?;
+            drop(file);
+            let state = self.state.lock().await;
+            state.account(session)?;
+            let path = pending.commit().map_err(|_| Error::Unavailable)?;
+            return Ok((mime, Vec::new(), Some(path)));
+        }
+        let (mime, bytes) = self.client.image(url, &token, web.as_ref()).await?;
+        let state = self.state.clone().lock_owned().await;
+        state.account(session)?;
+        let Some(cache) = cache else {
+            return Ok((mime, bytes, None));
+        };
+        tokio::task::spawn_blocking(move || {
+            let path = cache.save_preview(&item, &mime, &bytes);
+            drop(state);
+            (mime, bytes, path)
+        })
+        .await
+        .map_err(|_| Error::Unavailable)
+    }
+
+    pub(super) async fn avatar(
+        &self,
+        session: Uuid,
+        id: &str,
+    ) -> Result<std::path::PathBuf, Error> {
+        let profile = self.lookup_user(session, id).await?;
+        let cache = {
+            let state = self.state.lock().await;
+            state.account(session)?;
+            state.cache.disk.clone().ok_or(Error::Unavailable)?
+        };
+        let path = cache.avatar_path(id);
+        if disk::regular_file(&path) {
+            return Ok(path);
+        }
+        let url = profile.avatar_url.as_deref().ok_or(Error::Attachment)?;
+        let bytes = self.client.avatar(url).await?;
+        let state = self.state.clone().lock_owned().await;
+        state.account(session)?;
+        if state
+            .user_directory
+            .as_ref()
+            .and_then(|directory| directory.find(id))
+            .and_then(|current| current.avatar_url.as_deref())
+            != Some(url)
+        {
+            return Err(Error::Attachment);
+        }
+        tokio::task::spawn_blocking(move || {
+            let png = disk::avatar_png(&bytes).ok_or(Error::Attachment)?;
+            disk::atomic_write(&path, &png).map_err(|_| Error::Unavailable)?;
+            drop(state);
+            Ok(path)
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
+    pub(super) async fn user_result(
+        &self,
+        session: Uuid,
+        user: &UserProfile,
+    ) -> Result<Value, Error> {
+        let state = self.state.lock().await;
+        state.account(session)?;
+        Ok(state
+            .cache
+            .disk
+            .as_ref()
+            .map_or_else(|| json!(user), |cache| cache.user_result(user)))
     }
 
     async fn find_message(
@@ -657,42 +875,68 @@ impl SlackService {
                 (items, root, more, covered, true)
             }
             Err(error @ (Error::Unavailable | Error::Upstream | Error::RateLimited(_))) => {
-                let state = self.state.lock().await;
+                let state = self.state.clone().lock_owned().await;
                 state.account(session)?;
-                let conversation = state.cache.conversations.get(&id).ok_or(error)?;
-                let root = thread
-                    .as_ref()
-                    .map(|root| conversation.messages.get(root).cloned().ok_or(error))
-                    .transpose()?;
-                let mut items: Vec<_> = conversation
-                    .messages
-                    .values()
-                    .filter(|message| message.thread_ts == thread)
-                    .filter(|message| {
-                        anchor
-                            .as_ref()
-                            .is_none_or(|anchor| timestamp(&message.ts) < timestamp(anchor))
-                    })
-                    .cloned()
-                    .collect();
-                if items.is_empty()
-                    && (anchor.is_some()
-                        || !conversation
+                let (id, thread, anchor) = (id.clone(), thread.clone(), anchor.clone());
+                tokio::task::spawn_blocking(move || {
+                    let conversation = state.cache.conversations.get(&id).ok_or(error)?;
+                    let root = thread
+                        .as_ref()
+                        .map(|root| {
+                            conversation
+                                .messages
+                                .get(root)
+                                .cloned()
+                                .or_else(|| conversation.disk.as_ref()?.message(&id, None, root))
+                                .ok_or(error)
+                        })
+                        .transpose()?;
+                    let mut stored: BTreeMap<_, _> = conversation
+                        .disk
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|disk| disk.messages(&id, thread.as_deref()))
+                        .map(|message| (message.ts.clone(), message))
+                        .collect();
+                    stored.extend(
+                        conversation
+                            .messages
+                            .iter()
+                            .map(|(ts, message)| (ts.clone(), message.clone())),
+                    );
+                    let mut items: Vec<_> = stored
+                        .into_values()
+                        .filter(|message| {
+                            message.thread_ts == thread
+                                && !conversation.deleted.contains(&message.ts)
+                        })
+                        .filter(|message| {
+                            anchor
+                                .as_ref()
+                                .is_none_or(|anchor| timestamp(&message.ts) < timestamp(anchor))
+                        })
+                        .collect();
+                    if items.is_empty()
+                        && (anchor.is_some()
+                            || !conversation
+                                .loaded
+                                .contains_key(thread.as_deref().unwrap_or_default()))
+                    {
+                        return Err(error);
+                    }
+                    items.sort_by_key(|item| timestamp(&item.ts));
+                    let start = items.len().saturating_sub(limit);
+                    let more = start > 0
+                        || conversation
                             .loaded
-                            .contains_key(thread.as_deref().unwrap_or_default()))
-                {
-                    return Err(error);
-                }
-                items.sort_by_key(|item| timestamp(&item.ts));
-                let start = items.len().saturating_sub(limit);
-                let more = start > 0
-                    || conversation
-                        .loaded
-                        .get(thread.as_deref().unwrap_or_default())
-                        .copied()
-                        .unwrap_or(true);
-                items.drain(..start);
-                (items, root, more, None, false)
+                            .get(thread.as_deref().unwrap_or_default())
+                            .copied()
+                            .unwrap_or(true);
+                    items.drain(..start);
+                    Ok((items, root, more, None, false))
+                })
+                .await
+                .map_err(|_| Error::Unavailable)??
             }
             Err(error) => return Err(error),
         };
@@ -711,6 +955,19 @@ impl SlackService {
             .get(&id)
             .ok_or(Error::Conversation)?;
         let positions = state.cache.positions(&id);
+        let public_message = |message: &Message| {
+            let mut value = json!(message);
+            if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
+                for (value, item) in attachments.iter_mut().zip(&message.attachments) {
+                    value["original_available"] = json!(item.download_url.is_some());
+                }
+            }
+            if let Some(disk) = &state.cache.disk {
+                return disk.message_result(&id, message, value);
+            }
+            value
+        };
+        let items: Vec<_> = items.iter().map(public_message).collect();
         let mut result = json!({
             "api_version":"1","conversation_id":id,"items":items,"next_cursor":next,
             "sync_state":if live { "live" } else { "cached" },
@@ -720,7 +977,7 @@ impl SlackService {
                 .min_by_key(|message| timestamp(&message.ts)).map(|message| &message.ts)
         });
         if thread.is_some() {
-            result["root"] = json!(root);
+            result["root"] = root.as_ref().map_or(Value::Null, public_message);
         }
         Ok(result)
     }
