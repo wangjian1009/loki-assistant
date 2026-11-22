@@ -954,18 +954,7 @@ impl SlackService {
             .get(&id)
             .ok_or(Error::Conversation)?;
         let positions = &conversation.read_positions;
-        let public_message = |message: &Message| {
-            let mut value = json!(message);
-            if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
-                for (value, item) in attachments.iter_mut().zip(&message.attachments) {
-                    value["original_available"] = json!(item.download_url.is_some());
-                }
-            }
-            if let Some(disk) = &state.cache.disk {
-                return disk.message_result(&id, message, value);
-            }
-            value
-        };
+        let public_message = |message: &Message| conversation.message_result(message);
         let items: Vec<_> = items.iter().map(public_message).collect();
         let mut result = json!({
             "api_version":"1","conversation_id":id,"items":items,"next_cursor":next,
@@ -989,10 +978,11 @@ impl SlackService {
         before: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Message>, Option<Message>, bool), Error> {
-        let exists = {
+        let (exists, observed) = {
             let state = self.state.lock().await;
             state.account(session)?;
-            state.cache.conversations.contains_key(id)
+            let room = state.cache.conversations.get(id);
+            (room.is_some(), room.and_then(|room| room.journal.as_ref()).map(|journal| journal.observe()))
         };
         if !exists {
             self.refresh_directory(session).await?;
@@ -1061,7 +1051,7 @@ impl SlackService {
                 seen_cursors.clear();
             }
         };
-        self.store_page(session, id, None, &items, None, more)
+        self.store_page(session, id, None, &items, None, more, observed)
             .await?;
         Ok((items, None, more))
     }
@@ -1139,7 +1129,7 @@ impl SlackService {
         let root = root.ok_or(Error::Thread)?;
         let items: Vec<_> = window.into_iter().collect();
         let more = count > limit;
-        self.store_page(session, id, Some(thread), &items, Some(&root), more)
+        self.store_page(session, id, Some(thread), &items, Some(&root), more, None)
             .await?;
         Ok((items, Some(root), more))
     }
@@ -1152,6 +1142,7 @@ impl SlackService {
         items: &[Message],
         root: Option<&Message>,
         more: bool,
+        observed: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
     ) -> Result<(), Error> {
         let id = id.to_owned();
         let view = view.map(str::to_owned);
@@ -1164,6 +1155,13 @@ impl SlackService {
                 .ok_or(Error::Conversation)?;
             let marker = view.clone().unwrap_or_default();
             conversation.loaded.insert(marker, more);
+            let changed = match (view.as_deref(), conversation.journal.as_ref(), observed.as_ref()) {
+                (None, Some(journal), Some(observed)) => journal.changed_since(observed),
+                (None, Some(_), None) => None,
+                _ => Some(Default::default()),
+            };
+            // 拉取期间的实时事件优先于 Slack 分页响应。
+            let current = |ts: &str| changed.as_ref().is_some_and(|changed| !changed.contains(ts));
             if let (Some(first), Some(last)) = (items.first(), items.last()) {
                 let min = timestamp(&first.ts);
                 let max = timestamp(&last.ts);
@@ -1172,6 +1170,7 @@ impl SlackService {
                     .values()
                     .filter(|message| {
                         message.thread_ts == view
+                            && current(&message.ts)
                             && timestamp(&message.ts) >= min
                             && timestamp(&message.ts) <= max
                             && !items.iter().any(|current| current.ts == message.ts)
@@ -1182,7 +1181,7 @@ impl SlackService {
                     conversation.remove(&ts);
                 }
             }
-            for message in items.into_iter().chain(root) {
+            for message in items.into_iter().chain(root).filter(|message| current(&message.ts)) {
                 conversation.ingest(message);
             }
             Ok(())

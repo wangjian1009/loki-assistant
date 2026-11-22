@@ -72,6 +72,21 @@
           (should (equal (loki-assistant-slack--cached-record entry 'ts "10.000001" '(text)) entry)))
       (when (file-exists-p path) (delete-file path)))))
 
+(defun loki-assistant-slack-chat-test--deliver (id session sequence kind &rest fields)
+  "以临时文件模拟 services 的消息回调。"
+  (let ((path (make-temp-file "loki-slack-delivery-")))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'utf-8))
+            (with-temp-file path
+              (insert (json-serialize
+                       (append `((api_version . "1") (subscription_id . ,id)
+                                 (conversation_id . "TTEST.DCHAT") (session_id . ,session)
+                                 (sequence . ,sequence) (kind . ,kind))
+                               fields)))))
+          (loki-assistant-slack-dispatch-messages path))
+      (delete-file path))))
+
 (ert-deftest loki-assistant-slack-chat-test-top-level-timeline-and-send ()
   (skip-unless (require 'shell-maker nil t))
   (let ((shell-maker-root-path (make-temp-file "loki-slack-chat-test-" t))
@@ -79,7 +94,8 @@
         (room '((id . "TTEST.DCHAT") (session_id . "session") (team_id . "TTEST") (title . "聊天")))
         (root-path "/slack/conversations/TTEST.DCHAT/messages")
         (thread-path "/slack/conversations/TTEST.DCHAT/threads/123.000001/messages")
-        buffer sent requested-users)
+        (session "session")
+        buffer sent requested-users canceled subscription)
     (unwind-protect
         (save-window-excursion
           (cl-letf (((symbol-function 'loki-assistant-slack--request)
@@ -89,32 +105,42 @@
                          (setq sent (cons path (plist-get args :body)))
                          (funcall callback '(:ok t :data ((state . "sent")))))
                         ((equal path "/status/slack/connections")
-                         (funcall callback '(:ok t :data ((value . [((session_id . "session")
-                                                                    (user_id . "TTEST.U1"))])))))
+                         (funcall callback
+                                  `(:ok t :data ((value . [((team_id . "TTEST")
+                                                             (session_id . ,session)
+                                                             (user_id . "TTEST.U1"))])))))
                         ((equal path "/slack/users")
                          (push (plist-get args :params) requested-users)
                          (funcall callback '(:ok t :data ((items . [])))))
-                        ((equal path root-path)
-                         (funcall
-                          callback
-                          '(:ok t :data
-                                ((items . [((ts . "123.000001") (text . "根消息")
-                                            (author . ((id . "TTEST.U1") (name . "本人")))
-                                            (reply_count . 1))
-                                           ((ts . "124.000001") (text . "既有回复")
-                                            (thread_ts . "123.000001"))
-                                           ((ts . "183.000001") (text . "同一人的第二条")
-                                            (author . ((id . "TTEST.U1") (name . "本人"))))
-                                           ((ts . "243.000001") (text . "另一位发言者")
-                                            (author . ((id . "TTEST.U2") (name . "本人"))))
-                                           ((ts . "303.000001") (text . "本人再次发言")
-                                            (author . ((id . "TTEST.U1") (name . "本人"))))
-                                           ((ts . "172923.000001") (text . "隔日消息")
-                                            (author . ((id . "TTEST.U1") (name . "本人"))))])))))
+                        ((equal method "DELETE") (push path canceled))
+                        ((equal method "PUT")
+                         (should (equal session (alist-get 'session_id (plist-get args :room))))
+                         (setq subscription (file-name-nondirectory path))
+                         (should
+                          (eq 'applied
+                              (loki-assistant-slack-chat-test--deliver
+                               subscription session 1 "snapshot"
+                               '(snapshot .
+                                 ((items . [((ts . "123.000001") (text . "根消息")
+                                             (author . ((id . "TTEST.U1") (name . "本人")))
+                                             (reply_count . 1))
+                                            ((ts . "124.000001") (text . "既有回复")
+                                             (thread_ts . "123.000001"))
+                                            ((ts . "183.000001") (text . "同一人的第二条")
+                                             (author . ((id . "TTEST.U1") (name . "本人"))))
+                                            ((ts . "243.000001") (text . "另一位发言者")
+                                             (author . ((id . "TTEST.U2") (name . "本人"))))
+                                            ((ts . "303.000001") (text . "本人再次发言")
+                                             (author . ((id . "TTEST.U1") (name . "本人"))))
+                                            ((ts . "172923.000001") (text . "隔日消息")
+                                             (author . ((id . "TTEST.U1") (name . "本人"))))]))))))
+                         (funcall callback '(:ok t)))
                         (t (ert-fail path))))))
             (setq buffer (loki-assistant-slack--open room))
             (with-current-buffer buffer
-              (should (equal (reverse requested-users) '(((id . "TTEST.U1")) ((id . "TTEST.U2")))))
+              (loki-assistant-slack--load-profiles)
+              (should (equal (sort (mapcar #'cdr (car requested-users)) #'string<)
+                             '("TTEST.U1" "TTEST.U2")))
               (should-not (string-match-p "既有回复\\|条回复\\|────────" (buffer-string)))
               (should (string-match-p "本人再次发言\n\n隔日消息" (buffer-string)))
               (goto-char (loki-assistant-slack--message-position "172923.000001"))
@@ -153,8 +179,24 @@
               (should (= 1 (how-many "根消息" (point-min) (point-max))))
               (should-not (string-match-p "既有回复" (buffer-string)))
               (should (equal (buffer-substring-no-properties (loki-assistant-slack--draft-start) (point-max)) "pn"))
+              (let ((old subscription))
+                (setq session "restarted")
+                (loki-assistant-slack-refresh)
+                (should-not (equal subscription old))
+                (should (equal (alist-get 'session_id loki-assistant-slack--room) session))
+                (should (eq 'buffer-closed
+                            (loki-assistant-slack-chat-test--deliver old "session" 2 "probe")))
+                (should (equal (buffer-substring-no-properties
+                                (loki-assistant-slack--draft-start) (point-max)) "pn"))
+                (dotimes (_ 2)
+                  (should (eq 'applied
+                              (loki-assistant-slack-chat-test--deliver
+                               subscription session 2 "changes"
+                               '(items . [((ts . "172924.000001") (text . "恢复后的新消息"))])
+                               '(deleted_ts . ["172923.000001"])))))
+                (should (= 1 (how-many "恢复后的新消息" (point-min) (point-max))))
+                (should-not (loki-assistant-slack--message-position "172923.000001")))
               (delete-region (loki-assistant-slack--draft-start) (point-max))
-              (loki-assistant-slack-refresh)
               (should-not (string-match-p "既有回复" (buffer-string)))
               (goto-char (point-max))
               ;; 模拟直接重载时仍留在输入区里的线程草稿。
@@ -182,7 +224,10 @@
               (cl-letf (((symbol-function 'y-or-n-p)
                          (lambda (&rest _) (ert-fail "关闭 Slack 聊天时弹出保存提示"))))
                 (should (kill-buffer buffer)))
-              (should-not (buffer-live-p buffer)))))
+              (should-not (buffer-live-p buffer))
+              (should (seq-some (lambda (path) (string-suffix-p subscription path)) canceled))
+              (should (eq 'buffer-closed
+                          (loki-assistant-slack-chat-test--deliver subscription session 3 "probe"))))))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer (set-buffer-modified-p nil))
         (kill-buffer buffer))

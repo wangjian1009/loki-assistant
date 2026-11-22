@@ -2,9 +2,10 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
         Path, Query, State,
-        rejection::{JsonRejection, PathRejection, QueryRejection},
+        rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection},
     },
     http::{
         HeaderMap, HeaderValue, StatusCode, Uri,
@@ -260,7 +261,7 @@ fn identified(mut value: Value, team_id: &str) -> Value {
     value
 }
 
-fn messages_result(mut value: Value, team_id: &str) -> Value {
+pub(super) fn messages_result(mut value: Value, team_id: &str) -> Value {
     fn qualify_author(message: &mut Value, team_id: &str) {
         if let Some(id) = message["author"]["id"].as_str() {
             message["author"]["id"] = json!(format!("{team_id}.{id}"));
@@ -276,6 +277,64 @@ fn messages_result(mut value: Value, team_id: &str) -> Value {
         qualify_author(root, team_id);
     }
     conversation_result(value, team_id)
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "subscribe-messages",
+    method = "PUT",
+    path = "/slack/conversations/{id}/subscriptions/{subscription_id}",
+    summary = "订阅 Slack 会话消息",
+    description = "登记 Emacs 聊天 buffer，向现有 Emacs server 推送快照和消息变更。"
+)]
+async fn subscribe_messages(
+    State(projects): Service,
+    headers: HeaderMap,
+    path: Segment<(String, Uuid)>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    let (id, subscription) = path.map_err(|_| Error::Invalid)?.0;
+    let session = session_header(&headers)?.ok_or(Error::Invalid)?;
+    if !body.map_err(|_| Error::Invalid)?.is_empty() {
+        return Err(Error::Invalid);
+    }
+    let (_, room, service) = conversation(&projects, id.clone()).await?;
+    let created = service.subscribe_messages(session, room, subscription).await?;
+    Ok((
+        if created { StatusCode::CREATED } else { StatusCode::OK },
+        Json(json!({"api_version":"1", "subscription_id":subscription,
+            "conversation_id":id, "session_id":session})),
+    ))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "unsubscribe-messages",
+    method = "DELETE",
+    path = "/slack/conversations/{id}/subscriptions/{subscription_id}",
+    summary = "取消 Slack 会话消息订阅",
+    description = "按聊天和订阅标识停止 Emacs 消息投递。"
+)]
+async fn unsubscribe_messages(
+    State(projects): Service,
+    path: Segment<(String, Uuid)>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<StatusCode, Error> {
+    let (id, subscription) = path.map_err(|_| Error::Invalid)?.0;
+    let (team, room) = split_id(&id)?;
+    if !body.map_err(|_| Error::Invalid)?.is_empty() {
+        return Err(Error::Invalid);
+    }
+    match projects.service(team).await {
+        Ok(service) => service.unsubscribe_messages(room.to_owned(), subscription).await,
+        Err(Error::Project) => {},
+        Err(error) => return Err(error),
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[loki_api(

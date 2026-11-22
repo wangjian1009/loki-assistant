@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use super::disk::DiskCache;
 use super::protocol::{Error, Identity, Message, timestamp};
+use super::subscriptions::{MessageJournal, Subscription, SubscriptionKey};
 
 #[derive(Default)]
 pub(super) struct Secrets {
@@ -30,6 +31,7 @@ pub(super) struct Cache {
     pub sends: BTreeMap<Uuid, SendRecord>,
     pub events: BTreeSet<String>,
     pub notifications: BTreeMap<String, String>,
+    pub subscriptions: BTreeMap<SubscriptionKey, Subscription>,
 }
 
 impl Cache {
@@ -43,7 +45,6 @@ impl Cache {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct Conversation {
     pub disk: Option<DiskCache>,
     pub id: String,
@@ -54,6 +55,7 @@ pub(super) struct Conversation {
     pub messages: BTreeMap<String, Message>,
     pub deleted: BTreeSet<String>,
     pub loaded: BTreeMap<String, bool>,
+    pub journal: Option<MessageJournal>,
 }
 
 #[derive(Clone, Default)]
@@ -63,6 +65,19 @@ pub(super) struct ReadPositions {
 }
 
 impl Conversation {
+    pub fn message_result(&self, message: &Message) -> Value {
+        let mut value = json!(message);
+        if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
+            for (value, item) in attachments.iter_mut().zip(&message.attachments) {
+                value["original_available"] = json!(item.download_url.is_some());
+            }
+        }
+        if let Some(disk) = &self.disk {
+            return disk.message_result(&self.id, message, value);
+        }
+        value
+    }
+
     pub fn new(id: &str, kind: &str, title: &str) -> Self {
         Self {
             disk: None,
@@ -74,6 +89,7 @@ impl Conversation {
             messages: BTreeMap::new(),
             deleted: BTreeSet::new(),
             loaded: BTreeMap::new(),
+            journal: None,
         }
     }
 
@@ -124,13 +140,16 @@ impl Conversation {
         if self
             .messages
             .get(&message.ts)
-            .is_some_and(|old| old.edited && !message.edited)
+            .is_some_and(|old| old == &message || (old.edited && !message.edited))
         {
             return;
         }
         if let Some(disk) = &self.disk {
             let _ = disk.save_room(self);
             disk.save_message(&self.id, &message);
+        }
+        if message.thread_ts.is_none() && let Some(journal) = &mut self.journal {
+            journal.push(message.ts.clone(), Some(message.clone()));
         }
         self.messages.insert(message.ts.clone(), message);
         if self.messages.len() > 1_000 {
@@ -146,6 +165,9 @@ impl Conversation {
     }
 
     pub fn remove(&mut self, ts: &str) {
+        if !self.deleted.insert(ts.into()) {
+            return;
+        }
         let removed = self.messages.remove(ts);
         if let Some(disk) = &self.disk {
             disk.remove_message(
@@ -156,9 +178,21 @@ impl Conversation {
                     .and_then(|message| message.thread_ts.as_deref()),
             );
         }
-        self.deleted.insert(ts.into());
+        if removed.as_ref().is_none_or(|message| message.thread_ts.is_none())
+            && let Some(journal) = &mut self.journal
+        {
+            journal.push(ts.to_owned(), None);
+        }
         if self.deleted.len() > 2_000 {
             self.deleted.pop_first();
+        }
+    }
+
+    pub fn update_reply_count(&mut self, ts: &str, count: u64) {
+        if let Some(parent) = self.messages.get(ts) && parent.reply_count < count {
+            let mut parent = parent.clone();
+            parent.reply_count = count;
+            self.ingest(parent);
         }
     }
 }

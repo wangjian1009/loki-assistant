@@ -41,7 +41,11 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct OpenSlackRunner;
+#[derive(Default)]
+struct OpenSlackRunner {
+    deliveries: Mutex<Vec<Value>>,
+    emacs_exited: AtomicBool,
+}
 
 impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
     fn run<'a>(
@@ -54,8 +58,6 @@ impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
     > {
         Box::pin(async move {
             assert_eq!(args[0], "--alternate-editor=/usr/bin/false");
-            assert!(args[3].contains("loki-assistant-slack-open-notification"));
-            assert!(args[3].contains("TTEAM.DDIRECT"));
             let decode_string = |source: &str| {
                 serde_json::Deserializer::from_str(source)
                     .into_iter::<String>()
@@ -64,6 +66,22 @@ impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
                     .unwrap()
             };
             let script = decode_string(args[3].split_once("((source ").unwrap().1);
+            if let Some((_, argument)) = script.split_once("(loki-assistant-slack-dispatch-messages ") {
+                use std::os::unix::fs::PermissionsExt;
+                let file = decode_string(argument);
+                assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+                let payload = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+                self.deliveries.lock().unwrap().push(payload);
+                let exited = self.emacs_exited.load(Ordering::SeqCst);
+                return Ok(crate::modules::emacs::service::CommandOutput {
+                    success: !exited,
+                    status: Some(if exited { 1 } else { 0 }),
+                    stdout: if exited { String::new() }
+                        else { json!(json!({"result":"applied"}).to_string()).to_string() },
+                    stderr: String::new(),
+                });
+            }
+            assert!(script.contains("TTEAM.DDIRECT"));
             let target = decode_string(
                 script
                     .split_once("(loki-assistant-slack-open-notification ")
@@ -417,6 +435,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .replace("emacs", "emacsclient_path", json!("/usr/bin/true"))
         .await
         .unwrap();
+    let emacs = Arc::new(OpenSlackRunner::default());
     let start = || {
         let projects = Arc::new(Projects::with_backend(
             Arc::clone(&config),
@@ -426,7 +445,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 crate::modules::emacs::config::EmacsConfig::new(config.clone()),
                 notification.clone(),
                 status.clone(),
-                Arc::new(OpenSlackRunner),
+                emacs.clone(),
                 Duration::from_secs(1),
             )),
             Backend {
@@ -596,7 +615,46 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await;
     assert_eq!(view["items"][0]["unread_count"], 1);
 
+    let subscription = Uuid::new_v4();
+    let subscribe = format!("/slack/conversations/TTEAM.CWORK/subscriptions/{subscription}");
+    assert_eq!(invoke(&app, "PUT", &subscribe, None, None, None).await.0, StatusCode::BAD_REQUEST);
+    let (code, _, created) = invoke(&app, "PUT", &subscribe, session, None, None).await;
+    assert_eq!(code, StatusCode::CREATED);
+    assert_eq!(created["subscription_id"], json!(subscription));
+    assert_eq!(invoke(&app, "PUT", &subscribe, session, None, None).await.0, StatusCode::OK);
+    timeout(Duration::from_secs(3), async {
+        while emacs.deliveries.lock().unwrap().is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(emacs.deliveries.lock().unwrap()[0]["kind"], "snapshot");
+    assert_eq!(emacs.deliveries.lock().unwrap()[0]["sequence"], 1);
+
     send_channel.send(()).unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let delivered = emacs.deliveries.lock().unwrap().iter().any(|batch| {
+                batch["kind"] == "changes" && batch["items"].as_array().unwrap().iter().any(|item| {
+                    item["ts"] == mock.root && item["author"]["id"] == "TTEAM.UYOU"
+                        && item["reply_count"] == 1
+                })
+            });
+            if delivered { break; }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    emacs.emacs_exited.store(true, Ordering::SeqCst);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    timeout(Duration::from_secs(3), async {
+        while service.state.lock().await.cache.subscriptions.contains_key(&("CWORK".into(), subscription)) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    tokio::time::resume();
+    assert_eq!(emacs.deliveries.lock().unwrap().last().unwrap()["kind"], "probe");
+    assert_eq!(invoke(&app, "DELETE", &subscribe, None, None, None).await.0, StatusCode::NO_CONTENT);
+
     let channel = timeout(Duration::from_secs(3), async {
         loop {
             let (_, _, data) = invoke(
@@ -716,6 +774,34 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let service = ready_service(&projects, "TTEAM").await;
     let fresh_session = service.session_id().await;
     assert_ne!(fresh_session, session);
+    let recovered = Uuid::new_v4();
+    let recovered_path = format!("/slack/conversations/TTEAM.DDIRECT/subscriptions/{recovered}");
+    assert_eq!(
+        invoke(&app, "PUT", &recovered_path, session, None, None).await.0,
+        StatusCode::CONFLICT
+    );
+    emacs.emacs_exited.store(false, Ordering::SeqCst);
+    assert_eq!(
+        invoke(&app, "PUT", &recovered_path, fresh_session, None, None).await.0,
+        StatusCode::CREATED
+    );
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if emacs.deliveries.lock().unwrap().iter().any(|batch| {
+                batch["subscription_id"] == json!(recovered)
+                    && batch["sequence"] == 1
+                    && batch["snapshot"]["sync_state"] == "cached"
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(
+        invoke(&app, "DELETE", &recovered_path, None, None, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(service.state.lock().await.cache.subscriptions.is_empty());
     let (code, _, restored) = invoke(&app, "GET", timeline, fresh_session, None, None).await;
     assert_eq!(code, StatusCode::OK, "{restored}");
     assert_eq!(restored["sync_state"], "cached");

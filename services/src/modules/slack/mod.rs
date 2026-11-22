@@ -8,6 +8,7 @@ mod routes;
 mod service;
 mod status;
 mod store;
+mod subscriptions;
 mod worker;
 
 #[cfg(test)]

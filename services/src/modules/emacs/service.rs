@@ -1,4 +1,5 @@
 use std::{collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -360,6 +361,35 @@ impl EmacsService {
         }
     }
 
+    pub(crate) async fn dispatch_slack_messages(&self, payload: &Value) -> Result<bool, EmacsError> {
+        let path = std::env::temp_dir().join(format!("loki-slack-{}.json", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|_| EmacsError::InvalidResponse("无法创建 Slack 投递文件。".into()))?;
+        let path = SlackPayloadFile(path);
+        serde_json::to_writer(&mut file, payload)
+            .and_then(|_| file.flush().map_err(serde_json::Error::io))
+            .map_err(|_| EmacsError::InvalidResponse("无法写入 Slack 投递文件。".into()))?;
+        drop(file);
+        let argument = serde_json::to_string(&path.0.to_string_lossy())
+            .expect("投递文件路径可序列化");
+        let script = format!(
+            "(if (fboundp 'loki-assistant-slack-dispatch-messages) \
+                 (loki-assistant-slack-dispatch-messages {argument}) 'buffer-closed)"
+        );
+        match timeout(Duration::from_secs(10), self.eval_with_startup(&script, false)).await {
+            Ok(Ok(output)) if output == "applied" => Ok(true),
+            Ok(Ok(output)) if output == "buffer-closed" => Ok(false),
+            Ok(Err(EmacsError::CommandFailed { .. } | EmacsError::ConnectionFailed(_))) => Ok(false),
+            Ok(Ok(_)) => Err(EmacsError::InvalidResponse("Slack 消息分发回执无效。".into())),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(EmacsError::Timeout),
+        }
+    }
+
     pub async fn register_notification_handler(
         &self,
         module_id: impl Into<String>,
@@ -497,6 +527,14 @@ impl EmacsService {
             .receive_receipt(id, receipt)
             .await
             .map_err(Into::into)
+    }
+}
+
+struct SlackPayloadFile(PathBuf);
+
+impl Drop for SlackPayloadFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

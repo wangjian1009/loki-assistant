@@ -36,6 +36,7 @@
 ;; 保留 expanded 槽的位置，以兼容直接重载时的会话分页状态。
 (cl-defstruct loki-assistant-slack--page items cursor loading loaded expanded error)
 (cl-defstruct loki-assistant-slack--choice room group stamp title workspace search avatars status summary)
+(cl-defstruct loki-assistant-slack--subscription id room self-id (sequence 0) timeout)
 
 (defvar-local loki-assistant-slack--room nil)
 (defvar-local loki-assistant-slack--self-id nil)
@@ -44,10 +45,15 @@
 (defvar-local loki-assistant-slack--reply nil
   "直接重载时保留的线程回复草稿目标。")
 (defvar-local loki-assistant-slack--send-request nil)
-(defvar-local loki-assistant-slack--refresh-timer nil)
+(defvar-local loki-assistant-slack--subscription nil)
+(defvar-local loki-assistant-slack--pending-subscription nil)
+(defvar-local loki-assistant-slack--page-changes nil)
+(defvar-local loki-assistant-slack--notification-root nil)
+(defvar loki-assistant-slack--subscription-buffers (make-hash-table :test #'equal))
+(defvar loki-assistant-slack--refresh-timer nil)
 (defvar-local loki-assistant-slack--profiles nil)
 (defvar-local loki-assistant-slack--images nil)
-(defvar loki-assistant-slack--media-refresh nil)
+(defvar-local loki-assistant-slack--media-refresh nil)
 (defvar loki-assistant-slack--selection nil)
 (defvar loki-assistant-slack--completion-choices nil)
 (defvar url-http-response-status)
@@ -403,15 +409,11 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
         (setq loki-assistant-slack--history-end (copy-marker (loki-assistant-slack--prompt-start)))
         (loki-assistant-slack-input-mode 1)
         (add-hook 'kill-buffer-hook #'loki-assistant-slack--stop-refresh nil t))
-      (unless (and loki-assistant-slack--timeline
-                   (equal session (alist-get 'session_id loki-assistant-slack--room)))
+      (unless loki-assistant-slack--timeline
         (setq loki-assistant-slack--timeline (make-loki-assistant-slack--page)
               loki-assistant-slack--profiles (make-hash-table :test #'equal)
-              loki-assistant-slack--images (make-hash-table :test #'equal)
-              loki-assistant-slack--self-id nil
-              loki-assistant-slack--reply nil
-              loki-assistant-slack--send-request nil))
-      (setq loki-assistant-slack--room room))
+              loki-assistant-slack--images (make-hash-table :test #'equal)))
+      (unless loki-assistant-slack--room (setq loki-assistant-slack--room room)))
     (let* ((existing (get-buffer-window buffer t))
            (window (or existing
                       (display-buffer buffer
@@ -422,12 +424,12 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
       (select-frame-set-input-focus (window-frame window))
       (select-window window)
       (with-current-buffer buffer
-        (unless (timerp loki-assistant-slack--refresh-timer)
-          (setq loki-assistant-slack--refresh-timer
-                (run-at-time 15 15 #'loki-assistant-slack--refresh-visible buffer)))
         (loki-assistant-slack--render)
         (unless existing (goto-char (point-max)))
-        (unless defer-refresh (loki-assistant-slack-refresh)))
+        (unless (or defer-refresh
+                    (and loki-assistant-slack--subscription
+                         (equal session (alist-get 'session_id loki-assistant-slack--room))))
+          (loki-assistant-slack-refresh)))
       buffer)))
 
 (defun loki-assistant-slack--message-position (ts)
@@ -453,6 +455,8 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
     (select-frame frame)
     (with-current-buffer (loki-assistant-slack--open room t)
       (when root
+        (unless loki-assistant-slack--subscription
+          (setq loki-assistant-slack--notification-root root))
         (setf (loki-assistant-slack--page-items loki-assistant-slack--timeline)
               (loki-assistant-slack--merge
                (loki-assistant-slack--page-items loki-assistant-slack--timeline)
@@ -464,11 +468,18 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
           (goto-char position)
           (recenter))
         (setq result (cond (message-position 'message) (thread-position 'thread) (t 'conversation))))
-      (loki-assistant-slack-refresh))
+      (unless (and loki-assistant-slack--subscription
+                   (equal (alist-get 'session_id room)
+                          (alist-get 'session_id loki-assistant-slack--room)))
+        (loki-assistant-slack-refresh)))
     result))
 
 (defun loki-assistant-slack--stop-refresh ()
-  "清理当前会话的定时刷新。"
+  "取消当前 buffer 的订阅并清理图片重绘任务。"
+  (loki-assistant-slack--cancel-subscription loki-assistant-slack--pending-subscription)
+  (loki-assistant-slack--cancel-subscription loki-assistant-slack--subscription)
+  (setq loki-assistant-slack--pending-subscription nil
+        loki-assistant-slack--subscription nil)
   (when (timerp loki-assistant-slack--refresh-timer)
     (cancel-timer loki-assistant-slack--refresh-timer)
     (setq loki-assistant-slack--refresh-timer nil))
@@ -476,11 +487,12 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
     (cancel-timer loki-assistant-slack--media-refresh)
     (setq loki-assistant-slack--media-refresh nil)))
 
-(defun loki-assistant-slack--refresh-visible (buffer)
-  "仅在 BUFFER 可见且连接可用时刷新。"
-  (when (and (buffer-live-p buffer) (get-buffer-window buffer t)
-             (comint-check-proc buffer))
-    (with-current-buffer buffer (loki-assistant-slack-refresh))))
+;; 直接重载时清理旧版本的消息轮询，保留现有聊天 buffer。
+(dolist (buffer (buffer-list))
+  (with-current-buffer buffer
+    (when (timerp loki-assistant-slack--refresh-timer)
+      (cancel-timer loki-assistant-slack--refresh-timer)
+      (setq loki-assistant-slack--refresh-timer nil))))
 
 (defun loki-assistant-slack--non-null (value)
   "把 JSON 空值 VALUE 转成 nil。"
@@ -534,6 +546,7 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
           (room loki-assistant-slack--room)
           (cursor (and older (loki-assistant-slack--page-cursor page))))
       (setf (loki-assistant-slack--page-loading page) t)
+      (setq loki-assistant-slack--page-changes nil)
       (loki-assistant-slack--request
        "GET" (loki-assistant-slack--path room nil)
        (lambda (response)
@@ -547,46 +560,222 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                        (when (or older (not (loki-assistant-slack--page-loaded page)))
                          (let ((next (alist-get 'next_cursor data)))
                            (setf (loki-assistant-slack--page-cursor page) (and (stringp next) next))))
-                       (setf (loki-assistant-slack--page-loaded page) t
-                             (loki-assistant-slack--page-error page) nil
-                             (loki-assistant-slack--page-items page)
-                             (loki-assistant-slack--merge (loki-assistant-slack--page-items page) data)))
+                       (let* ((items (loki-assistant-slack--merge
+                                      (loki-assistant-slack--page-items page) data))
+                              (lower (and (loki-assistant-slack--page-cursor page)
+                                          (alist-get 'ts (car items)))))
+                         (dolist (changes (nreverse loki-assistant-slack--page-changes))
+                           (setq items (loki-assistant-slack--apply-changes items changes lower)))
+                         (setf (loki-assistant-slack--page-loaded page) t
+                               (loki-assistant-slack--page-error page) nil
+                               (loki-assistant-slack--page-items page) items)))
                    (setf (loki-assistant-slack--page-error page)
                          (or (plist-get response :error-message) "Slack 消息读取失败")))
+                 (setq loki-assistant-slack--page-changes nil)
                  (unless (equal before page) (loki-assistant-slack--render))
                  (loki-assistant-slack--load-profiles))))))
        :room room :params (when cursor (list (cons 'cursor cursor)))))))
 
-(defun loki-assistant-slack-refresh ()
-  "刷新主会话的顶层消息。"
-  (interactive)
-  (loki-assistant-slack--load-self-id)
-  (loki-assistant-slack--load loki-assistant-slack--timeline))
+(defun loki-assistant-slack--subscription-path (subscription)
+  "返回 SUBSCRIPTION 的本机接口路径。"
+  (format "/slack/conversations/%s/subscriptions/%s"
+          (url-hexify-string
+           (alist-get 'id (loki-assistant-slack--subscription-room subscription)))
+          (loki-assistant-slack--subscription-id subscription)))
 
-(defun loki-assistant-slack--load-self-id ()
-  "从当前会话的连接状态取得 Slack 用户 ID。"
-  (when-let* (((null loki-assistant-slack--self-id))
-              (room loki-assistant-slack--room)
-              (session (alist-get 'session_id room)))
-    (setq loki-assistant-slack--self-id 'pending)
-    (let ((buffer (current-buffer)))
-      (loki-assistant-slack--request
-       "GET" "/status/slack/connections"
-       (lambda (response)
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (when (equal session (alist-get 'session_id loki-assistant-slack--room))
-               (let* ((connections (and (plist-get response :ok)
-                                        (alist-get 'value (plist-get response :data))))
-                      (connection (seq-find (lambda (value)
-                                              (equal session (alist-get 'session_id value)))
-                                            (and (sequencep connections) connections)))
-                      (id (alist-get 'user_id connection)))
-                 (setq loki-assistant-slack--self-id (and (stringp id) id))
-                 (when loki-assistant-slack--self-id
-                   (loki-assistant-slack--render)
-                   (loki-assistant-slack--load-profiles)))))))
-       :room room))))
+(defun loki-assistant-slack--cancel-subscription (subscription)
+  "清理本地 SUBSCRIPTION 并通知 services。"
+  (when subscription
+    (when-let ((timer (loki-assistant-slack--subscription-timeout subscription)))
+      (cancel-timer timer))
+    (let ((id (loki-assistant-slack--subscription-id subscription)))
+      (when (gethash id loki-assistant-slack--subscription-buffers)
+        (remhash id loki-assistant-slack--subscription-buffers)
+        (loki-assistant-slack--request
+         "DELETE" (loki-assistant-slack--subscription-path subscription) #'ignore)))))
+
+(defun loki-assistant-slack--subscription-failed (subscription reason)
+  "清理等待中的 SUBSCRIPTION 并显示 REASON。"
+  (when (eq subscription loki-assistant-slack--pending-subscription)
+    (setq loki-assistant-slack--pending-subscription nil)
+    (loki-assistant-slack--cancel-subscription subscription)
+    (message "%s" reason)))
+
+(defun loki-assistant-slack-refresh ()
+  "刷新最近一页并恢复当前聊天 buffer 的订阅。"
+  (interactive)
+  (when (and loki-assistant-slack--room (null loki-assistant-slack--pending-subscription))
+    (let ((subscription (make-loki-assistant-slack--subscription
+                         :id (loki-assistant-slack--uuid)
+                         :room (copy-tree loki-assistant-slack--room)))
+          (buffer (current-buffer)))
+      (setq loki-assistant-slack--pending-subscription subscription)
+      (setf (loki-assistant-slack--subscription-timeout subscription)
+            (run-at-time
+             45 nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (loki-assistant-slack--subscription-failed
+                    subscription "等待 Slack 消息快照超时"))))))
+      (loki-assistant-slack--register-subscription buffer subscription t))))
+
+(defun loki-assistant-slack--register-subscription (buffer subscription retry)
+  "获取 BUFFER 的当前会话并登记 SUBSCRIPTION。RETRY 允许重试会话变更。"
+  (loki-assistant-slack--request
+   "GET" "/status/slack/connections"
+   (lambda (response)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (eq subscription loki-assistant-slack--pending-subscription)
+           (let* ((room (loki-assistant-slack--subscription-room subscription))
+                  (team (or (alist-get 'team_id room)
+                            (car (split-string (alist-get 'id room) "[.]"))))
+                  (connections (alist-get 'value (plist-get response :data)))
+                  (connection (and (sequencep connections)
+                                   (seq-find (lambda (item)
+                                               (equal team (alist-get 'team_id item)))
+                                             connections)))
+                  (session (alist-get 'session_id connection)))
+             (if (and (plist-get response :ok) (stringp session))
+                 (progn
+                   (setf (alist-get 'session_id room) session
+                         (alist-get 'team_id room) team
+                         (loki-assistant-slack--subscription-room subscription) room
+                         (loki-assistant-slack--subscription-self-id subscription)
+                         (loki-assistant-slack--non-null (alist-get 'user_id connection)))
+                   (puthash (loki-assistant-slack--subscription-id subscription)
+                            buffer loki-assistant-slack--subscription-buffers)
+                   (loki-assistant-slack--request
+                    "PUT" (loki-assistant-slack--subscription-path subscription)
+                    (lambda (result)
+                      (loki-assistant-slack--registration-result buffer subscription result retry))
+                    :room room))
+               (loki-assistant-slack--subscription-failed
+                subscription (or (plist-get response :error-message)
+                                 "Slack 工作区会话暂不可用，请刷新重试"))))))))))
+
+(defun loki-assistant-slack--registration-result (buffer subscription result retry)
+  "处理 BUFFER 中 SUBSCRIPTION 的登记结果 RESULT。"
+  (let ((live (buffer-live-p buffer)))
+    (cond
+     ((plist-get result :ok)
+      (unless (and live (eq (gethash (loki-assistant-slack--subscription-id subscription)
+                                    loki-assistant-slack--subscription-buffers)
+                            buffer))
+        (loki-assistant-slack--request
+         "DELETE" (loki-assistant-slack--subscription-path subscription) #'ignore)))
+     (live
+      (with-current-buffer buffer
+        (when (eq subscription loki-assistant-slack--pending-subscription)
+          (if (and retry (equal (plist-get result :error-code) "slack-session-changed"))
+              (loki-assistant-slack--register-subscription buffer subscription nil)
+            (loki-assistant-slack--subscription-failed
+             subscription (or (plist-get result :error-message) "Slack 订阅登记失败")))))))))
+
+(defun loki-assistant-slack--apply-changes (items data &optional lower)
+  "将 DATA 中的消息变更应用到 ITEMS，LOWER 为已加载区间的起点。"
+  (let ((deleted (append (alist-get 'deleted_ts data) nil)))
+    (loki-assistant-slack--merge
+     (seq-remove (lambda (item) (member (alist-get 'ts item) deleted)) items)
+     (list (cons 'items
+                 (seq-filter
+                  (lambda (item)
+                    (let ((ts (alist-get 'ts item)))
+                      (and (stringp ts)
+                           (or (null lower) (not (loki-assistant-slack--stamp< ts lower))
+                               (seq-some (lambda (entry) (equal ts (alist-get 'ts entry))) items)))))
+                  (alist-get 'items data)))))))
+
+(defun loki-assistant-slack--apply-snapshot (subscription snapshot)
+  "将 SUBSCRIPTION 的 SNAPSHOT 安装到当前 buffer。"
+  (let ((previous loki-assistant-slack--subscription)
+        (room (loki-assistant-slack--subscription-room subscription))
+        (cursor (alist-get 'next_cursor snapshot)))
+    (unless (equal (alist-get 'session_id room)
+                   (alist-get 'session_id loki-assistant-slack--room))
+      (setq loki-assistant-slack--profiles (make-hash-table :test #'equal)
+            loki-assistant-slack--images (make-hash-table :test #'equal)
+            loki-assistant-slack--send-request nil))
+    (setq loki-assistant-slack--timeline
+          (make-loki-assistant-slack--page
+           :items (loki-assistant-slack--merge
+                   (and loki-assistant-slack--notification-root
+                        (list loki-assistant-slack--notification-root))
+                   snapshot)
+           :cursor (and (stringp cursor) cursor)
+           :loaded t)
+          loki-assistant-slack--page-changes nil
+          loki-assistant-slack--notification-root nil
+          loki-assistant-slack--room room
+          loki-assistant-slack--self-id (loki-assistant-slack--subscription-self-id subscription))
+    (loki-assistant-slack--render)
+    (when (eq subscription loki-assistant-slack--pending-subscription)
+      (when-let ((timer (loki-assistant-slack--subscription-timeout subscription)))
+        (cancel-timer timer)
+        (setf (loki-assistant-slack--subscription-timeout subscription) nil))
+      (setq loki-assistant-slack--subscription subscription
+            loki-assistant-slack--pending-subscription nil)
+      ;; 回调返回后再向 services 取消旧订阅。
+      (when previous
+        (remhash (loki-assistant-slack--subscription-id previous)
+                 loki-assistant-slack--subscription-buffers)
+        (run-at-time
+         0 nil #'loki-assistant-slack--request "DELETE"
+         (loki-assistant-slack--subscription-path previous) #'ignore)))))
+
+(defun loki-assistant-slack-dispatch-messages (payload-file)
+  "应用 services 的 PAYLOAD-FILE，返回 applied 或 buffer-closed。"
+  (let* ((data (with-temp-buffer
+                 (let ((coding-system-for-read 'utf-8))
+                   (insert-file-contents payload-file))
+                 (json-parse-buffer :object-type 'alist :array-type 'list :null-object nil)))
+         (id (alist-get 'subscription_id data))
+         (buffer (gethash id loki-assistant-slack--subscription-buffers)))
+    (unless (equal (alist-get 'api_version data) "1")
+      (error "Slack 投递协议版本无效"))
+    (if (not (buffer-live-p buffer))
+        'buffer-closed
+      (with-current-buffer buffer
+        (let* ((pending loki-assistant-slack--pending-subscription)
+               (active loki-assistant-slack--subscription)
+               (subscription (seq-find
+                              (lambda (entry)
+                                (and entry (equal id (loki-assistant-slack--subscription-id entry))))
+                              (list pending active)))
+               (room (and subscription (loki-assistant-slack--subscription-room subscription)))
+               (kind (alist-get 'kind data))
+               (sequence (alist-get 'sequence data)))
+          (cond
+           ((not (and subscription (equal (alist-get 'session_id data) (alist-get 'session_id room))
+                      (equal (alist-get 'conversation_id data) (alist-get 'id room))))
+            'buffer-closed)
+           ((equal kind "probe") 'applied)
+           ((<= sequence (loki-assistant-slack--subscription-sequence subscription)) 'applied)
+           ((/= sequence (1+ (loki-assistant-slack--subscription-sequence subscription)))
+            (error "Slack 消息序号不连续"))
+           (t
+            (pcase kind
+              ("snapshot"
+               (loki-assistant-slack--apply-snapshot subscription (alist-get 'snapshot data)))
+              ("changes"
+               (unless (eq subscription active) (error "Slack 订阅缺少快照"))
+               (let* ((page loki-assistant-slack--timeline)
+                      (items (loki-assistant-slack--page-items page))
+                      (lower (and (loki-assistant-slack--page-cursor page)
+                                  (alist-get 'ts (car items)))))
+                 (setf (loki-assistant-slack--page-items page)
+                       (loki-assistant-slack--apply-changes items data lower))
+                 (when (loki-assistant-slack--page-loading page)
+                   (push data loki-assistant-slack--page-changes))
+                 (loki-assistant-slack--render)))
+              (_ (error "未知的 Slack 消息投递类型")))
+            (setf (loki-assistant-slack--subscription-sequence subscription) sequence)
+            (run-at-time 0 nil
+                         (lambda ()
+                           (when (buffer-live-p buffer)
+                             (with-current-buffer buffer (loki-assistant-slack--load-profiles)))))
+            'applied)))))))
 
 (defun loki-assistant-slack--load-profiles ()
   "批量补齐当前聊天中可见的发送者和输入区的本人资料。"
@@ -1001,7 +1190,6 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                 (when loki-assistant-slack--reply
                   (setq loki-assistant-slack--reply nil)
                   (loki-assistant-slack--render))))
-            (loki-assistant-slack-refresh)
             (message "Slack 消息已发送"))
            ((and ok (equal state "pending") (< polls 20))
             (run-at-time

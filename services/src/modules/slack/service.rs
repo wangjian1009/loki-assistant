@@ -62,6 +62,7 @@ pub struct SlackService {
     pub(super) alerts: Notify,
     pub(super) user_fetch: Mutex<()>,
     pub(super) picker_changed: Notify,
+    pub(super) subscriptions_changed: Notify,
     project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     imported_token: Option<Arc<ConfigService>>,
     imported_token_lock: Mutex<()>,
@@ -100,6 +101,7 @@ impl SlackService {
             alerts: Notify::new(),
             user_fetch: Mutex::default(),
             picker_changed: Notify::new(),
+            subscriptions_changed: Notify::new(),
             project: (id, settings, generation, reporter),
             imported_token,
             imported_token_lock: Mutex::new(()),
@@ -114,6 +116,7 @@ impl SlackService {
     pub(super) async fn retire(&self) {
         let mut state = self.state.lock().await;
         state.retired = true;
+        state.cache.clear_subscriptions();
         self.signal_change();
     }
 
@@ -185,6 +188,9 @@ impl SlackService {
                 .await
                 .map_err(|_| Error::Unavailable)?;
             }
+        }
+        else if session.is_some_and(|session| state.account(session).is_err()) {
+            state.cache.clear_subscriptions();
         }
         self.picker_changed.notify_one();
         Ok(result)

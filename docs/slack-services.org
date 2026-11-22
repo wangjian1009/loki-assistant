@@ -139,6 +139,63 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 会话和消息记录可带 ~cache_path~ ，附件可带 ~original_path~ 、 ~preview_path~ 和 ~original_available~ 。预览接口传入 ~local_path=true~ 时按需缓存图片并返回 ~cache_path~ 。 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ 按需缓存原件并返回 ~cache_path~ 。路径均为本机绝对路径，文件格式和清理规则见 [[file:slack.org::*缓存设计][缓存设计]]。
 
+* 会话消息订阅
+
+每个 Slack 聊天 buffer 创建时生成一个 UUID，并在登记本地 buffer 映射后创建订阅。订阅随 buffer 存活，窗口隐藏或切换时继续接收消息。关闭 buffer 时先移除本地映射，再取消订阅。同一会话重新打开时生成新 UUID。
+
+** 本机 HTTP 接口
+
+| 方法与路径 | 约定 |
+|------------+------|
+| ~PUT /slack/conversations/{id}/subscriptions/{subscription_id}~ | 空请求体，必填 ~X-Loki-Slack-Session~ 。新建返回 HTTP 201，使用相同会话、会话代次和 UUID 重试返回 HTTP 200。两者均返回 ~api_version~ 、 ~subscription_id~ 、 ~conversation_id~ 、 ~session_id~ 。 |
+| ~DELETE /slack/conversations/{id}/subscriptions/{subscription_id}~ | 空请求体，按复合会话 ID 与 UUID 取消。重复取消或订阅已失效时均返回 HTTP 204。即使工作区断开也可清理。 |
+
+接口沿用 Slack 模块的本机访问范围、响应版本与通用 JSON 错误。创建时校验 UUID、会话和当前授权。缺失或无效的请求参数返回 ~400 invalid-request~ ，未知工作区或会话返回对应的 ~404~ ，过期的 ~session_id~ 返回 ~409 slack-session-changed~ 。同一订阅的重试沿用已有投递进度。
+
+** Emacs 消息分发
+
+services 通过现有 Emacs gateway 在配置指定的 Emacs server 上调用固定函数 ~(loki-assistant-slack-dispatch-messages payload-file)~ 。参数是 services 创建的本机临时文件路径，文件内容为 UTF-8 JSON。文件仅对当前用户可读写，调用结束后清理。后台投递仅连接现有 Emacs server。HTTP 调用方只提供会话和订阅标识，函数及目标 server 由 services 决定。
+
+每次投递包含 ~api_version~ 、 ~subscription_id~ 、 ~conversation_id~ 、 ~session_id~ 、 ~sequence~ 和 ~kind~ 。每个订阅的 ~sequence~ 从 1 开始递增，同一批次重试沿用原序号和数据。
+
+- ~kind=snapshot~ 时， ~snapshot~ 携带会话顶层消息的第一页，字段及格式沿用 ~GET /slack/conversations/{id}/messages~ 响应。注册成功后由后台投递首次快照。buffer 用它初始化时间线和翻页游标，读取更早消息仍使用现有分页接口。
+- ~kind=changes~ 时， ~items~ 携带新增或更新的完整顶层消息， ~deleted_ts~ 携带已删除的顶层消息时间戳。两个字段均为数组，任一数组可以为空。消息标识与历史列表一致。线程回复使顶层消息的摘要变化时，投递更新后的顶层消息。
+- ~kind=probe~ 用于确认 buffer 仍存活。它使用下一条消息的 ~sequence~ ，只核对订阅，收到回执后消息序号保持原值。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "subscription_id": "715348a3-2d42-4a03-95c8-cd127edce5e5",
+  "conversation_id": "T123.C456",
+  "session_id": "2c4df94e-af61-4bcf-87b5-e2143f8937a3",
+  "sequence": 2,
+  "kind": "changes",
+  "items": [],
+  "deleted_ts": ["1795074000.000001"]
+}
+#+end_src
+
+Emacs 按订阅 UUID 查找仍存活的 buffer，并核对会话和会话代次。分发函数应用消息或确认探测后返回 Lisp 符号 ~applied~ ，已应用的同序号重试也返回 ~applied~ 。找不到匹配的 buffer 时返回 ~buffer-closed~ ，services 据此删除对应订阅。分发流程直接更新 buffer 数据并重绘，保留当前草稿。
+
+** 投递时序与恢复
+
+- 登记订阅时开始跟踪该会话的缓存变更。生成第一页时取得一致的缓存快照和变更位置，先投递快照，再投递该位置之后的变更。首次回调可能先于 ~PUT~ 响应到达。
+- Slack 实时事件、重连补拉与本机发送结果都通过缓存更新进入投递队列。仅投递实际提交到缓存的变化。同一订阅按顺序投递，每次等待上一批回执后再投递下一批。等待 Emacs 时释放消息缓存锁。
+- 待投递的变更按消息时间戳合并。同一消息只保留最终状态。积压超限时重新取得快照，待当前批次确认后发送新快照。buffer 收到后以新快照重建时间线并重置翻页游标。
+- 主动取消立即停止后续投递。关闭时若创建请求仍在进行，Emacs 在创建成功后补发取消请求。取消请求未能送达时，已发出或后续的消息回调通过 ~buffer-closed~ 清理旧订阅。
+- services 在订阅空闲 60 秒后探测；Emacs 异常退出时，下一次投递或探测无法连接原 server，services 删除该订阅。所有后台调用禁用 Emacs 自动启动。回调函数缺失视同 ~buffer-closed~ 。求值超时、Lisp 错误和未知回执按退避重试。
+- 订阅保存在 services 内存中，services 重启或工作区会话失效时清理。Slack 实时连接在同一会话下重连时，订阅继续接收补拉结果。日常收取消息由 services 推送驱动。
+
+** 聊天 buffer 刷新
+
+在已有聊天 buffer 中执行 ~C-c C-r~ 时，Emacs 刷新最近一页并重新登记消息订阅。services 重启且工作区授权恢复后，一次刷新即可在原 buffer 中恢复推送。
+
+1. Emacs 调用 ~GET /status/slack/connections~ ，按当前聊天的 ~team_id~ 取得最新的 ~session_id~ 和 ~user_id~ 。
+2. Emacs 为本次刷新生成新的订阅 UUID，先登记本地映射，再携带当前 ~session_id~ 调用订阅 ~PUT~ 。若返回 ~slack-session-changed~ ，刷新流程重新读取状态并重试一次。刷新进行期间重复按键合并为同一次操作。
+3. services 按消息读取规则准备最近一页，优先从 Slack 获取，暂时无法获取时使用可读缓存。Emacs 收到新订阅的首次快照后，重建时间线和翻页游标，保留草稿，并更新 buffer 的 ~session_id~ 、 ~user_id~ 和订阅 UUID。随后移除旧订阅的本地映射并发送 ~DELETE~ 。迟到的旧投递收到 ~buffer-closed~ ，刷新前发出的分页请求也不能覆盖新时间线。
+
+刷新失败时，Emacs 保留当前时间线与草稿，提示失败原因并清理本次新建的订阅。等待快照期间关闭 buffer 时，按关闭流程取消关联的全部订阅。
+
 * 消息发送与发送记录
 
 ~POST /slack/conversations/{id}/messages~ 发送顶层消息。 ~POST /slack/conversations/{id}/threads/{thread_ts}/messages~ 发送线程回复。两个接口均要求 UUID 格式的 ~Idempotency-Key~ ，JSON 请求体包含 ~text~ 。

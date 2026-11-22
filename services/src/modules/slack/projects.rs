@@ -569,7 +569,7 @@ impl Projects {
             ));
             self.status
                 .register(&id, generation, service.public_status().await);
-            let worker = tokio::spawn(Arc::clone(&service).run());
+            let worker = tokio::spawn(Arc::clone(&service).run(Arc::clone(&self.emacs)));
             projects.insert(
                 id,
                 Project {

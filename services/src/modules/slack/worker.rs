@@ -7,6 +7,7 @@ use tokio_tungstenite::tungstenite::Message as Frame;
 use uuid::Uuid;
 
 use crate::modules::notification::protocol::NotificationRequest;
+use crate::modules::emacs::service::EmacsService;
 
 use super::{
     client::Socket,
@@ -16,7 +17,7 @@ use super::{
 };
 
 impl SlackService {
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>, emacs: Arc<EmacsService>) {
         self.restore_user_token().await;
         self.publish_status().await;
         self.sync.notify_one();
@@ -26,7 +27,8 @@ impl SlackService {
             self.synchronizing(),
             self.warming_users(),
             self.refreshing_picker(),
-            self.notifications()
+            self.notifications(),
+            self.subscription_workers(&emacs)
         );
     }
 
@@ -295,9 +297,7 @@ impl SlackService {
                     .filter(|item| item.thread_ts.as_ref() == Some(root))
                     .count()
                     + usize::from(!conversation.messages.contains_key(&message.ts));
-                if let Some(parent) = conversation.messages.get_mut(root) {
-                    parent.reply_count = parent.reply_count.max(count as u64);
-                }
+                conversation.update_reply_count(root, count as u64);
             }
             if notify {
                 let mut callback = format!(

@@ -181,13 +181,13 @@ pub(super) struct Identity {
     pub team_name: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct Author {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct Message {
     pub ts: String,
     pub thread_ts: Option<String>,
@@ -203,7 +203,7 @@ pub(super) struct Message {
     pub tables: Vec<Vec<Vec<String>>>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct Attachment {
     pub title: String,
     pub mimetype: Option<String>,
