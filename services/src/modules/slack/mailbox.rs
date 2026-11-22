@@ -49,12 +49,43 @@ pub(super) fn next_cursor(session: Uuid, target: String, anchor: String) -> Stri
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("Slack 游标可序列化"))
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct UserProfile {
     pub id: String,
     team_id: String,
-    name: String,
+    pub name: String,
     is_bot: bool,
+    display_name: Option<String>,
+    username: Option<String>,
+    avatar_url: Option<String>,
+}
+
+impl UserProfile {
+    fn from_slack(team_id: &str, id: &str, user: &Value) -> Self {
+        let profile = &user["profile"];
+        let name = [&profile["display_name"], &user["real_name"], &user["name"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .find(|name| !name.trim().is_empty())
+            .unwrap_or(id);
+        Self {
+            id: format!("{team_id}.{id}"),
+            team_id: team_id.to_owned(),
+            name: name.to_owned(),
+            is_bot: user["is_bot"] == true,
+            display_name: profile["display_name"].as_str().map(str::to_owned),
+            username: user["name"].as_str().map(str::to_owned),
+            avatar_url: [&profile["image_48"], &profile["image_72"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|url| !url.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    pub fn slack_id(&self) -> &str {
+        &self.id[self.team_id.len() + 1..]
+    }
 }
 
 pub(super) struct UserDirectory {
@@ -108,25 +139,8 @@ impl SlackService {
                 if user["deleted"] == true {
                     continue;
                 }
-                let name = [
-                    &user["profile"]["display_name"],
-                    &user["real_name"],
-                    &user["name"],
-                ]
-                .into_iter()
-                .filter_map(Value::as_str)
-                .find(|name| !name.trim().is_empty())
-                .unwrap_or(id);
-                let id = format!("{team_id}.{id}");
-                users.insert(
-                    id.clone(),
-                    UserProfile {
-                        id,
-                        team_id: team_id.clone(),
-                        name: name.to_owned(),
-                        is_bot: user["is_bot"] == true,
-                    },
-                );
+                let profile = UserProfile::from_slack(&team_id, id, user);
+                users.insert(profile.id.clone(), profile);
             }
             let next = response["response_metadata"]["next_cursor"]
                 .as_str()
@@ -148,6 +162,37 @@ impl SlackService {
             users: users.clone(),
         });
         Ok(users)
+    }
+
+    pub(super) async fn update_directory_user(&self, session: Uuid, id: &str, user: &Value) {
+        if !user.is_object() || !valid_id(id) {
+            return;
+        }
+        let mut directory = self.user_directory.lock().await;
+        let Some(directory) = directory
+            .as_mut()
+            .filter(|current| current.session == session)
+        else {
+            return;
+        };
+        let state = self.state.lock().await;
+        let Ok(account) = state.account(session) else {
+            return;
+        };
+        let profile = UserProfile::from_slack(&account.identity.team_id, id, user);
+        let mut users = directory.users.to_vec();
+        match (
+            users.binary_search_by(|user| user.id.cmp(&profile.id)),
+            user["deleted"] == true,
+        ) {
+            (Ok(index), false) => users[index] = profile,
+            (Ok(index), true) => {
+                users.remove(index);
+            }
+            (Err(index), false) => users.insert(index, profile),
+            (Err(_), true) => return,
+        }
+        directory.users = users.into();
     }
 
     async fn directory(
@@ -237,7 +282,8 @@ impl SlackService {
                     .entry(id)
                     .and_modify(|current| {
                         current.kind.clone_from(&entry.kind);
-                        if current.participants != entry.participants
+                        if (!entry.participants.is_empty()
+                            && current.participants != entry.participants)
                             || matches!(entry.kind.as_str(), "public_channel" | "private_channel")
                         {
                             current.participants.clone_from(&entry.participants);
@@ -250,6 +296,83 @@ impl SlackService {
             Ok(())
         })
         .await
+    }
+
+    pub(super) async fn refresh_group_members(&self, session: Uuid) -> Result<(), Error> {
+        let groups: Vec<_> = {
+            let state = self.state.lock().await;
+            state.account(session)?;
+            state
+                .cache
+                .conversations
+                .values()
+                .filter(|room| room.kind == "mpim" && room.participants.is_empty())
+                .map(|room| room.id.clone())
+                .collect()
+        };
+        let mut members = BTreeMap::new();
+        for id in groups {
+            match self.conversation_members(session, &id).await {
+                Ok(users) if !users.is_empty() => {
+                    members.insert(id, users);
+                }
+                Err(
+                    Error::RateLimited(_)
+                    | Error::Session
+                    | Error::Authorization
+                    | Error::Unavailable,
+                ) => break,
+                _ => {}
+            }
+        }
+        if members.is_empty() {
+            return Ok(());
+        }
+        self.update_cache(session, move |cache, _| {
+            for (id, users) in members {
+                if let Some(room) = cache.conversations.get_mut(&id)
+                    && room.participants.is_empty()
+                {
+                    room.participants = users;
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn conversation_members(&self, session: Uuid, id: &str) -> Result<Vec<String>, Error> {
+        let mut members = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cursor = String::new();
+        loop {
+            let page = self
+                .slack_get(
+                    session,
+                    "conversations.members",
+                    &[("channel", id), ("limit", "100"), ("cursor", &cursor)],
+                )
+                .await?;
+            members.extend(
+                page["members"]
+                    .as_array()
+                    .ok_or(Error::Upstream)?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|id| valid_id(id))
+                    .map(str::to_owned),
+            );
+            let next = page["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or_default();
+            if next.is_empty() {
+                return Ok(members.into_iter().collect());
+            }
+            if !seen.insert(next.to_owned()) {
+                return Err(Error::Upstream);
+            }
+            cursor = next.to_owned();
+        }
     }
 
     pub(super) async fn conversation_rows(
@@ -269,12 +392,14 @@ impl SlackService {
             .values()
             .filter(|value| kind.is_empty() || value.kind == kind)
             .filter_map(|value| {
-                let (latest, unread_time, mut summary) = value.summarize(account);
+                let (latest, unread_time, mut summary) =
+                    value.summarize(account, state.cache.positions(&value.id));
                 if unread && unread_time.is_none() {
                     return None;
                 }
                 summary["id"] = json!(format!("{}.{}", account.identity.team_id, value.id));
                 summary["team_id"] = json!(account.identity.team_id);
+                summary["team_name"] = json!(account.identity.team_name);
                 summary["session_id"] = json!(session);
                 Some(ConversationRow {
                     order: if unread { unread_time } else { latest },
@@ -284,6 +409,11 @@ impl SlackService {
             })
             .collect();
         Ok((rows, state.socket_state == "connected"))
+    }
+
+    pub(super) async fn refresh_latest(&self, session: Uuid, id: &str) -> Result<(), Error> {
+        self.fetch_messages(session, id, None, None, 50).await?;
+        Ok(())
     }
 
     pub(super) async fn messages(
@@ -370,12 +500,13 @@ impl SlackService {
             .conversations
             .get(&id)
             .ok_or(Error::Conversation)?;
+        let positions = state.cache.positions(&id);
         let mut result = json!({
             "api_version":"1","conversation_id":id,"items":items,"next_cursor":next,
             "sync_state":if live { "live" } else { "cached" },
-            "read_through_ts":conversation.read_position(thread.as_deref()),"covered_range":covered,
+            "read_through_ts":positions.get(thread.as_deref()),"covered_range":covered,
             "first_unread_ts":conversation.messages.values()
-                .filter(|message| message.thread_ts == thread && conversation.unread(message, account))
+                .filter(|message| message.thread_ts == thread && positions.unread(message, account))
                 .min_by_key(|message| timestamp(&message.ts)).map(|message| &message.ts)
         });
         if thread.is_some() {
@@ -605,17 +736,18 @@ impl SlackService {
             return Err(Error::Invalid);
         }
         self.update_cache(session, move |cache, account| {
-            let conversation = cache.conversations.get_mut(&id).ok_or(Error::Conversation)?;
-            let existing = conversation.read_position(thread.as_deref()).and_then(timestamp);
+            let conversation = cache.conversations.get(&id).ok_or(Error::Conversation)?;
+            let existing = cache.positions(&id).get(thread.as_deref()).and_then(timestamp);
             if existing.is_none_or(|value| position > value) {
                 if !conversation.messages.get(&target).is_some_and(|message| message.thread_ts == thread) {
                     return Err(Error::ReadPosition);
                 }
-                conversation.positions.insert(thread.clone().unwrap_or_default(), target);
+                cache.read_positions.entry(id.clone()).or_default().0.insert(thread.clone().unwrap_or_default(), target);
             }
-            let (_, _, summary) = conversation.summarize(account);
+            let positions = cache.positions(&id);
+            let (_, _, summary) = conversation.summarize(account, positions);
             Ok(json!({"api_version":"1","conversation_id":id,"thread_ts":thread,
-                "read_through_ts":conversation.read_position(thread.as_deref()),"unread_count":summary["unread_count"]}))
+                "read_through_ts":positions.get(thread.as_deref()),"unread_count":summary["unread_count"]}))
         }).await
     }
 

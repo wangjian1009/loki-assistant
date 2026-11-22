@@ -70,7 +70,7 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         Field::new(
                             "issue_code",
                             "问题代码",
-                            "最近一次连接或存储错误。",
+                            "最近一次授权或连接错误。",
                             StatusSchema::string(),
                         )
                         .nullable(),

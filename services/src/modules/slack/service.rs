@@ -1,6 +1,5 @@
 use std::{
     fmt,
-    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,14 +17,11 @@ use super::{
     projects::{Backend, SlackTeam},
     protocol::{Error, Identity, valid_id},
     status::ProjectsStatus,
-    store::{Account, Cache, Keychain, Secrets, SendState},
+    store::{Account, Cache, Secrets},
 };
 
 #[derive(Default)]
 pub(super) struct State {
-    pub initialized: bool,
-    pub credentials_locked: bool,
-    pub storage_unavailable: bool,
     pub secrets: Secrets,
     pub cache: Cache,
     pub socket_state: &'static str,
@@ -37,12 +33,6 @@ impl State {
     pub fn account(&self, session: Uuid) -> Result<&Account, Error> {
         if self.retired {
             return Err(Error::Project);
-        }
-        if self.credentials_locked {
-            return Err(Error::Credentials);
-        }
-        if self.storage_unavailable {
-            return Err(Error::Storage);
         }
         let account = self.secrets.account.as_ref().ok_or(Error::Session)?;
         if account.identity.session_id != session {
@@ -56,7 +46,7 @@ impl State {
 }
 
 pub struct SlackService {
-    pub(super) state: Arc<Mutex<State>>,
+    pub(super) state: Mutex<State>,
     pub(super) client: SlackClient,
     pub(super) notification: Arc<NotificationService>,
     pub(super) change: watch::Sender<u64>,
@@ -64,9 +54,7 @@ pub struct SlackService {
     pub(super) sync: Notify,
     pub(super) alerts: Notify,
     pub(super) user_directory: Mutex<Option<UserDirectory>>,
-    keychain: Arc<dyn Keychain>,
-    cache_path: Option<PathBuf>,
-    project: Option<(String, SlackTeam, Uuid, Arc<ProjectsStatus>)>,
+    project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     imported_token: Option<Arc<ConfigService>>,
     imported_token_lock: Mutex<()>,
 }
@@ -89,114 +77,23 @@ impl SlackService {
         backend: &Backend,
         config: Arc<ConfigService>,
     ) -> Self {
-        // 沿用未配置 Client ID 时的工作区 Keychain 和缓存名称。
-        let namespace = format!("{id}--{}", settings.team_id.as_deref().unwrap_or_default());
-        let mut service = Self::with_dependencies(
-            notification,
-            (backend.keychain)(namespace.clone()),
-            &backend.api,
-            backend.path.clone(),
-        );
-        service.cache_path = service
-            .cache_path
-            .map(|path| path.with_file_name(format!("slack-cache-{namespace}.json")));
-        if settings.token.is_some() {
-            service.imported_token = Some(config);
-        }
-        service.project = Some((id, settings, generation, reporter));
-        service
-    }
-
-    fn with_dependencies(
-        notification: Arc<NotificationService>,
-        keychain: Arc<dyn Keychain>,
-        api: &str,
-        service_path: Option<PathBuf>,
-    ) -> Self {
+        let imported_token = settings.token.is_some().then_some(config);
         Self {
-            state: Arc::new(Mutex::new(State {
+            state: Mutex::new(State {
                 socket_state: "stopped",
                 ..State::default()
-            })),
-            client: SlackClient::new(api),
+            }),
+            client: SlackClient::new(&backend.api),
             notification,
             change: watch::channel(0).0,
             outgoing: Notify::new(),
             sync: Notify::new(),
             alerts: Notify::new(),
             user_directory: Mutex::default(),
-            keychain,
-            cache_path: service_path
-                .as_ref()
-                .map(|path| path.with_file_name("slack-cache.json")),
-            project: None,
-            imported_token: None,
+            project: (id, settings, generation, reporter),
+            imported_token,
             imported_token_lock: Mutex::new(()),
         }
-    }
-
-    pub(super) async fn initialize(&self) -> Result<(), Error> {
-        let keychain = Arc::clone(&self.keychain);
-        let cache_path = self.cache_path.clone();
-        let has_imported_password = self
-            .project
-            .as_ref()
-            .is_none_or(|(_, settings, _, _)| settings.token.is_some());
-        let mut state = Arc::clone(&self.state).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            if state.initialized && !state.credentials_locked {
-                return Ok(());
-            }
-
-            if !state.initialized {
-                let cache = cache_path
-                    .as_deref()
-                    .ok_or(Error::Storage)
-                    .and_then(Cache::load);
-                match cache {
-                    Ok(cache) => state.cache = cache,
-                    Err(_) => state.storage_unavailable = true,
-                }
-                state.initialized = true;
-            }
-            match keychain.load() {
-                Ok(mut secrets) => {
-                    if !has_imported_password
-                        || secrets
-                            .account
-                            .as_ref()
-                            .is_some_and(|account| account.imported_token_hash.is_none())
-                    {
-                        secrets.account = None;
-                    }
-                    state.credentials_locked = false;
-                    let session = secrets
-                        .account
-                        .as_ref()
-                        .map(|account| account.identity.session_id);
-                    state.cache.reset(session);
-                    for record in state.cache.sends.values_mut() {
-                        if record.state == SendState::Attempting {
-                            record.state = SendState::Unknown;
-                            record.failure = Some(Error::DeliveryUnknown);
-                            record.text = None;
-                        }
-                    }
-                    state.secrets = secrets;
-                    if !state.storage_unavailable && state.cache.save(cache_path.as_ref()).is_err()
-                    {
-                        state.storage_unavailable = true;
-                    }
-                    Ok(())
-                }
-                Err(error) => {
-                    state.credentials_locked = true;
-                    Err(error)
-                }
-            }
-        })
-        .await
-        .map_err(|_| Error::Storage)?
     }
 
     pub(super) fn signal_change(&self) {
@@ -210,73 +107,41 @@ impl SlackService {
         self.signal_change();
     }
 
-    pub(super) async fn update_cache<T: Send + 'static>(
+    pub(super) async fn update_cache<T>(
         &self,
         session: Uuid,
-        operation: impl FnOnce(&mut Cache, &Account) -> Result<T, Error> + Send + 'static,
+        operation: impl FnOnce(&mut Cache, &Account) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut state = Arc::clone(&self.state).lock_owned().await;
-        let account = state.account(session)?.clone();
-        let path = self.cache_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut cache = state.cache.clone();
-            let result = operation(&mut cache, &account)?;
-            cache.save(path.as_ref())?;
-            state.cache = cache;
-            Ok(result)
-        })
-        .await
-        .map_err(|_| Error::Storage)?
+        let mut state = self.state.lock().await;
+        state.account(session)?;
+        let State { cache, secrets, .. } = &mut *state;
+        operation(
+            cache,
+            secrets.account.as_ref().expect("已验证的 Slack 会话"),
+        )
     }
 
-    async fn update_secrets<T: Send + 'static>(
+    async fn update_secrets<T>(
         &self,
-        operation: impl FnOnce(&mut Secrets, &State) -> Result<T, Error> + Send + 'static,
+        operation: impl FnOnce(&mut Secrets) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut state = Arc::clone(&self.state).lock_owned().await;
-        let keychain = Arc::clone(&self.keychain);
-        let path = self.cache_path.clone();
-        tokio::task::spawn_blocking(move || {
-            if state.retired {
-                return Err(Error::Project);
-            }
-            if state.credentials_locked {
-                return Err(Error::Credentials);
-            }
-            if state.storage_unavailable {
-                return Err(Error::Storage);
-            }
-            let mut next = state.secrets.clone();
-            let result = operation(&mut next, &state)?;
-            let mut stored = next.clone();
-            if let Some(account) = &mut stored.account
-                && account.imported_token_hash.is_some()
-            {
-                account.access.clear();
-            }
-            keychain.save(&stored)?;
-            let session = next
-                .account
-                .as_ref()
-                .map(|account| account.identity.session_id);
-            state.secrets = next;
-            if state.cache.session_id != session {
-                state.cache.reset(session);
-                if state.cache.save(path.as_ref()).is_err() {
-                    state.storage_unavailable = true;
-                    return Err(Error::Storage);
-                }
-            }
-            Ok(result)
-        })
-        .await
-        .map_err(|_| Error::Credentials)?
+        let mut state = self.state.lock().await;
+        if state.retired {
+            return Err(Error::Project);
+        }
+        let result = operation(&mut state.secrets)?;
+        let session = state
+            .secrets
+            .account
+            .as_ref()
+            .map(|account| account.identity.session_id);
+        state.cache.reset(session);
+        Ok(result)
     }
 
     fn authorization_state(state: &State) -> &'static str {
         let account = state.secrets.account.as_ref();
         match account {
-            _ if state.credentials_locked => "credentials_unavailable",
             Some(account) if account.revoked => "reauthorization_required",
             Some(account) if !account.access.is_empty() || account.web_session => "authorized",
             _ => "unconfigured",
@@ -292,29 +157,21 @@ impl SlackService {
     pub(super) async fn public_status(&self) -> Value {
         let state = self.state.lock().await;
         let account = state.secrets.account.as_ref().filter(|account| {
-            !state.credentials_locked
-                && !account.revoked
-                && (!account.access.is_empty() || account.web_session)
+            !account.revoked && (!account.access.is_empty() || account.web_session)
         });
-        let (team_id, settings, _, _) = self.project.as_ref().expect("Slack 工作区配置");
-        let issue = if state.storage_unavailable {
-            Some(Error::Storage)
-        } else {
-            state.issue
-        };
+        let (team_id, settings, _, _) = &self.project;
         json!({"team_id":team_id,"name":settings.name,
                "team_name":account.map(|account| &account.identity.team_name),
                "session_id":account.map(|account| account.identity.session_id),
                "user_id":account.map(|account| format!("{team_id}.{}", account.identity.user_id)),
                "authorization_state":Self::authorization_state(&state),
                "socket_state":state.socket_state,
-               "issue_code":issue.map(|error| error.object()["code"].clone())})
+               "issue_code":state.issue.map(|error| error.object()["code"].clone())})
     }
 
     pub(super) async fn publish_status(&self) {
-        if let Some((id, _, generation, reporter)) = &self.project {
-            reporter.update(id, *generation, self.public_status().await);
-        }
+        let (id, _, generation, reporter) = &self.project;
+        reporter.update(id, *generation, self.public_status().await);
     }
 
     async fn verify_user_token(&self, token: &str) -> Result<Identity, Error> {
@@ -345,8 +202,9 @@ impl SlackService {
             .to_owned();
         if self
             .project
+            .1
+            .team_id
             .as_ref()
-            .and_then(|(_, settings, _, _)| settings.team_id.as_ref())
             .is_some_and(|expected| expected != &team)
         {
             return Err(Error::TeamMismatch);
@@ -444,7 +302,7 @@ impl SlackService {
             imported_token_hash: Some(imported_token_hash),
             revoked: false,
         };
-        self.update_secrets(move |secrets, _| {
+        self.update_secrets(move |secrets| {
             if let Some(previous) = &secrets.account
                 && previous.identity.team_id == account.identity.team_id
                 && previous.identity.user_id == account.identity.user_id
@@ -464,7 +322,7 @@ impl SlackService {
     }
 
     pub(super) async fn disconnect(&self, session: Option<Uuid>) -> Result<(), Error> {
-        self.update_secrets(move |secrets, _| {
+        self.update_secrets(move |secrets| {
             if let Some(session) = session
                 && secrets
                     .account
@@ -492,7 +350,7 @@ impl SlackService {
     pub(super) async fn revoke(&self, session: Uuid, token: &str) {
         let token = token.to_owned();
         let revoked = self
-            .update_secrets(move |secrets, _| {
+            .update_secrets(move |secrets| {
                 if let Some(account) = &mut secrets.account
                     && account.identity.session_id == session
                     && account.access == token
@@ -520,7 +378,7 @@ impl SlackService {
 
     async fn read_passwords(&self) -> Result<[Option<String>; 2], Error> {
         let config = self.imported_token.as_ref().ok_or(Error::Configuration)?;
-        let (team, _, _, _) = self.project.as_ref().ok_or(Error::Configuration)?;
+        let (team, _, _, _) = &self.project;
         config
             .read_record_passwords("slack", "teams", team, SlackTeam::PASSWORD_FIELDS)
             .await

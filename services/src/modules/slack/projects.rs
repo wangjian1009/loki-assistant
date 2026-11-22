@@ -1,6 +1,4 @@
-use std::{
-    collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
-};
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use axum::Router;
 use serde::Deserialize;
@@ -12,13 +10,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{
-    modules::{
-        config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService},
-        notification::NotificationService,
-        status::StatusService,
-    },
-    runtime::ServicePfile,
+use crate::modules::{
+    config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService},
+    notification::NotificationService,
+    status::StatusService,
 };
 
 use super::{
@@ -27,7 +22,6 @@ use super::{
     routes,
     service::SlackService,
     status::ProjectsStatus,
-    store::{Keychain, LoginKeychain},
 };
 
 pub(super) type BrowserFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -40,9 +34,7 @@ pub(super) enum RegistrationStatus {
 }
 
 pub(super) struct Backend {
-    pub path: Option<PathBuf>,
     pub api: String,
-    pub keychain: Arc<dyn Fn(String) -> Arc<dyn Keychain> + Send + Sync>,
     pub open_browser: Arc<dyn Fn(String) -> BrowserFuture + Send + Sync>,
 }
 
@@ -139,9 +131,7 @@ impl Projects {
             notification,
             status,
             Backend {
-                path: ServicePfile::path().ok(),
                 api: "https://slack.com/api".into(),
-                keychain: Arc::new(|account| Arc::new(LoginKeychain(account))),
                 open_browser: Arc::new(|url| {
                     Box::pin(async move {
                         let mut opener = tokio::process::Command::new("/usr/bin/open");

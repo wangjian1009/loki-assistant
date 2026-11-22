@@ -1790,7 +1790,6 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls",
- "security-framework",
  "serde",
  "serde_json",
  "serde_yaml_ng",

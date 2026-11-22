@@ -111,6 +111,7 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/emacs/buffers~ | 查询当前 Emacs buffer 列表 |
 | GET | ~/password/entries~ | 查询密码条目，可选 query 按路径过滤 |
 | GET | ~/password/entries/{*file}~ | 按相对 .gpg 路径读取单条密码原文 |
+| GET | ~/slack/users~ | 分页读取已授权工作区的用户目录，仅限本机。见 [[file:slack.org::*services RESTful 接口][Slack 接口]] |
 
 * 配置中心
 

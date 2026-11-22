@@ -31,9 +31,7 @@ pub(super) enum Error {
     RateLimited(u64),
     Upstream,
     Unavailable,
-    Credentials,
     PasswordRead,
-    Storage,
     DeliveryUnknown,
     Method,
 }
@@ -115,16 +113,6 @@ impl Error {
                 "slack-password-unavailable",
                 "无法读取项目的 pass 条目，请检查密码库设置。",
             ),
-            Self::Credentials => (
-                503,
-                "slack-credentials-unavailable",
-                "暂时无法访问 Slack 本机凭据。",
-            ),
-            Self::Storage => (
-                503,
-                "slack-storage-unavailable",
-                "暂时无法读写 Slack 本机存储。",
-            ),
             Self::DeliveryUnknown => (
                 503,
                 "slack-delivery-unknown",
@@ -135,7 +123,7 @@ impl Error {
 
     fn source(self) -> ErrorSource {
         match self {
-            Self::Invalid | Self::Method | Self::Storage => ErrorSource::Services,
+            Self::Invalid | Self::Method => ErrorSource::Services,
             _ => ErrorSource::Business,
         }
     }
@@ -193,9 +181,32 @@ pub(super) struct Message {
     pub text: String,
     pub reply_count: u64,
     pub edited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<String>,
 }
 
 impl Message {
+    pub fn mentions(&self, user: &str) -> bool {
+        self.text.match_indices("<@").any(|(start, _)| {
+            self.text[start + 2..]
+                .strip_prefix(user)
+                .is_some_and(|tail| {
+                    tail.starts_with('>')
+                        || tail
+                            .strip_prefix('|')
+                            .is_some_and(|label| label.contains('>'))
+                })
+        })
+    }
+
+    pub fn preview(&self) -> String {
+        let text = self.text.trim();
+        if text.is_empty() {
+            return self.attachment.clone().unwrap_or_default();
+        }
+        text.chars().take(120).collect()
+    }
+
     pub fn from_slack(value: &Value, root: Option<&str>) -> Option<Self> {
         let ts = value.get("ts")?.as_str()?;
         timestamp(ts)?;
@@ -216,6 +227,22 @@ impl Message {
                     .unwrap_or(id)
                     .into(),
             });
+        let attachment = [&value["files"][0], &value["attachments"][0]]
+            .into_iter()
+            .find(|value| value.is_object())
+            .map(|file| {
+                [
+                    &file["title"],
+                    &file["name"],
+                    &file["filetype"],
+                    &file["fallback"],
+                ]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|text| !text.trim().is_empty())
+                .map(|text| format!("附件 · {}", text.chars().take(100).collect::<String>()))
+                .unwrap_or_else(|| "附件".into())
+            });
         Some(Self {
             ts: ts.into(),
             thread_ts: thread.map(str::to_owned),
@@ -223,6 +250,7 @@ impl Message {
             text: value["text"].as_str().unwrap_or_default().to_owned(),
             reply_count: value["reply_count"].as_u64().unwrap_or_default(),
             edited: value.get("edited").is_some(),
+            attachment,
         })
     }
 }

@@ -5,15 +5,20 @@
 (require 'button)
 (require 'cl-lib)
 (require 'comint)
+(require 'quail)
 (require 'seq)
+(require 'url)
 (require 'loki-assistant)
 
 (declare-function consult--read "consult")
-(declare-function consult--lookup-cdr "consult")
+(declare-function consult--tofu-append "consult")
+(declare-function consult--async-sink "consult")
 (declare-function shell-maker-start-v2 "shell-maker")
 (declare-function make-shell-maker-config "shell-maker")
 
 (cl-defstruct loki-assistant-slack--page items cursor loading loaded expanded error)
+(cl-defstruct loki-assistant-slack--picker users directory-state update)
+(cl-defstruct loki-assistant-slack--choice room group stamp title workspace search avatars status summary)
 
 (defvar-local loki-assistant-slack--room nil)
 (defvar-local loki-assistant-slack--timeline nil)
@@ -23,6 +28,10 @@
 (defvar-local loki-assistant-slack--send-request nil)
 (defvar-local loki-assistant-slack--refresh-timer nil)
 (defvar loki-assistant-slack--selection nil)
+(defvar loki-assistant-slack--pinyin-table nil)
+(defvar loki-assistant-slack--completion-choices nil)
+(defvar url-http-response-status)
+(defvar url-http-end-of-headers)
 
 (cl-defun loki-assistant-slack--request (method path callback &key room params body key)
   "通过 services 发起 Slack 请求。"
@@ -43,6 +52,217 @@
   (concat (when (member (alist-get 'kind room) '("public_channel" "private_channel")) "#")
           (replace-regexp-in-string "[\n\r]+" " " (or (alist-get 'title room) (alist-get 'id room)))))
 
+(defun loki-assistant-slack--collect (window selection path callback &optional cursor pages seen issue)
+  "逐页读取 PATH，在 WINDOW 和 SELECTION 仍有效时调用 CALLBACK。"
+  (loki-assistant-slack--request
+   "GET" path
+   (lambda (response)
+     (when (and (eq selection loki-assistant-slack--selection) (window-live-p window))
+       (if (not (plist-get response :ok))
+           (funcall callback (apply #'append (nreverse pages))
+                    (or (plist-get response :error-message) "Slack 数据暂不可用"))
+         (let* ((data (plist-get response :data))
+                (next (alist-get 'next_cursor data)))
+           (push (append (alist-get 'items data) nil) pages)
+           (setq issue (or issue (and (not (seq-empty-p (alist-get 'issues data)))
+                                      "部分 Slack 工作区数据暂不可用")))
+           (cond
+            ((not (stringp next)) (funcall callback (apply #'append (nreverse pages)) issue))
+            ((member next seen) (funcall callback (apply #'append (nreverse pages)) "Slack 分页重复"))
+            (t (loki-assistant-slack--collect window selection path callback next pages
+                                             (cons next seen) issue)))))))
+   :params (append '((limit . 100)) (when cursor (list (cons 'cursor cursor))))))
+
+(defun loki-assistant-slack--pinyin-table ()
+  "从 Emacs 的简体和繁体拼音输入法构造读音索引。"
+  (or loki-assistant-slack--pinyin-table
+      (let ((table (make-hash-table :test #'eql))
+            (quail-current-package quail-current-package))
+        (cl-labels ((visit (node key)
+                      (let ((translations (quail-map-definition node)))
+                        (when (and (vectorp translations) (string-match "\\`\\([a-z:]+\\)[1-5]?\\'" key))
+                          (let ((sound (replace-regexp-in-string "u:" "v" (match-string 1 key))))
+                            (seq-doseq (text translations)
+                              (when (and (stringp text) (= (length text) 1))
+                                (cl-pushnew sound (gethash (aref text 0) table) :test #'equal))))))
+                      (dolist (branch (cdr node))
+                        (when (and (consp branch) (characterp (car branch)))
+                          (visit (cdr branch) (concat key (char-to-string (car branch))))))))
+          (dolist (entry '(("leim/quail/PY" . "chinese-py") ("leim/quail/PY-b5" . "chinese-py-b5")))
+            (unless (quail-package (cdr entry)) (load (car entry) t t))
+            (when (setq quail-current-package (quail-package (cdr entry)))
+              (visit (quail-map) ""))))
+        (setq loki-assistant-slack--pinyin-table table))))
+
+(defun loki-assistant-slack--search-fields (name)
+  "返回 NAME 的原文、全拼和首字母。"
+  (let ((name (downcase name)))
+    (if (not (string-match-p "\\cc" name))
+        (list name)
+      (let* ((table (loki-assistant-slack--pinyin-table))
+             (readings (mapcar (lambda (char)
+                                 (or (gethash char table) (list (char-to-string char))))
+                               (replace-regexp-in-string "[[:space:]]+" "" name)))
+             (variants (list ""))
+             (initials (list "")))
+        (dolist (syllables readings)
+          (setq variants (seq-take (cl-loop for prefix in variants append
+                                           (mapcar (lambda (sound) (concat prefix sound)) syllables)) 64)
+                initials (seq-take (delete-dups (cl-loop for prefix in initials append
+                                                        (mapcar (lambda (sound) (concat prefix (substring sound 0 1))) syllables))) 64)))
+        (cons name (delete-dups (append variants initials)))))))
+
+(defun loki-assistant-slack--single-line (text)
+  "返回压成一行的 TEXT。"
+  (when (stringp text) (string-trim (replace-regexp-in-string "[[:space:][:cntrl:]]+" " " text))))
+
+(defun loki-assistant-slack--choice-for (room users)
+  "用 USERS 补齐 ROOM 的候选资料。"
+  (let* ((kind (alist-get 'kind room))
+         (private (member kind '("im" "mpim")))
+         (participants (mapcar (lambda (id) (gethash id users)) (alist-get 'participant_ids room)))
+         (people (delq nil (copy-sequence participants)))
+         (title (or (and (equal kind "im") (loki-assistant-slack--single-line (alist-get 'name (car people))))
+                    (loki-assistant-slack--label room)))
+         (workspace (or (loki-assistant-slack--single-line (alist-get 'team_name room))
+                        (alist-get 'team_id room) ""))
+         (mention (loki-assistant-slack--non-null (alist-get 'last_unread_mention_ts room)))
+         (unread (or (alist-get 'unread_count room) 0))
+         (last-message (loki-assistant-slack--non-null (alist-get 'last_message room)))
+         (activity (loki-assistant-slack--non-null (alist-get 'last_activity_ts room)))
+         (author (loki-assistant-slack--non-null (alist-get 'author last-message)))
+         (sender (or (alist-get 'name (gethash (alist-get 'id author) users)) (alist-get 'name author)))
+         (preview (loki-assistant-slack--single-line (or (alist-get 'preview last-message) (alist-get 'preview room))))
+         (details (if activity
+                      (delq nil (list (loki-assistant-slack--single-line sender)
+                                      (format-time-string "%m-%d %H:%M" (seconds-to-time (string-to-number activity)))
+                                      (unless (string-empty-p (or preview "")) (truncate-string-to-width preview 60 nil nil "…"))))
+                    (list (if (memq (alist-get 'history_loaded room) '(t nil)) "暂无消息" "消息摘要暂不可用"))))
+         (names (cons (string-remove-prefix "#" title) (append (and private (list (loki-assistant-slack--label room)))
+                                    (cl-loop for user in people append
+                                             (mapcar (lambda (key) (alist-get key user)) '(name display_name username)))))))
+    (make-loki-assistant-slack--choice
+     :room room :group (cond (mention 0) ((> unread 0) 1) (t 2)) :stamp (or mention activity "0.0")
+     :title title :workspace workspace
+     :search (delete-dups (mapcan #'loki-assistant-slack--search-fields (seq-filter #'stringp names)))
+     :avatars (when private (or (mapcar (lambda (user) (alist-get 'avatar_url user)) participants) '(nil)))
+     :status (concat (when (> unread 0) (format "%d 未读" unread))
+                     (when mention (propertize " @我" 'face 'warning)))
+     :summary (propertize (string-join details " · ") 'face 'shadow))))
+
+(defun loki-assistant-slack--choice< (left right)
+  "按默认顺序比较候选 LEFT 和 RIGHT。"
+  (let ((a (loki-assistant-slack--choice-group left)) (b (loki-assistant-slack--choice-group right))
+        (ta (loki-assistant-slack--choice-stamp left)) (tb (loki-assistant-slack--choice-stamp right))
+        (na (loki-assistant-slack--choice-title left)) (nb (loki-assistant-slack--choice-title right)))
+    (cond ((/= a b) (< a b))
+          ((loki-assistant-slack--stamp< tb ta) t)
+          ((loki-assistant-slack--stamp< ta tb) nil)
+          ((not (equal na nb)) (string-lessp na nb))
+          (t (string-lessp (loki-assistant-slack--choice-workspace left)
+                           (loki-assistant-slack--choice-workspace right))))))
+
+(defun loki-assistant-slack--matches (input table pred)
+  "按照分组和匹配程度返回 TABLE 中符合 INPUT 和 PRED 的候选。"
+  (let* ((query (downcase (string-trim input)))
+         (pattern (mapconcat (lambda (char) (regexp-quote (char-to-string char))) query ".*?"))
+         matches)
+    (dolist (candidate (all-completions "" table pred))
+      (when-let ((choice (gethash candidate loki-assistant-slack--completion-choices)))
+        (let* ((fields (loki-assistant-slack--choice-search choice))
+               (exact (or (string-empty-p query) (equal candidate input) (member query fields))))
+          (when (or exact (seq-some (lambda (field) (string-match-p pattern field)) fields))
+            (push (list candidate (loki-assistant-slack--choice-group choice) (if exact 0 1)) matches)))))
+    (mapcar #'car
+            (cl-stable-sort (nreverse matches)
+                            (lambda (left right)
+                              (if (= (nth 1 left) (nth 1 right))
+                                  (< (nth 2 left) (nth 2 right))
+                                (< (nth 1 left) (nth 1 right))))))))
+
+(defun loki-assistant-slack--try-completion (input table pred point)
+  "根据 INPUT、TABLE 和 PRED 尝试补全，保留光标 POINT。"
+  (let ((matches (loki-assistant-slack--matches input table pred)))
+    (cond ((member input matches) t)
+          ((null matches) nil)
+          ((null (cdr matches)) (cons (car matches) (length (car matches))))
+          (t (cons input point)))))
+
+(defun loki-assistant-slack--all-completions (input table pred _point)
+  "返回 INPUT 在 TABLE 和 PRED 下的全部匹配。"
+  (when-let ((matches (loki-assistant-slack--matches input table pred)))
+    (nconc matches 0)))
+
+(defun loki-assistant-slack--avatar (url images update)
+  "异步读取 URL 的头像，更新 IMAGES 并调用 UPDATE。"
+  (when (and (display-graphic-p) (stringp url)
+             (string-match-p "\\`https://\\(?:[a-z0-9-]+\\.\\)*\\(?:slack-edge\\.com\\|slack\\.com\\|gravatar\\.com\\)/" url)
+             (eq (gethash url images 'missing) 'missing)
+             (< (cl-count 'loading (hash-table-values images)) 8))
+    (puthash url 'loading images)
+    (let ((url-automatic-caching nil)
+          (url-max-redirections 0)
+          (url-request-extra-headers nil)
+          (url-request-method "GET")
+          (url-request-data nil))
+      (condition-case nil
+          (url-retrieve
+           url (lambda (status)
+                 (unwind-protect
+                     (let* ((start (and url-http-end-of-headers (1+ url-http-end-of-headers)))
+                            (data (and (not (plist-get status :error)) (eq url-http-response-status 200)
+                                       start (<= 1 (- (point-max) start) (* 128 1024))
+                                       (buffer-substring-no-properties start (point-max))))
+                            (type (and data (image-type-from-data data))))
+                       (puthash url (and (memq type '(jpeg png gif webp))
+                                         (ignore-errors (create-image data type t :max-width 20 :max-height 20 :ascent 'center))) images))
+                   (kill-buffer (current-buffer)))
+                 (funcall update)) nil t t)
+        (error (puthash url nil images)))))
+  (let ((image (gethash url images)))
+    (if (consp image) (propertize "○" 'display image) (propertize "○" 'face 'shadow))))
+
+(defun loki-assistant-slack--align-to (column)
+  "返回延伸至 COLUMN 的空格。"
+  (propertize " " 'display `(space :align-to ,column)))
+
+(defun loki-assistant-slack--fit-column (text width)
+  "将 TEXT 缩短至 WIDTH 列。"
+  (let* ((fitted (truncate-string-to-width text width nil nil "…"))
+         (pixels (* width (frame-char-width))))
+    (when (and (display-graphic-p) (fboundp 'string-pixel-width)
+               (> (string-pixel-width fitted) pixels))
+      (let ((end (length fitted)))
+        (while (and (> end 0) (> (string-pixel-width (concat (substring fitted 0 end) "…")) pixels))
+          (setq end (1- end)))
+        (setq fitted (concat (substring fitted 0 end) "…"))))
+    fitted))
+
+(defun loki-assistant-slack--choice-row (key choice title-width workspace-width images refresh)
+  "按 TITLE-WIDTH 和 WORKSPACE-WIDTH 对齐 KEY 对应的 CHOICE，使用 IMAGES 和 REFRESH 显示头像。"
+  (let* ((kind (alist-get 'kind (loki-assistant-slack--choice-room choice)))
+         (avatars (loki-assistant-slack--choice-avatars choice))
+         (title-column 19)
+         (workspace-column (+ title-column title-width))
+         (status-column (+ workspace-column workspace-width)))
+    (list key
+          (concat (cond ((equal kind "im") "私聊")
+                        ((equal kind "mpim") "群组私聊")
+                        (t "主题聊天"))
+                  (loki-assistant-slack--align-to 10)
+                  (mapconcat (lambda (url) (loki-assistant-slack--avatar url images refresh))
+                             (seq-take avatars 2) "")
+                  (when (cddr avatars) (propertize "…" 'face 'shadow))
+                  (loki-assistant-slack--align-to title-column))
+          (concat (when (> workspace-width 0)
+                    (concat (loki-assistant-slack--align-to workspace-column)
+                            (loki-assistant-slack--fit-column
+                             (loki-assistant-slack--choice-workspace choice) (- workspace-width 2))))
+                  (loki-assistant-slack--align-to status-column)
+                  (loki-assistant-slack--choice-status choice)
+                  (loki-assistant-slack--align-to (+ status-column 15))
+                  (loki-assistant-slack--choice-summary choice)))))
+
 (defun loki-assistant-slack--choose (window selection rooms)
   "在 WINDOW 选择当前请求 SELECTION 得到的 ROOMS。"
   (when (and (eq selection loki-assistant-slack--selection) (window-live-p window))
@@ -50,31 +270,65 @@
      ((active-minibuffer-window) (message "请退出当前 minibuffer 后重新选择 Slack 聊天。"))
      ((null rooms) (message "没有可用的 Slack 聊天。"))
      (t
-      (let* ((choices (mapcar (lambda (room)
-                               (cons (format "%s  [%s]" (loki-assistant-slack--label room)
-                                             (alist-get 'id room)) room))
-                             rooms))
-             (room (with-selected-window window
-                     (consult--read choices :prompt "Slack 聊天："
-                                    :sort nil :require-match t :lookup #'consult--lookup-cdr))))
+      (let* ((sink (consult--async-sink))
+             (images (make-hash-table :test #'equal))
+             (users (loki-assistant-slack--picker-users selection))
+             (show-workspace (> (length (delete-dups (mapcar (lambda (room) (alist-get 'team_id room)) rooms))) 1))
+             (window-width (window-body-width (minibuffer-window (window-frame window))))
+             (title-width (min 34 (max 10 (/ window-width 4))))
+             (workspace-width (if show-workspace (min 17 (max 8 (/ window-width 7))) 0))
+             (loki-assistant-slack--completion-choices (make-hash-table :test #'equal))
+             (completion-styles-alist (cons '(loki-slack loki-assistant-slack--try-completion
+                                                        loki-assistant-slack--all-completions "Slack 模糊匹配。") completion-styles-alist))
+             (completion-category-overrides (cons '(loki-slack (styles loki-slack)) completion-category-overrides))
+             (completion-ignore-case t)
+             (choices-table loki-assistant-slack--completion-choices)
+             (refresh (lambda () (funcall sink 'refresh)))
+             (rebuild
+              (lambda ()
+                (clrhash choices-table)
+                (funcall sink 'flush)
+                (let ((items (cl-loop for room in rooms for index from 0
+                                      for choice = (loki-assistant-slack--choice-for room users)
+                                      for title = (loki-assistant-slack--choice-title choice)
+                                      for key = (consult--tofu-append
+                                                 (loki-assistant-slack--fit-column title (- title-width 2))
+                                                 index)
+                                      do (puthash key choice choices-table) collect key)))
+                  (funcall sink (sort items (lambda (a b) (loki-assistant-slack--choice< (gethash a choices-table)
+                                                                                    (gethash b choices-table))))))
+                (funcall refresh)))
+             minibuffer room)
+        (setf (loki-assistant-slack--picker-update selection) rebuild)
+        (funcall rebuild)
+        (unwind-protect
+            (setq room
+                  (with-selected-window window
+                    (consult--read
+                     (lambda (action)
+                       (cond
+                        ((eq action 'setup) (setq minibuffer (current-buffer)) (funcall sink action))
+                        ((stringp action)
+                         (when (eq (current-buffer) minibuffer)
+                           (let ((state (loki-assistant-slack--picker-directory-state selection)))
+                             (cond ((not (loki-assistant-slack--matches action minibuffer-completion-table nil))
+                                    (minibuffer-message "未找到匹配的聊天"))
+                                   ((eq state 'loading) (minibuffer-message "正在准备 Slack 用户目录"))
+                                   ((eq state 'incomplete) (minibuffer-message "Slack 用户目录暂不完整"))))))
+                        (t (funcall sink action))))
+                     :prompt "Slack 聊天：" :category 'loki-slack :async-wrap nil :sort nil :require-match t
+                     :lookup (lambda (key &rest _)
+                               (when-let ((choice (gethash key choices-table))) (loki-assistant-slack--choice-room choice)))
+                     :group (lambda (key transform)
+                              (if transform key
+                                (aref ["未读 @我" "其他未读" "其余聊天"]
+                                      (loki-assistant-slack--choice-group (gethash key choices-table)))))
+                     :annotate (lambda (key)
+                                 (loki-assistant-slack--choice-row
+                                  key (gethash key choices-table)
+                                  title-width workspace-width images refresh)))))
+          (setf (loki-assistant-slack--picker-update selection) nil))
         (when room (loki-assistant-slack--open room)))))))
-
-(defun loki-assistant-slack--select (window selection &optional cursor pages seen)
-  "加载会话页并在 WINDOW 发起 Consult 选择。"
-  (loki-assistant-slack--request
-   "GET" "/slack/conversations"
-   (lambda (response)
-     (when (and (eq selection loki-assistant-slack--selection) (window-live-p window))
-       (if (not (plist-get response :ok))
-           (message "%s" (plist-get response :error-message))
-         (let* ((data (plist-get response :data))
-                (next (alist-get 'next_cursor data)))
-           (push (append (alist-get 'items data) nil) pages)
-           (if (and (stringp next) (not (member next seen)))
-               (loki-assistant-slack--select window selection next pages (cons next seen))
-             (run-at-time 0 nil #'loki-assistant-slack--choose
-                          window selection (apply #'append (nreverse pages))))))))
-   :params (append '((limit . 100)) (when cursor (list (cons 'cursor cursor))))))
 
 ;;;###autoload
 (defun loki-assistant-slack-select-chat ()
@@ -82,8 +336,21 @@
   (interactive)
   (unless (require 'consult nil t) (user-error "Slack 聊天需要 Consult"))
   (unless (require 'shell-maker nil t) (user-error "Slack 聊天需要 shell-maker"))
-  (loki-assistant-slack--select (selected-window)
-                               (setq loki-assistant-slack--selection (list nil))))
+  (let* ((window (selected-window))
+         (users (make-hash-table :test #'equal))
+         (selection (make-loki-assistant-slack--picker :users users :directory-state 'loading)))
+    (setq loki-assistant-slack--selection selection)
+    (loki-assistant-slack--collect
+     window selection "/slack/users"
+     (lambda (items issue)
+       (dolist (user items) (puthash (alist-get 'id user) user users))
+       (setf (loki-assistant-slack--picker-directory-state selection) (if issue 'incomplete 'ready))
+       (when-let ((update (loki-assistant-slack--picker-update selection))) (funcall update))))
+    (loki-assistant-slack--collect
+     window selection "/slack/conversations"
+     (lambda (rooms issue)
+       (if (and issue (null rooms)) (message "%s" issue)
+         (run-at-time 0 nil #'loki-assistant-slack--choose window selection rooms))))))
 
 (defun loki-assistant-slack--open (room)
   "在独立窗口中显示 ROOM，重用已经显示的窗口。"

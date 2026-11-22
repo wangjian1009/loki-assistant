@@ -36,9 +36,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 tower = { version = "0.5", features = ["util"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
-
 [dev-dependencies]
 loki-mobile-network = { path = "../apps/harmony/entry/src/main/rust" }
 quircs = "0.10"

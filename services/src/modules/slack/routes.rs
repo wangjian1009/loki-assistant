@@ -70,10 +70,12 @@ async fn team_config_changed(
             let mut response = StatusCode::NO_CONTENT.into_response();
             let reload_team = identity.is_some().then_some(team_id);
             if let Some(identity) = identity {
-                let fields = serde_json::to_value(identity).map_err(|_| Error::Storage)?;
-                let Value::Object(fields) = fields else {
-                    return Err(Error::Storage);
-                };
+                let fields = [
+                    ("team_name".into(), json!(identity.team_name)),
+                    ("user_id".into(), json!(identity.user_id)),
+                ]
+                .into_iter()
+                .collect();
                 response
                     .extensions_mut()
                     .insert(NotificationConfirmedFields(fields));

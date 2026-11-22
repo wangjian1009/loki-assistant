@@ -17,13 +17,14 @@ use super::{
 
 impl SlackService {
     pub async fn run(self: Arc<Self>) {
-        let _ = self.initialize().await;
         self.restore_user_token().await;
         self.publish_status().await;
+        self.sync.notify_one();
         tokio::join!(
             self.sockets(),
             self.sending(),
             self.synchronizing(),
+            self.warming_users(),
             self.notifications()
         );
     }
@@ -31,6 +32,23 @@ impl SlackService {
     async fn restore_user_token(&self) {
         if let Err(error) = self.restore_imported_token().await {
             self.state.lock().await.issue = Some(error);
+        }
+    }
+
+    async fn warming_users(&self) {
+        let mut changes = self.change.subscribe();
+        loop {
+            let delay = match self.session_id().await {
+                Some(session) => match self.users(session).await {
+                    Ok(_) => 300,
+                    Err(error) => error.retry_after().unwrap_or(60),
+                },
+                None => 60,
+            };
+            tokio::select! {
+                _ = changes.changed() => {},
+                _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+            }
         }
     }
 
@@ -89,9 +107,7 @@ impl SlackService {
                 tokio::select! {
                     _ = changes.changed() => { backoff = 1; }
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        if self.initialize().await.is_ok() {
-                            self.restore_user_token().await;
-                        }
+                        self.restore_user_token().await;
                         self.publish_status().await;
                     }
                 }
@@ -181,6 +197,12 @@ impl SlackService {
                         self.alerts.notify_one();
                     }
                 }
+                Some("user_change" | "team_join") => {
+                    let user = &event["user"];
+                    if let Some(id) = user["id"].as_str() {
+                        self.update_directory_user(session, id, user).await;
+                    }
+                }
                 _ => {}
             }
         }
@@ -228,28 +250,29 @@ impl SlackService {
             {
                 return Ok(false);
             }
-            let kind = if id.starts_with('D') || channel_type.as_deref() == Some("im") {
-                "im"
-            } else if channel_type.as_deref() == Some("mpim")
-                || cache
-                    .conversations
-                    .get(&id)
-                    .is_some_and(|room| room.kind == "mpim")
-            {
-                "mpim"
-            } else {
-                return Ok(false);
-            };
+            let kind = match cache.conversations.get(&id) {
+                Some(room) => room.kind.as_str(),
+                None if id.starts_with('D') || channel_type.as_deref() == Some("im") => "im",
+                None if channel_type.as_deref() == Some("mpim") => "mpim",
+                None => return Ok(false),
+            }
+            .to_owned();
+            let private = matches!(kind.as_str(), "im" | "mpim");
             if !cache.events.insert(event_id.clone()) {
                 return Ok(false);
             }
             if cache.events.len() > 10_000 {
                 cache.events.pop_first();
             }
+            let unread = private
+                && new
+                && message
+                    .as_ref()
+                    .is_some_and(|message| cache.positions(&id).unread(message, account));
             let conversation = cache
                 .conversations
                 .entry(id.clone())
-                .or_insert_with(|| Conversation::new(&id, kind, &id));
+                .or_insert_with(|| Conversation::new(&id, &kind, &id));
             if subtype == "message_deleted" {
                 if let Some(deleted) = deleted {
                     conversation.remove(&deleted);
@@ -259,9 +282,7 @@ impl SlackService {
             let Some(message) = message else {
                 return Ok(false);
             };
-            let notify = new
-                && conversation.unread(&message, account)
-                && !conversation.deleted.contains(&message.ts);
+            let notify = unread && !conversation.deleted.contains(&message.ts);
             if let Some(root) = &message.thread_ts {
                 let count = conversation
                     .messages
@@ -286,9 +307,11 @@ impl SlackService {
     }
 
     async fn synchronizing(&self) {
+        let mut changes = self.change.subscribe();
         loop {
             let reconnect = tokio::select! {
                 _ = self.sync.notified() => true,
+                _ = changes.changed() => true,
                 _ = tokio::time::sleep(Duration::from_secs(120)) => false,
             };
             let Some(session) = self.session_id().await else {
@@ -297,50 +320,62 @@ impl SlackService {
             if self.refresh_directory(session).await.is_err() {
                 continue;
             }
+            self.refresh_recent_messages(session, reconnect).await;
+            let _ = self.refresh_group_members(session).await;
             self.refresh_names(session).await;
-            if !reconnect {
-                continue;
+        }
+    }
+
+    async fn refresh_recent_messages(&self, session: Uuid, reconnect: bool) {
+        let rooms: Vec<_> = {
+            let state = self.state.lock().await;
+            if state.account(session).is_err() {
+                return;
             }
-            let targets: Vec<_> = {
-                let state = self.state.lock().await;
-                let Ok(account) = state.account(session) else {
-                    continue;
-                };
-                state
-                    .cache
-                    .conversations
-                    .values()
-                    .filter(|item| matches!(item.kind.as_str(), "im" | "mpim"))
-                    .map(|item| {
-                        let latest = item
-                            .messages
-                            .values()
-                            .filter(|message| message.thread_ts.is_none())
-                            .max_by_key(|message| timestamp(&message.ts))
-                            .map(|message| message.ts.clone())
-                            .unwrap_or_else(|| format!("{}.000000", account.baseline));
-                        let threads = item
-                            .messages
-                            .values()
-                            .filter_map(|message| {
-                                message.thread_ts.clone().or_else(|| {
-                                    (message.reply_count > 0).then(|| message.ts.clone())
-                                })
-                            })
-                            .collect::<std::collections::BTreeSet<_>>();
-                        (
-                            item.id.clone(),
-                            latest,
-                            threads.into_iter().rev().take(5).collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect()
+            state
+                .cache
+                .conversations
+                .values()
+                .filter(|item| reconnect || !item.loaded.contains_key(""))
+                .map(|item| {
+                    let checkpoint = item
+                        .messages
+                        .values()
+                        .filter(|message| message.thread_ts.is_none())
+                        .max_by_key(|message| timestamp(&message.ts))
+                        .map(|message| message.ts.clone());
+                    let threads = if reconnect {
+                        item.loaded
+                            .keys()
+                            .rev()
+                            .filter(|ts| !ts.is_empty())
+                            .take(5)
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (item.id.clone(), checkpoint, threads)
+                })
+                .collect()
+        };
+        for (id, checkpoint, threads) in rooms {
+            let result = if let Some(checkpoint) = checkpoint {
+                self.catch_up(session, &id, None, Some(&checkpoint)).await
+            } else {
+                self.refresh_latest(session, &id).await
             };
-            for (id, checkpoint, threads) in targets {
-                self.catch_up(session, &id, None, Some(&checkpoint)).await;
-                for thread in threads {
-                    self.catch_up(session, &id, Some(thread), None).await;
-                }
+            match result {
+                Err(
+                    Error::RateLimited(_)
+                    | Error::Session
+                    | Error::Authorization
+                    | Error::Unavailable,
+                ) => break,
+                _ => {}
+            }
+            for thread in threads {
+                let _ = self.catch_up(session, &id, Some(thread), None).await;
             }
         }
     }
@@ -351,10 +386,10 @@ impl SlackService {
         id: &str,
         thread: Option<String>,
         checkpoint: Option<&str>,
-    ) {
+    ) -> Result<(), Error> {
         let mut cursor = None;
         loop {
-            let Ok(page) = self
+            let page = self
                 .messages(
                     session,
                     id.to_owned(),
@@ -365,10 +400,7 @@ impl SlackService {
                         ..Page::default()
                     },
                 )
-                .await
-            else {
-                break;
-            };
+                .await?;
             if page["sync_state"] != "live"
                 || checkpoint.is_none()
                 || page["items"].as_array().is_none_or(|items| {
@@ -385,6 +417,7 @@ impl SlackService {
             }
             cursor = next;
         }
+        Ok(())
     }
 
     async fn refresh_names(&self, session: Uuid) {
@@ -401,8 +434,21 @@ impl SlackService {
                 .flat_map(|item| item.participants.iter().cloned())
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        let mut names = BTreeMap::new();
+        if ids.is_empty() {
+            return;
+        }
+        let mut names: BTreeMap<_, _> = self
+            .users(session)
+            .await
+            .ok()
+            .iter()
+            .flat_map(|users| users.iter())
+            .map(|user| (user.slack_id().to_owned(), user.name.clone()))
+            .collect();
         for id in ids {
+            if names.get(&id).is_some_and(|name| name != &id) {
+                continue;
+            }
             match self
                 .slack_get(session, "users.info", &[("user", &id)])
                 .await
@@ -414,6 +460,8 @@ impl SlackService {
                         .or(value["user"]["real_name"].as_str())
                         .or(value["user"]["name"].as_str())
                     {
+                        self.update_directory_user(session, &id, &value["user"])
+                            .await;
                         names.insert(id, name.to_owned());
                     }
                 }

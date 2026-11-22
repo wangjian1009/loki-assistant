@@ -42,23 +42,8 @@ use crate::{
 
 use super::{
     projects::{Backend, Projects},
-    protocol::Error,
     service::now,
-    store::{Keychain, Secrets},
 };
-
-#[derive(Default)]
-struct MemoryKeychain(Mutex<Secrets>);
-
-impl Keychain for MemoryKeychain {
-    fn load(&self) -> Result<Secrets, Error> {
-        Ok(self.0.lock().unwrap().clone())
-    }
-    fn save(&self, secrets: &Secrets) -> Result<(), Error> {
-        *self.0.lock().unwrap() = secrets.clone();
-        Ok(())
-    }
-}
 
 #[derive(Debug, Default)]
 struct Alerts(Mutex<Vec<NotificationContent>>);
@@ -137,7 +122,7 @@ async fn ready_service(projects: &Projects, team: &str) -> Arc<super::service::S
     timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(service) = projects.service(team).await
-                && service.state.lock().await.initialized
+                && service.session_id().await.is_some()
             {
                 break service;
             }
@@ -174,10 +159,16 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             Json(json!({"ok":true,"team_id":"TTEAM","user_id":"UME","team":"工作区"}))
         }))
         .route("/users.conversations", get(|| async {
-            Json(json!({"ok":true,"channels":[{"id":"DDIRECT","user":"UYOU","is_im":true}]}))
+            Json(json!({"ok":true,"channels":[
+                {"id":"DDIRECT","user":"UYOU","is_im":true},
+                {"id":"CWORK","name":"产品讨论","is_channel":true}
+            ]}))
         }))
         .route("/users.info", get(|| async { Json(json!({"ok":true,"user":{"real_name":"林舟"}})) }))
         .route("/conversations.history", get(|State(mock): State<Arc<Mock>>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
+            if query.get("channel").is_some_and(|channel| channel == "CWORK") {
+                return Json(json!({"ok":true,"messages":[]}));
+            }
             let root = json!({"ts":mock.root,"text":"问候","user":"UYOU","reply_count":2});
             let response = if query.get("latest") == Some(&mock.root) {
                 json!({"ok":true,"messages":[{"ts":"1.000001","text":"更早的顶层消息","user":"UYOU"}]})
@@ -216,6 +207,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         axum::serve(web, slack).await.unwrap();
     });
     let (done, messages_sent) = tokio::sync::oneshot::channel();
+    let (send_channel, channel_ready) = tokio::sync::oneshot::channel();
     let socket_mock = Arc::clone(&mock);
     let socket = tokio::spawn(async move {
         let mut stream = accept_hdr_async(
@@ -240,26 +232,19 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         stream.send(message.clone()).await.unwrap();
         stream.send(message).await.unwrap();
         let _ = done.send(());
+        channel_ready.await.unwrap();
+        stream
+            .send(Message::Text(
+                json!({"type":"message","channel":"CWORK","ts":socket_mock.reply,
+            "user":"UYOU","text":"请 <@UME> 看一下"})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
         std::future::pending::<()>().await;
     });
 
-    let previous_session = Uuid::new_v4();
-    let secrets = serde_json::from_value(json!({
-        "account": {
-            "identity": {
-                "session_id": previous_session,
-                "team_id": "TTEAM",
-                "user_id": "UME",
-                "team_name": "工作区"
-            },
-            "access": "old-user-token",
-            "refresh": "old-refresh-token",
-            "expires_at": now + 3600,
-            "baseline": 0
-        }
-    }))
-    .unwrap();
-    let keychain = Arc::new(MemoryKeychain(Mutex::new(secrets)));
     let alerts = Arc::new(Alerts::default());
     let notification = Arc::new(NotificationService::with_launcher(
         alerts.clone(),
@@ -284,15 +269,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .unwrap();
     let status = Arc::new(StatusService::new());
     let start = || {
-        let keychain = Arc::clone(&keychain);
         let projects = Arc::new(Projects::with_backend(
             Arc::clone(&config),
             Arc::clone(&notification),
             Arc::clone(&status),
             Backend {
-                path: Some(directory.0.join("service")),
                 api: api.clone(),
-                keychain: Arc::new(move |_| keychain.clone()),
                 open_browser: Arc::new(|_| unreachable!()),
             },
         ));
@@ -325,7 +307,6 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(data["value"][0]["authorization_state"], "authorized");
     assert_eq!(data["value"][0]["socket_state"], "connected");
     let session = Some(Uuid::parse_str(data["value"][0]["session_id"].as_str().unwrap()).unwrap());
-    assert_ne!(session, Some(previous_session));
 
     let timeline = "/slack/conversations/TTEAM.DDIRECT/messages";
     let thread = format!(
@@ -418,6 +399,32 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await;
     assert_eq!(view["items"][0]["unread_count"], 1);
 
+    send_channel.send(()).unwrap();
+    let channel = timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, _, data) = invoke(
+                &app,
+                "GET",
+                "/slack/conversations?kind=public_channel",
+                None,
+                None,
+                None,
+            )
+            .await;
+            let row = &data["items"][0];
+            if row["last_unread_mention_ts"] == mock.reply {
+                break row.clone();
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("实时频道提及进入会话摘要");
+    assert_eq!(channel["unread_count"], 1);
+    assert_eq!(channel["last_message"]["author"]["id"], "TTEAM.UYOU");
+    assert_eq!(channel["last_message"]["preview"], "请 <@UME> 看一下");
+    assert_eq!(alerts.0.lock().unwrap().len(), 1);
+
     // 已翻阅的旧线程根消息可能已经被逐出缓存，发送前向 Slack 核对。
     let root = mock.root.clone();
     service
@@ -487,17 +494,23 @@ async fn socket_notifications_threads_and_idempotent_sends() {
 
     let (projects, app, worker) = start();
     let service = ready_service(&projects, "TTEAM").await;
-    timeout(Duration::from_secs(5), async {
-        while service.session_id().await.is_none() {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let fresh_session = service.session_id().await;
+    assert_ne!(fresh_session, session);
     assert_eq!(
-        invoke(&app, "GET", send, session, None, None).await.2["state"],
-        "sent"
+        invoke(&app, "GET", send, session, None, None).await.0,
+        StatusCode::CONFLICT
     );
+    assert_eq!(
+        invoke(&app, "GET", send, fresh_session, None, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(!fs::read_dir(&directory.0).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("slack-")
+    }));
     assert_eq!(
         invoke(
             &app,
@@ -644,14 +657,22 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let (base, passwords) = password_config(&config_path, &directory.0).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
+    let user_directory_requests = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+    let requested_teams = Arc::clone(&user_directory_requests);
+    let history_requests = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+    let requested_rooms = Arc::clone(&history_requests);
     let slack = Router::new()
         .route(
             "/users.list",
-            get(|| async {
-                Json(json!({"ok":true,"members":[
-                    {"id":"U1","profile":{"display_name":"林舟"}},
-                    {"id":"UOLD","deleted":true}
-                ]}))
+            get(move |headers: HeaderMap| {
+                let requested_teams = Arc::clone(&requested_teams);
+                async move {
+                    requested_teams.lock().unwrap().insert(headers["authorization"].to_str().unwrap().to_owned());
+                    Json(json!({"ok":true,"members":[
+                        {"id":"U1","name":"linzhou","profile":{"display_name":"林舟","image_48":"https://avatars.slack-edge.com/avatar.png"}},
+                        {"id":"UOLD","deleted":true}
+                    ]}))
+                }
             }),
         )
         .route(
@@ -666,11 +687,13 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         )
         .route(
             "/conversations.history",
-            get(|headers: HeaderMap| async move {
-                let identity = headers["authorization"].to_str().unwrap();
-                Json(
-                    json!({"ok":true,"messages":[{"ts":"100.000001","text":identity,"user":"U2"}]}),
-                )
+            get(move |headers: HeaderMap, Query(query): Query<std::collections::BTreeMap<String, String>>| {
+                let requested_rooms = Arc::clone(&requested_rooms);
+                async move {
+                    let identity = headers["authorization"].to_str().unwrap();
+                    requested_rooms.lock().unwrap().insert((identity.to_owned(), query["channel"].clone()));
+                    Json(json!({"ok":true,"messages":[{"ts":"100.000001","text":identity,"user":"U2"}]}))
+                }
             }),
         )
         .route(
@@ -700,26 +723,13 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         axum::serve(listener, slack).await.unwrap();
     });
     let status = Arc::new(StatusService::new());
-    let keychains = Arc::new(Mutex::new(std::collections::BTreeMap::<
-        String,
-        Arc<MemoryKeychain>,
-    >::new()));
     let (browser, mut opened) = tokio::sync::mpsc::unbounded_channel::<String>();
     let projects = Arc::new(Projects::with_backend(
         base.clone(),
         Arc::new(NotificationService::new()),
         status.clone(),
         Backend {
-            path: Some(directory.0.join("service")),
             api,
-            keychain: Arc::new(move |id| {
-                keychains
-                    .lock()
-                    .unwrap()
-                    .entry(id)
-                    .or_insert_with(|| Arc::new(MemoryKeychain::default()))
-                    .clone()
-            }),
             open_browser: Arc::new(move |url| {
                 let browser = browser.clone();
                 Box::pin(async move {
@@ -922,9 +932,23 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(public[0]["user_id"], "TALPHA.U1");
     assert_eq!(public[1]["user_id"], "TBETA.U1");
 
+    timeout(Duration::from_secs(3), async {
+        while user_directory_requests.lock().unwrap().len() < 2
+            || history_requests.lock().unwrap().len() < 6
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("WebSocket 不可用时，两个工作区仍在首次查询前预热用户目录与会话消息");
     let (_, _, users) = invoke(&app, "GET", "/slack/users?limit=1", None, None, None).await;
     assert_eq!(users["items"][0]["id"], "TALPHA.U1");
     assert_eq!(users["items"][0]["name"], "林舟");
+    assert_eq!(users["items"][0]["username"], "linzhou");
+    assert_eq!(
+        users["items"][0]["avatar_url"],
+        "https://avatars.slack-edge.com/avatar.png"
+    );
     let cursor = users["next_cursor"].as_str().unwrap();
     let (_, _, users) = invoke(
         &app,
@@ -1399,6 +1423,50 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     projects.stop().await;
     worker.await.unwrap();
     upstream.abort();
+}
+
+#[test]
+fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
+    use super::{
+        protocol::{Identity, Message},
+        store::{Account, Conversation, ReadPositions},
+    };
+
+    let account = Account {
+        identity: Identity {
+            session_id: Uuid::nil(),
+            team_id: "TTEAM".into(),
+            user_id: "UME".into(),
+            team_name: "工作区".into(),
+        },
+        access: String::new(),
+        web_session: true,
+        baseline: 100,
+        imported_token_hash: None,
+        revoked: false,
+    };
+    let mut room = Conversation::new("CCHAT", "public_channel", "产品讨论");
+    room.participants = vec!["UME".into(), "UYOU".into()];
+    for message in [
+        json!({"ts":"101.0","user":"UYOU","text":"你好 <@UME>"}),
+        json!({"ts":"102.0","user":"UME","text":"自己的消息 <@UME>"}),
+        json!({"ts":"103.0","user":"UYOU","thread_ts":"101.0","text":"请看 <@UME|我的名字>"}),
+        json!({"ts":"104.0","user":"UYOU","thread_ts":"101.0","files":[{"title":"进度表"}]}),
+    ] {
+        room.ingest(Message::from_slack(&message, None).unwrap());
+    }
+    let mut positions = ReadPositions::default();
+    let (_, _, summary) = room.summarize(&account, &positions);
+    assert_eq!(summary["participant_ids"], json!(["TTEAM.UYOU"]));
+    assert_eq!(summary["unread_count"], 3);
+    assert_eq!(summary["last_unread_mention_ts"], "103.0");
+    assert_eq!(summary["last_message"]["ts"], "104.0");
+    assert_eq!(summary["last_message"]["author"]["id"], "TTEAM.UYOU");
+    assert_eq!(summary["last_message"]["preview"], "附件 · 进度表");
+
+    positions.0.insert("101.0".into(), "104.0".into());
+    let (_, _, summary) = room.summarize(&account, &positions);
+    assert_eq!(summary["last_unread_mention_ts"], "101.0");
 }
 
 #[tokio::test]
