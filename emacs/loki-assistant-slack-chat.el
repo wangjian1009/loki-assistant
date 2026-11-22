@@ -6,6 +6,7 @@
 (require 'cl-lib)
 (require 'comint)
 (require 'seq)
+(require 'time-date)
 (require 'url)
 (require 'loki-assistant)
 
@@ -44,6 +45,13 @@
 (defface loki-assistant-slack-action
   '((t :inherit link :underline nil))
   "聊天链接和操作入口的样式。"
+  :group 'loki-assistant)
+
+(defface loki-assistant-slack-message-time
+  '((((class color) (background light)) :foreground "#4b4b4b" :background "#e4e4e4" :height 0.85)
+    (((class color) (background dark)) :foreground "#e1e1e1" :background "#555555" :height 0.85)
+    (t :inverse-video t))
+  "消息末尾的发送时间色块。"
   :group 'loki-assistant)
 
 ;; 保留槽位顺序，以兼容直接重载时的分页状态。
@@ -1301,11 +1309,40 @@
                         name " ")))
     (insert (propertize "\n" 'loki-slack-label (propertize label 'face face)))))
 
+(defun loki-assistant-slack--message-time (time)
+  "按本地日期格式化消息发送时间 TIME。"
+  (format-time-string
+   (pcase (- (time-to-days (current-time)) (time-to-days time))
+     (0 "今天 %H:%M")
+     (1 "昨天 %H:%M")
+     (_ "%Y年%m月%d日 %H:%M"))
+   time))
+
+(defun loki-assistant-slack--insert-message-time (start time)
+  "为从 START 开始的消息添加时间色块 TIME。"
+  (let ((label (propertize (concat " " (loki-assistant-slack--message-time time) " ")
+                           'face 'loki-assistant-slack-message-time))
+        (tail (save-excursion
+                (skip-chars-backward "\n" start)
+                (point))))
+    (if (and (< start tail)
+             (not (or (get-text-property (1- tail) 'display)
+                      (get-text-property (1- tail) 'agent-shell-markdown-table-source)
+                      (get-text-property (1- tail) 'agent-shell-markdown-frozen))))
+        (if (= tail (point))
+            (insert "  " label "\n")
+          (save-excursion
+            (goto-char tail)
+            (insert "  " label)))
+      (unless (bolp) (insert "\n"))
+      (insert label "\n"))))
+
 (defun loki-assistant-slack--message (message room profiles)
   "渲染 ROOM 中的 MESSAGE 正文和附件。"
   (let* ((start (point))
          (ts (alist-get 'ts message))
-         (timestamp (format-time-string "%Y-%m-%d %H:%M" (seconds-to-time (string-to-number ts))))
+         (time (seconds-to-time (string-to-number ts)))
+         (timestamp (format-time-string "%Y-%m-%d %H:%M" time))
          (help (if (eq (alist-get 'edited message) t) (concat timestamp "（已编辑）") timestamp)))
     (when-let ((icon (or (when-let ((image (loki-assistant-slack--file-image
                                           (alist-get 'icon_path message) 20 20)))
@@ -1316,8 +1353,7 @@
     (loki-assistant-slack--message-body message (alist-get 'team_id room) profiles)
     (cl-loop for attachment across (vconcat (alist-get 'attachments message)) for index from 0
              do (loki-assistant-slack--attachment attachment index ts room))
-    (when (or (= start (point)) (not (bolp)))
-      (insert "\n"))
+    (loki-assistant-slack--insert-message-time start time)
     (add-text-properties start (point) (list 'line-prefix "  " 'wrap-prefix "  " 'loki-slack-message ts))
     (let ((position start))
       (while (< position (point))
@@ -1495,6 +1531,8 @@
 
 (defun loki-assistant-slack--render-buffer ()
   "更新提示符上方的历史，保留当前输入和编辑位置。"
+  ;; 历史已带有正文、链接和时间的 face，避免 Font Lock 在显示时清除它们。
+  (when font-lock-mode (font-lock-mode -1))
   (let* ((timeline loki-assistant-slack--timeline)
          (message (get-text-property (point) 'loki-slack-message))
          (root (get-text-property (point) 'loki-slack-root))

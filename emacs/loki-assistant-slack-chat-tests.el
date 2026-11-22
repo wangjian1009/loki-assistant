@@ -4,6 +4,26 @@
 (require 'loki-assistant-slack-chat)
 (require 'loki-assistant-dispatch)
 
+(ert-deftest loki-assistant-slack-chat-test-shows-local-time-at-message-end ()
+  (let ((now (encode-time 0 15 0 1 1 2026))
+        (yesterday (encode-time 0 55 23 31 12 2025))
+        (earlier (encode-time 0 42 16 30 12 2025)))
+    (cl-letf (((symbol-function 'current-time) (lambda () now)))
+      (should (equal (loki-assistant-slack--message-time now) "今天 00:15"))
+      (should (equal (loki-assistant-slack--message-time yesterday) "昨天 23:55"))
+      (should (equal (loki-assistant-slack--message-time earlier) "2025年12月30日 16:42"))
+      (with-temp-buffer
+        (loki-assistant-slack--message
+         `((ts . ,(number-to-string (time-convert yesterday 'integer)))
+           (text . "<https://example.com|报告>"))
+         nil (make-hash-table :test #'equal))
+        (goto-char (point-min))
+        (should (looking-at-p "报告   昨天 23:55 \n"))
+        (should (button-at (point)))
+        (search-forward "昨天 23:55")
+        (should-not (button-at (1- (point))))
+        (should (eq (get-text-property (1- (point)) 'face) 'loki-assistant-slack-message-time))))))
+
 (ert-deftest loki-assistant-slack-chat-test-renders-message-content ()
   (skip-unless (require 'agent-shell-markdown nil t))
   (let ((profiles (make-hash-table :test #'equal))
@@ -261,7 +281,7 @@
                 (save-excursion
                   (search-forward "初始回复")
                   (should (invisible-p (match-beginning 0)))))
-              (should (string-match-p "本人再次发言\n\n隔日消息" (buffer-string)))
+              (should (string-match-p "本人再次发言  .*\n\n隔日消息" (buffer-string)))
               (goto-char (loki-assistant-slack--message-position "172923.000001"))
               (should (looking-at-p "隔日消息"))
               (should-not (get-char-property (1- (point)) 'before-string))
@@ -357,6 +377,11 @@
               (should (eq (loki-assistant-slack--find-buffer "TTEST.DCHAT") buffer))
               (with-current-buffer thread-buffer
                 (should (looking-at-p "初始回复"))
+                (when font-lock-mode
+                  (font-lock-flush)
+                  (font-lock-ensure))
+                (should (text-property-any
+                         (point-min) (point-max) 'face 'loki-assistant-slack-message-time))
                 (should-not (loki-assistant-slack--message-position "125.000001"))
                 (should (equal header-line-format " 工作区 · 聊天 · 根消息 详情 补充信息"))
                 (should (equal frame-title-format "工作区 · 聊天 · 根消息 详情 补充信息"))
