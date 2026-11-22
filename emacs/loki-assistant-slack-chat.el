@@ -626,6 +626,38 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
       (marker-position (process-mark process))
     (user-error "请重新打开此 Slack 会话")))
 
+(defun loki-assistant-slack--move-item (backward count)
+  "按 COUNT 移动消息或按钮，BACKWARD 非空时向上移动。
+在末尾输入区按字母键时插入该字母。"
+  (let ((draft-start (loki-assistant-slack--draft-start)))
+    (if (and (>= (point) draft-start) (memq last-command-event '(?n ?p)))
+        (self-insert-command count)
+      (dotimes (_ (abs count))
+        (let* ((origin (point))
+               (reverse (if (< count 0) (not backward) backward))
+               (message (save-excursion
+                          (if reverse
+                              (text-property-search-backward 'loki-slack-message)
+                            (text-property-search-forward 'loki-slack-message nil nil t))))
+               (button (if reverse (previous-button origin) (next-button origin)))
+               (positions (delq nil
+                                (list (and message (prop-match-beginning message))
+                                      (and button (button-start button))
+                                      (and (not reverse) (< origin draft-start) draft-start)))))
+          (when positions
+            (deactivate-mark)
+            (goto-char (apply (if reverse #'max #'min) positions))))))))
+
+(defun loki-assistant-slack-next-item (count)
+  "向下移动 COUNT 个消息或按钮。"
+  (interactive "p")
+  (loki-assistant-slack--move-item nil count))
+
+(defun loki-assistant-slack-previous-item (count)
+  "向上移动 COUNT 个消息或按钮。"
+  (interactive "p")
+  (loki-assistant-slack--move-item t count))
+
 (defun loki-assistant-slack--target (root)
   "将输入目标切换到 ROOT 线程或主会话。"
   (when (and (not (equal root loki-assistant-slack--reply))
@@ -850,6 +882,10 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
          (threads loki-assistant-slack--threads)
          (message (get-text-property (point) 'loki-slack-message))
          (root (get-text-property (point) 'loki-slack-root))
+         (anchor-property (if message 'loki-slack-message 'loki-slack-root))
+         (offset (when (or message root)
+                   (- (point) (previous-single-property-change
+                               (1+ (point)) anchor-property nil (point-min)))))
          (buffer (current-buffer))
          (room loki-assistant-slack--room)
          (profiles loki-assistant-slack--profiles)
@@ -871,7 +907,8 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
       (delete-region (point-min) loki-assistant-slack--history-end)
       (goto-char (point-min))
       (insert history)
-      (add-text-properties (point-min) (point) '(read-only t rear-nonsticky t))
+      (add-text-properties (point-min) (point)
+                           '(read-only t front-sticky (read-only) rear-nonsticky t))
       (set-marker loki-assistant-slack--history-end (point)))
     (when-let ((process (get-buffer-process (current-buffer))))
       (let ((start (marker-position loki-assistant-slack--history-end))
@@ -881,13 +918,16 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
               (put-text-property start end 'display
                                  (propertize "线程回复> " 'face 'comint-highlight-prompt))
             (remove-text-properties start end '(display nil))))))
-    (if-let ((position (loki-assistant-slack--message-position message)))
-        (goto-char position)
-      (when root
+    (when offset
       (let ((anchor (save-excursion
                       (goto-char (point-min))
-                      (text-property-search-forward 'loki-slack-root root t))))
-          (when anchor (goto-char (prop-match-beginning anchor))))))
+                      (or (text-property-search-forward anchor-property (or message root) t)
+                          (and root (text-property-search-forward 'loki-slack-root root t))))))
+        (when anchor
+          (goto-char
+           (if (equal (prop-match-value anchor) (or message root))
+               (min (+ (prop-match-beginning anchor) offset) (1- (prop-match-end anchor)))
+             (prop-match-beginning anchor))))))
     (restore-buffer-modified-p modified)))
 
 (defun loki-assistant-slack--submit ()
@@ -957,6 +997,13 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
 
 (defvar loki-assistant-slack-input-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "n") #'loki-assistant-slack-next-item)
+    (define-key map (kbd "p") #'loki-assistant-slack-previous-item)
+    (define-key map (kbd "TAB") #'loki-assistant-slack-next-item)
+    (define-key map (kbd "<tab>") #'loki-assistant-slack-next-item)
+    (define-key map (kbd "<backtab>") #'loki-assistant-slack-previous-item)
+    (define-key map [remap forward-button] #'loki-assistant-slack-next-item)
+    (define-key map [remap backward-button] #'loki-assistant-slack-previous-item)
     (define-key map (kbd "RET") #'loki-assistant-slack--submit)
     (define-key map (kbd "<return>") #'loki-assistant-slack--submit)
     (define-key map (kbd "S-<return>") #'newline)
