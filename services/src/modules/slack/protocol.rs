@@ -15,6 +15,7 @@ pub(super) enum Error {
     Cursor,
     Permission,
     Conversation,
+    Attachment,
     UserNotFound,
     Project,
     TeamMismatch,
@@ -48,6 +49,7 @@ impl Error {
             ),
             Self::Permission => (403, "slack-permission-denied", "Slack 应用缺少所需权限。"),
             Self::Conversation => (404, "slack-conversation-not-found", "找不到 Slack 会话。"),
+            Self::Attachment => (404, "slack-attachment-not-found", "找不到 Slack 图片预览。"),
             Self::UserNotFound => (404, "slack-user-not-found", "找不到 Slack 用户。"),
             Self::Project => (404, "slack-project-not-found", "请选择有效的 Slack 项目。"),
             Self::TeamMismatch => (
@@ -185,6 +187,96 @@ pub(super) struct Message {
     pub edited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<Vec<Vec<String>>>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct Attachment {
+    pub title: String,
+    pub mimetype: Option<String>,
+    pub size: Option<u64>,
+    pub url: Option<String>,
+    pub text: Option<String>,
+    pub image: bool,
+    #[serde(skip)]
+    pub image_url: Option<String>,
+}
+
+impl Attachment {
+    fn from_slack(value: &Value, file: bool) -> Option<Self> {
+        if !value.is_object() {
+            return None;
+        }
+        let field = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| value[*key].as_str())
+                .find(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let mimetype = field(&["mimetype"]);
+        let image_url = if file
+            && mimetype
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            field(&["thumb_480", "thumb_360", "thumb_720", "url_private"])
+        } else if !file {
+            field(&["image_url", "thumb_url"])
+        } else {
+            None
+        };
+        Some(Self {
+            title: field(&["title", "name", "fallback", "filetype"])
+                .unwrap_or_else(|| "附件".into()),
+            mimetype,
+            size: value["size"].as_u64(),
+            url: field(&["permalink", "title_link", "from_url"]),
+            text: (!file).then(|| field(&["text", "pretext"])).flatten(),
+            image: image_url
+                .as_deref()
+                .is_some_and(super::client::slack_image_url),
+            image_url,
+        })
+    }
+}
+
+fn table_text(cell: &Value, output: &mut String) {
+    if let Some(text) = cell["text"].as_str() {
+        output.push_str(text);
+    } else if let Some(elements) = cell["elements"].as_array() {
+        for element in elements {
+            table_text(element, output);
+        }
+    } else if let Some(url) = cell["url"].as_str() {
+        output.push_str(url);
+    } else if let Some(id) = cell["user_id"].as_str() {
+        output.push_str(&format!("@{id}"));
+    }
+}
+
+fn table_rows(block: &Value) -> Option<Vec<Vec<String>>> {
+    if block["type"] != "table" {
+        return None;
+    }
+    Some(
+        block["rows"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_array)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        let mut text = String::new();
+                        table_text(cell, &mut text);
+                        text
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 impl Message {
@@ -204,7 +296,11 @@ impl Message {
     pub fn preview(&self) -> String {
         let text = self.text.trim();
         if text.is_empty() {
-            return self.attachment.clone().unwrap_or_default();
+            return self
+                .attachment
+                .clone()
+                .or_else(|| (!self.tables.is_empty()).then(|| "表格".into()))
+                .unwrap_or_default();
         }
         text.chars().take(120).collect()
     }
@@ -229,22 +325,29 @@ impl Message {
                     .unwrap_or(id)
                     .into(),
             });
-        let attachment = [&value["files"][0], &value["attachments"][0]]
+        let files = value["files"].as_array().into_iter().flatten();
+        let unfurls = value["attachments"].as_array().into_iter().flatten();
+        let attachments: Vec<_> = files
+            .filter_map(|file| Attachment::from_slack(file, true))
+            .chain(
+                unfurls
+                    .clone()
+                    .filter_map(|card| Attachment::from_slack(card, false)),
+            )
+            .collect();
+        let attachment = attachments.first().map(|file| {
+            format!(
+                "附件 · {}",
+                file.title.chars().take(100).collect::<String>()
+            )
+        });
+        let tables = value["blocks"]
+            .as_array()
             .into_iter()
-            .find(|value| value.is_object())
-            .map(|file| {
-                [
-                    &file["title"],
-                    &file["name"],
-                    &file["filetype"],
-                    &file["fallback"],
-                ]
-                .into_iter()
-                .filter_map(Value::as_str)
-                .find(|text| !text.trim().is_empty())
-                .map(|text| format!("附件 · {}", text.chars().take(100).collect::<String>()))
-                .unwrap_or_else(|| "附件".into())
-            });
+            .flatten()
+            .chain(unfurls.flat_map(|card| card["blocks"].as_array().into_iter().flatten()))
+            .filter_map(table_rows)
+            .collect();
         Some(Self {
             ts: ts.into(),
             thread_ts: thread.map(str::to_owned),
@@ -253,6 +356,8 @@ impl Message {
             reply_count: value["reply_count"].as_u64().unwrap_or_default(),
             edited: value.get("edited").is_some(),
             attachment,
+            attachments,
+            tables,
         })
     }
 }

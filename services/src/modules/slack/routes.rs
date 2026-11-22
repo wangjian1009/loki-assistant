@@ -8,7 +8,7 @@ use axum::{
     },
     http::{
         HeaderMap, HeaderValue, StatusCode, Uri,
-        header::{CACHE_CONTROL, LOCATION},
+        header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION, X_CONTENT_TYPE_OPTIONS},
     },
     middleware,
     response::{Html, IntoResponse, Response},
@@ -490,6 +490,39 @@ async fn timeline(
         .messages(session(&headers, &service).await?, id, None, page)
         .await
         .map(|value| Json(messages_result(value, &team_id)))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "attachment-preview",
+    method = "GET",
+    path = "/slack/conversations/{id}/messages/{ts}/attachments/{index}/preview",
+    summary = "读取 Slack 图片附件预览",
+    description = "从当前工作区会话的消息读取指定图片附件。"
+)]
+async fn attachment_preview(
+    State(projects): Service,
+    headers: HeaderMap,
+    path: Segment<(String, String, usize)>,
+) -> Result<Response, Error> {
+    let Path((id, ts, index)) = path.map_err(|_| Error::Invalid)?;
+    if super::protocol::timestamp(&ts).is_none() {
+        return Err(Error::Invalid);
+    }
+    let (_, id, service) = conversation(&projects, id).await?;
+    let (mime, image) = service
+        .attachment_preview(session(&headers, &service).await?, &id, &ts, index)
+        .await?;
+    Ok((
+        [
+            (CONTENT_TYPE, mime.as_str()),
+            (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        image,
+    )
+        .into_response())
 }
 
 #[loki_api(

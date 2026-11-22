@@ -519,7 +519,14 @@ impl SlackService {
             }
             _ => None,
         };
-        self.state.lock().await.account(session)?;
+        self.update_cache(session, |cache, _| {
+            let room = cache.conversations.get_mut(id).ok_or(Error::Conversation)?;
+            for message in root.iter().chain(reply.iter()) {
+                room.ingest(message.clone());
+            }
+            Ok(())
+        })
+        .await?;
         let anchored_thread = thread.filter(|_| root.is_some());
         let anchored_message = match (thread, message, root.as_ref(), reply.as_ref()) {
             (None, Some(ts), Some(_), _) => Some(ts),
@@ -529,6 +536,33 @@ impl SlackService {
         };
         Ok(json!({"room":room,"root":root,"reply":reply,
             "thread_ts":anchored_thread,"message_ts":anchored_message}))
+    }
+
+    pub(super) async fn attachment_preview(
+        &self,
+        session: Uuid,
+        id: &str,
+        ts: &str,
+        index: usize,
+    ) -> Result<(String, Vec<u8>), Error> {
+        let (url, token) = {
+            let state = self.state.lock().await;
+            let account = state.account(session)?;
+            let url = state
+                .cache
+                .conversations
+                .get(id)
+                .and_then(|room| room.messages.get(ts))
+                .and_then(|message| message.attachments.get(index))
+                .filter(|attachment| attachment.image)
+                .and_then(|attachment| attachment.image_url.clone())
+                .ok_or(Error::Attachment)?;
+            (url, account.access.clone())
+        };
+        let web = self.web_session(session).await?;
+        let result = self.client.image(&url, &token, web.as_ref()).await?;
+        self.state.lock().await.account(session)?;
+        Ok(result)
     }
 
     async fn find_message(

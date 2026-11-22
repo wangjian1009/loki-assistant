@@ -16,6 +16,19 @@ use super::protocol::Error;
 
 pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+pub(super) fn slack_image_url(value: &str) -> bool {
+    Url::parse(value).ok().is_some_and(|url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.host_str().is_some_and(|host| {
+                matches!(host, "files.slack.com" | "files-origin.slack.com")
+                    || host.ends_with(".slack-edge.com")
+            })
+    })
+}
+
 pub(super) const WEB_TOKEN_PATTERN: &str = r"^xoxc-[A-Za-z0-9_-]{1,4091}$";
 static WEB_TOKEN_REGEX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(WEB_TOKEN_PATTERN).expect("Slack 网页令牌正则有效"));
@@ -71,6 +84,59 @@ pub(super) struct SlackClient {
 }
 
 impl SlackClient {
+    pub async fn image(
+        &self,
+        url: &str,
+        token: &str,
+        web: Option<&WebSession>,
+    ) -> Result<(String, Vec<u8>), Error> {
+        const MAX_BYTES: usize = 5 * 1024 * 1024;
+        if !slack_image_url(url) {
+            return Err(Error::Attachment);
+        }
+        let url = Url::parse(url).map_err(|_| Error::Attachment)?;
+        let private = matches!(
+            url.host_str(),
+            Some("files.slack.com" | "files-origin.slack.com")
+        );
+        let mut request = self.http.get(url);
+        if private {
+            request = request.bearer_auth(web.map_or(token, |web| &web.token));
+            if let Some(web) = web {
+                request = request.header(reqwest::header::COOKIE, format!("d={}", web.d_cookie));
+            }
+        }
+        let mut response = request.send().await.map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|size| size > MAX_BYTES as u64)
+        {
+            return Err(Error::Attachment);
+        }
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .filter(|mime| {
+                matches!(
+                    *mime,
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                )
+            })
+            .ok_or(Error::Attachment)?
+            .to_owned();
+        let mut image = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+            if image.len() + chunk.len() > MAX_BYTES {
+                return Err(Error::Attachment);
+            }
+            image.extend_from_slice(&chunk);
+        }
+        Ok((mime, image))
+    }
+
     pub fn new(api: &str) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         Self {

@@ -22,6 +22,7 @@
 | GET    | ~/slack/conversations/picker~                                 | [[file:slack-services.org::*会话选择][一次读取会话候选]]     |
 | GET    | ~/slack/conversations/{id}/messages~                          | [[file:slack-services.org::*消息读取][分页读取顶层消息]]     |
 | GET    | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | [[file:slack-services.org::*消息读取][分页读取线程回复]]     |
+| GET    | ~/slack/conversations/{id}/messages/{ts}/attachments/{index}/preview~ | [[file:slack-services.org::*消息读取][读取图片附件预览]] |
 | POST   | ~/slack/conversations/{id}/messages~                          | [[file:slack-services.org::*消息发送与发送记录][发送顶层消息]]         |
 | POST   | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | [[file:slack-services.org::*消息发送与发送记录][发送线程回复]]         |
 | POST   | ~/slack/conversations/{id}/open~                              | [[file:slack-services.org::*通知点击跳转][打开通知对应的会话]]   |

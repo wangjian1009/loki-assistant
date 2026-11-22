@@ -1691,7 +1691,13 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
         json!({"ts":"101.0","user":"UYOU","text":"你好 <@UME>"}),
         json!({"ts":"102.0","user":"UME","text":"自己的消息 <@UME>"}),
         json!({"ts":"103.0","user":"UYOU","thread_ts":"101.0","text":"请看 <@UME|我的名字>"}),
-        json!({"ts":"104.0","user":"UYOU","thread_ts":"101.0","files":[{"title":"进度表"}]}),
+        json!({"ts":"104.0","user":"UYOU","thread_ts":"101.0",
+            "files":[{"title":"进度表","mimetype":"image/png","size":4096,
+                      "permalink":"https://example.slack.com/files/F1",
+                      "thumb_480":"https://files.slack.com/files-tmb/F1/report.png"}],
+            "blocks":[{"type":"table","rows":[[{"type":"raw_text","text":"版本"}],
+                [{"type":"rich_text","elements":[{"type":"rich_text_section",
+                 "elements":[{"type":"text","text":"3.3.107"}]}]}]]}]}),
     ] {
         room.ingest(Message::from_slack(&message, None).unwrap());
     }
@@ -1703,6 +1709,12 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     assert_eq!(summary["last_message"]["ts"], "104.0");
     assert_eq!(summary["last_message"]["author"]["id"], "TTEAM.UYOU");
     assert_eq!(summary["last_message"]["preview"], "附件 · 进度表");
+    let message = &room.messages["104.0"];
+    let wire = serde_json::to_value(message).unwrap();
+    assert_eq!(wire["tables"], json!([[["版本"], ["3.3.107"]]]));
+    assert_eq!(wire["attachments"][0]["image"], true);
+    assert_eq!(wire["attachments"][0]["size"], 4096);
+    assert!(wire["attachments"][0].get("image_url").is_none());
 
     positions.0.insert("101.0".into(), "104.0".into());
     let (_, _, summary) = room.summarize(&account, &positions);

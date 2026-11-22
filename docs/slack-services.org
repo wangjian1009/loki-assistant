@@ -131,6 +131,10 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 两个接口均接受 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。响应包含 ~api_version~ 、 ~conversation_id~ 、 ~team_id~ 、 ~items~ 、 ~next_cursor~ 、 ~read_through_ts~ 、 ~first_unread_ts~ 、 ~covered_range~ 和 ~sync_state~ 。 ~sync_state~ 为 ~live~ 或 ~cached~ 。
 
+消息中可包含 ~attachments~ 和 ~tables~ 。附件包含 ~title~ 、 ~mimetype~ 、 ~size~ 、 ~url~ 、 ~text~ 和 ~image~ ，其中 ~url~ 是供用户打开的链接， ~image~ 表示可读取图片预览。 ~tables~ 以表格、行、单元格的数组返回 Slack 原生表格的文本。
+
+~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/preview~ 读取当前会话消息中的单张图片。 ~index~ 是 ~attachments~ 中从零起算的位置。成功响应为 PNG、JPEG、GIF 或 WebP，最大 5 MiB。附件或预览不可用时返回 ~slack-attachment-not-found~ 。
+
 * 消息发送与发送记录
 
 ~POST /slack/conversations/{id}/messages~ 发送顶层消息。 ~POST /slack/conversations/{id}/threads/{thread_ts}/messages~ 发送线程回复。两个接口均要求 UUID 格式的 ~Idempotency-Key~ ，JSON 请求体包含 ~text~ 。
