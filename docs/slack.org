@@ -18,6 +18,8 @@
 ├── users/
 │   ├── {user_id}.txt
 │   └── {user_id}.png
+├── icons/
+│   └── {sha256}.png
 ├── conversations/{conversation_id}/
 │   ├── info.txt
 │   ├── messages/
@@ -33,6 +35,7 @@
 - 每个 ~.txt~ 文件保存一条 UTF-8 S 表达式。顶层消息平铺在 ~messages/~ 下，线程回复按根消息的 ~thread_ts~ 分目录，文件名保留 Slack 返回的原始 ~ts~ 。
 - services 启动时读取已授权工作区的缓存，收到 Slack 更新后更新对应文件。写入时先写同目录的临时文件，再原子替换。资料或消息缓存缺失或损坏时按需从 Slack 补取。
 - 附件跟随所属消息记录，记录原始文件名、MIME 类型和缓存引用。文件按需下载到工作区的 ~attachments/~ ，同一 Slack 文件可由多条消息共用。 ~{key}~ 优先取 Slack ~file_id~ 。缺少 ID 时使用 ~url-~ 加实际下载 URL 的 SHA-256 小写十六进制值，原件和预览各用自己的 URL 计算。
+- 消息自带的图片图标以 URL 的 SHA-256 散列为文件名保存在 ~icons/~ ，沿用附件的缓存保留时间。同一 URL 由多条消息共用。
 - 原件优先沿用原始文件名的扩展名，缺失时按下载响应的 MIME 类型推断，仍无法识别时用 ~bin~ 。预览按下载响应的图片类型取扩展名。例如同一附件可保存为 ~F123ABC.original.png~ 和 ~F123ABC.preview.webp~ 。
 - 在 Slack 配置中通过 ~cache_retention_days~ 设置消息和附件的缓存保留天数，默认 30 天。services 启动时、配置变更后和之后每天清理一次。普通消息和附件按各自的文件修改时间计算，线程按根消息及所有回复中最近一次写入的时间计算，到期时一起清理。过期数据在查询或打开时按需从 Slack 补取。
 - 本机查询接口可返回用户资料、头像、会话、消息和附件的缓存绝对路径。Emacs 直接读取文件，用 ~read~ 解析 ~.txt~ 。文件缺失时，Emacs 重新请求 services 补取。

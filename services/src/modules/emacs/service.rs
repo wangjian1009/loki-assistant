@@ -338,7 +338,7 @@ impl EmacsService {
     ) -> Result<String, EmacsError> {
         let argument = serde_json::to_string(&target.to_string()).expect("JSON 字符串可序列化");
         let script = format!(
-            "(when (require 'loki-assistant-slack-chat nil t) (loki-assistant-slack-open-notification {argument}))"
+            "(when (require 'loki-assistant-dispatch nil t) (loki-assistant-dispatch-slack-notification {argument}))"
         );
         let output = timeout(
             Duration::from_secs(10),
@@ -361,6 +361,15 @@ impl EmacsService {
         }
     }
 
+    pub(crate) async fn activate_slack(&self) -> Result<(), EmacsError> {
+        let script = "(when (require 'loki-assistant-dispatch nil t) (loki-assistant-dispatch-activate-slack))";
+        match self.eval(script).await?.as_str() {
+            "t" => Ok(()),
+            "nil" => Err(EmacsError::AppNotFound("slack".into())),
+            _ => Err(EmacsError::InvalidResponse("Slack 聊天激活回执无效。".into())),
+        }
+    }
+
     pub(crate) async fn dispatch_slack_messages(&self, payload: &Value) -> Result<bool, EmacsError> {
         let path = std::env::temp_dir().join(format!("loki-slack-{}.json", uuid::Uuid::new_v4()));
         let mut file = std::fs::OpenOptions::new()
@@ -377,8 +386,8 @@ impl EmacsService {
         let argument = serde_json::to_string(&path.0.to_string_lossy())
             .expect("投递文件路径可序列化");
         let script = format!(
-            "(if (fboundp 'loki-assistant-slack-dispatch-messages) \
-                 (loki-assistant-slack-dispatch-messages {argument}) 'buffer-closed)"
+            "(if (require 'loki-assistant-dispatch nil t) \
+                 (loki-assistant-dispatch-slack-messages {argument}) 'buffer-closed)"
         );
         match timeout(Duration::from_secs(10), self.eval_with_startup(&script, false)).await {
             Ok(Ok(output)) if output == "applied" => Ok(true),

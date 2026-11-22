@@ -67,7 +67,7 @@ impl DiskCache {
         match fs::read_to_string(&owner) {
             Ok(previous) if previous == user => return Ok(cache),
             Ok(_) => {
-                for name in ["users", "conversations", "attachments"] {
+                for name in ["users", "conversations", "attachments", "icons"] {
                     match fs::remove_dir_all(cache.0.join(name)) {
                         Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -115,7 +115,7 @@ impl DiskCache {
     }
 
     pub fn user_result(&self, user: &UserProfile) -> Value {
-        let mut value = json!(user);
+        let mut value = user.result();
         add_path(
             &mut value,
             "cache_path",
@@ -131,6 +131,14 @@ impl DiskCache {
 
     pub fn avatar_path(&self, id: &str) -> PathBuf {
         self.user_path(id, "png")
+    }
+
+    pub fn cached_avatar(&self, id: &str) -> Option<PathBuf> {
+        if !valid_id(id) {
+            return None;
+        }
+        let path = self.avatar_path(id);
+        regular_file(&path).then_some(path)
     }
 
     pub fn room_path(&self, id: &str) -> PathBuf {
@@ -233,6 +241,9 @@ impl DiskCache {
 
     pub fn save_message(&self, id: &str, message: &Message) {
         let mut value = json!(message);
+        if let Some(url) = &message.icon_url {
+            value["icon_url"] = json!(url);
+        }
         if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
             for (value, item) in attachments.iter_mut().zip(&message.attachments) {
                 value["file_id"] = json!(item.file_id);
@@ -263,6 +274,14 @@ impl DiskCache {
             "cache_path",
             self.message_path(id, message.thread_ts.as_deref(), &message.ts),
         );
+        if let Some(url) = &message.icon_url {
+            add_path(&mut value, "icon_path", self.message_icon_path(url));
+        }
+        if let Some(author) = &message.author
+            && let Some(path) = self.cached_avatar(&author.id)
+        {
+            value["author"]["avatar_path"] = json!(path);
+        }
         if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
             for (value, item) in attachments.iter_mut().zip(&message.attachments) {
                 if let Some(path) = self.attachment(item, true) {
@@ -274,6 +293,10 @@ impl DiskCache {
             }
         }
         value
+    }
+
+    pub fn message_icon_path(&self, url: &str) -> PathBuf {
+        self.0.join("icons").join(format!("{:x}.png", Sha256::digest(url.as_bytes())))
     }
 
     fn attachment_base(item: &Attachment, preview: bool) -> Option<String> {
@@ -390,7 +413,7 @@ impl DiskCache {
                 .is_some_and(super::projects::valid_team_id)
                 && regular_file(&path.join(".owner"))
         }) {
-            for path in entries(&team.join("attachments"), false) {
+            for path in entries(&team.join("attachments"), false).chain(entries(&team.join("icons"), false)) {
                 if expired(&path) {
                     let _ = fs::remove_file(path);
                 }

@@ -196,6 +196,10 @@ pub(super) struct Message {
     pub reply_count: u64,
     pub edited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_emoji: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub icon_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -381,6 +385,22 @@ impl Message {
             text: value["text"].as_str().unwrap_or_default().to_owned(),
             reply_count: value["reply_count"].as_u64().unwrap_or_default(),
             edited: value.get("edited").is_some(),
+            icon_emoji: value["icons"]["emoji"]
+                .as_str()
+                .filter(|emoji| {
+                    emoji.strip_prefix(':').and_then(|name| name.strip_suffix(':'))
+                        .is_some_and(|name| {
+                            !name.is_empty() && name.len() <= 64 && name.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+')
+                            })
+                        })
+                })
+                .map(str::to_owned),
+            icon_url: ["image_48", "image_72", "image_36"]
+                .into_iter()
+                .filter_map(|size| value["icons"][size].as_str())
+                .find(|url| super::client::message_icon_url(url))
+                .map(str::to_owned),
             attachment,
             attachments,
             tables,

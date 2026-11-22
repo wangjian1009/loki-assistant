@@ -488,7 +488,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 9);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 10);
             let capture = body["apis"]
                 .as_array()
                 .unwrap()
@@ -506,6 +506,10 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
             assert_eq!(open_app["method"], "POST");
             assert_eq!(open_app["path"], "/emacs/apps/open");
             assert!(open_app["description"].as_str().unwrap().contains("app"));
+            let slack = body["apis"].as_array().unwrap().iter()
+                .find(|api| api["id"] == "activate-slack").unwrap();
+            assert_eq!(slack["path"], "/emacs/slack/activate");
+            assert_eq!(slack["access"], "local");
             let notification = body["apis"]
                 .as_array()
                 .unwrap()
@@ -1005,6 +1009,17 @@ async fn open_logs_app_opens_org_log_through_gateway() {
     assert_eq!(calls.len(), 1);
     assert!(calls[0].1[3].contains("loki-assistant.log.org"));
     assert!(calls[0].1[3].contains("find-file"));
+}
+
+#[tokio::test]
+async fn activates_slack_through_emacs_dispatch() {
+    let (service, runner, _) = service(vec![Ok(wire(json!({"result":"t"})))]);
+    let (status, body) = request(service, "POST", "/emacs/slack/activate", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"api_version":"1", "app":"slack", "opened":true}));
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].1[3].contains("loki-assistant-dispatch-activate-slack"));
 }
 
 #[tokio::test]

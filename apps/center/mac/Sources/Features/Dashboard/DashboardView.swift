@@ -6,6 +6,7 @@ struct DashboardView: View {
     let idleSleep: IdleSleepController
     @State private var openingSettings = false
     @State private var openingLog = false
+    @State private var openingSlack = false
     @State private var appOpenError: String?
     @State private var appOpenErrorTitle = "无法打开 Emacs"
 
@@ -34,6 +35,26 @@ struct DashboardView: View {
                 )
             }
             Divider()
+            Button {
+                openingSlack = true
+                Task { @MainActor in
+                    defer { openingSlack = false }
+                    let operation = CenterLog.shared.start("激活 Slack 聊天")
+                    do {
+                        try await ServiceSettingsClient().activateSlack(operation: operation)
+                        CenterLog.shared.finish(operation, result: "success")
+                    } catch {
+                        CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
+                        appOpenErrorTitle = "无法激活 Slack 聊天"
+                        appOpenError = error.localizedDescription
+                    }
+                }
+            } label: {
+                Label(openingSlack ? "打开 Slack 聊天…" : "Slack 聊天", systemImage: "bubble.left.and.bubble.right")
+            }
+            .disabled(openingSlack)
+            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity, alignment: .leading)
             Button {
                 openingSettings = true
                 Task { @MainActor in

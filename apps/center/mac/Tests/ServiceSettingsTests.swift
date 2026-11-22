@@ -25,6 +25,24 @@ final class ServiceSettingsTests: XCTestCase {
         try await client.open()
     }
 
+    func testActivatesSlackThroughDedicatedRoute() async throws {
+        let client = ServiceSettingsClient(discover: { Self.endpoint }, transport: { request in
+            let url = try XCTUnwrap(request.url)
+            let body: String
+            if url.path == "/healthz" {
+                body = #"{"service":"loki-services","status":"ok","version":"0.1.0","uptime_seconds":1}"#
+            } else {
+                XCTAssertEqual(url.path, "/emacs/slack/activate")
+                XCTAssertNil(url.query)
+                XCTAssertEqual(request.httpMethod, "POST")
+                XCTAssertNil(request.httpBody)
+                body = #"{"api_version":"1","app":"slack","opened":true}"#
+            }
+            return (Data(body.utf8), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        })
+        try await client.activateSlack()
+    }
+
     func testPreservesMissingAppAndGatewayErrors() async {
         for (status, code, message) in [
             (404, "app-not-found", "Emacs 应用不存在或未安装：config"),

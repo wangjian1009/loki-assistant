@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -9,7 +10,7 @@ use uuid::Uuid;
 
 use super::{
     disk,
-    protocol::{Error, Message, Page, timestamp, valid_id},
+    protocol::{Attachment, Error, Message, Page, timestamp, valid_id},
     service::{SlackService, now},
     store::{Account, Conversation, SendRecord, SendState},
 };
@@ -63,6 +64,14 @@ pub(super) struct UserProfile {
 }
 
 impl UserProfile {
+    pub fn result(&self) -> Value {
+        let mut value = json!(self);
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("avatar_url");
+        }
+        value
+    }
+
     fn from_slack(team_id: &str, id: &str, user: &Value) -> Self {
         let profile = &user["profile"];
         let name = [&profile["display_name"], &user["real_name"], &user["name"]]
@@ -235,6 +244,7 @@ impl SlackService {
         .await
         .map_err(|_| Error::Unavailable)?;
         self.picker_changed.notify_one();
+        self.avatars_changed.notify_one();
         Ok(users)
     }
 
@@ -275,6 +285,7 @@ impl SlackService {
             .await
             .map_err(|_| Error::Unavailable)?;
             self.picker_changed.notify_one();
+            self.avatars_changed.notify_one();
         }
         Ok(profile)
     }
@@ -322,6 +333,7 @@ impl SlackService {
         })
         .await;
         self.picker_changed.notify_one();
+        self.avatars_changed.notify_one();
     }
 
     async fn directory(
@@ -617,6 +629,7 @@ impl SlackService {
         };
         let room_id = id.to_owned();
         let messages: Vec<_> = root.iter().chain(reply.iter()).cloned().collect();
+        self.warm_message_media(session, &messages).await;
         self.update_cache(session, move |cache, _| {
             let room = cache
                 .conversations
@@ -635,7 +648,20 @@ impl SlackService {
             (_, Some(ts), _, Some(_)) => Some(ts),
             _ => None,
         };
-        Ok(json!({"room":room,"root":root,"reply":reply,
+        let state = self.state.lock().await;
+        state.account(session)?;
+        let conversation = state
+            .cache
+            .conversations
+            .get(id)
+            .ok_or(Error::Conversation)?;
+        let wire_root = root
+            .as_ref()
+            .map(|message| conversation.message_result(message));
+        let wire_reply = reply
+            .as_ref()
+            .map(|message| conversation.message_result(message));
+        Ok(json!({"room":room,"root":wire_root,"reply":wire_reply,
             "thread_ts":anchored_thread,"message_ts":anchored_message}))
     }
 
@@ -715,19 +741,8 @@ impl SlackService {
             let path = pending.commit().map_err(|_| Error::Unavailable)?;
             return Ok((mime, Vec::new(), Some(path)));
         }
-        let (mime, bytes) = self.client.image(url, &token, web.as_ref()).await?;
-        let state = self.state.clone().lock_owned().await;
-        state.account(session)?;
-        let Some(cache) = cache else {
-            return Ok((mime, bytes, None));
-        };
-        tokio::task::spawn_blocking(move || {
-            let path = cache.save_preview(&item, &mime, &bytes);
-            drop(state);
-            (mime, bytes, path)
-        })
-        .await
-        .map_err(|_| Error::Unavailable)
+        self.download_preview(session, &item, &token, web.as_ref(), cache)
+            .await
     }
 
     pub(super) async fn avatar(
@@ -742,7 +757,7 @@ impl SlackService {
             state.cache.disk.clone().ok_or(Error::Unavailable)?
         };
         let path = cache.avatar_path(id);
-        if disk::regular_file(&path) {
+        if let Some(path) = cache.cached_avatar(id) {
             return Ok(path);
         }
         let url = profile.avatar_url.as_deref().ok_or(Error::Attachment)?;
@@ -768,6 +783,201 @@ impl SlackService {
         .map_err(|_| Error::Unavailable)?
     }
 
+    pub(super) async fn warm_avatars(&self, session: Uuid) {
+        let (users, bots) = {
+            let state = self.state.lock().await;
+            let Some(cache) = state
+                .cache
+                .disk
+                .as_ref()
+                .filter(|_| state.account(session).is_ok())
+            else {
+                return;
+            };
+            let users = state
+                .user_directory
+                .iter()
+                .flat_map(|directory| directory.users.iter())
+                .filter(|user| {
+                    user.avatar_url.is_some() && cache.cached_avatar(user.slack_id()).is_none()
+                })
+                .map(|user| user.slack_id().to_owned())
+                .collect::<Vec<_>>();
+            let bots = state
+                .cache
+                .conversations
+                .values()
+                .flat_map(|room| room.messages.values())
+                .filter_map(|message| message.author.as_ref())
+                .map(|author| &author.id)
+                .filter(|id| id.starts_with('B') && valid_id(id))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter(|id| cache.cached_avatar(id).is_none())
+                .cloned()
+                .collect::<Vec<_>>();
+            (users, bots)
+        };
+        stream::iter(
+            users
+                .into_iter()
+                .map(|id| (id, false))
+                .chain(bots.into_iter().map(|id| (id, true))),
+        )
+        .for_each_concurrent(4, |(id, bot)| async move {
+            let result = if bot {
+                self.warm_bot_avatar(session, &id).await
+            } else {
+                self.avatar(session, &id).await.map(|_| ())
+            };
+            if result.is_ok() {
+                self.picker_changed.notify_one();
+            }
+        })
+        .await;
+    }
+
+    async fn warm_bot_avatar(&self, session: Uuid, id: &str) -> Result<(), Error> {
+        let result = self.slack_get(session, "bots.info", &[("bot", id)]).await?;
+        let bot = &result["bot"];
+        if bot["id"].as_str() != Some(id) || bot["deleted"] == true {
+            return Err(Error::Attachment);
+        }
+        let url = ["image_48", "image_72", "image_36"]
+            .into_iter()
+            .filter_map(|key| bot["icons"][key].as_str())
+            .find(|url| !url.is_empty())
+            .ok_or(Error::Attachment)?;
+        let bytes = self.client.avatar(url).await?;
+        let state = self.state.clone().lock_owned().await;
+        state.account(session)?;
+        let path = state
+            .cache
+            .disk
+            .as_ref()
+            .ok_or(Error::Unavailable)?
+            .avatar_path(id);
+        tokio::task::spawn_blocking(move || {
+            let png = disk::avatar_png(&bytes).ok_or(Error::Attachment)?;
+            let result = disk::atomic_write(&path, &png).map_err(|_| Error::Unavailable);
+            drop(state);
+            result
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
+    pub(super) async fn warm_message_media(&self, session: Uuid, messages: &[Message]) {
+        let (cache, token) = {
+            let state = self.state.lock().await;
+            let (Ok(account), Some(cache)) = (state.account(session), &state.cache.disk) else {
+                return;
+            };
+            (cache.clone(), account.access.clone())
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let missing: Vec<_> = messages
+            .iter()
+            .flat_map(|message| &message.attachments)
+            .filter(|item| item.image && cache.attachment(item, true).is_none())
+            .filter(|item| {
+                item.image_url
+                    .as_deref()
+                    .is_some_and(|url| seen.insert((item.file_id.as_deref(), url)))
+            })
+            .collect();
+        let icons: std::collections::BTreeSet<_> = messages.iter()
+            .filter_map(|message| message.icon_url.as_deref())
+            .filter(|url| !disk::regular_file(&cache.message_icon_path(url)))
+            .map(str::to_owned)
+            .collect();
+        let previews = async {
+            if missing.is_empty() {
+                return;
+            }
+            let Ok(web) = self.web_session(session).await else {
+                return;
+            };
+            stream::iter(missing).for_each_concurrent(4, |item| async {
+                let _ = self
+                    .download_preview(session, item, &token, web.as_ref(), Some(cache.clone()))
+                    .await;
+            }).await;
+        };
+        let icons = async {
+            for url in icons {
+                let _ = self.cache_message_icon(session, &cache, &url).await;
+            }
+        };
+        // 图片获取失败或过慢时，消息正文仍可到达聊天界面。
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            tokio::join!(icons, previews);
+        }).await;
+    }
+
+    async fn cache_message_icon(
+        &self,
+        session: Uuid,
+        cache: &disk::DiskCache,
+        url: &str,
+    ) -> Result<(), Error> {
+        let _permit = self.preview_downloads.acquire().await.map_err(|_| Error::Unavailable)?;
+        let path = cache.message_icon_path(url);
+        if disk::regular_file(&path) {
+            return Ok(());
+        }
+        let bytes = self.client.avatar(url).await?;
+        let state = self.state.clone().lock_owned().await;
+        state.account(session)?;
+        tokio::task::spawn_blocking(move || {
+            let png = disk::avatar_png(&bytes).ok_or(Error::Attachment)?;
+            let result = disk::atomic_write(&path, &png).map_err(|_| Error::Unavailable);
+            drop(state);
+            result
+        }).await.map_err(|_| Error::Unavailable)?
+    }
+
+    async fn download_preview(
+        &self,
+        session: Uuid,
+        item: &Attachment,
+        token: &str,
+        web: Option<&super::client::WebSession>,
+        cache: Option<disk::DiskCache>,
+    ) -> Result<(String, Vec<u8>, Option<std::path::PathBuf>), Error> {
+        let _permit = self
+            .preview_downloads
+            .acquire()
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if let Some(path) = cache
+            .as_ref()
+            .and_then(|cache| cache.attachment(item, true))
+            && let Some(mime) = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(disk::preview_mime)
+            && let Ok(bytes) = tokio::fs::read(&path).await
+        {
+            return Ok((mime.into(), bytes, Some(path)));
+        }
+        let url = item.image_url.as_deref().ok_or(Error::Attachment)?;
+        let (mime, bytes) = self.client.image(url, token, web).await?;
+        let state = self.state.clone().lock_owned().await;
+        state.account(session)?;
+        let Some(cache) = cache else {
+            return Ok((mime, bytes, None));
+        };
+        let item = item.clone();
+        tokio::task::spawn_blocking(move || {
+            let path = cache.save_preview(&item, &mime, &bytes);
+            drop(state);
+            (mime, bytes, path)
+        })
+        .await
+        .map_err(|_| Error::Unavailable)
+    }
+
     pub(super) async fn user_result(
         &self,
         session: Uuid,
@@ -779,7 +989,7 @@ impl SlackService {
             .cache
             .disk
             .as_ref()
-            .map_or_else(|| json!(user), |cache| cache.user_result(user)))
+            .map_or_else(|| user.result(), |cache| cache.user_result(user)))
     }
 
     async fn find_message(
@@ -1051,6 +1261,7 @@ impl SlackService {
                 seen_cursors.clear();
             }
         };
+        self.warm_message_media(session, &items).await;
         self.store_page(session, id, None, &items, None, more, observed)
             .await?;
         Ok((items, None, more))
@@ -1129,6 +1340,9 @@ impl SlackService {
         let root = root.ok_or(Error::Thread)?;
         let items: Vec<_> = window.into_iter().collect();
         let more = count > limit;
+        self.warm_message_media(session, &items).await;
+        self.warm_message_media(session, std::slice::from_ref(&root))
+            .await;
         self.store_page(session, id, Some(thread), &items, Some(&root), more, None)
             .await?;
         Ok((items, Some(root), more))

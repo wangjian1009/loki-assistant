@@ -58,11 +58,11 @@ Slack 业务接口和工作区配置只接受本机调用，客户端可直接�
 
 * 用户目录
 
-~GET /slack/users~ 默认分页查询全部已授权工作区的用户。结果包含 ~api_version~ 、 ~items~ 、 ~next_cursor~ 和 ~issues~ 。每条用户记录含 ~id~ 、 ~team_id~ 、 ~name~ 、 ~display_name~ 、 ~username~ 、 ~is_bot~ 和 ~avatar_url~ 。 ~id~ 格式为 ~team_id.用户ID~ 。部分工作区查询失败时， ~issues~ 记录其 ~team_id~ 和 ~error~ 。
+~GET /slack/users~ 默认分页查询全部已授权工作区的用户。结果包含 ~api_version~ 、 ~items~ 、 ~next_cursor~ 和 ~issues~ 。每条用户记录含 ~id~ 、 ~team_id~ 、 ~name~ 、 ~display_name~ 、 ~username~ 和 ~is_bot~ 。 ~id~ 格式为 ~team_id.用户ID~ 。部分工作区查询失败时， ~issues~ 记录其 ~team_id~ 和 ~error~ 。
 
 ~GET /slack/users/{id}~ 计划按复合用户标识查询单条用户资料。响应字段待定。
 
-本机用户记录可带 ~cache_path~ 和 ~avatar_path~ ，分别指向资料和 PNG 头像。 ~GET /slack/users/{id}/avatar~ 按需下载头像并返回 ~cache_path~ ，其中 ~id~ 为复合用户 ID。
+本机用户记录可带 ~cache_path~ 和 ~avatar_path~ ，分别指向资料和 PNG 头像。services 启动后预热头像，写入成功时通过 ~avatar_path~ 返回本机绝对路径。 ~GET /slack/users/{id}/avatar~ 支持显式获取头像并返回 ~cache_path~ ，其中 ~id~ 为复合用户 ID。
 
 ** 批量查询用户
 
@@ -85,7 +85,7 @@ GET /slack/users?id=T123.U123&id=T456.U456
       "display_name": "林舟",
       "username": "linzhou",
       "is_bot": false,
-      "avatar_url": null
+      "avatar_path": "/Users/me/.cache/slack/T123/users/U123.png"
     }
   ],
   "next_cursor": null,
@@ -121,7 +121,7 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 | ~workspaces~ | 各工作区的 ~team_id~ 、 ~team_name~ 和 ~state~ 。 ~state~ 可为 ~warming_up~ （准备中）、 ~ready~ （已完成）或 ~unavailable~ （数据暂不可用）。准备期间或部分工作区不可用时仍返回已有候选。没有可用候选时， ~items~ 为空数组。 |
 | ~items~ | 会话候选。每项包含 ~id~ 、 ~team_id~ 、 ~team_name~ 、 ~session_id~ 、 ~kind~ 、 ~title~ 、 ~unread_count~ 、 ~last_activity_ts~ 、 ~last_unread_mention_ts~ 和 ~history_loaded~ 。Emacs 根据这些字段组织界面、分组和排序。 |
 | ~items[].last_message~ | 最后一条消息的 ~author_name~ 、 ~ts~ 和 ~preview~ 。没有可展示的消息时为 ~null~ 。 |
-| ~items[].participants~ | 私聊参与者的 ~id~ 、 ~name~ 、 ~username~ 和 ~avatar_url~ 。头像地址缺失时为 ~null~ ，频道的参与者列表为空数组。 |
+| ~items[].participants~ | 私聊参与者包含 ~id~ 、 ~name~ 和 ~username~ 。已缓存的头像通过 ~avatar_path~ 提供。频道的参与者列表为空数组。 |
 | ~items[].search_terms~ | services 准备的搜索词，包含会话名称、用户显示名、Slack 用户名及可用的全拼和拼音首字母。输入变化时在本次响应内筛选。                                                                                                           |
 
 * 消息读取
@@ -134,6 +134,10 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 两个接口均接受 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。响应包含 ~api_version~ 、 ~conversation_id~ 、 ~team_id~ 、 ~items~ 、 ~next_cursor~ 、 ~read_through_ts~ 、 ~first_unread_ts~ 、 ~covered_range~ 和 ~sync_state~ 。 ~sync_state~ 为 ~live~ 或 ~cached~ 。
 
 消息中可包含 ~attachments~ 和 ~tables~ 。附件包含 ~title~ 、 ~mimetype~ 、 ~size~ 、 ~url~ 、 ~text~ 和 ~image~ ，其中 ~url~ 是供用户打开的链接， ~image~ 表示可读取图片预览。 ~tables~ 以表格、行、单元格的数组返回 Slack 原生表格的文本。
+
+服务启动时预热用户与已知机器人的头像，历史分页及订阅投递可在 ~author.avatar_path~ 提供本地头像。services 获取消息后先尝试缓存支持的图片预览，缓存成功时在 ~attachments[].preview_path~ 提供本地绝对路径。下载失败或超时后继续提供消息与附件信息。Emacs 只显示由这些路径指向的本地图片。
+
+带独立图标的 Slack 消息可提供 ~icon_path~ 或 ~icon_emoji~ 。前者指向 services 缓存的 PNG，后者是 Slack emoji 短代码。Emacs 在对应消息正文开头显示图标，同一机器人发出的消息可以带不同图标。
 
 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/preview~ 读取当前会话消息中的单张图片。 ~index~ 是 ~attachments~ 中从零起算的位置。成功响应为 PNG、JPEG、GIF 或 WebP，最大 5 MiB。附件或预览不可用时返回 ~slack-attachment-not-found~ 。
 
@@ -154,7 +158,7 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 ** Emacs 消息分发
 
-services 通过现有 Emacs gateway 在配置指定的 Emacs server 上调用固定函数 ~(loki-assistant-slack-dispatch-messages payload-file)~ 。参数是 services 创建的本机临时文件路径，文件内容为 UTF-8 JSON。文件仅对当前用户可读写，调用结束后清理。后台投递仅连接现有 Emacs server。HTTP 调用方只提供会话和订阅标识，函数及目标 server 由 services 决定。
+services 通过现有 Emacs gateway 调用 ~loki-assistant-dispatch~ 的固定入口 ~(loki-assistant-dispatch-slack-messages payload-file)~ ，由 Emacs 按订阅定位目标 buffer。参数是 services 创建的本机临时文件路径，文件内容为 UTF-8 JSON。文件仅对当前用户可读写，调用结束后清理。后台投递仅连接现有 Emacs server。HTTP 调用方只提供会话和订阅标识，函数及目标 server 由 services 决定。
 
 每次投递包含 ~api_version~ 、 ~subscription_id~ 、 ~conversation_id~ 、 ~session_id~ 、 ~sequence~ 和 ~kind~ 。每个订阅的 ~sequence~ 从 1 开始递增，同一批次重试沿用原序号和数据。
 
@@ -211,6 +215,8 @@ Emacs 按订阅 UUID 查找仍存活的 buffer，并核对会话和会话代次�
 * 通知点击跳转
 
 ~POST /slack/conversations/{id}/open~ 打开或聚焦通知对应的 Emacs Slack 会话，请求体为空。可选查询参数 ~thread_ts~ 展开指定线程， ~message_ts~ 定位目标消息。两者同时提供时，目标消息是指定线程中的回复。
+
+Emacs gateway 使用 ~loki-assistant-dispatch-slack-notification~ 转发通知目标。菜单栏「Slack 聊天」调用本机接口 ~POST /emacs/slack/activate~ ，请求体为空，由 ~loki-assistant-dispatch-activate-slack~ 激活最近使用的聊天或打开选择器。成功响应为 ~{"api_version":"1","app":"slack","opened":true}~ 。
 
 成功返回 HTTP 200，包含 ~api_version~ 、 ~conversation_id~ 和 ~target~ 。 ~target~ 为 ~conversation~ 、 ~thread~ 或 ~message~ ，表示实际定位到的层级。消息不可用时回退到线程或会话，失败沿用通用 JSON 错误。 [[file:control-center-services.org::*平台转交与点击跳转][通用通知回调]]
 

@@ -7,7 +7,7 @@ use std::{
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use uuid::Uuid;
 
 use crate::modules::{config::service::ConfigService, notification::NotificationService};
@@ -62,6 +62,8 @@ pub struct SlackService {
     pub(super) alerts: Notify,
     pub(super) user_fetch: Mutex<()>,
     pub(super) picker_changed: Notify,
+    pub(super) avatars_changed: Notify,
+    pub(super) preview_downloads: Semaphore,
     pub(super) subscriptions_changed: Notify,
     project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     imported_token: Option<Arc<ConfigService>>,
@@ -101,6 +103,8 @@ impl SlackService {
             alerts: Notify::new(),
             user_fetch: Mutex::default(),
             picker_changed: Notify::new(),
+            avatars_changed: Notify::new(),
+            preview_downloads: Semaphore::new(4),
             subscriptions_changed: Notify::new(),
             project: (id, settings, generation, reporter),
             imported_token,

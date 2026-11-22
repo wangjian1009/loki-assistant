@@ -19,6 +19,14 @@ struct ServiceSettingsClient: Sendable {
     }
 
     func open(app: String, operation: CenterLogOperation? = nil) async throws {
+        try await open(app: app, path: "/emacs/apps/open", query: [URLQueryItem(name: "app", value: app)], operation: operation)
+    }
+
+    func activateSlack(operation: CenterLogOperation? = nil) async throws {
+        try await open(app: "slack", path: "/emacs/slack/activate", query: nil, operation: operation)
+    }
+
+    private func open(app: String, path: String, query: [URLQueryItem]?, operation: CenterLogOperation?) async throws {
         let endpoint = try discover()
         let healthRequest = URLRequest(
             url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/healthz"),
@@ -37,9 +45,9 @@ struct ServiceSettingsClient: Sendable {
               health.service == "loki-services", health.status == "ok" else {
             throw NotificationReceiptError.serviceUnavailable
         }
-        let openURL = try NotificationReceiptClient.url(endpoint: endpoint, path: "/emacs/apps/open")
+        let openURL = try NotificationReceiptClient.url(endpoint: endpoint, path: path)
         var components = URLComponents(url: openURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "app", value: app)]
+        components.queryItems = query
         var request = URLRequest(
             url: components.url!,
             cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 35)
@@ -48,11 +56,11 @@ struct ServiceSettingsClient: Sendable {
         do {
             (data, response) = try await transport(request)
         } catch {
-            operation?.call("POST /emacs/apps/open", result: "failure", details: ["app": app, "error": error.localizedDescription])
+            operation?.call("POST \(path)", result: "failure", details: ["app": app, "error": error.localizedDescription])
             throw error
         }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-        operation?.call("POST /emacs/apps/open", result: statusCode == 200 ? "success" : "failure", details: ["app": app, "http_status": "\(statusCode)"])
+        operation?.call("POST \(path)", result: statusCode == 200 ? "success" : "failure", details: ["app": app, "http_status": "\(statusCode)"])
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard response.statusCode == 200 else {
             let error = try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data)

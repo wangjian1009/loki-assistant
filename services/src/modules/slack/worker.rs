@@ -26,6 +26,7 @@ impl SlackService {
             self.sending(),
             self.synchronizing(),
             self.warming_users(),
+            self.warming_avatars(),
             self.refreshing_picker(),
             self.notifications(),
             self.subscription_workers(&emacs)
@@ -54,6 +55,23 @@ impl SlackService {
             tokio::select! {
                 _ = changes.changed() => {},
                 _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+            }
+        }
+    }
+
+    async fn warming_avatars(&self) {
+        let mut changes = self.change.subscribe();
+        loop {
+            if let Some(session) = self.session_id().await {
+                tokio::select! {
+                    _ = self.warm_avatars(session) => {},
+                    _ = changes.changed() => continue,
+                }
+            }
+            tokio::select! {
+                _ = self.avatars_changed.notified() => {},
+                _ = changes.changed() => {},
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {},
             }
         }
     }
@@ -248,7 +266,21 @@ impl SlackService {
             return Ok(false);
         };
         let event_id = format!("{id}.{subtype}.{event_ts}");
-        self.update_cache(session, move |cache, account| {
+        {
+            let state = self.state.lock().await;
+            let account = state.account(session)?;
+            if team.as_deref().is_some_and(|team| team != account.identity.team_id)
+                || state.cache.events.contains(&event_id)
+            {
+                return Ok(false);
+            }
+        }
+        if let Some(message) = &message {
+            self.warm_message_media(session, std::slice::from_ref(message)).await;
+        }
+        let bot = message.as_ref().and_then(|message| message.author.as_ref())
+            .is_some_and(|author| author.id.starts_with('B'));
+        let result = self.update_cache(session, move |cache, account| {
             if team
                 .as_deref()
                 .is_some_and(|team| team != account.identity.team_id)
@@ -316,7 +348,11 @@ impl SlackService {
             conversation.ingest(message);
             Ok(notify)
         })
-        .await
+        .await;
+        if bot && result.is_ok() {
+            self.avatars_changed.notify_one();
+        }
+        result
     }
 
     async fn synchronizing(&self) {
@@ -335,6 +371,7 @@ impl SlackService {
                 continue;
             }
             self.refresh_recent_messages(session, reconnect).await;
+            self.avatars_changed.notify_one();
             let _ = self.refresh_group_members(session).await;
             self.refresh_names(session).await;
         }
@@ -588,6 +625,9 @@ impl SlackService {
                 }
             }
         };
+        if let Ok((_, Some(message))) = &outcome {
+            self.warm_message_media(session, std::slice::from_ref(message)).await;
+        }
         let _ = self
             .update_cache(session, move |cache, _| {
                 let record = cache.sends.get_mut(&id).ok_or(Error::SendRecord)?;

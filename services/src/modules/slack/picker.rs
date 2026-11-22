@@ -1,11 +1,11 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use pinyin::ToPinyinMulti;
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{mailbox::UserProfile, service::SlackService};
+use super::{disk::DiskCache, mailbox::UserProfile, service::SlackService};
 
 #[derive(Serialize)]
 pub(super) struct PickerItem {
@@ -20,11 +20,12 @@ struct Participant {
     id: String,
     name: String,
     username: Option<String>,
-    avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_path: Option<PathBuf>,
 }
 
 impl PickerItem {
-    fn from_summary(mut summary: Value, users: &[UserProfile]) -> Self {
+    fn from_summary(mut summary: Value, users: &[UserProfile], disk: Option<&DiskCache>) -> Self {
         let find_user = |id: &str| {
             users
                 .binary_search_by(|user| user.id.as_str().cmp(id))
@@ -55,7 +56,7 @@ impl PickerItem {
                     id: id.to_owned(),
                     name: name.to_owned(),
                     username: user.and_then(|user| user.username.clone()),
-                    avatar_url: user.and_then(|user| user.avatar_url.clone()),
+                    avatar_path: user.and_then(|user| disk?.cached_avatar(user.slack_id())),
                 }
             })
             .collect();
@@ -148,7 +149,11 @@ impl SlackService {
                 .conversations
                 .values()
                 .map(|room| {
-                    PickerItem::from_summary(self.conversation_summary(account, room).2, users)
+                    PickerItem::from_summary(
+                        self.conversation_summary(account, room).2,
+                        users,
+                        state.cache.disk.as_ref(),
+                    )
                 })
                 .collect();
             state.picker_items = items;

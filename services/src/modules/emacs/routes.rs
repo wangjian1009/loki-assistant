@@ -83,6 +83,26 @@ async fn open_app(
 #[loki_api(
     module = "emacs",
     mount = "Arc<EmacsService>",
+    id = "activate-slack",
+    method = "POST",
+    path = "/emacs/slack/activate",
+    summary = "激活 Emacs Slack 聊天",
+    description = "从本机托盘激活最近使用的 Slack 聊天，或打开聊天选择器。"
+)]
+async fn activate_slack(
+    State(service): State<Arc<EmacsService>>,
+) -> Result<Json<OpenAppResponse>, Response> {
+    service.activate_slack().await.map_err(error_response)?;
+    Ok(Json(OpenAppResponse {
+        api_version: API_VERSION.to_owned(),
+        app: "slack".to_owned(),
+        opened: true,
+    }))
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
     id = "capture-full",
     method = "POST",
     path = "/emacs/capture/full",

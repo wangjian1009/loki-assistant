@@ -66,7 +66,8 @@ impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
                     .unwrap()
             };
             let script = decode_string(args[3].split_once("((source ").unwrap().1);
-            if let Some((_, argument)) = script.split_once("(loki-assistant-slack-dispatch-messages ") {
+            assert!(script.contains("loki-assistant-dispatch"));
+            if let Some((_, argument)) = script.split_once("(loki-assistant-dispatch-slack-messages ") {
                 use std::os::unix::fs::PermissionsExt;
                 let file = decode_string(argument);
                 assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
@@ -84,7 +85,7 @@ impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
             assert!(script.contains("TTEAM.DDIRECT"));
             let target = decode_string(
                 script
-                    .split_once("(loki-assistant-slack-open-notification ")
+                    .split_once("(loki-assistant-dispatch-slack-notification ")
                     .unwrap()
                     .1,
             );
@@ -303,7 +304,21 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         posts: AtomicUsize::default(),
         history_unavailable: AtomicBool::default(),
     });
+    let media = get(|axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap| async move {
+            if name == "preview.png" {
+                assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
+            } else {
+                assert!(!headers.contains_key("authorization"));
+            }
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(1, 1)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            ([("content-type", "image/png")], png.into_inner())
+        });
     let slack = Router::new()
+        .route("/media/{name}", media.clone())
+        .route("/slack-files2/bot_icons/{name}", media)
         .route("/rtm.connect", post(|State(mock): State<Arc<Mock>>, headers: HeaderMap| async move {
             assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
             assert_eq!(headers["cookie"], "d=first");
@@ -321,12 +336,20 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             ]}))
         }))
         .route("/users.info", get(|| async { Json(json!({"ok":true,"user":{"real_name":"林舟"}})) }))
+        .route("/users.list", get(|| async {
+            Json(json!({"ok":true,"members":[
+                {"id":"UYOU","name":"林舟","profile":{"image_48":"https://avatars.slack-edge.com/media/user.png"}}
+            ]}))
+        }))
+        .route("/bots.info", get(|| async {
+            Json(json!({"ok":true,"bot":{"id":"BNEWS","icons":{"image_48":"https://avatars.slack-edge.com/media/bot.png"}}}))
+        }))
         .route("/conversations.history", get(|State(mock): State<Arc<Mock>>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
             if mock.history_unavailable.load(Ordering::SeqCst) {
                 return Json(json!({"ok":false,"error":"internal_error"}));
             }
             if query.get("channel").is_some_and(|channel| channel == "CWORK") {
-                return Json(json!({"ok":true,"messages":[]}));
+                return Json(json!({"ok":true,"messages":[{"ts":"1.000001","text":"新闻","bot_id":"BNEWS"}]}));
             }
             let root = json!({"ts":mock.root,"text":"问候","user":"UYOU","reply_count":2});
             let response = if query.contains_key("inclusive") {
@@ -396,7 +419,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         let _ = done.send(());
         channel_ready.await.unwrap();
         let ordinary = json!({"type":"message","channel":"CWORK","ts":socket_mock.root,
-            "user":"UYOU","text":"<!channel> 请 <@UMEOTHER> 看一下"});
+            "user":"UYOU","text":"<!channel> 请 <@UMEOTHER> 看一下",
+            "icons":{"image_48":"https://s3-us-west-2.amazonaws.com/slack-files2/bot_icons/alert.png"},
+            "files":[{"id":"FPREVIEW","name":"截图.png","mimetype":"image/png",
+                       "thumb_480":"https://files.slack.com/media/preview.png"}]});
         let mention = json!({"type":"message","channel":"CWORK","ts":socket_mock.reply,
             "thread_ts":socket_mock.root,"user":"UYOU","text":"请 <@UME> 看一下"});
         for payload in [&ordinary, &mention, &mention] {
@@ -460,6 +486,40 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     };
     let (projects, app, worker) = start();
     let service = ready_service(&projects, "TTEAM").await;
+    let avatar_dir = directory.0.join("cache/TTEAM/users");
+    timeout(Duration::from_secs(3), async {
+        while !(avatar_dir.join("UYOU.png").is_file() && avatar_dir.join("BNEWS.png").is_file()) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "启动头像预热，用户 {}，机器人 {}",
+            avatar_dir.join("UYOU.png").is_file(),
+            avatar_dir.join("BNEWS.png").is_file()
+        )
+    });
+    let (_, _, users) = invoke(&app, "GET", "/slack/users?id=TTEAM.UYOU", None, None, None).await;
+    assert_eq!(
+        users["items"][0]["avatar_path"],
+        json!(avatar_dir.join("UYOU.png"))
+    );
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, _, picker) =
+                invoke(&app, "GET", "/slack/conversations/picker", None, None, None).await;
+            if picker["items"].as_array().unwrap().iter().any(|item| {
+                item["id"] == "TTEAM.DDIRECT"
+                    && item["participants"][0]["avatar_path"] == json!(avatar_dir.join("UYOU.png"))
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("会话选择器应提供本机头像路径");
     let (status_code, headers, _) =
         invoke(&app, "GET", "/slack/conversations", None, None, None).await;
     assert_eq!(status_code, StatusCode::OK);
@@ -643,6 +703,26 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             sleep(Duration::from_millis(10)).await;
         }
     }).await.unwrap();
+    let delivered = emacs.deliveries.lock().unwrap();
+    let first = delivered
+        .iter()
+        .filter_map(|batch| batch["items"].as_array())
+        .flatten()
+        .find(|item| item["ts"] == mock.root)
+        .unwrap();
+    assert_eq!(
+        first["author"]["avatar_path"],
+        json!(avatar_dir.join("UYOU.png"))
+    );
+    let preview_path = directory
+        .0
+        .join("cache/TTEAM/attachments/FPREVIEW.preview.png");
+    assert_eq!(first["attachments"][0]["preview_path"], json!(preview_path));
+    assert!(preview_path.is_file());
+    let icon = std::path::Path::new(first["icon_path"].as_str().unwrap());
+    assert!(icon.starts_with(directory.0.join("cache/TTEAM/icons")) && icon.is_file());
+    assert!(first.get("icon_url").is_none());
+    drop(delivered);
     emacs.emacs_exited.store(true, Ordering::SeqCst);
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
@@ -1349,10 +1429,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .find(|item| item["kind"] == "im")
         .unwrap();
     assert_eq!(im["participants"][0]["name"], "林舟");
-    assert_eq!(
-        im["participants"][0]["avatar_url"],
-        "https://avatars.slack-edge.com/avatar.png"
-    );
+    assert!(im["participants"][0].get("avatar_url").is_none());
     assert!(
         im["search_terms"]
             .as_array()
@@ -1364,10 +1441,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(users["items"][0]["id"], "TALPHA.U1");
     assert_eq!(users["items"][0]["name"], "林舟");
     assert_eq!(users["items"][0]["username"], "linzhou");
-    assert_eq!(
-        users["items"][0]["avatar_url"],
-        "https://avatars.slack-edge.com/avatar.png"
-    );
+    assert!(users["items"][0].get("avatar_url").is_none());
     let cursor = users["next_cursor"].as_str().unwrap();
     let (_, _, users) = invoke(
         &app,

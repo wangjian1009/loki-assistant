@@ -29,6 +29,22 @@ pub(super) fn slack_image_url(value: &str) -> bool {
     })
 }
 
+fn slack_bot_icon_storage(value: &str) -> bool {
+    Url::parse(value).ok().is_some_and(|url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.host_str() == Some("s3-us-west-2.amazonaws.com")
+            && url.path().starts_with("/slack-files2/bot_icons/")
+            && url.path().ends_with(".png")
+    })
+}
+
+pub(super) fn message_icon_url(value: &str) -> bool {
+    slack_image_url(value) || slack_bot_icon_storage(value)
+}
+
 pub(super) const WEB_TOKEN_PATTERN: &str = r"^xoxc-[A-Za-z0-9_-]{1,4091}$";
 static WEB_TOKEN_REGEX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(WEB_TOKEN_PATTERN).expect("Slack 网页令牌正则有效"));
@@ -156,7 +172,7 @@ impl SlackClient {
                             || host.ends_with(".gravatar.com")
                     })
             });
-        if !slack_image_url(url) && !approved_avatar {
+        if !slack_image_url(url) && !approved_avatar && !(avatar && slack_bot_icon_storage(url)) {
             return Err(Error::Attachment);
         }
         let url = Url::parse(url).map_err(|_| Error::Attachment)?;
@@ -164,6 +180,15 @@ impl SlackClient {
             url.host_str(),
             Some("files.slack.com" | "files-origin.slack.com")
         );
+        #[cfg(test)]
+        let url = Url::parse(&self.api)
+            .ok()
+            .filter(|api| api.scheme() == "http" && api.host_str() == Some("127.0.0.1"))
+            .map_or(url.clone(), |mut api| {
+                api.set_path(url.path());
+                api.set_query(url.query());
+                api
+            });
         let mut request = self.http.get(url);
         if private && !avatar {
             request = request.bearer_auth(web.map_or(token, |web| &web.token));
