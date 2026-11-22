@@ -880,9 +880,10 @@
   (goto-char (point-max)))
 
 (defun loki-assistant-slack--link-p (url)
-  "判断 URL 是否为网页或 Slack 应用链接。"
+  "判断 URL 是否为可打开的网页、Slack 应用或邮件链接。"
   (and (stringp url)
-       (string-match-p "\\`\\(?:https?\\|slack\\)://[^/?#[:space:]]+" url)))
+       (or (string-match-p "\\`\\(?:https?\\|slack\\)://[^/?#[:space:]]+" url)
+           (string-match-p "\\`mailto:[^[:space:]?#]+\\(?:\\?[^[:space:]#]*\\)?\\'" url))))
 
 (defun loki-assistant-slack--emoji (code)
   "返回 CODE 对应的 Unicode 表情。"
@@ -950,7 +951,7 @@
                       (label (when separator (substring markup (1+ separator))))
                       (replacement
                        (cond
-                        ((loki-assistant-slack--link-p target)
+                        ((string-match-p "\\`[A-Za-z][A-Za-z0-9+.-]*:" target)
                          (propertize (or label target) 'agent-shell-markdown-url target))
                         ((string-prefix-p "@" target)
                          (let ((profile (gethash (concat team "." (substring target 1)) profiles)))
