@@ -52,6 +52,7 @@
 (defvar-local loki-assistant-slack--reply nil
   "直接重载时保留的线程回复草稿目标。")
 (defvar-local loki-assistant-slack--send-request nil)
+(defvar-local loki-assistant-slack--send-timer nil)
 (defvar-local loki-assistant-slack--subscription nil)
 (defvar-local loki-assistant-slack--pending-subscription nil)
 (defvar-local loki-assistant-slack--page-changes nil)
@@ -460,6 +461,7 @@
 
 (defun loki-assistant-slack--stop-refresh ()
   "取消当前 buffer 的订阅。"
+  (loki-assistant-slack--stop-send-timer)
   (loki-assistant-slack--cancel-subscription loki-assistant-slack--pending-subscription)
   (loki-assistant-slack--cancel-subscription loki-assistant-slack--subscription)
   (setq loki-assistant-slack--pending-subscription nil
@@ -1130,7 +1132,36 @@
         (overlay-put overlay 'before-string (concat (prop-match-value label) "\n"))))
     (let ((overlay (make-overlay prompt input)))
       (overlay-put overlay 'loki-slack-chat-display t)
-      (overlay-put overlay 'display (propertize "  ❯ " 'face 'default)))))
+      (overlay-put overlay 'display (propertize "  ❯ " 'face 'default))))
+  (loki-assistant-slack--update-send-prompt (current-buffer)))
+
+(defun loki-assistant-slack--stop-send-timer ()
+  "停止当前聊天的发送动画。"
+  (when (timerp loki-assistant-slack--send-timer)
+    (cancel-timer loki-assistant-slack--send-timer)
+    (setq loki-assistant-slack--send-timer nil)))
+
+(defun loki-assistant-slack--update-send-prompt (buffer)
+  "根据 BUFFER 的发送状态更新输入提示符。"
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((busy (and (plist-get loki-assistant-slack--send-request :busy)
+                       (comint-check-proc buffer))))
+        (if busy
+            (unless (timerp loki-assistant-slack--send-timer)
+              (setq loki-assistant-slack--send-timer
+                    (run-at-time 0.125 0.125 #'loki-assistant-slack--update-send-prompt buffer)))
+          (loki-assistant-slack--stop-send-timer))
+        (when-let* ((start (and loki-assistant-slack--history-end
+                                 (marker-position loki-assistant-slack--history-end)))
+                    (prompt (seq-find (lambda (overlay)
+                                        (and (overlay-get overlay 'loki-slack-chat-display)
+                                             (overlay-get overlay 'display)))
+                                      (overlays-at start))))
+          (let ((frame (if busy (elt ["|" "/" "-" "\\"] (mod (floor (* 8 (float-time))) 4)) " ")))
+            (overlay-put prompt 'display
+                         (concat (propertize frame 'face 'shadow)
+                                 (propertize " ❯ " 'face 'default)))))))))
 
 (defun loki-assistant-slack--render ()
   "更新提示符上方的历史，保留当前输入和编辑位置。"
@@ -1200,7 +1231,7 @@
             (list :id (if same-draft (plist-get previous :id) (loki-assistant-slack--uuid))
                   :text text :thread thread :busy t))
       (let ((request loki-assistant-slack--send-request) (buffer (current-buffer)))
-        (message "正在发送 Slack 消息…")
+        (loki-assistant-slack--update-send-prompt buffer)
         (loki-assistant-slack--request
          "POST" (loki-assistant-slack--path room thread)
          (lambda (response) (loki-assistant-slack--sent buffer room request response 0))
@@ -1217,6 +1248,7 @@
           (cond
            ((and ok (equal state "sent"))
             (setq loki-assistant-slack--send-request nil)
+            (loki-assistant-slack--update-send-prompt buffer)
             (let ((start (loki-assistant-slack--draft-start)))
               (when (and (equal loki-assistant-slack--reply (plist-get request :thread))
                          (equal (buffer-substring-no-properties start (point-max))
@@ -1238,12 +1270,14 @@
                   :room room :params (list (cons 'team_id (alist-get 'team_id room))))))))
            (t
             (setf (plist-get request :busy) nil)
+            (loki-assistant-slack--update-send-prompt buffer)
             (when (or (equal state "failed")
                       (and (not ok) (zerop polls)
                            (integerp (plist-get response :status))
                            (<= 400 (plist-get response :status) 499)))
               (setq loki-assistant-slack--send-request nil))
-            (message "%s" (or (alist-get 'message (alist-get 'error data))
+            (message "%s" (or (alist-get 'message
+                                         (loki-assistant-slack--non-null (alist-get 'error data)))
                               (plist-get response :error-message)
                               "发送结果待确认，草稿已保留。")))))))))
 

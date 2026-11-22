@@ -11,7 +11,7 @@ use crate::modules::emacs::service::EmacsService;
 
 use super::{
     client::Socket,
-    protocol::{Error, Message, Page, timestamp, valid_id},
+    protocol::{Author, Error, Message, Page, timestamp, valid_id},
     service::SlackService,
     store::{Conversation, SendState},
 };
@@ -629,16 +629,20 @@ impl SlackService {
             self.warm_message_media(session, std::slice::from_ref(message)).await;
         }
         let _ = self
-            .update_cache(session, move |cache, _| {
+            .update_cache(session, move |cache, account| {
                 let record = cache.sends.get_mut(&id).ok_or(Error::SendRecord)?;
                 match outcome {
                     Ok((ts, message)) => {
                         record.state = SendState::Sent;
                         record.ts = Some(ts);
-                        if let Some(message) = message
+                        if let Some(mut message) = message
                             && let Some(conversation) =
                                 cache.conversations.get_mut(&record.conversation)
                         {
+                            message.author.get_or_insert_with(|| Author {
+                                id: account.identity.user_id.clone(),
+                                name: account.identity.user_id.clone(),
+                            });
                             conversation.ingest(message);
                         }
                     }

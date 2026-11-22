@@ -418,7 +418,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             assert_eq!(body["text"], "收到");
             mock.posts.fetch_add(1, Ordering::SeqCst);
             Json(json!({"ok":true,"ts":mock.sent,"message":{"ts":mock.sent,"thread_ts":mock.root,
-                        "text":"收到","user":"UME"}}))
+                        "text":"收到"}}))
         })).with_state(Arc::clone(&mock));
     let http = tokio::spawn(async {
         axum::serve(web, slack).await.unwrap();
@@ -881,6 +881,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await
     .unwrap();
     assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    {
+        let state = service.state.lock().await;
+        let room = &state.cache.conversations["DDIRECT"];
+        let message = &room.messages[&mock.sent];
+        assert_eq!(message.author.as_ref().unwrap().id, "UME");
+    }
     assert_eq!(alerts.0.lock().unwrap().len(), 2);
     assert_eq!(
         invoke(

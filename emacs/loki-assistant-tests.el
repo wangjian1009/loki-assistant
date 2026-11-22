@@ -130,6 +130,21 @@
         (should (equal (plist-get response :error-message) "未注册处理器"))
         (should (string-match-p "未注册处理器" (plist-get response :body)))))))
 
+(ert-deftest loki-assistant-test-http-slack-send-receipts-with-null-error ()
+  (dolist (receipt '((202 . "pending") (200 . "sent")))
+    (loki-assistant-test--with-server
+        (lambda (_headers _body)
+          (list (car receipt) (format "{\"state\":%s,\"error\":null}" (json-encode (cdr receipt)))))
+      (let* ((response (loki-assistant-test--await
+                        (lambda (callback)
+                          (loki-assistant-request "GET" "/send-record" :callback callback))))
+             (data (plist-get response :data)))
+        (should (plist-get response :ok))
+        (should (= (plist-get response :status) (car receipt)))
+        (should-not (plist-get response :error-message))
+        (should (eq (alist-get 'error data) :null))
+        (should (equal (alist-get 'state data) (cdr receipt)))))))
+
 (ert-deftest loki-assistant-test-empty-and-invalid-responses ()
   (dolist (case '((204 "" t nil) (200 "无效 JSON" nil "invalid-response")
                   (502 "upstream failed" nil "http-error")))
