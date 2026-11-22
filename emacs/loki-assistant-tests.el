@@ -83,8 +83,9 @@
               (lambda (callback)
                 (loki-assistant-request
                  'put "/echo?existing=1" :params '((buffer . "中文 &?\"\\") (tag . "a") (tag . "b"))
-                 :body '((title . "中文通知") (enabled . :false) (empty . :null))
-                 :headers '(("X-Loki-Test" . "yes")) :callback callback)))))
+                 :body '((title . "中文通知 👋") (enabled . :false) (empty . :null))
+                 :headers (list (cons "X-Loki-Test" (string-to-multibyte "yes")))
+                 :callback callback)))))
         (should (plist-get response :ok))
         (should (= (plist-get response :status) 200))
         (should (equal (alist-get '回答 (plist-get response :data)) "成功"))
@@ -94,7 +95,7 @@
         (should (string-prefix-p "PUT /echo?existing=1&buffer=" (car received)))
         (should (string-match-p (regexp-quote "%E4%B8%AD%E6%96%87%20%26%3F%22%5C&tag=a&tag=b") (car received)))
         (should (string-match-p "X-Loki-Test: yes" (car received)))
-        (should (equal (alist-get 'title (json-parse-string (cadr received) :object-type 'alist)) "中文通知"))))))
+        (should (equal (alist-get 'title (json-parse-string (cadr received) :object-type 'alist)) "中文通知 👋"))))))
 
 (ert-deftest loki-assistant-test-http-errors-preserve-details ()
   (dolist (status '(400 404 503))

@@ -168,11 +168,15 @@ TIMEOUT 是正数秒，超时结果未知，不会自动重试。回调至多执
     (user-error "HTTP timeout 必须是正数"))
   (let* ((callback (or callback #'loki-assistant--report-response))
          (query (loki-assistant--query-string params))
-         (url-request-method method)
+         (url-request-method (encode-coding-string method 'us-ascii))
          (url-request-extra-headers
-          (append headers
-                  (unless (assoc-string "Content-Type" headers t)
-                    '(("Content-Type" . "application/json; charset=utf-8")))))
+          ;; URL 会拼接请求头和正文，统一使用字节字符串以保留正文的 UTF-8 编码。
+          (mapcar (lambda (header)
+                    (cons (encode-coding-string (car header) 'us-ascii)
+                          (encode-coding-string (cdr header) 'utf-8)))
+                  (append headers
+                          (unless (assoc-string "Content-Type" headers t)
+                            '(("Content-Type" . "application/json; charset=utf-8"))))))
          (json-null :null)
          (json-false :false)
          (url-request-data

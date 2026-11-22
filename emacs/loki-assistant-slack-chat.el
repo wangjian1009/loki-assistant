@@ -16,12 +16,27 @@
 (declare-function make-shell-maker-config "shell-maker")
 (declare-function agent-shell-markdown-replace-markup "agent-shell-markdown")
 (declare-function agent-shell-markdown--linkify-file-references "agent-shell-markdown")
+(declare-function emojify-create-emojify-emojis "emojify")
+(declare-function emojify-get-emoji "emojify")
 (defvar agent-shell-markdown-render-functions)
+
+(defconst loki-assistant-slack--prompt "消息> ")
+
+(defface loki-assistant-slack-self-label
+  '((t :inherit (bold comint-highlight-prompt) :inverse-video t))
+  "本人消息的身份色块。"
+  :group 'loki-assistant)
+
+(defface loki-assistant-slack-sender-label
+  '((t :inherit (bold font-lock-function-name-face) :inverse-video t))
+  "其他发送者的身份色块。"
+  :group 'loki-assistant)
 
 (cl-defstruct loki-assistant-slack--page items cursor loading loaded expanded error)
 (cl-defstruct loki-assistant-slack--choice room group stamp title workspace search avatars status summary)
 
 (defvar-local loki-assistant-slack--room nil)
+(defvar-local loki-assistant-slack--self-id nil)
 (defvar-local loki-assistant-slack--timeline nil)
 (defvar-local loki-assistant-slack--threads nil)
 (defvar-local loki-assistant-slack--history-end nil)
@@ -378,11 +393,12 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
          (buffer (if (comint-check-proc name) (get-buffer name)
                    (shell-maker-start-v2
                     :config (make-shell-maker-config
-                             :name "loki-slack" :prompt "消息> " :prompt-regexp "^消息> ")
+                             :name "loki-slack" :prompt loki-assistant-slack--prompt
+                             :prompt-regexp (concat "^" (regexp-quote loki-assistant-slack--prompt)))
                     :no-focus t :buffer-name name :alias-commands nil))))
     (with-current-buffer buffer
       (unless loki-assistant-slack--history-end
-        (setq loki-assistant-slack--history-end (copy-marker (point-min)))
+        (setq loki-assistant-slack--history-end (copy-marker (loki-assistant-slack--prompt-start)))
         (loki-assistant-slack-input-mode 1)
         (add-hook 'kill-buffer-hook #'loki-assistant-slack--stop-refresh nil t))
       (unless (and loki-assistant-slack--timeline
@@ -392,6 +408,7 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
               loki-assistant-slack--thread-queue nil
               loki-assistant-slack--profiles (make-hash-table :test #'equal)
               loki-assistant-slack--images (make-hash-table :test #'equal)
+              loki-assistant-slack--self-id nil
               loki-assistant-slack--reply nil
               loki-assistant-slack--send-request nil))
       (setq loki-assistant-slack--room room))
@@ -555,7 +572,32 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
 (defun loki-assistant-slack-refresh ()
   "刷新主会话和已展开的线程。"
   (interactive)
+  (loki-assistant-slack--load-self-id)
   (loki-assistant-slack--load loki-assistant-slack--timeline nil))
+
+(defun loki-assistant-slack--load-self-id ()
+  "从当前会话的连接状态取得 Slack 用户 ID。"
+  (when-let* (((null loki-assistant-slack--self-id))
+              (room loki-assistant-slack--room)
+              (session (alist-get 'session_id room)))
+    (setq loki-assistant-slack--self-id 'pending)
+    (let ((buffer (current-buffer)))
+      (loki-assistant-slack--request
+       "GET" "/status/slack/connections"
+       (lambda (response)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (equal session (alist-get 'session_id loki-assistant-slack--room))
+               (let* ((connections (and (plist-get response :ok)
+                                        (alist-get 'value (plist-get response :data))))
+                      (connection (seq-find (lambda (value)
+                                              (equal session (alist-get 'session_id value)))
+                                            (and (sequencep connections) connections)))
+                      (id (alist-get 'user_id connection)))
+                 (setq loki-assistant-slack--self-id (and (stringp id) id))
+                 (when loki-assistant-slack--self-id
+                   (loki-assistant-slack--render)))))))
+       :room room))))
 
 (defun loki-assistant-slack--queue-threads (timeline)
   "安排读取 TIMELINE 中已展开的线程。"
@@ -626,6 +668,15 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
       (marker-position (process-mark process))
     (user-error "请重新打开此 Slack 会话")))
 
+(defun loki-assistant-slack--prompt-start ()
+  "从进程标记定位实际的 Slack 输入提示符。"
+  (let* ((end (loki-assistant-slack--draft-start))
+         (start (- end (length loki-assistant-slack--prompt))))
+    (unless (and (>= start (point-min))
+                 (equal (buffer-substring-no-properties start end) loki-assistant-slack--prompt))
+      (user-error "Slack 输入提示符已失效，请重新打开此会话"))
+    start))
+
 (defun loki-assistant-slack--move-item (backward count)
   "按 COUNT 移动消息或按钮，BACKWARD 非空时向上移动。
 在末尾输入区按字母键时插入该字母。"
@@ -676,13 +727,24 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
   (interactive)
   (loki-assistant-slack--target nil))
 
-(defun loki-assistant-slack--web-link-p (url)
-  "判断 URL 是否可作为聊天中的网页链接。"
-  (and (stringp url) (string-match-p "\\`https?://[^/?#[:space:]]+" url)))
+(defun loki-assistant-slack--link-p (url)
+  "判断 URL 是否为网页或 Slack 应用链接。"
+  (and (stringp url)
+       (string-match-p "\\`\\(?:https?\\|slack\\)://[^/?#[:space:]]+" url)))
+
+(defun loki-assistant-slack--emoji (code)
+  "返回 CODE 对应的 Unicode 表情。"
+  (or (and (equal code ":wave:") "👋")
+      (ignore-errors
+        (save-match-data
+          (when (require 'emojify nil t)
+            (emojify-create-emojify-emojis)
+            (when-let ((data (emojify-get-emoji code)))
+              (gethash "unicode" data)))))))
 
 (defun loki-assistant-slack--link (label url)
   "插入指向 URL 的 LABEL。"
-  (if (loki-assistant-slack--web-link-p url)
+  (if (loki-assistant-slack--link-p url)
       (insert-text-button label 'face 'link 'follow-link t 'help-echo url
                           'action (lambda (_) (browse-url url)))
     (insert label)))
@@ -693,11 +755,17 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
          (with-temp-buffer
            (insert text "\n")
            (goto-char (point-min))
-           (while (re-search-forward "```\\|`[^`\n]*`\\|<\\([^<>\n]+\\)>\\|&\\(amp\\|lt\\|gt\\);" nil t)
+           (while (re-search-forward
+                   (concat "```\\|`[^`\n]*`\\|<\\([^<>\n]+\\)>\\|&\\(amp\\|lt\\|gt\\);"
+                           "\\|\\(?:https?\\|slack\\)://[^<[:space:]]+\\|\\(:[[:alnum:]_+-]+:\\)")
+                   nil t)
              (cond
               ((equal (match-string 0) "```") (unless (search-forward "```" nil t) (goto-char (point-max))))
               ((match-string 2)
                (replace-match (pcase (match-string 2) ("amp" "&") ("lt" "<") (_ ">")) t t))
+              ((match-string 3)
+               (when-let ((emoji (loki-assistant-slack--emoji (match-string 3))))
+                 (replace-match emoji t t)))
               ((match-string 1)
                (let* ((markup (match-string 1))
                       (separator (string-search "|" markup))
@@ -705,8 +773,8 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                       (label (when separator (substring markup (1+ separator))))
                       (replacement
                        (cond
-                        ((loki-assistant-slack--web-link-p target)
-                         (format "[%s](<%s>)" (or label target) target))
+                        ((loki-assistant-slack--link-p target)
+                         (propertize (or label target) 'agent-shell-markdown-url target))
                         ((string-prefix-p "@" target)
                          (let ((profile (gethash (concat team "." (substring target 1)) profiles)))
                            (concat "@" (or (and (listp profile) (alist-get 'name profile))
@@ -735,7 +803,7 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                  (when url
                    (remove-text-properties start end '(keymap nil help-echo nil pointer nil browse-url-data nil cursor-sensor-functions nil
                                                                agent-shell-markdown-url nil))
-                   (when (loki-assistant-slack--web-link-p url)
+                   (when (loki-assistant-slack--link-p url)
                      (make-text-button start end 'face 'link 'follow-link t 'help-echo url
                                        'action (lambda (_) (browse-url url)))))
                  (setq start end))))
@@ -752,13 +820,13 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
         (endpoint (and (stringp ts)
                        (format "%s/%s/attachments/%s" (loki-assistant-slack--path room nil)
                                (url-hexify-string ts) index))))
-    (insert (propertize "  │ " 'face 'shadow))
     (if (and endpoint (eq (alist-get 'original_available attachment) t))
         (insert-text-button title 'face 'link 'follow-link t
                             'action (lambda (_)
                                       (loki-assistant-slack--open-attachment attachment endpoint room)))
-      (loki-assistant-slack--link (propertize title 'face 'bold) url))
-    (when (numberp size) (insert (propertize (format "  %s" (file-size-human-readable size)) 'face 'shadow)))
+      (loki-assistant-slack--link title url))
+    (when (numberp size)
+      (insert (propertize (format " (%s)" (file-size-human-readable size)) 'face 'shadow)))
     (insert "\n")
     (when (and (stringp text) (not (string-empty-p text)))
       (let ((start (point)))
@@ -770,7 +838,7 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                         (loki-assistant-slack--media path '((local_path . "true"))
                                                      room images refresh 560 320)
                         (loki-assistant-slack--image path images refresh session))))
-        (insert "  " (cond ((consp image) (propertize title 'display image))
+        (insert (cond ((consp image) (propertize title 'display image))
                             ((eq image 'loading) (propertize "正在加载图片…" 'face 'shadow))
                             (t (propertize "图片预览暂不可用" 'face 'shadow))) "\n")))))
 
@@ -789,30 +857,47 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
          (unless (and (plist-get response :ok)
                       (funcall open (alist-get 'cache_path (plist-get response :data))))
            (let ((url (alist-get 'url attachment)))
-             (if (loki-assistant-slack--web-link-p url)
+             (if (loki-assistant-slack--link-p url)
                  (browse-url url)
                (message "%s" (or (plist-get response :error-message) "Slack 附件暂不可用"))))))
        :room room))))
 
-(defun loki-assistant-slack--message (message room profiles images refresh)
-  "渲染 ROOM 中的 MESSAGE 和发送者资料。"
+(defun loki-assistant-slack--message (message room profiles images refresh &optional thread)
+  "渲染 ROOM 中的 MESSAGE。THREAD 非空时缩进显示回复。"
   (let* ((start (point))
          (ts (alist-get 'ts message))
          (author (loki-assistant-slack--non-null (alist-get 'author message)))
          (id (alist-get 'id author))
          (profile (gethash id profiles))
          (profile (and (listp profile) profile))
-         (name (or (alist-get 'name profile) (alist-get 'name author) "Slack"))
+         (self (and (stringp id) (equal id loki-assistant-slack--self-id)))
+         (name (if self "我" (or (alist-get 'name profile) (alist-get 'name author) "Slack")))
+         (face (if self 'loki-assistant-slack-self-label 'loki-assistant-slack-sender-label))
+         (label (concat " " (loki-assistant-slack--profile-avatar profile room images refresh) " " name " "))
          (text (or (alist-get 'text message) ""))
          (tables (alist-get 'tables message)))
-    (insert (loki-assistant-slack--profile-avatar profile room images refresh)
-            "  " (propertize name 'face 'bold)
-            (if (stringp ts) (propertize (format-time-string "   %H:%M" (seconds-to-time (string-to-number ts))) 'face 'shadow) "")
-            (if (eq (alist-get 'edited message) t) (propertize "  已编辑" 'face 'shadow) "") "\n")
-    (when (or (not (string-empty-p text)) (not (seq-empty-p tables)))
-      (loki-assistant-slack--markdown text (alist-get 'team_id room) profiles tables))
-    (cl-loop for attachment across (vconcat (alist-get 'attachments message)) for index from 0
-             do (loki-assistant-slack--attachment attachment index ts room images refresh))
+    (put-text-property 0 (length label) 'face face label)
+    (if (stringp ts)
+        (insert-text-button label 'face face 'follow-link t 'help-echo "消息操作"
+                            'action (lambda (_)
+                                      (read-multiple-choice "消息操作" '((?r "回复" "在线程中回复")))
+                                      (loki-assistant-slack--target (or thread ts))))
+      (insert label))
+    (when (stringp ts)
+      (insert " " (propertize (format-time-string "%H:%M" (seconds-to-time (string-to-number ts)))
+                              'face 'shadow)))
+    (when (eq (alist-get 'edited message) t)
+      (insert (propertize "（已编辑）" 'face 'shadow)))
+    (insert "\n")
+    (when thread
+      (add-text-properties start (point) '(line-prefix "    " wrap-prefix "    ")))
+    (let ((body (point))
+          (indent (if thread "      " "  ")))
+      (when (or (not (string-empty-p text)) (not (seq-empty-p tables)))
+        (loki-assistant-slack--markdown text (alist-get 'team_id room) profiles tables))
+      (cl-loop for attachment across (vconcat (alist-get 'attachments message)) for index from 0
+               do (loki-assistant-slack--attachment attachment index ts room images refresh))
+      (add-text-properties body (point) (list 'line-prefix indent 'wrap-prefix indent)))
     (when (stringp ts)
       (put-text-property start (point) 'loki-slack-message ts))))
 
@@ -837,28 +922,26 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
            (expanded (and page (loki-assistant-slack--page-expanded page)))
            (day (format-time-string "%Y-%m-%d" (seconds-to-time (string-to-number root)))))
       (unless (equal date day)
-        (insert (propertize (concat "────  " day "  ────\n\n") 'face 'shadow))
+        (insert (propertize (concat "────────  " day "  ────────\n\n") 'face 'shadow))
         (setq date day start (point)))
       (loki-assistant-slack--message message room profiles images refresh)
       (when (or expanded (> count 0))
-        (insert-text-button (if expanded (format "▾ 折叠回复（%d）" count) (format "▸ 展开 %d 条回复" count))
+        (insert "  ")
+        (insert-text-button (format "%s %s" (if expanded "▾" "▸")
+                                    (if (> count 0) (format "%d 条回复" count) "线程"))
                             'follow-link t
                             'action (lambda (_) (loki-assistant-slack--toggle root)))
-        (insert "  "))
-      (insert-text-button "回复" 'follow-link t
-                          'action (lambda (_) (loki-assistant-slack--target root)))
-      (insert "\n")
+        (insert "\n"))
       (when expanded
         (let ((start (point)))
           (loki-assistant-slack--pagination page root)
-          (dolist (reply (loki-assistant-slack--page-items page))
-            (loki-assistant-slack--message reply room profiles images refresh)
-            (insert "\n"))
-          (when (and (not (loki-assistant-slack--page-loaded page))
-                     (not (loki-assistant-slack--page-error page)))
-            (insert "正在读取回复…\n"))
-          (let ((indent (propertize "  │  " 'face 'shadow)))
-            (add-text-properties start (point) (list 'line-prefix indent 'wrap-prefix indent)))))
+          (add-text-properties start (point) '(line-prefix "    " wrap-prefix "    ")))
+        (dolist (reply (loki-assistant-slack--page-items page))
+          (loki-assistant-slack--message reply room profiles images refresh root)
+          (insert "\n"))
+        (when (and (not (loki-assistant-slack--page-loaded page))
+                   (not (loki-assistant-slack--page-error page)))
+          (insert "    正在读取回复…\n")))
       (insert "\n")
       (put-text-property start (point) 'loki-slack-root root)))))
 
@@ -888,10 +971,12 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                                (1+ (point)) anchor-property nil (point-min)))))
          (buffer (current-buffer))
          (room loki-assistant-slack--room)
+         (self-id loki-assistant-slack--self-id)
          (profiles loki-assistant-slack--profiles)
          (images loki-assistant-slack--images)
          (refresh (lambda () (loki-assistant-slack--schedule-render buffer images)))
          (history (with-temp-buffer
+                    (setq-local loki-assistant-slack--self-id self-id)
                     (loki-assistant-slack--history timeline threads room profiles images refresh)
                     (buffer-string)))
          (modified (buffer-modified-p))
@@ -900,11 +985,9 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
     (setq header-line-format
           (replace-regexp-in-string
            "%" "%%"
-           (concat " " (loki-assistant-slack--label loki-assistant-slack--room)
-                   (when loki-assistant-slack--reply
-                     (format " · 回复线程 %s · C-c C-k 切回会话" loki-assistant-slack--reply)))))
+           (concat " " (loki-assistant-slack--label room))))
     (save-excursion
-      (delete-region (point-min) loki-assistant-slack--history-end)
+      (delete-region (point-min) (loki-assistant-slack--prompt-start))
       (goto-char (point-min))
       (insert history)
       (add-text-properties (point-min) (point)
@@ -913,6 +996,9 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
     (when-let ((process (get-buffer-process (current-buffer))))
       (let ((start (marker-position loki-assistant-slack--history-end))
             (end (marker-position (process-mark process))))
+        (when (and (markerp (car-safe comint-last-prompt)) (markerp (cdr-safe comint-last-prompt)))
+          (set-marker (car comint-last-prompt) start)
+          (set-marker (cdr comint-last-prompt) end))
         (with-silent-modifications
           (if loki-assistant-slack--reply
               (put-text-property start end 'display
