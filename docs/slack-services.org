@@ -143,6 +143,48 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 会话和消息记录可带 ~cache_path~ ，附件可带 ~original_path~ 、 ~preview_path~ 和 ~original_available~ 。预览接口传入 ~local_path=true~ 时按需缓存图片并返回 ~cache_path~ 。 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ 按需缓存原件并返回 ~cache_path~ 。路径均为本机绝对路径，文件格式和清理规则见 [[file:slack.org::*缓存设计][缓存设计]]。
 
+** Block Kit 消息正文
+
+消息对象可包含 ~blocks~ 数组，按 Slack 消息中的顺序传递可渲染的正文区块。应用可以把「未处理的告警」放在顶层 ~text~ ，把告警分组、持续时间和明细放在 ~section~ 中。顶层 ~text~ 用于预览和正文回退，每个区块用 ~type~ 标记结构。
+
+| ~type~ | 字段 | 约定 |
+|--------+------+------|
+| ~section~ | 可选的 ~text~ 和 ~fields~ | ~text~ 是文本对象， ~fields~ 是有序的文本对象数组。只传递至少含一项有效文本的区块。 |
+| ~table~ | ~rows~ | 二维字符串数组，外层是行，内层是该行的单元格。 |
+
+文本对象包含 ~type~ 和 ~text~ 两个字段。 ~type~ 为 ~mrkdwn~ 或 ~plain_text~ 。services 保留 Slack 返回的字符串，Emacs 根据文本类型解析。以下示例省略了消息标识等字段。
+
+#+begin_src json
+{
+  "text": "未处理的告警",
+  "blocks": [
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "&gt;值班 <@U123>: *<https://example.com/alerts|IP绑定不通>*\n&gt;已持续0.4小时: `有3个绑定的IP无法连通`"
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "&gt;值班 <@U456>: *节点记录冲突*\n&gt;已持续209.9小时: `同一节点对应多条矿机记录`"
+      }
+    }
+  ]
+}
+#+end_src
+
+首批支持消息顶层的 ~section~ 和 ~table~ 。services 按原顺序解析区块，逐项跳过未知类型或无效数据。已有的附件内表格按原顺序追加到正文区块末尾。协议版本维持 ~1~ ，旧客户端可继续读取 ~text~ 、 ~tables~ 与 ~attachments~ 。新客户端优先使用 ~blocks~ 中的表格，缺少可渲染区块时回退到 ~tables~ ，避免重复显示。
+
+Emacs 按下列规则选择和显示正文。
+
+- 有可渲染的 ~section~ 时，以区块作为正文，顶层 ~text~ 留作预览。只有表格区块时，先显示顶层 ~text~ ，再显示表格。附件接在正文之后。
+- 按数组顺序显示区块以及 ~section~ 内的 ~text~ 和 ~fields~ 。 ~mrkdwn~ 支持引用、行内代码、强调、链接和 Slack 用户提及。识别行首的 Slack 引用标记 ~&gt;~ 。提及按工作区查找用户资料，缺少显示名时回退到用户 ID。 ~plain_text~ 按字面显示，Slack 字符实体在显示时解码一次。
+
+历史分页、线程消息、订阅快照和实时更新使用同一消息定义。services 将新增区块随消息写入磁盘缓存。旧缓存缺少 ~blocks~ 时仍可显示已有的正文和表格。按现有刷新或翻页流程从 Slack 重新取得消息后，以新解析的数据更新同一条缓存记录。Emacs 从响应或订阅收到的区块以该次投递为准。
+
 * 会话消息订阅
 
 每个 Slack 聊天 buffer 创建时生成一个 UUID，并在登记本地 buffer 映射后创建订阅。订阅随 buffer 存活，窗口隐藏或切换时继续接收消息。关闭 buffer 时先移除本地映射，再取消订阅。同一会话重新打开时生成新 UUID。

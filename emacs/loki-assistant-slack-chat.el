@@ -23,6 +23,12 @@
 
 (defconst loki-assistant-slack--prompt "消息> ")
 
+(defconst loki-assistant-slack--entity-regexp "&\\(?:amp\\|lt\\|gt\\);")
+
+(defconst loki-assistant-slack--markup-regexp
+  (concat "```\\|`[^`\n]*`\\|<\\([^<>\n]+\\)>\\|\\(" loki-assistant-slack--entity-regexp "\\)"
+          "\\|\\(?:https?\\|slack\\)://[^<[:space:]]+\\|\\(:[[:alnum:]_+-]+:\\)"))
+
 (defface loki-assistant-slack-self-label
   '((t :inherit (bold font-lock-keyword-face) :inverse-video t :box t))
   "本人消息的身份色块。"
@@ -753,16 +759,45 @@
                              (with-current-buffer buffer (loki-assistant-slack--load-profiles)))))
             'applied)))))))
 
+(defun loki-assistant-slack--section-texts (block)
+  "返回 BLOCK 中有序的、可显示的 section 文本对象。"
+  (when (equal (alist-get 'type block) "section")
+    (seq-filter (lambda (part)
+                  (and (member (alist-get 'type part) '("mrkdwn" "plain_text"))
+                       (stringp (alist-get 'text part))
+                       (not (string-blank-p (alist-get 'text part)))))
+                (cons (alist-get 'text block) (append (alist-get 'fields block) nil)))))
+
+(defun loki-assistant-slack--block-users (message team)
+  "返回 MESSAGE 的 mrkdwn 区块中提及的 TEAM 用户。"
+  (let (users)
+    (seq-doseq (block (alist-get 'blocks message))
+      (dolist (part (loki-assistant-slack--section-texts block))
+        (when (equal (alist-get 'type part) "mrkdwn")
+          (with-temp-buffer
+            (insert (alist-get 'text part))
+            (goto-char (point-min))
+            (while (re-search-forward loki-assistant-slack--markup-regexp nil t)
+              (if (equal (match-string 0) "```")
+                  (unless (search-forward "```" nil t) (goto-char (point-max)))
+                (when-let ((tag (match-string 1)))
+                  (when (string-match "\\`@\\([UW][A-Z0-9]+\\)\\(?:|.*\\)?\\'" tag)
+                    (push (concat team "." (match-string 1 tag)) users)))))))))
+    users))
+
 (defun loki-assistant-slack--load-profiles ()
-  "批量补齐当前聊天中可见的发送者和输入区的本人资料。"
+  "批量补齐当前聊天中可见的发送者、提及和本人资料。"
   (let ((profiles loki-assistant-slack--profiles)
         (buffer (current-buffer))
         (team (alist-get 'team_id loki-assistant-slack--room))
+        (items (loki-assistant-slack--page-items loki-assistant-slack--timeline))
         ids)
     (dolist (id (cons loki-assistant-slack--self-id
-                      (mapcar (lambda (message)
-                                (alist-get 'id (loki-assistant-slack--non-null (alist-get 'author message))))
-                              (loki-assistant-slack--page-items loki-assistant-slack--timeline))))
+                      (seq-mapcat
+                       (lambda (message)
+                         (cons (alist-get 'id (loki-assistant-slack--non-null (alist-get 'author message)))
+                               (loki-assistant-slack--block-users message team)))
+                       items)))
       (when (and (stringp id) (stringp team) (string-prefix-p (concat team ".") id)
                  (null (gethash id profiles)))
         (puthash id 'pending profiles)
@@ -865,20 +900,44 @@
                           'action (lambda (_) (browse-url url)))
     (insert label)))
 
-(defun loki-assistant-slack--markdown (text team profiles tables)
-  "渲染 TEXT 和 TABLES。TEAM 与 PROFILES 用于显示 Slack 用户提及。"
-  (let ((content
+(defun loki-assistant-slack--decode-entity (entity)
+  "将 Slack 字符实体 ENTITY 解码一次。"
+  (pcase entity ("&amp;" "&") ("&lt;" "<") ("&gt;" ">") (_ entity)))
+
+(defun loki-assistant-slack--mrkdwn-emphasis (delimiter openers)
+  "将当前位置的 Slack DELIMITER 转为 Markdown，返回更新后的 OPENERS。"
+  (let* ((kind (aref delimiter 0))
+         (start (match-beginning 0))
+         (opener (alist-get kind openers)))
+    (cond
+     ((/= (length delimiter) 1) openers)
+     ((and opener (>= opener (line-beginning-position))
+           (not (memq (char-before start) '(?\s ?\t))))
+      (insert delimiter)
+      (save-excursion
+        (goto-char opener)
+        (insert delimiter))
+      (assq-delete-all kind openers))
+     ((looking-at-p "[^[:space:]]")
+      (setf (alist-get kind openers) start)
+      openers)
+     (t openers))))
+
+(defun loki-assistant-slack--markdown (text team profiles tables &optional mrkdwn)
+  "渲染 TEXT 和 TABLES。MRKDWN 启用 Slack 区块文本的强调语法。"
+  (let* ((markup (if mrkdwn
+                     (concat loki-assistant-slack--markup-regexp "\\|\\\\[*~]\\|\\([*]+\\|~+\\)")
+                   loki-assistant-slack--markup-regexp))
+         openers
+         (content
          (with-temp-buffer
            (insert text "\n")
            (goto-char (point-min))
-           (while (re-search-forward
-                   (concat "```\\|`[^`\n]*`\\|<\\([^<>\n]+\\)>\\|&\\(amp\\|lt\\|gt\\);"
-                           "\\|\\(?:https?\\|slack\\)://[^<[:space:]]+\\|\\(:[[:alnum:]_+-]+:\\)")
-                   nil t)
+           (while (re-search-forward markup nil t)
              (cond
               ((equal (match-string 0) "```") (unless (search-forward "```" nil t) (goto-char (point-max))))
               ((match-string 2)
-               (replace-match (pcase (match-string 2) ("amp" "&") ("lt" "<") (_ ">")) t t))
+               (replace-match (loki-assistant-slack--decode-entity (match-string 2)) t t))
               ((match-string 3)
                (when-let ((emoji (loki-assistant-slack--emoji (match-string 3))))
                  (replace-match emoji t t)))
@@ -897,7 +956,9 @@
                                            label (substring target 1)))))
                         ((string-prefix-p "#" target)
                          (concat "#" (or label (substring target 1)))))))
-                 (when replacement (replace-match replacement t t))))))
+                 (when replacement (replace-match replacement t t))))
+              ((and mrkdwn (match-string 4))
+               (setq openers (loki-assistant-slack--mrkdwn-emphasis (match-string 4) openers)))))
            (goto-char (point-max))
            (seq-doseq (table tables)
              (when (> (length table) 0)
@@ -920,11 +981,33 @@
                    (remove-text-properties start end '(keymap nil help-echo nil pointer nil browse-url-data nil cursor-sensor-functions nil
                                                                agent-shell-markdown-url nil))
                    (when (loki-assistant-slack--link-p url)
-                     (make-text-button start end 'face 'link 'follow-link t 'help-echo url
-                                       'action (lambda (_) (browse-url url)))))
+                     (make-text-button start end 'follow-link t 'help-echo url
+                                       'action (lambda (_) (browse-url url)))
+                     (add-face-text-property start end 'link)))
                  (setq start end))))
            (buffer-string))))
     (insert content)))
+
+(defun loki-assistant-slack--message-body (message team profiles)
+  "按顺序渲染 MESSAGE 的正文区块，使用 TEAM 和 PROFILES 解析提及。"
+  (let* ((text (or (alist-get 'text message) ""))
+         (blocks (alist-get 'blocks message))
+         (legacy-tables (unless (seq-some (lambda (block) (equal (alist-get 'type block) "table")) blocks)
+                          (alist-get 'tables message))))
+    (unless (seq-some #'loki-assistant-slack--section-texts blocks)
+      (when (or (not (string-empty-p text)) (not (seq-empty-p legacy-tables)))
+        (loki-assistant-slack--markdown text team profiles legacy-tables)))
+    (seq-doseq (block blocks)
+      (pcase (alist-get 'type block)
+        ("section"
+         (dolist (part (loki-assistant-slack--section-texts block))
+           (let ((body (string-remove-suffix "\n" (alist-get 'text part))))
+             (if (equal (alist-get 'type part) "plain_text")
+                 (insert (replace-regexp-in-string loki-assistant-slack--entity-regexp
+                                                   #'loki-assistant-slack--decode-entity body t t) "\n")
+               (loki-assistant-slack--markdown body team profiles nil t)))))
+        ("table"
+         (loki-assistant-slack--markdown "" team profiles (list (alist-get 'rows block))))))))
 
 (defun loki-assistant-slack--attachment (attachment index ts room)
   "插入 ROOM 中消息 TS 的第 INDEX 个 ATTACHMENT。"
@@ -983,8 +1066,6 @@
   "渲染 ROOM 中的 MESSAGE 正文和附件。"
   (let* ((start (point))
          (ts (alist-get 'ts message))
-         (text (or (alist-get 'text message) ""))
-         (tables (alist-get 'tables message))
          (timestamp (format-time-string "%Y-%m-%d %H:%M" (seconds-to-time (string-to-number ts))))
          (help (if (eq (alist-get 'edited message) t) (concat timestamp "（已编辑）") timestamp)))
     (when-let ((icon (or (when-let ((image (loki-assistant-slack--file-image
@@ -993,8 +1074,7 @@
                          (when-let ((emoji (alist-get 'icon_emoji message)))
                            (loki-assistant-slack--emoji emoji)))))
       (insert icon " "))
-    (when (or (not (string-empty-p text)) (not (seq-empty-p tables)))
-      (loki-assistant-slack--markdown text (alist-get 'team_id room) profiles tables))
+    (loki-assistant-slack--message-body message (alist-get 'team_id room) profiles)
     (cl-loop for attachment across (vconcat (alist-get 'attachments message)) for index from 0
              do (loki-assistant-slack--attachment attachment index ts room))
     (when (or (= start (point)) (not (bolp)))

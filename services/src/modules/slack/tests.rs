@@ -149,6 +149,10 @@ struct Mock {
     history_unavailable: AtomicBool,
 }
 
+fn alert_section(text: &str) -> Value {
+    json!({"type":"section","text":{"type":"mrkdwn","text":text}})
+}
+
 #[test]
 fn disk_cache_retains_active_threads_and_restores_message_records() {
     use std::{io::Write, time::SystemTime};
@@ -175,6 +179,17 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
     let root = Message::from_slack(
         &json!({
             "ts":"10.000001", "text":"UTF-8 文本\n引号\"与反斜杠\\",
+            "blocks":[
+                alert_section("&gt;组一 *IP绑定不通*\n&gt;已持续0.4小时"),
+                {"type":"unsupported"},
+                {"type":"table","rows":[[{"type":"raw_text","text":"正文表格"}]]},
+                {"type":"section","text":{"type":"unknown","text":"无效正文"},
+                 "fields":[{"type":"plain_text","text":"*字面量*"},{"type":"mrkdwn","text":" "}]},
+                {"type":"section","text":{"type":"plain_text","text":" "}}
+            ],
+            "attachments":[{"title":"汇总","blocks":[
+                {"type":"table","rows":[[{"type":"raw_text","text":"附件表格"}]]}
+            ]}],
             "files":[{"id":"F1","name":"报告.pdf","mimetype":"application/pdf",
                       "url_private_download":"https://files.slack.com/download"}]
         }),
@@ -201,6 +216,20 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
     let loaded = cache.rooms().remove("CROOM").unwrap();
     let saved = &loaded.messages[&root.ts];
     assert_eq!(saved.text, root.text);
+    assert_eq!(
+        serde_json::to_value(saved).unwrap()["blocks"],
+        json!([
+            alert_section("&gt;组一 *IP绑定不通*\n&gt;已持续0.4小时"),
+            {"type":"table","rows":[["正文表格"]]},
+            {"type":"section","fields":[{"type":"plain_text","text":"*字面量*"}]},
+            {"type":"table","rows":[["附件表格"]]}
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(saved).unwrap()["tables"],
+        json!([[["正文表格"]], [["附件表格"]]])
+    );
+    assert!(loaded.messages[&stale.ts].blocks.is_empty());
     assert_eq!(saved.attachments[0].download_url, attachment.download_url);
 
     let room_path = directory.0.join("TTEAM/conversations/CROOM");
@@ -349,9 +378,11 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 return Json(json!({"ok":false,"error":"internal_error"}));
             }
             if query.get("channel").is_some_and(|channel| channel == "CWORK") {
-                return Json(json!({"ok":true,"messages":[{"ts":"1.000001","text":"新闻","bot_id":"BNEWS"}]}));
+                return Json(json!({"ok":true,"messages":[{"ts":"1.000001","text":"新闻","bot_id":"BNEWS",
+                    "blocks":[alert_section("告警快照")]}]}));
             }
-            let root = json!({"ts":mock.root,"text":"问候","user":"UYOU","reply_count":2});
+            let root = json!({"ts":mock.root,"text":"问候","user":"UYOU","reply_count":2,
+                "blocks":[alert_section("历史告警")]});
             let response = if query.contains_key("inclusive") {
                 if query.get("latest") == Some(&mock.root) { json!({"ok":true,"messages":[root]}) }
                 else { json!({"ok":true,"messages":[]}) }
@@ -370,7 +401,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .route("/conversations.replies", get(|State(mock): State<Arc<Mock>>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
             let earlier = format!("{}5", mock.root);
             let response = if query.get("oldest") == Some(&earlier) || query.get("oldest") == Some(&mock.reply) {
-                json!({"ok":true,"messages":[{"ts":mock.reply,"thread_ts":mock.root,"text":"线程回复","user":"UYOU"}]})
+                json!({"ok":true,"messages":[{"ts":mock.reply,"thread_ts":mock.root,"text":"线程回复","user":"UYOU",
+                    "blocks":[alert_section("线程告警")]}]})
             } else {
                 json!({"ok":true,"has_more":!query.contains_key("latest"),"messages":[
                     {"ts":mock.root,"thread_ts":mock.root,"text":"问候","user":"UYOU"},
@@ -420,6 +452,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         channel_ready.await.unwrap();
         let ordinary = json!({"type":"message","channel":"CWORK","ts":socket_mock.root,
             "user":"UYOU","text":"<!channel> 请 <@UMEOTHER> 看一下",
+            "blocks":[alert_section("&gt;实时告警 `节点记录冲突`")],
             "icons":{"image_48":"https://s3-us-west-2.amazonaws.com/slack-files2/bot_icons/alert.png"},
             "files":[{"id":"FPREVIEW","name":"截图.png","mimetype":"image/png",
                        "thumb_480":"https://files.slack.com/media/preview.png"}]});
@@ -589,6 +622,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     );
     let (_, _, view) = invoke(&app, "GET", timeline, None, None, None).await;
     assert_eq!(view["items"][0]["ts"], mock.root);
+    assert_eq!(
+        view["items"][0]["blocks"],
+        json!([alert_section("历史告警")])
+    );
     let (status, _, view) = invoke(
         &app,
         "GET",
@@ -624,6 +661,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(view["root"]["ts"], mock.root);
     assert_eq!(view["root"]["author"]["id"], "TTEAM.UYOU");
     assert_eq!(view["items"][0]["ts"], mock.reply);
+    assert_eq!(
+        view["items"][0]["blocks"],
+        json!([alert_section("线程告警")])
+    );
     let reply_path = directory.0.join(format!(
         "cache/TTEAM/conversations/DDIRECT/threads/{}/{}.txt",
         mock.root, mock.reply
@@ -689,6 +730,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     }).await.unwrap();
     assert_eq!(emacs.deliveries.lock().unwrap()[0]["kind"], "snapshot");
     assert_eq!(emacs.deliveries.lock().unwrap()[0]["sequence"], 1);
+    assert_eq!(
+        emacs.deliveries.lock().unwrap()[0]["snapshot"]["items"][0]["blocks"],
+        json!([alert_section("告警快照")])
+    );
 
     send_channel.send(()).unwrap();
     timeout(Duration::from_secs(3), async {
@@ -710,6 +755,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .flatten()
         .find(|item| item["ts"] == mock.root)
         .unwrap();
+    assert_eq!(
+        first["blocks"],
+        json!([alert_section("&gt;实时告警 `节点记录冲突`")])
+    );
     assert_eq!(
         first["author"]["avatar_path"],
         json!(avatar_dir.join("UYOU.png"))

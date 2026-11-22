@@ -193,6 +193,8 @@ pub(super) struct Message {
     pub thread_ts: Option<String>,
     pub author: Option<Author>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<MessageBlock>,
     pub reply_count: u64,
     pub edited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,6 +207,65 @@ pub(super) struct Message {
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<Vec<Vec<String>>>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum MessageBlock {
+    Section {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<BlockText>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fields: Vec<BlockText>,
+    },
+    Table {
+        rows: Vec<Vec<String>>,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum BlockText {
+    Mrkdwn { text: String },
+    PlainText { text: String },
+}
+
+impl BlockText {
+    fn from_slack(value: &Value) -> Option<Self> {
+        let text = value["text"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())?;
+        match value["type"].as_str()? {
+            "mrkdwn" => Some(Self::Mrkdwn { text: text.into() }),
+            "plain_text" => Some(Self::PlainText { text: text.into() }),
+            _ => None,
+        }
+    }
+}
+
+impl MessageBlock {
+    fn from_slack(value: &Value) -> Option<Self> {
+        match value["type"].as_str()? {
+            "section" => {
+                let text = BlockText::from_slack(&value["text"]);
+                let fields: Vec<_> = array_items(&value["fields"])
+                    .filter_map(BlockText::from_slack)
+                    .collect();
+                (text.is_some() || !fields.is_empty()).then_some(Self::Section { text, fields })
+            }
+            "table" => Self::table_from_slack(value),
+            _ => None,
+        }
+    }
+
+    fn table_from_slack(value: &Value) -> Option<Self> {
+        let rows = table_rows(value)?;
+        (!rows.is_empty()).then_some(Self::Table { rows })
+    }
+}
+
+fn array_items(value: &Value) -> impl Iterator<Item = &Value> {
+    value.as_array().into_iter().flatten()
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -371,18 +432,27 @@ impl Message {
                 file.title.chars().take(100).collect::<String>()
             )
         });
-        let tables = value["blocks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(unfurls.flat_map(|card| card["blocks"].as_array().into_iter().flatten()))
-            .filter_map(table_rows)
+        let blocks: Vec<_> = array_items(&value["blocks"])
+            .filter_map(MessageBlock::from_slack)
+            .chain(
+                unfurls
+                    .flat_map(|card| array_items(&card["blocks"]))
+                    .filter_map(MessageBlock::table_from_slack),
+            )
+            .collect();
+        let tables = blocks
+            .iter()
+            .filter_map(|block| match block {
+                MessageBlock::Table { rows } => Some(rows.clone()),
+                MessageBlock::Section { .. } => None,
+            })
             .collect();
         Some(Self {
             ts: ts.into(),
             thread_ts: thread.map(str::to_owned),
             author,
             text: value["text"].as_str().unwrap_or_default().to_owned(),
+            blocks,
             reply_count: value["reply_count"].as_u64().unwrap_or_default(),
             edited: value.get("edited").is_some(),
             icon_emoji: value["icons"]["emoji"]
