@@ -183,6 +183,16 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
             "blocks":[
                 alert_section("&gt;组一 *IP绑定不通*\n&gt;已持续0.4小时"),
                 {"type":"unsupported"},
+                {"type":"rich_text","elements":[
+                    {"type":"rich_text_section","elements":[{"type":"text","text":"普通正文"}]},
+                    {"type":"rich_text_preformatted","language":"python","elements":[
+                        {"type":"text","text":"  # "},
+                        {"type":"link","url":"https://example.com/"},
+                        {"type":"text","text":"\n  print(\"你好\")\n"}
+                    ]},
+                    {"type":"rich_text_preformatted","elements":[{"type":"text","text":"echo ok"}]}
+                ]},
+                {"type":"markdown","text":"```json\n{}\n```"},
                 {"type":"table","rows":[[{"type":"raw_text","text":"正文表格"}]]},
                 {"type":"section","text":{"type":"unknown","text":"无效正文"},
                  "fields":[{"type":"plain_text","text":"*字面量*"},{"type":"mrkdwn","text":" "}]},
@@ -221,6 +231,9 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
         serde_json::to_value(saved).unwrap()["blocks"],
         json!([
             alert_section("&gt;组一 *IP绑定不通*\n&gt;已持续0.4小时"),
+            {"type":"rich_text_preformatted","language":"python","text":"  # https://example.com/\n  print(\"你好\")\n"},
+            {"type":"rich_text_preformatted","text":"echo ok"},
+            {"type":"markdown","text":"```json\n{}\n```"},
             {"type":"table","rows":[["正文表格"]]},
             {"type":"section","fields":[{"type":"plain_text","text":"*字面量*"}]},
             {"type":"table","rows":[["附件表格"]]}
@@ -384,7 +397,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                     "blocks":[alert_section("告警快照")]}]}));
             }
             let root = json!({"ts":mock.root,"text":"问候","user":"UYOU","reply_count":2,
-                "blocks":[alert_section("历史告警")]});
+                "blocks":[alert_section("历史告警"), {"type":"rich_text","elements":[
+                    {"type":"rich_text_preformatted","language":"json",
+                     "elements":[{"type":"text","text":"{}"}]}
+                ]}]});
             let response = if query.contains_key("inclusive") {
                 if query.get("latest") == Some(&mock.root) { json!({"ok":true,"messages":[root]}) }
                 else { json!({"ok":true,"messages":[]}) }
@@ -649,7 +665,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(view["items"][0]["ts"], mock.root);
     assert_eq!(
         view["items"][0]["blocks"],
-        json!([alert_section("历史告警")])
+        json!([
+            alert_section("历史告警"),
+            {"type":"rich_text_preformatted","language":"json","text":"{}"}
+        ])
     );
     let (status, _, view) = invoke(
         &app,

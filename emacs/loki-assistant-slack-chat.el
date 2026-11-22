@@ -30,8 +30,14 @@
 (defconst loki-assistant-slack--entity-regexp "&\\(?:amp\\|lt\\|gt\\);")
 
 (defconst loki-assistant-slack--markup-regexp
-  (concat "```\\|`[^`\n]*`\\|<\\([^<>\n]+\\)>\\|\\(" loki-assistant-slack--entity-regexp "\\)"
+  (concat "`\\{3,\\}\\|'''\\|`[^`\n]*`\\|<\\([^<>\n]+\\)>\\|\\(" loki-assistant-slack--entity-regexp "\\)"
           "\\|\\(?:https?\\|slack\\)://[^<[:space:]]+\\|\\(:[[:alnum:]_+-]+:\\)"))
+
+(defun loki-assistant-slack--search-code-fence-end (fence)
+  "查找 FENCE 的闭合位置并设置匹配数据。"
+  (re-search-forward
+   (if (equal fence "'''") fence (format "`\\{%d,\\}" (length fence)))
+   nil t))
 
 (defface loki-assistant-slack-self-label
   '((t :inherit (bold font-lock-keyword-face) :inverse-video t :box t))
@@ -1326,11 +1332,13 @@
             (insert (alist-get 'text part))
             (goto-char (point-min))
             (while (re-search-forward loki-assistant-slack--markup-regexp nil t)
-              (if (equal (match-string 0) "```")
-                  (unless (search-forward "```" nil t) (goto-char (point-max)))
-                (when-let ((tag (match-string 1)))
-                  (when (string-match "\\`@\\([UW][A-Z0-9]+\\)\\(?:|.*\\)?\\'" tag)
-                    (push (concat team "." (match-string 1 tag)) users)))))))))
+              (let ((token (match-string 0)))
+                (if (or (string-prefix-p "```" token) (equal token "'''"))
+                    (unless (or (loki-assistant-slack--search-code-fence-end token) (equal token "'''"))
+                      (goto-char (point-max)))
+                  (when-let ((tag (match-string 1)))
+                    (when (string-match "\\`@\\([UW][A-Z0-9]+\\)\\(?:|.*\\)?\\'" tag)
+                      (push (concat team "." (match-string 1 tag)) users))))))))))
     users))
 
 (defun loki-assistant-slack--load-profiles ()
@@ -1503,11 +1511,44 @@
       openers)
      (t openers))))
 
+(defun loki-assistant-slack--markdown-fence-line-p (start end suffix)
+  "判断 START 到 END 的围栏是否独占一行并匹配 SUFFIX。"
+  (save-excursion
+    (goto-char start)
+    (and (string-match-p "\\`[ \t>]*\\'" (buffer-substring-no-properties (line-beginning-position) start))
+         (progn (goto-char end) (looking-at-p suffix)))))
+
+(defun loki-assistant-slack--normalize-code-fence (start body-start body-end end)
+  "将 START 到 END 的 Slack 代码块转换为独占行的 Markdown 围栏。"
+  (unless (or (= body-start body-end)
+              (and (eq (char-after start) ?`)
+                   (loki-assistant-slack--markdown-fence-line-p
+                    start body-start "[ \t]*[[:alnum:]#+-]*[ \t]*$")
+                   (loki-assistant-slack--markdown-fence-line-p body-end end "[ \t]*$")))
+    (let ((body (buffer-substring-no-properties body-start body-end))
+          (fence-width 3)
+          (offset 0))
+      ;; 围栏比正文中最长的反引号序列多一个字符。
+      (while (string-match "`+" body offset)
+        (setq offset (match-end 0)
+              fence-width (max fence-width (1+ (- offset (match-beginning 0))))))
+      (let ((fence (make-string fence-width ?`)))
+        (delete-region start end)
+        (goto-char start)
+        (unless (bolp) (insert "\n"))
+        (insert fence)
+        (unless (string-prefix-p "\n" body) (insert "\n"))
+        (insert body)
+        (unless (bolp) (insert "\n"))
+        (insert fence)
+        (unless (eolp) (insert "\n"))))))
+
 (defun loki-assistant-slack--markdown (text team profiles tables &optional mrkdwn)
   "渲染 TEXT 和 TABLES。MRKDWN 启用 Slack 区块文本的强调语法。"
   (let* ((markup (if mrkdwn
                      (concat loki-assistant-slack--markup-regexp "\\|\\\\[*~]\\|\\([*]+\\|~+\\)")
                    loki-assistant-slack--markup-regexp))
+         (renderer (require 'agent-shell-markdown nil t))
          openers
          (content
          (with-temp-buffer
@@ -1515,7 +1556,14 @@
            (goto-char (point-min))
            (while (re-search-forward markup nil t)
              (cond
-              ((equal (match-string 0) "```") (unless (search-forward "```" nil t) (goto-char (point-max))))
+              ((or (string-prefix-p "```" (match-string 0)) (equal (match-string 0) "'''"))
+               (let ((fence (match-string 0))
+                     (start (match-beginning 0))
+                     (body-start (point)))
+                 (if (loki-assistant-slack--search-code-fence-end fence)
+                     (when renderer
+                       (loki-assistant-slack--normalize-code-fence start body-start (match-beginning 0) (point)))
+                   (unless (equal fence "'''") (goto-char (point-max))))))
               ((match-string 2)
                (replace-match (loki-assistant-slack--decode-entity (match-string 2)) t t))
               ((match-string 3)
@@ -1549,7 +1597,7 @@
                                            row " | ") " |\n")
                  (when (eq row (elt table 0))
                    (insert "| " (mapconcat (lambda (_) "---") row " | ") " |\n")))))
-           (when (require 'agent-shell-markdown nil t)
+           (when renderer
              (let ((agent-shell-markdown-render-functions nil))
                (cl-letf (((symbol-function 'agent-shell-markdown--linkify-file-references) #'ignore))
                  (agent-shell-markdown-replace-markup :complete t :render-images nil :highlight-blocks nil))))

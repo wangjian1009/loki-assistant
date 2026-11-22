@@ -239,6 +239,14 @@ pub(super) enum MessageBlock {
     Table {
         rows: Vec<Vec<String>>,
     },
+    RichTextPreformatted {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    Markdown {
+        text: String,
+    },
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -272,8 +280,34 @@ impl MessageBlock {
                 (text.is_some() || !fields.is_empty()).then_some(Self::Section { text, fields })
             }
             "table" => Self::table_from_slack(value),
+            "markdown" => {
+                let text = value["text"]
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())?;
+                Some(Self::Markdown { text: text.into() })
+            }
             _ => None,
         }
+    }
+
+    fn preformatted_from_slack(value: &Value) -> Option<Self> {
+        if value["type"] != "rich_text_preformatted" {
+            return None;
+        }
+        let text: String = array_items(&value["elements"])
+            .filter_map(|element| match element["type"].as_str()? {
+                "text" => element["text"].as_str(),
+                "link" => element["text"].as_str().or_else(|| element["url"].as_str()),
+                _ => None,
+            })
+            .collect();
+        (!text.is_empty()).then(|| Self::RichTextPreformatted {
+            text,
+            language: value["language"]
+                .as_str()
+                .filter(|language| !language.trim().is_empty())
+                .map(str::to_owned),
+        })
     }
 
     fn table_from_slack(value: &Value) -> Option<Self> {
@@ -450,19 +484,27 @@ impl Message {
                 file.title.chars().take(100).collect::<String>()
             )
         });
-        let blocks: Vec<_> = array_items(&value["blocks"])
-            .filter_map(MessageBlock::from_slack)
-            .chain(
-                unfurls
-                    .flat_map(|card| array_items(&card["blocks"]))
-                    .filter_map(MessageBlock::table_from_slack),
-            )
-            .collect();
+        let mut blocks = Vec::new();
+        for block in array_items(&value["blocks"]) {
+            if block["type"] == "rich_text" {
+                blocks.extend(
+                    array_items(&block["elements"])
+                        .filter_map(MessageBlock::preformatted_from_slack),
+                );
+            } else {
+                blocks.extend(MessageBlock::from_slack(block));
+            }
+        }
+        blocks.extend(
+            unfurls
+                .flat_map(|card| array_items(&card["blocks"]))
+                .filter_map(MessageBlock::table_from_slack),
+        );
         let tables = blocks
             .iter()
             .filter_map(|block| match block {
                 MessageBlock::Table { rows } => Some(rows.clone()),
-                MessageBlock::Section { .. } => None,
+                _ => None,
             })
             .collect();
         Some(Self {

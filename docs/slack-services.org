@@ -156,6 +156,8 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 |--------+------+------|
 | ~section~ | 可选的 ~text~ 和 ~fields~ | ~text~ 是文本对象， ~fields~ 是有序的文本对象数组。只传递至少含一项有效文本的区块。 |
 | ~table~ | ~rows~ | 二维字符串数组，外层是行，内层是该行的单元格。 |
+| ~rich_text_preformatted~ | ~text~ 和可选的 ~language~ | 将 ~rich_text~ 中的代码块按原顺序展开到 ~blocks~ 。 ~text~ 包含按顺序拼接的代码正文，保留缩进和换行。 ~language~ 沿用 Slack 提供的语言名。 |
+| ~markdown~ | ~text~ | 保留 Slack 提供的 Markdown 正文，其中的代码围栏可以携带语言标签。 |
 
 文本对象包含 ~type~ 和 ~text~ 两个字段。 ~type~ 为 ~mrkdwn~ 或 ~plain_text~ 。services 保留 Slack 返回的字符串，Emacs 根据文本类型解析。以下示例省略了消息标识等字段。
 
@@ -181,7 +183,7 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 }
 #+end_src
 
-首批支持消息顶层的 ~section~ 和 ~table~ 。services 按原顺序解析区块，逐项跳过未知类型或无效数据。已有的附件内表格按原顺序追加到正文区块末尾。协议版本维持 ~1~ ，旧客户端可继续读取 ~text~ 、 ~tables~ 与 ~attachments~ 。新客户端优先使用 ~blocks~ 中的表格，缺少可渲染区块时回退到 ~tables~ ，避免重复显示。
+services 按原顺序解析区块，逐项跳过未知类型或无效数据。已有的附件内表格按原顺序追加到正文区块末尾。协议版本维持 ~1~ ，旧客户端可继续读取 ~text~ 、 ~tables~ 与 ~attachments~ 。新客户端优先使用 ~blocks~ 中的表格，缺少可渲染区块时回退到 ~tables~ ，避免重复显示。
 
 Emacs 按下列规则选择和显示正文。
 
