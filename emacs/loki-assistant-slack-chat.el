@@ -584,21 +584,24 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                       (id (alist-get 'user_id connection)))
                  (setq loki-assistant-slack--self-id (and (stringp id) id))
                  (when loki-assistant-slack--self-id
-                   (loki-assistant-slack--render)))))))
+                   (loki-assistant-slack--render)
+                   (loki-assistant-slack--load-profiles)))))))
        :room room))))
 
 (defun loki-assistant-slack--load-profiles ()
-  "批量补齐当前聊天中可见的发送者。"
+  "批量补齐当前聊天中可见的发送者和输入区的本人资料。"
   (let ((profiles loki-assistant-slack--profiles)
         (buffer (current-buffer))
         (team (alist-get 'team_id loki-assistant-slack--room))
         ids)
-    (dolist (message (loki-assistant-slack--page-items loki-assistant-slack--timeline))
-      (let ((id (alist-get 'id (loki-assistant-slack--non-null (alist-get 'author message)))))
-        (when (and (stringp id) (stringp team) (string-prefix-p (concat team ".") id)
-                   (null (gethash id profiles)))
-          (puthash id 'pending profiles)
-          (push id ids))))
+    (dolist (id (cons loki-assistant-slack--self-id
+                      (mapcar (lambda (message)
+                                (alist-get 'id (loki-assistant-slack--non-null (alist-get 'author message))))
+                              (loki-assistant-slack--page-items loki-assistant-slack--timeline))))
+      (when (and (stringp id) (stringp team) (string-prefix-p (concat team ".") id)
+                 (null (gethash id profiles)))
+        (puthash id 'pending profiles)
+        (push id ids)))
     (while ids
       (let ((batch (seq-take ids 100)))
         (setq ids (nthcdr (length batch) ids))
@@ -809,9 +812,14 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                (message "%s" (or (plist-get response :error-message) "Slack 附件暂不可用"))))))
        :room room))))
 
-(defun loki-assistant-slack--insert-label (name face)
-  "为 NAME 的身份色块保留一行，并记录显示所用的 FACE。"
-  (insert (propertize "\n" 'loki-slack-label (propertize (concat " " name " ") 'face face))))
+(defun loki-assistant-slack--insert-label (name face profile room images refresh)
+  "为 NAME 的身份色块保留一行，并按 FACE 显示姓名和 PROFILE 的头像。"
+  (let* ((avatar (when (and (consp profile) (display-graphic-p))
+                   (loki-assistant-slack--profile-avatar profile room images refresh)))
+         (label (concat " " (when (and avatar (get-text-property 0 'display avatar))
+                              (concat avatar " "))
+                        name " ")))
+    (insert (propertize "\n" 'loki-slack-label (propertize label 'face face)))))
 
 (defun loki-assistant-slack--message (message room profiles images refresh)
   "渲染 ROOM 中的 MESSAGE 正文和附件。"
@@ -853,16 +861,19 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
              (id (alist-get 'id author)))
         (unless (and (stringp id) (not (string-empty-p id)) (equal sender id))
           (let* ((entry (gethash id profiles))
-                 (name (or (and (listp entry) (alist-get 'name entry)) (alist-get 'name author)))
+                 (profile (and (listp entry) entry))
+                 (name (or (alist-get 'name profile) (alist-get 'name author)))
                  (self (and id (equal id loki-assistant-slack--self-id))))
             (loki-assistant-slack--insert-label
              (if self "我" (or (loki-assistant-slack--single-line name) "Slack"))
-             (if self 'loki-assistant-slack-self-label 'loki-assistant-slack-sender-label))))
+             (if self 'loki-assistant-slack-self-label 'loki-assistant-slack-sender-label)
+             profile room images refresh)))
         (loki-assistant-slack--message message room profiles images refresh)
         (insert "\n")
         (setq sender id))))
   (loki-assistant-slack--insert-label (if loki-assistant-slack--reply "我 · 线程回复" "我")
-                                     'loki-assistant-slack-self-label))
+                                     'loki-assistant-slack-self-label
+                                     (gethash loki-assistant-slack--self-id profiles) room images refresh))
 
 (defun loki-assistant-slack--decorate (prompt input)
   "用 overlay 显示身份色块和 PROMPT 到 INPUT 之间的输入提示符。"
