@@ -714,6 +714,14 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["code"], "slack-invalid-cursor");
+    let cached_reply = mock.reply.clone();
+    service
+        .update_cache(session.unwrap(), move |cache, _| {
+            assert!(cache.conversations.get_mut("DDIRECT").unwrap().messages.remove(&cached_reply).is_some());
+            Ok(())
+        })
+        .await
+        .unwrap();
     let (_, _, view) = invoke(
         &app,
         "PUT",

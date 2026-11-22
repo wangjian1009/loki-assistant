@@ -58,6 +58,7 @@
 (cl-defstruct loki-assistant-slack--page items cursor loading loaded expanded error)
 (cl-defstruct loki-assistant-slack--choice room group stamp mention title search avatars status sender time preview)
 (cl-defstruct loki-assistant-slack--subscription id room self-id (sequence 0) timeout)
+(cl-defstruct loki-assistant-slack--read-position acknowledged pending retry-at)
 
 (defvar-local loki-assistant-slack--room nil)
 (defvar-local loki-assistant-slack--display-name nil)
@@ -77,6 +78,8 @@
 (defvar-local loki-assistant-slack--pending-subscription nil)
 (defvar-local loki-assistant-slack--page-changes nil)
 (defvar-local loki-assistant-slack--notification-root nil)
+(defvar-local loki-assistant-slack--read-positions nil)
+(defvar-local loki-assistant-slack--read-timer nil)
 (defvar loki-assistant-slack--subscription-buffers (make-hash-table :test #'equal))
 (defvar loki-assistant-slack--refresh-timer nil)
 (defvar-local loki-assistant-slack--profiles nil)
@@ -92,10 +95,11 @@
                     (when key (list (cons "Idempotency-Key" key))))
    :callback callback))
 
-(defun loki-assistant-slack--path (room thread)
-  "构造 ROOM 的消息路径。THREAD 非空时指向回复。"
+(defun loki-assistant-slack--path (room thread &optional endpoint)
+  "构造 ROOM 的 ENDPOINT 路径。THREAD 非空时指向线程。"
   (concat "/slack/conversations/" (url-hexify-string (alist-get 'id room))
-          (when thread (concat "/threads/" (url-hexify-string thread))) "/messages"))
+          (when thread (concat "/threads/" (url-hexify-string thread)))
+          "/" (or endpoint "messages")))
 
 (defun loki-assistant-slack--label (room)
   "生成 ROOM 的显示名称。"
@@ -520,6 +524,9 @@
 
 (defun loki-assistant-slack--stop-refresh ()
   "清理当前 buffer 的订阅、发送动画和线程视图登记。"
+  (when (timerp loki-assistant-slack--read-timer)
+    (cancel-timer loki-assistant-slack--read-timer)
+    (setq loki-assistant-slack--read-timer nil))
   (when (buffer-live-p loki-assistant-slack--parent-buffer)
     (let ((buffer (current-buffer)) (root loki-assistant-slack--thread-root))
       (with-current-buffer loki-assistant-slack--parent-buffer
@@ -553,6 +560,84 @@
         (string< (substring (concat (cadr l) "000000000") 0 9)
                  (substring (concat (cadr r) "000000000") 0 9))
       (< ls rs))))
+
+(defun loki-assistant-slack--visible-read-positions (window)
+  "取得 WINDOW 中各时间线最后一条已显示到末尾的消息。"
+  (let ((limit (or (window-end window t) (window-start window)))
+        (positions (make-hash-table :test #'equal)))
+    (save-excursion
+      (goto-char (window-start window))
+      (while (< (point) limit)
+        (let* ((start (point))
+               (ts (get-text-property start 'loki-slack-message))
+               (end (next-single-property-change start 'loki-slack-message nil limit)))
+          (when (and ts (not (invisible-p start))
+                     (or (< end limit) (not (equal ts (get-text-property end 'loki-slack-message))))
+                     (pos-visible-in-window-p (1- end) window))
+            (let* ((thread (or (get-text-property start 'loki-slack-root)
+                               (unless (equal ts loki-assistant-slack--thread-root)
+                                 loki-assistant-slack--thread-root)))
+                   (previous (gethash thread positions)))
+              (when (or (null previous) (loki-assistant-slack--stamp< previous ts))
+                (puthash thread ts positions))))
+          (goto-char end))))
+    positions))
+
+(defun loki-assistant-slack--foreground-window-p (window)
+  "判断 WINDOW 是否是当前获得焦点的聊天窗口。"
+  (and (eq window (selected-window))
+       (eq (frame-focus-state (window-frame window)) t)
+       (not (active-minibuffer-window))))
+
+(defun loki-assistant-slack--read-window (buffer window)
+  "提交 BUFFER 在 WINDOW 中已显示的消息位置。"
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq loki-assistant-slack--read-timer nil)
+      (when (and (loki-assistant-slack--foreground-window-p window)
+                 (eq (window-buffer window) buffer))
+        (let ((positions (loki-assistant-slack--visible-read-positions window))
+              (owner (or loki-assistant-slack--parent-buffer buffer)))
+          (when (buffer-live-p owner)
+            (with-current-buffer owner
+              (maphash #'loki-assistant-slack--mark-read positions))))))))
+
+(defun loki-assistant-slack--schedule-read (window)
+  "等待重绘完成后，检查 WINDOW 已显示的消息。"
+  (when (and (bound-and-true-p loki-assistant-slack-input-mode)
+             (loki-assistant-slack--foreground-window-p window)
+             (not (timerp loki-assistant-slack--read-timer)))
+    (setq loki-assistant-slack--read-timer
+          (run-at-time 0.25 nil #'loki-assistant-slack--read-window (current-buffer) window))))
+
+(defun loki-assistant-slack--mark-read (thread ts)
+  "推进当前会话的 THREAD 已读位置到 TS。"
+  (when (and loki-assistant-slack--room (alist-get 'session_id loki-assistant-slack--room))
+    (unless loki-assistant-slack--read-positions
+      (setq loki-assistant-slack--read-positions (make-hash-table :test #'equal)))
+    (let* ((buffer (current-buffer))
+           (positions loki-assistant-slack--read-positions)
+           (state (or (gethash thread positions)
+                      (puthash thread (make-loki-assistant-slack--read-position) positions)))
+           (acknowledged (loki-assistant-slack--read-position-acknowledged state)))
+      (when (and (not (loki-assistant-slack--read-position-pending state))
+                 (or (null acknowledged) (loki-assistant-slack--stamp< acknowledged ts))
+                 (>= (float-time) (or (loki-assistant-slack--read-position-retry-at state) 0)))
+        (setf (loki-assistant-slack--read-position-pending state) t)
+        (loki-assistant-slack--request
+         "PUT" (loki-assistant-slack--path loki-assistant-slack--room thread "read-position")
+         (lambda (response)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (when (eq positions loki-assistant-slack--read-positions)
+                 (setf (loki-assistant-slack--read-position-pending state) nil)
+                 (if (plist-get response :ok)
+                     (progn
+                       (setf (loki-assistant-slack--read-position-acknowledged state) ts)
+                       (with-current-buffer (window-buffer (selected-window))
+                         (loki-assistant-slack--schedule-read (selected-window))))
+                   (setf (loki-assistant-slack--read-position-retry-at state) (+ (float-time) 5)))))))
+         :room loki-assistant-slack--room :body `((through_ts . ,ts)))))))
 
 (defun loki-assistant-slack--root-message (ts)
   "返回 TS 对应的顶层消息。"
@@ -863,6 +948,7 @@
     (unless (equal (alist-get 'session_id room)
                    (alist-get 'session_id loki-assistant-slack--room))
       (setq loki-assistant-slack--profiles (make-hash-table :test #'equal)
+            loki-assistant-slack--read-positions nil
             loki-assistant-slack--send-request nil))
     (when (and loki-assistant-slack--threads (assq 'thread_items snapshot))
       (maphash (lambda (root page)
@@ -1311,12 +1397,15 @@
 
 (defun loki-assistant-slack--message-time (time)
   "按本地日期格式化消息发送时间 TIME。"
-  (format-time-string
-   (pcase (- (time-to-days (current-time)) (time-to-days time))
-     (0 "今天 %H:%M")
-     (1 "昨天 %H:%M")
-     (_ "%Y年%m月%d日 %H:%M"))
-   time))
+  (let ((now (current-time)))
+    (format-time-string
+     (pcase (- (time-to-days now) (time-to-days time))
+       (0 "今天 %H:%M")
+       (1 "昨天 %H:%M")
+       (_ (if (equal (format-time-string "%Y" now) (format-time-string "%Y" time))
+              "%m月%d日 %H:%M"
+            "%Y年%m月%d日 %H:%M")))
+     time)))
 
 (defun loki-assistant-slack--insert-message-time (start time)
   "为从 START 开始的消息添加时间色块 TIME。"
@@ -1531,6 +1620,7 @@
 
 (defun loki-assistant-slack--render-buffer ()
   "更新提示符上方的历史，保留当前输入和编辑位置。"
+  (add-hook 'pre-redisplay-functions #'loki-assistant-slack--schedule-read nil t)
   ;; 历史已带有正文、链接和时间的 face，避免 Font Lock 在显示时清除它们。
   (when font-lock-mode (font-lock-mode -1))
   (let* ((timeline loki-assistant-slack--timeline)

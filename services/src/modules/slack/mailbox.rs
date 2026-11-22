@@ -1434,7 +1434,17 @@ impl SlackService {
             let conversation = cache.conversations.get_mut(&id).ok_or(Error::Conversation)?;
             let existing = conversation.read_positions.get(thread.as_deref()).and_then(timestamp);
             if existing.is_none_or(|value| position > value) {
-                if !conversation.messages.get(&target).is_some_and(|message| message.thread_ts == thread) {
+                let belongs = |message: &Message| message.thread_ts == thread;
+                let known = conversation.messages.get(&target).map_or_else(
+                    || {
+                        conversation.disk.as_ref()
+                            .and_then(|disk| disk.message(&id, thread.as_deref(), &target))
+                            .as_ref()
+                            .is_some_and(belongs)
+                    },
+                    belongs,
+                );
+                if conversation.deleted.contains(&target) || !known {
                     return Err(Error::ReadPosition);
                 }
                 let previous = conversation.read_positions.clone();
