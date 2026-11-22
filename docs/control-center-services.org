@@ -111,7 +111,8 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/emacs/buffers~ | 查询当前 Emacs buffer 列表 |
 | GET | ~/password/entries~ | 查询密码条目，可选 query 按路径过滤 |
 | GET | ~/password/entries/{*file}~ | 按相对 .gpg 路径读取单条密码原文 |
-| GET | ~/slack/users~ | 本机分页读取 Slack 用户目录或按 ID 批量查询。见 [[file:slack-services.org::*用户目录][Slack 用户目录接口]] |
+| GET | ~/slack/users~ | 本机一次读取 Slack 用户目录，支持按 ID 批量筛选。见 [[file:slack-services.org::*用户目录][Slack 用户目录接口]] |
+| POST | ~/slack/users/{id}/dm~ | 本机按工作区用户打开 Slack 私聊。见 [[file:slack-services.org::*按用户打开私聊][私聊接口]] |
 
 * 配置中心
 

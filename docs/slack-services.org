@@ -58,7 +58,7 @@ Slack 业务接口和工作区配置只接受本机调用，客户端可直接�
 
 * 用户目录
 
-~GET /slack/users~ 默认分页查询全部已授权工作区的用户。结果包含 ~api_version~ 、 ~items~ 、 ~next_cursor~ 和 ~issues~ 。每条用户记录含 ~id~ 、 ~team_id~ 、 ~name~ 、 ~display_name~ 、 ~username~ 和 ~is_bot~ 。 ~id~ 格式为 ~team_id.用户ID~ 。部分工作区查询失败时， ~issues~ 记录其 ~team_id~ 和 ~error~ 。
+~GET /slack/users~ 一次返回已授权工作区的完整用户目录，优先使用 services 已缓存的资料。响应包含 ~api_version~ 、 ~items~ 和 ~issues~ 。每条用户记录含 ~id~ 、 ~team_id~ 、 ~team_name~ 、 ~session_id~ 、 ~name~ 、 ~display_name~ 、 ~username~ 和 ~is_bot~ 。 ~id~ 格式为 ~team_id.用户ID~ 。部分工作区查询失败时， ~issues~ 记录其 ~team_id~ 和 ~error~ ，其余工作区的用户仍可用。
 
 ~GET /slack/users/{id}~ 计划按复合用户标识查询单条用户资料。响应字段待定。
 
@@ -66,13 +66,13 @@ Slack 业务接口和工作区配置只接受本机调用，客户端可直接�
 
 ** 批量查询用户
 
-~GET /slack/users~ 支持可重复的查询参数 ~id~ 。一次可传入 1 到 100 个复合用户 ID，格式为 ~team_id.用户ID~ ，同一请求可跨工作区。客户端可直接传入消息作者或私聊参与者的 ID。使用 ~id~ 时省略 ~limit~ 和 ~cursor~ 。空值、格式无效、超限或同时传入分页参数会返回 HTTP 400 ~invalid-request~ 。
+~GET /slack/users~ 支持可重复的查询参数 ~id~ 。一次可传入 1 到 100 个复合用户 ID，格式为 ~team_id.用户ID~ ，同一请求可跨工作区。客户端可直接传入消息作者或私聊参与者的 ID。空值、格式无效、超限或未知查询参数会返回 HTTP 400 ~invalid-request~ 。
 
 #+begin_example
 GET /slack/users?id=T123.U123&id=T456.U456
 #+end_example
 
-查询返回 HTTP 200 和 ~Cache-Control: no-store~ 。 ~items~ 包含查到的用户，按各 ID 在请求中首次出现的顺序排列，重复 ID 只返回一次。 ~issues~ 按同样的顺序记录每个失败的 ~id~ 、 ~team_id~ 和 ~error~ 。 ~next_cursor~ 为 ~null~ 。
+查询返回 HTTP 200 和 ~Cache-Control: no-store~ 。 ~items~ 包含查到的用户，按各 ID 在请求中首次出现的顺序排列，重复 ID 只返回一次。 ~issues~ 按同样的顺序记录每个失败的 ~id~ 、 ~team_id~ 和 ~error~ 。
 
 #+begin_src json
 {
@@ -81,6 +81,8 @@ GET /slack/users?id=T123.U123&id=T456.U456
     {
       "id": "T123.U123",
       "team_id": "T123",
+      "team_name": "项目协作",
+      "session_id": "039f972c-2956-40b8-9281-9fca566a50eb",
       "name": "林舟",
       "display_name": "林舟",
       "username": "linzhou",
@@ -88,7 +90,6 @@ GET /slack/users?id=T123.U123&id=T456.U456
       "avatar_path": "/Users/me/.cache/slack/T123/users/U123.png"
     }
   ],
-  "next_cursor": null,
   "issues": [
     {
       "id": "T456.U456",
@@ -113,7 +114,7 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 * 会话选择
 
-~GET /slack/conversations/picker~ 一次返回全部工作区的会话候选。请求无查询参数，响应不分页，返回 HTTP 200 和 ~Cache-Control: no-store~ 。
+~GET /slack/conversations/picker~ 一次返回全部工作区的会话候选。响应不分页，返回 HTTP 200 和 ~Cache-Control: no-store~ 。
 
 | 字段                   | 内容                                                                                                                                                                                                                          |
 |------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -123,6 +124,10 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 | ~items[].last_message~ | 最后一条消息的 ~author_name~ 、 ~ts~ 和 ~preview~ 。没有可展示的消息时为 ~null~ 。 |
 | ~items[].participants~ | 私聊参与者包含 ~id~ 、 ~name~ 和 ~username~ 。已缓存的头像通过 ~avatar_path~ 提供。频道的参与者列表为空数组。 |
 | ~items[].search_terms~ | services 准备的搜索词，包含会话名称、用户显示名、Slack 用户名及可用的全拼和拼音首字母。输入变化时在本次响应内筛选。                                                                                                           |
+
+* 按用户打开私聊
+
+~POST /slack/users/{id}/dm~ 按 ~team_id.用户ID~ 打开一对一私聊。请求无需消息正文，可带 ~X-Loki-Slack-Session~ 指定用户候选的授权会话。services 复用已知私聊，首次打开时调用 Slack 的 ~conversations.open~ 。响应返回 ~api_version~ 和 ~conversation~ ，后者包含会话目录中的会话标识、名称和授权会话等字段。Emacs 用该会话标识打开或聚焦聊天窗口。
 
 * 消息读取
 

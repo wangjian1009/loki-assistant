@@ -499,28 +499,19 @@ async fn conversations(
     method = "GET",
     path = "/slack/users",
     summary = "查询 Slack 用户",
-    description = "使用重复的 id 参数筛选用户，省略 id 时分页读取用户目录。"
+    description = "一次读取已授权工作区的用户目录，支持使用重复的 id 参数筛选用户。"
 )]
 async fn users(State(projects): Service, uri: Uri) -> Result<Json<Value>, Error> {
     let query = uri.query().unwrap_or_default();
     let mut ids = Vec::new();
-    let mut has_other_params = false;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        if key == "id" {
-            if ids.len() == 100 {
-                return Err(Error::Invalid);
-            }
-            ids.push(value);
-        } else {
-            has_other_params = true;
+        if key != "id" || ids.len() == 100 {
+            return Err(Error::Invalid);
         }
+        ids.push(value);
     }
     if ids.is_empty() {
-        let Query(page) = Query::<MessagePage>::try_from_uri(&uri).map_err(|_| Error::Invalid)?;
-        return projects.users(page.into()).await.map(Json);
-    }
-    if has_other_params {
-        return Err(Error::Invalid);
+        return projects.users().await.map(Json);
     }
     let mut seen = BTreeSet::new();
     let users = ids
@@ -552,6 +543,35 @@ async fn picker(
 ) -> Result<Json<Value>, Error> {
     query.map_err(|_| Error::Invalid)?;
     Ok(Json(projects.picker().await))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "open-dm",
+    method = "POST",
+    path = "/slack/users/{id}/dm",
+    summary = "打开用户私聊",
+    description = "打开或复用指定工作区用户的 Slack 私聊并返回会话资料。"
+)]
+async fn open_dm(
+    State(projects): Service,
+    headers: HeaderMap,
+    id: Segment<String>,
+    uri: Uri,
+) -> Result<Json<Value>, Error> {
+    if uri.query().is_some_and(|query| !query.is_empty()) {
+        return Err(Error::Invalid);
+    }
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    let (team, user) = split_id(&id)?;
+    let service = projects.service(team).await?;
+    let session = session(&headers, &service).await?;
+    let conversation = service.open_dm(session, user).await?;
+    Ok(Json(
+        json!({"api_version":"1", "conversation":conversation}),
+    ))
 }
 
 #[derive(Deserialize)]

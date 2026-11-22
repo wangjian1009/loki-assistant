@@ -324,7 +324,7 @@ impl Projects {
     async fn active_sessions(
         &self,
         team_id: Option<&str>,
-    ) -> Result<(Vec<(String, Arc<SlackService>, Uuid)>, String), Error> {
+    ) -> Result<Vec<(String, Arc<SlackService>, Uuid)>, Error> {
         let services: Vec<_> = if let Some(team_id) = team_id {
             vec![(team_id.to_owned(), self.service(team_id).await?)]
         } else {
@@ -336,23 +336,16 @@ impl Projects {
                 .collect()
         };
         let mut sessions = Vec::new();
-        let mut fingerprint = Sha256::new();
         for (id, service) in services {
             if let Some(session) = service.session_id().await {
-                fingerprint.update(id.as_bytes());
-                fingerprint.update(session.as_bytes());
                 sessions.push((id, service, session));
             }
         }
-        Ok((sessions, format!("{:x}", fingerprint.finalize())))
+        Ok(sessions)
     }
 
-    pub(super) async fn users(&self, page: Page) -> Result<Value, Error> {
-        let limit = page.limit()?;
-        let (sessions, fingerprint) = self.active_sessions(None).await?;
-        let target = format!("users:{fingerprint}");
-        let anchor = read_cursor(&page, Uuid::nil(), &target)?;
-        let anchor = anchor.as_deref().unwrap_or_default();
+    pub(super) async fn users(&self) -> Result<Value, Error> {
+        let sessions = self.active_sessions(None).await?;
         let results = futures_util::future::join_all(sessions.iter().map(
             |(id, service, session)| async move {
                 (id, service, *session, service.users(*session).await)
@@ -383,12 +376,8 @@ impl Projects {
                     .iter()
                     .map(move |user| (user, id, *service, *session))
             })
-            .filter(|(user, _, _, _)| user.id.as_str() > anchor)
             .collect();
         users.sort_unstable_by(|left, right| left.0.id.cmp(&right.0.id));
-        let next_cursor = (users.len() > limit)
-            .then(|| next_cursor(Uuid::nil(), target, users[limit - 1].0.id.clone()));
-        users.truncate(limit);
         let mut items = Vec::with_capacity(users.len());
         for (user, team, service, session) in users {
             match service.user_result(session, user).await {
@@ -396,7 +385,7 @@ impl Projects {
                 Err(error) => issues.push(json!({"team_id":team,"error":error.object()})),
             }
         }
-        Ok(json!({"api_version":"1","items":items,"next_cursor":next_cursor,"issues":issues}))
+        Ok(json!({"api_version":"1","items":items,"issues":issues}))
     }
 
     pub(super) async fn lookup_users(&self, ids: Vec<(String, String)>) -> Value {
@@ -424,7 +413,7 @@ impl Projects {
                 ),
             }
         }
-        json!({"api_version":"1","items":items,"next_cursor":null,"issues":issues})
+        json!({"api_version":"1","items":items,"issues":issues})
     }
 
     pub(super) async fn picker(&self) -> Value {
@@ -466,10 +455,16 @@ impl Projects {
         ) {
             return Err(Error::Invalid);
         }
-        let (sessions, fingerprint) = self.active_sessions(team_id).await?;
+        let sessions = self.active_sessions(team_id).await?;
         if team_id.is_some() && sessions.is_empty() {
             return Err(Error::Authorization);
         }
+        let mut fingerprint = Sha256::new();
+        for (id, _, session) in &sessions {
+            fingerprint.update(id.as_bytes());
+            fingerprint.update(session.as_bytes());
+        }
+        let fingerprint = format!("{:x}", fingerprint.finalize());
         let target = format!(
             "conversations:{}:{kind}:{unread}:{fingerprint}",
             team_id.unwrap_or_default()

@@ -1363,7 +1363,22 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let requested_users = Arc::clone(&user_info_requests);
     let history_requests = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let requested_rooms = Arc::clone(&history_requests);
+    let dm_open_requests = Arc::new(AtomicUsize::new(0));
+    let opened_dms = Arc::clone(&dm_open_requests);
     let slack = Router::new()
+        .route(
+            "/conversations.open",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let opened_dms = Arc::clone(&opened_dms);
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer xoxc-TALPHA");
+                    assert_eq!(headers["cookie"], "d=test-web-cookie");
+                    assert_eq!(body, json!({"users":"UADDED"}));
+                    opened_dms.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"ok":true,"channel":{"id":"DNEW"}}))
+                }
+            }),
+        )
         .route(
             "/users.info",
             get(move |headers: HeaderMap, Query(query): Query<std::collections::BTreeMap<String, String>>| {
@@ -1737,31 +1752,25 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             .iter()
             .any(|term| term == "lz")
     );
-    let (_, _, users) = invoke(&app, "GET", "/slack/users?limit=1", None, None, None).await;
+    let (code, headers, users) = invoke(&app, "GET", "/slack/users", None, None, None).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(users["items"][0]["id"], "TALPHA.U1");
     assert_eq!(users["items"][0]["name"], "林舟");
     assert_eq!(users["items"][0]["username"], "linzhou");
     assert!(users["items"][0].get("avatar_url").is_none());
-    let cursor = users["next_cursor"].as_str().unwrap();
-    let (_, _, users) = invoke(
-        &app,
-        "GET",
-        &format!("/slack/users?cursor={cursor}"),
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(users["items"][0]["id"], "TALPHA.U2");
-    assert_eq!(users["items"][1]["id"], "TBETA.U1");
-    assert_eq!(users["items"][2]["id"], "TBETA.U2");
-    assert_eq!(users["items"].as_array().unwrap().len(), 3);
-    assert!(users["next_cursor"].is_null());
+    assert_eq!(users["items"][1]["id"], "TALPHA.U2");
+    assert_eq!(users["items"][2]["id"], "TBETA.U1");
+    assert_eq!(users["items"][3]["id"], "TBETA.U2");
+    assert_eq!(users["items"].as_array().unwrap().len(), 4);
+    assert!(users.get("next_cursor").is_none());
 
     for query in [
         "id=".to_owned(),
         "id=U1".to_owned(),
         "id=TALPHA.U1&id=wrong".to_owned(),
+        "limit=1".to_owned(),
+        "cursor=page".to_owned(),
         "id=TALPHA.U1&limit=1".to_owned(),
         "id=TALPHA.U1&cursor=page".to_owned(),
         vec!["id=TALPHA.U1"; 101].join("&"),
@@ -1784,7 +1793,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(code, StatusCode::OK);
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(batch["api_version"], "1");
-    assert!(batch["next_cursor"].is_null());
+    assert!(batch.get("next_cursor").is_none());
     let ids: Vec<_> = batch["items"]
         .as_array()
         .unwrap()
@@ -1898,6 +1907,59 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     .await;
     assert_eq!(code, StatusCode::CONFLICT);
     assert_eq!(error["error"]["code"], "slack-session-changed");
+
+    let (code, headers, users) = invoke(&app, "GET", "/slack/users", None, None, None).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
+    let users = users["items"].as_array().unwrap();
+    assert_eq!(users.len(), 5);
+    let peer = users.iter().find(|item| item["id"] == "TBETA.U2").unwrap();
+    assert_eq!(peer["team_name"], "网页协作");
+    assert_eq!(peer["session_id"], json!(beta));
+    assert!(peer.get("avatar_url").is_none());
+
+    let (code, _, dm) = invoke(
+        &app,
+        "POST",
+        "/slack/users/TBETA.U2/dm",
+        Some(beta),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(dm["conversation"]["id"], "TBETA.DSHARED");
+    assert_eq!(dm["conversation"]["title"], "林舟");
+    assert_eq!(dm_open_requests.load(Ordering::SeqCst), 0);
+
+    let dm_path = "/slack/users/TALPHA.UADDED/dm";
+    let (code, _, error) = invoke(&app, "POST", dm_path, Some(beta), None, None).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(error["error"]["code"], "slack-session-changed");
+    let (left, right) = tokio::join!(
+        invoke(&app, "POST", dm_path, Some(alpha), None, None),
+        invoke(&app, "POST", dm_path, Some(alpha), None, None)
+    );
+    for (code, _, dm) in [left, right] {
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(dm["conversation"]["id"], "TALPHA.DNEW");
+        assert_eq!(
+            dm["conversation"]["participant_ids"],
+            json!(["TALPHA.UADDED"])
+        );
+    }
+    assert_eq!(dm_open_requests.load(Ordering::SeqCst), 1);
+    let (code, _, messages) = invoke(
+        &app,
+        "GET",
+        "/slack/conversations/TALPHA.DNEW/messages",
+        Some(alpha),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(messages["conversation_id"], "TALPHA.DNEW");
 
     for _ in 0..2 {
         let (status, _, _) =

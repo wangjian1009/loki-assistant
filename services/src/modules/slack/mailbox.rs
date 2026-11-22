@@ -405,6 +405,7 @@ impl SlackService {
     }
 
     pub(super) async fn refresh_directory(&self, session: Uuid) -> Result<(), Error> {
+        let _fetch = self.directory_fetch.lock().await;
         let directory = match self
             .directory(session, "im,mpim,public_channel,private_channel")
             .await
@@ -451,6 +452,61 @@ impl SlackService {
             Ok(())
         })
         .await
+    }
+
+    pub(super) async fn open_dm(&self, session: Uuid, user: &str) -> Result<Value, Error> {
+        let profile = self.lookup_user(session, user).await?;
+        // 等待已开始的目录刷新，避免旧快照移除刚打开的私聊。
+        let _fetch = self.directory_fetch.lock().await;
+        {
+            let state = self.state.lock().await;
+            let account = state.account(session)?;
+            if let Some(room) = state
+                .cache
+                .conversations
+                .values()
+                .find(|room| room.kind == "im" && room.participants.iter().any(|id| id == user))
+            {
+                let mut summary = self.conversation_summary(account, room).2;
+                summary["title"] = json!(profile.name);
+                return Ok(summary);
+            }
+        }
+        let response = self
+            .slack_post(session, "conversations.open", &json!({"users":user}))
+            .await?;
+        let id = response["channel"]["id"]
+            .as_str()
+            .filter(|id| id.starts_with('D') && valid_id(id))
+            .ok_or(Error::Upstream)?
+            .to_owned();
+        let user = user.to_owned();
+        let title = profile.name;
+        let id = self
+            .update_cache(session, move |cache, account| {
+                let room = cache.conversations.entry(id.clone()).or_insert_with(|| {
+                    let mut room = Conversation::new(&id, "im", &title);
+                    room.disk.clone_from(&cache.disk);
+                    room.read_positions.baseline = Some(account.baseline);
+                    room
+                });
+                room.kind = "im".into();
+                room.title = title;
+                room.participants = vec![user];
+                if let Some(disk) = &room.disk {
+                    let _ = disk.save_room(room);
+                }
+                Ok(id)
+            })
+            .await?;
+        let state = self.state.lock().await;
+        let account = state.account(session)?;
+        let room = state
+            .cache
+            .conversations
+            .get(&id)
+            .ok_or(Error::Conversation)?;
+        Ok(self.conversation_summary(account, room).2)
     }
 
     pub(super) async fn refresh_group_members(&self, session: Uuid) -> Result<(), Error> {
@@ -983,13 +1039,17 @@ impl SlackService {
         session: Uuid,
         user: &UserProfile,
     ) -> Result<Value, Error> {
-        let state = self.state.lock().await;
-        state.account(session)?;
-        Ok(state
-            .cache
-            .disk
+        let (team_name, disk) = {
+            let state = self.state.lock().await;
+            let account = state.account(session)?;
+            (account.identity.team_name.clone(), state.cache.disk.clone())
+        };
+        let mut item = disk
             .as_ref()
-            .map_or_else(|| user.result(), |cache| cache.user_result(user)))
+            .map_or_else(|| user.result(), |cache| cache.user_result(user));
+        item["team_name"] = json!(team_name);
+        item["session_id"] = json!(session);
+        Ok(item)
     }
 
     pub(super) async fn find_message(

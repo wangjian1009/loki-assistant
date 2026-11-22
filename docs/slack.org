@@ -47,11 +47,12 @@
 | GET    | ~/status/slack/connections~                                   | [[file:slack-services.org::*工作区状态与会话][查看授权和连接状态]]   |
 | GET    | ~/slack/team-setup/{team_id}~                                 | [[file:slack-services.org::*工作区状态与会话][打开工作区配置页]]     |
 | DELETE | ~/slack/session~                                              | [[file:slack-services.org::*工作区状态与会话][断开本机 Slack 会话]]  |
-| GET    | ~/slack/users~                                                | [[file:slack-services.org::*用户目录][分页查询用户目录]]，[[file:slack-services.org::*批量查询用户][按 ID 筛选]] |
+| GET    | ~/slack/users~                                                | [[file:slack-services.org::*用户目录][一次读取用户目录]]，[[file:slack-services.org::*批量查询用户][按 ID 筛选]] |
 | GET    | ~/slack/users/{id}~                                           | [[file:slack-services.org::*用户目录][查询单个用户（计划）]] |
 | GET    | ~/slack/users/{id}/avatar~                                    | [[file:slack-services.org::*用户目录][获取头像缓存路径]] |
+| POST   | ~/slack/users/{id}/dm~                                        | [[file:slack-services.org::*按用户打开私聊][按用户打开私聊]] |
 | GET    | ~/slack/conversations~                                        | [[file:slack-services.org::*会话目录][分页查询会话]]         |
-| GET    | ~/slack/conversations/picker~                                 | [[file:slack-services.org::*会话选择][一次读取会话候选]]     |
+| GET    | ~/slack/conversations/picker~                                 | [[file:slack-services.org::*会话选择][一次读取会话候选]] |
 | GET    | ~/slack/watches~                                              | [[file:slack-services.org::#conversation-watches][一次读取全部主题关注]] |
 | GET、PUT | ~/slack/conversations/{id}/watch~                            | [[file:slack-services.org::#conversation-watches][查询或设置主题关注]] |
 | GET    | ~/slack/conversations/{id}/messages~                          | [[file:slack-services.org::*消息读取][分页读取顶层消息]]     |
