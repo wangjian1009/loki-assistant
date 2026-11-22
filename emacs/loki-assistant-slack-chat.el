@@ -62,6 +62,8 @@
 
 (defvar-local loki-assistant-slack--room nil)
 (defvar-local loki-assistant-slack--display-name nil)
+(defvar-local loki-assistant-slack--watching nil)
+(defvar-local loki-assistant-slack--watch-request nil)
 (defvar-local loki-assistant-slack--self-id nil)
 (defvar-local loki-assistant-slack--timeline nil)
 (defvar-local loki-assistant-slack--threads nil)
@@ -371,6 +373,12 @@
               team)
             " · " (loki-assistant-slack--label room))))
 
+(defun loki-assistant-slack--watchable-p ()
+  "判断当前 buffer 是否为主题聊天的主 buffer。"
+  (and (null loki-assistant-slack--thread-root)
+       (member (alist-get 'kind loki-assistant-slack--room)
+               '("public_channel" "private_channel"))))
+
 (defun loki-assistant-slack--update-title ()
   "更新当前 Slack buffer 的名字及窗口标题。"
   (let* ((thread loki-assistant-slack--thread-root)
@@ -379,12 +387,87 @@
                                                         loki-assistant-slack--thread-message)
                   (loki-assistant-slack--chat-title loki-assistant-slack--room)))
          (name (format "*Slack %s*" title))
-         (escaped (replace-regexp-in-string "%" "%%" title t t)))
+         (status (when (loki-assistant-slack--watchable-p)
+                   (pcase loki-assistant-slack--watching
+                     ('t " 〔已关注〕")
+                     (':false " 〔未关注〕")
+                     (_ " 〔关注状态未知〕"))))
+         (escaped (replace-regexp-in-string "%" "%%" (concat title status) t t)))
     (unless (equal name loki-assistant-slack--display-name)
       (unless (equal name (buffer-name)) (rename-buffer name t))
       (setq loki-assistant-slack--display-name name))
     (setq header-line-format (concat " " escaped))
     (setq-local frame-title-format escaped)))
+
+(defun loki-assistant-slack--request-watch (&optional watching on-read)
+  "读取关注状态，或设置目标状态 WATCHING。读取成功后可调用 ON-READ。"
+  (when (and (loki-assistant-slack--watchable-p)
+             (null loki-assistant-slack--watch-request))
+    (let* ((room loki-assistant-slack--room)
+           (id (alist-get 'id room))
+           (buffer (current-buffer))
+           (request (make-symbol "slack-watch")))
+      (setq loki-assistant-slack--watch-request request)
+      (when watching
+        (message "%s" (if (eq watching t) "正在关注…" "正在取消关注…")))
+      (loki-assistant-slack--request
+       (if watching "PUT" "GET") (loki-assistant-slack--path room nil "watch")
+       (lambda (response)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (eq loki-assistant-slack--watch-request request)
+               (setq loki-assistant-slack--watch-request nil)
+               (when (equal id (alist-get 'id loki-assistant-slack--room))
+                 (let* ((data (plist-get response :data))
+                        (state (and (listp data) (alist-get 'watching data)))
+                        (valid (and (plist-get response :ok)
+                                    (memq state '(t :false))
+                                    (equal id (alist-get 'conversation_id data)))))
+                   (cond
+                    (valid
+                     (setq loki-assistant-slack--watching state)
+                     (loki-assistant-slack--update-title)
+                     (when watching
+                       (message "%s %s" (if (eq state t) "已关注" "已取消关注")
+                                (loki-assistant-slack--label loki-assistant-slack--room)))
+                     (when on-read (funcall on-read)))
+                    (t
+                     (when (or (null watching)
+                               (plist-get response :ok)
+                               (null (plist-get response :status))
+                               (equal (plist-get response :error-code) "invalid-response"))
+                       (setq loki-assistant-slack--watching nil)
+                       (loki-assistant-slack--update-title)
+                       (when watching (loki-assistant-slack--request-watch)))
+                     (message "%s" (or (plist-get response :error-message)
+                                       "无法确认 Slack 关注状态。"))))))))))
+       :body (when watching `((watching . ,watching)))))))
+
+(defun loki-assistant-slack--set-watch (watching)
+  "将当前主题聊天的关注状态设置为 WATCHING。"
+  (unless (loki-assistant-slack--watchable-p)
+    (user-error "请在 Slack 主题聊天的主窗口操作"))
+  (loki-assistant-slack--request-watch watching))
+
+(defun loki-assistant-slack-watch ()
+  "关注当前 Slack 主题聊天。"
+  (interactive)
+  (loki-assistant-slack--set-watch t))
+
+(defun loki-assistant-slack-unwatch ()
+  "取消关注当前 Slack 主题聊天。"
+  (interactive)
+  (loki-assistant-slack--set-watch :false))
+
+(defun loki-assistant-slack-toggle-watch ()
+  "切换当前 Slack 主题聊天的关注状态。"
+  (interactive)
+  (unless (loki-assistant-slack--watchable-p)
+    (user-error "请在 Slack 主题聊天的主窗口操作"))
+  (if loki-assistant-slack--watching
+      (loki-assistant-slack--set-watch
+       (if (eq loki-assistant-slack--watching t) :false t))
+    (loki-assistant-slack--request-watch nil #'loki-assistant-slack-toggle-watch)))
 
 (defun loki-assistant-slack--thread-title (room message)
   "将根消息 MESSAGE 的摘要追加到 ROOM 的聊天标题。"
@@ -447,6 +530,7 @@
       (select-window window)
       (with-current-buffer buffer
         (loki-assistant-slack--render)
+        (loki-assistant-slack--request-watch)
         (unless existing (goto-char (point-max)))
         (unless (or defer-refresh
                     (and loki-assistant-slack--subscription
@@ -1773,6 +1857,10 @@
     (define-key map (kbd "q") #'loki-assistant-slack-quit-thread)
     (define-key map (kbd "C-c C-q") #'loki-assistant-slack-quit-thread)
     (define-key map (kbd "C-c C-r") #'loki-assistant-slack-refresh)
+    (define-key map (kbd "C-c C-w")
+      '(menu-item "" loki-assistant-slack-toggle-watch
+                  :filter (lambda (command)
+                            (and (loki-assistant-slack--watchable-p) command))))
     (define-key map (kbd "C-c C-k") #'loki-assistant-slack--main-target)
     map))
 

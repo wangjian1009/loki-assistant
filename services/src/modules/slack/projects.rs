@@ -4,7 +4,7 @@ use std::{
 
 use axum::Router;
 use futures_util::{StreamExt, stream};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -14,14 +14,16 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::modules::{
-    config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService},
+    config::service::{
+        ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService, ConfigServiceError,
+    },
     emacs::service::EmacsService,
     notification::NotificationService,
     status::StatusService,
 };
 
 use super::{
-    CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS,
+    CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS, WATCHES,
     disk::DiskCache,
     mailbox::{next_cursor, read_cursor},
     protocol::{Error, Page, valid_id},
@@ -60,6 +62,20 @@ pub(super) struct SlackTeam {
 pub(super) struct SlackTeamIdentity {
     pub team_name: Option<String>,
     pub user_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct SlackWatch {
+    pub id: String,
+    display_name: String,
+}
+
+pub(super) async fn read_watches(config: &ConfigService) -> Result<Vec<SlackWatch>, Error> {
+    let value = config
+        .value("slack", WATCHES)
+        .await
+        .map_err(|_| Error::WatchStorage)?;
+    serde_json::from_value(value.value).map_err(|_| Error::WatchStorage)
 }
 
 impl SlackTeam {
@@ -115,6 +131,7 @@ pub struct Projects {
     pub(super) status: Arc<ProjectsStatus>,
     projects: RwLock<BTreeMap<String, Project>>,
     reconcile: Mutex<()>,
+    watch_changes: Mutex<()>,
     port: std::sync::OnceLock<u16>,
     backend: Backend,
     shutdown: Notify,
@@ -130,6 +147,52 @@ impl std::fmt::Debug for Projects {
 }
 
 impl Projects {
+    pub(super) async fn watches(&self) -> Result<Vec<SlackWatch>, Error> {
+        read_watches(&self.config).await
+    }
+
+    pub(super) async fn set_watch(
+        &self,
+        id: String,
+        team: &str,
+        conversation: &str,
+        watching: bool,
+    ) -> Result<(), Error> {
+        let _change = self.watch_changes.lock().await;
+        if !watching {
+            self.config
+                .remove_record("slack".into(), WATCHES.into(), id.clone())
+                .await
+                .map_err(|_| Error::WatchStorage)?;
+            if let Ok(service) = self.service(team).await {
+                let mut state = service.state.lock().await;
+                state
+                    .cache
+                    .notifications
+                    .retain(|_, alert| alert.watch.as_deref() != Some(&id));
+            }
+            return Ok(());
+        }
+        if self.watches().await?.iter().any(|watch| watch.id == id) {
+            return Ok(());
+        }
+        let service = self.service(team).await?;
+        let display_name = service.watch_conversation_name(conversation).await?;
+        let value = serde_json::to_value(SlackWatch {
+            id: id.clone(),
+            display_name,
+        })
+        .map_err(|_| Error::WatchStorage)?;
+        match self
+            .config
+            .replace_record("slack".into(), WATCHES.into(), id, value, true, false)
+            .await
+        {
+            Ok(_) | Err(ConfigServiceError::RecordExists) => Ok(()),
+            Err(_) => Err(Error::WatchStorage),
+        }
+    }
+
     pub fn new(
         config: Arc<ConfigService>,
         notification: Arc<NotificationService>,
@@ -181,6 +244,7 @@ impl Projects {
             status: Arc::new(ProjectsStatus::new(status)),
             projects: RwLock::default(),
             reconcile: Mutex::default(),
+            watch_changes: Mutex::default(),
             port: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
@@ -598,6 +662,9 @@ impl ConfigChangeHandler for Projects {
 
     fn committed(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
+            if change.key == WATCHES {
+                return Ok(());
+            }
             if change.key == CACHE_RETENTION_DAYS {
                 self.clean_cache.notify_one();
                 return Ok(());

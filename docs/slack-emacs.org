@@ -58,3 +58,19 @@ Emacs 每次打开列表时从 services 读取一次候选快照，在当前选�
 * 从通知打开会话
 
 点击 Slack 通知后，打开对应聊天。聊天已打开时聚焦原窗口。若通知指向线程回复，展开对应线程并定位到回复。回复不可用时定位到根消息，根消息也不可用时打开对应会话。 [[file:slack-services.org::*通知点击跳转][通知跳转接口]]
+
+* 主题聊天关注
+:PROPERTIES:
+:CUSTOM_ID: conversation-watches
+:END:
+
+打开主题聊天时，Emacs 异步读取 ~GET /slack/conversations/{id}/watch~ ，在标题尾部显示「已关注」或「未关注」。以下操作适用于主题聊天主窗口的消息区和输入区。 [[file:slack-services.org::#conversation-watches][主题聊天关注接口]] · [[file:../design/emacs/slack-watches.fig][OpenPencil 界面稿]]
+
+| 操作 | 键盘入口 | 成功反馈 |
+|------+----------+----------|
+| 增加关注 | 标题显示「未关注」时按 ~C-c C-w~ ，或执行 ~M-x loki-assistant-slack-watch~ 。 | 标题改为「已关注」，回显区提示「已关注 #产品讨论」。 |
+| 取消关注 | 标题显示「已关注」时按 ~C-c C-w~ ，或执行 ~M-x loki-assistant-slack-unwatch~ 。 | 标题改为「未关注」，回显区提示「已取消关注 #产品讨论」。 |
+
+增加与取消分别向 ~PUT /slack/conversations/{id}/watch~ 提交 ~watching: true~ 与 ~watching: false~ 。Emacs 收到成功响应后更新标题，保留草稿、光标和滚动位置。提交期间在回显区显示「正在关注…」或「正在取消关注…」，合并重复按键。读取失败时标题显示「关注状态未知」，按切换键先重新查询。提交失败时显示 services 返回的中文说明，结果未知时重新查询后再允许切换。
+
+关注后，主题聊天里的普通新消息和线索回复都会触发提醒。点击通知沿用现有导航流程，聚焦主题聊天，并在需要时展开线索、定位到新回复。 [[file:slack-emacs.org::*从通知打开会话][从通知打开会话]]

@@ -246,6 +246,44 @@ Emacs 按订阅 UUID 查找仍存活的主聊天 buffer，并核对会话和会�
 
 刷新失败时，Emacs 保留当前时间线与草稿，提示失败原因并清理本次新建的订阅。等待快照期间关闭 buffer 时，按关闭流程取消关联的全部订阅。
 
+* 主题聊天关注队列
+:PROPERTIES:
+:CUSTOM_ID: conversation-watches
+:END:
+
+services 在本机持久化一份全局关注队列。配置项 ~slack/watches~ 是只读的 ~SlackWatch~ 数组，每条记录包含复合会话 ID ~id~ 和显示名称 ~display_name~ ，由 Slack 模块通过关注接口更新。主题聊天对应 Slack 的公开或私有频道（ ~public_channel~ 、 ~private_channel~ ）。关注范围包含主题聊天的顶层消息和该聊天中所有线索的回复。关闭聊天窗口、退出 Emacs 或重启 services 后仍保留关注。 [[file:slack-emacs.org::#conversation-watches][Emacs 主题聊天关注操作]]
+
+** 本机 HTTP 接口
+
+| 方法与路径 | 请求与响应 |
+|------------+------------|
+| ~GET /slack/watches~ | 无查询参数。HTTP 200 返回 ~api_version~ 和 ~items~ ，按 ~conversation_id~ 排序，每项包含一个已关注的 ~conversation_id~ 。空队列返回 ~items: []~ 。 |
+| ~GET /slack/conversations/{id}/watch~ | HTTP 200 返回 ~api_version~ 、 ~conversation_id~ 和布尔字段 ~watching~ 。 |
+| ~PUT /slack/conversations/{id}/watch~ | 以 ~{"watching":true}~ 开启关注，以 ~{"watching":false}~ 关闭。落盘后返回 HTTP 200 和与单条查询相同的结构。重复提交同一状态返回当前状态。 |
+
+#+begin_src json
+{
+  "api_version": "1",
+  "conversation_id": "T123.C456",
+  "watching": true
+}
+#+end_src
+
+接口仅限本机，响应设置 ~Cache-Control: no-store~ 。开启前根据会话目录核对会话类型，私聊和群组私聊返回 ~422 slack-watch-unsupported-conversation~ ，找不到会话返回 ~404 slack-conversation-not-found~ 。查询及关闭直接读取或修改本机队列，工作区断开或配置移除时仍可操作。参数格式错误返回 ~400 invalid-request~ ，关注存储失败返回 ~503 slack-watch-storage-error~ 。错误使用通用 JSON 响应。
+
+** 消息识别和通知
+
+- 当前的「提及和私信」规则继续适用。主题聊天开启关注后，services 将该主题下普通的未读新消息也纳入现有通知流程，沿用本人消息过滤。线索中的新回复按所属会话匹配关注，无论根消息何时发送、线索是否展开或进入过缓存。
+- Slack 实时消息归一化后，以复合会话 ID 匹配关注。~thread_ts~ 存在时用作线索根标识。编辑、删除和反应不触发关注通知。首次开启从落盘时开始生效，历史翻页和 buffer 快照只更新缓存。
+- 同一条新消息同时命中关注和直接提及时，只进入一次系统通知队列。按复合会话 ID 和消息 ~ts~ 去重，线索广播使用原回复的消息标识。关闭关注后，尚未转交的消息只按原有通知规则判断。
+- 通知使用共享 ~NotificationService~ 。回调复用 ~POST /slack/conversations/{id}/open~ ，以 ~message_ts~ 定位消息，线索回复同时携带 ~thread_ts~ 。回复不可用时定位到根消息，根消息不可用时打开对应会话。 [[file:slack-services.org::*通知点击跳转][通知点击协议]] · [[file:control-center-services.org::*系统通知模块][系统通知模块]]
+
+** 验收场景
+
+- 开启关注后，普通顶层消息和从未打开过的线索中的普通回复都能发出通知。关闭 Emacs 后仍可发送通知。
+- 同一条线索回复既广播到主聊天又直接提及本人时，只显示一次通知。点击后定位到原线索回复。
+- 关闭关注后，普通消息恢复为静默，直接提及仍会通知。重启 services 后标题可恢复已保存的关注状态。
+
 * 消息发送与发送记录
 
 ~POST /slack/conversations/{id}/messages~ 发送顶层消息。 ~POST /slack/conversations/{id}/threads/{thread_ts}/messages~ 发送线程回复。两个接口均要求 UUID 格式的 ~Idempotency-Key~ ，JSON 请求体包含 ~text~ 。

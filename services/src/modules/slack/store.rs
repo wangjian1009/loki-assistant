@@ -30,8 +30,15 @@ pub(super) struct Cache {
     pub directory_loaded: bool,
     pub sends: BTreeMap<Uuid, SendRecord>,
     pub events: BTreeSet<String>,
-    pub notifications: BTreeMap<String, String>,
+    pub new_messages: BTreeSet<((u64, u32), String)>,
+    pub notifications: BTreeMap<String, PendingNotification>,
     pub subscriptions: BTreeMap<SubscriptionKey, Subscription>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingNotification {
+    pub callback: String,
+    pub watch: Option<String>,
 }
 
 impl Cache {

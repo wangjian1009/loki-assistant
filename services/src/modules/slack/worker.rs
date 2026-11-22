@@ -13,7 +13,7 @@ use super::{
     client::Socket,
     protocol::{Author, Error, Message, Page, timestamp, valid_id},
     service::SlackService,
-    store::{Conversation, SendState},
+    store::{Conversation, PendingNotification, SendState},
 };
 
 impl SlackService {
@@ -89,20 +89,31 @@ impl SlackService {
                             .cache
                             .notifications
                             .first_key_value()
-                            .map(|(id, callback)| (session, id.clone(), callback.clone()))
+                            .map(|(id, alert)| (session, id.clone(), alert.clone()))
                     })
             };
-            let Some((session, id, callback)) = pending else {
+            let Some((session, id, alert)) = pending else {
                 self.alerts.notified().await;
                 continue;
             };
+            if let Some(watch) = &alert.watch {
+                let watched = self.watching(watch).await;
+                let mut state = self.state.lock().await;
+                if state.account(session).is_err() || !state.cache.notifications.contains_key(&id) {
+                    continue;
+                }
+                if !watched {
+                    state.cache.notifications.remove(&id);
+                    continue;
+                }
+            }
             let delivered = self
                 .notification
                 .send(NotificationRequest {
                     title: "Slack 新消息".into(),
                     body: None,
                     app: Some("slack".into()),
-                    callback_url: Some(callback),
+                    callback_url: Some(alert.callback),
                 })
                 .await;
             if delivered.is_ok() {
@@ -239,8 +250,10 @@ impl SlackService {
         let team = event["team"].as_str().map(str::to_owned);
         let channel_type = event["channel_type"].as_str().map(str::to_owned);
         let subtype = event["subtype"].as_str().unwrap_or_default().to_owned();
+        let broadcast = matches!(subtype.as_str(), "thread_broadcast" | "reply_broadcast");
         let prior_thread = event["previous_message"]["thread_ts"]
             .as_str()
+            .or_else(|| broadcast.then(|| event["root"]["ts"].as_str()).flatten())
             .filter(|ts| timestamp(ts).is_some())
             .map(str::to_owned);
         let message = Message::from_slack(
@@ -256,10 +269,8 @@ impl SlackService {
             .filter(|ts| timestamp(ts).is_some())
             .map(str::to_owned);
         let new = subtype.is_empty()
-            || matches!(
-                subtype.as_str(),
-                "bot_message" | "file_share" | "thread_broadcast"
-            );
+            || broadcast
+            || matches!(subtype.as_str(), "bot_message" | "file_share");
         let event_ts = event["event_ts"]
             .as_str()
             .or_else(|| event["message"]["edited"]["ts"].as_str())
@@ -270,7 +281,7 @@ impl SlackService {
             return Ok(false);
         };
         let event_id = format!("{id}.{subtype}.{event_ts}");
-        {
+        let conversation_id = {
             let state = self.state.lock().await;
             let account = state.account(session)?;
             if team.as_deref().is_some_and(|team| team != account.identity.team_id)
@@ -278,91 +289,113 @@ impl SlackService {
             {
                 return Ok(false);
             }
-        }
+            format!("{}.{id}", account.identity.team_id)
+        };
+        let watched = new && self.watching(&conversation_id).await;
         if let Some(message) = &message {
             self.warm_message_media(session, std::slice::from_ref(message)).await;
         }
-        let bot = message.as_ref().and_then(|message| message.author.as_ref())
+        let bot = message
+            .as_ref()
+            .and_then(|message| message.author.as_ref())
             .is_some_and(|author| author.id.starts_with('B'));
-        let result = self.update_cache(session, move |cache, account| {
-            if team
-                .as_deref()
-                .is_some_and(|team| team != account.identity.team_id)
-            {
-                return Ok(false);
-            }
-            let kind = match cache.conversations.get(&id) {
-                Some(room) => room.kind.as_str(),
-                None if id.starts_with('D') || channel_type.as_deref() == Some("im") => "im",
-                None if channel_type.as_deref() == Some("mpim") => "mpim",
-                None if channel_type.as_deref() == Some("channel") => "public_channel",
-                None if channel_type.as_deref() == Some("group") => "private_channel",
-                None => return Ok(false),
-            }
-            .to_owned();
-            let direct_message = matches!(kind.as_str(), "im" | "mpim");
-            if !cache.events.insert(event_id.clone()) {
-                return Ok(false);
-            }
-            if cache.events.len() > 10_000 {
-                cache.events.pop_first();
-            }
-            let conversation = cache.conversations.entry(id.clone()).or_insert_with(|| {
-                let mut room = Conversation::new(&id, &kind, &id);
-                room.disk.clone_from(&cache.disk);
-                room.read_positions.baseline = Some(account.baseline);
-                room
-            });
-            if subtype == "message_deleted" {
-                if let Some(deleted) = deleted {
-                    conversation.remove(&deleted, prior_thread.as_deref());
+        let result = self
+            .update_cache(session, move |cache, account| {
+                if team
+                    .as_deref()
+                    .is_some_and(|team| team != account.identity.team_id)
+                {
+                    return Ok(false);
                 }
-                return Ok(false);
-            }
-            let Some(mut message) = message else {
-                return Ok(false);
-            };
-            if subtype == "message_changed" {
-                let previous = conversation.messages.get(&message.ts).cloned()
-                    .or_else(|| conversation.disk.as_ref()?.find_message(&id, &message.ts));
-                if let Some(previous) = previous {
-                    message.edited |= previous.edited;
-                    if message.thread_ts.is_none() {
-                        message.thread_ts = previous.thread_ts;
+                let kind = match cache.conversations.get(&id) {
+                    Some(room) => room.kind.as_str(),
+                    None if id.starts_with('D') || channel_type.as_deref() == Some("im") => "im",
+                    None if channel_type.as_deref() == Some("mpim") => "mpim",
+                    None if channel_type.as_deref() == Some("channel") => "public_channel",
+                    None if channel_type.as_deref() == Some("group") => "private_channel",
+                    None if watched => "public_channel",
+                    None => return Ok(false),
+                }
+                .to_owned();
+                let direct_message = matches!(kind.as_str(), "im" | "mpim");
+                if !cache.events.insert(event_id.clone()) {
+                    return Ok(false);
+                }
+                if cache.events.len() > 10_000 {
+                    cache.events.pop_first();
+                }
+                let conversation = cache.conversations.entry(id.clone()).or_insert_with(|| {
+                    let mut room = Conversation::new(&id, &kind, &id);
+                    room.disk.clone_from(&cache.disk);
+                    room.read_positions.baseline = Some(account.baseline);
+                    room
+                });
+                if subtype == "message_deleted" {
+                    if let Some(deleted) = deleted {
+                        conversation.remove(&deleted, prior_thread.as_deref());
+                    }
+                    return Ok(false);
+                }
+                let Some(mut message) = message else {
+                    return Ok(false);
+                };
+                if subtype == "message_changed" {
+                    let previous = conversation
+                        .messages
+                        .get(&message.ts)
+                        .cloned()
+                        .or_else(|| conversation.disk.as_ref()?.find_message(&id, &message.ts));
+                    if let Some(previous) = previous {
+                        message.edited |= previous.edited;
+                        if message.thread_ts.is_none() {
+                            message.thread_ts = previous.thread_ts;
+                        }
                     }
                 }
-            }
-            let notify = new
-                && (direct_message || message.mentions(&account.identity.user_id))
-                && conversation.read_positions.unread(&message, account)
-                && !conversation.deleted.contains(&message.ts);
-            if let Some(root) = &message.thread_ts {
-                let count = conversation
-                    .messages
-                    .values()
-                    .filter(|item| item.thread_ts.as_ref() == Some(root))
-                    .count()
-                    + usize::from(!conversation.messages.contains_key(&message.ts));
-                conversation.update_reply_count(root, count as u64);
-            }
-            if notify {
-                let mut callback = format!(
-                    "/slack/conversations/{}.{id}/open?message_ts={}",
-                    account.identity.team_id, message.ts
-                );
-                if let Some(thread) = &message.thread_ts {
-                    callback.push_str("&thread_ts=");
-                    callback.push_str(thread);
+                let ordinary = direct_message || message.mentions(&account.identity.user_id);
+                let first_seen = new
+                    && timestamp(&message.ts)
+                        .is_some_and(|ts| cache.new_messages.insert((ts, id.clone())));
+                if cache.new_messages.len() > 10_000 {
+                    cache.new_messages.pop_first();
                 }
-                cache.notifications.insert(event_id, callback);
-                if cache.notifications.len() > 512 {
-                    cache.notifications.pop_first();
+                let notify = first_seen
+                    && (ordinary || (watched && !direct_message))
+                    && conversation.read_positions.unread(&message, account)
+                    && !conversation.deleted.contains(&message.ts);
+                if let Some(root) = &message.thread_ts {
+                    let count = conversation
+                        .messages
+                        .values()
+                        .filter(|item| item.thread_ts.as_ref() == Some(root))
+                        .count()
+                        + usize::from(!conversation.messages.contains_key(&message.ts));
+                    conversation.update_reply_count(root, count as u64);
                 }
-            }
-            conversation.ingest(message);
-            Ok(notify)
-        })
-        .await;
+                if notify {
+                    let mut callback = format!(
+                        "/slack/conversations/{conversation_id}/open?message_ts={}",
+                        message.ts
+                    );
+                    if let Some(thread) = &message.thread_ts {
+                        callback.push_str("&thread_ts=");
+                        callback.push_str(thread);
+                    }
+                    cache.notifications.insert(
+                        event_id,
+                        PendingNotification {
+                            callback,
+                            watch: (!ordinary).then_some(conversation_id),
+                        },
+                    );
+                    if cache.notifications.len() > 512 {
+                        cache.notifications.pop_first();
+                    }
+                }
+                conversation.ingest(message);
+                Ok(notify)
+            })
+            .await;
         if bot && result.is_ok() {
             self.avatars_changed.notify_one();
         }

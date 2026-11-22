@@ -27,6 +27,8 @@ pub(super) enum Error {
     Conflict,
     ReadPosition,
     ReadPositionStorage,
+    WatchUnsupported,
+    WatchStorage,
     UserToken,
     WebUserToken,
     WebCookie,
@@ -99,6 +101,16 @@ impl Error {
                 503,
                 "slack-read-position-storage-error",
                 "无法将 Slack 已读位置保存到本地缓存。",
+            ),
+            Self::WatchUnsupported => (
+                422,
+                "slack-watch-unsupported-conversation",
+                "只有主题聊天可以关注。",
+            ),
+            Self::WatchStorage => (
+                503,
+                "slack-watch-storage-error",
+                "无法读取或保存 Slack 关注配置。",
             ),
             Self::UserToken => (
                 422,

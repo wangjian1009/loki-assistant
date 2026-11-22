@@ -972,7 +972,7 @@ impl ConfigService {
         .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
     }
 
-    pub(super) async fn remove_record(
+    pub(crate) async fn remove_record(
         &self,
         module_id: String,
         key: String,

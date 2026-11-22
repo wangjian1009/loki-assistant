@@ -433,6 +433,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     });
     let (done, messages_sent) = tokio::sync::oneshot::channel();
     let (send_channel, channel_ready) = tokio::sync::oneshot::channel();
+    let (watch_events, mut watched_socket_events) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let socket_mock = Arc::clone(&mock);
     let socket = tokio::spawn(async move {
         let mut stream = accept_hdr_async(
@@ -483,7 +484,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 .await
                 .unwrap();
         }
-        std::future::pending::<()>().await;
+        while let Some(event) = watched_socket_events.recv().await {
+            stream
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
     });
 
     let alerts = Arc::new(Alerts::default());
@@ -993,6 +999,133 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let (_, _, repeated) = invoke(&app, "POST", &thread, session, misplaced_key, Some(body)).await;
     assert_eq!(repeated["state"], "unknown");
     assert_eq!(mock.posts.load(Ordering::SeqCst), 2);
+
+    let watch_path = "/slack/conversations/TTEAM.CWORK/watch";
+    let list_path = "/slack/watches";
+    assert_eq!(
+        invoke(&app, "GET", watch_path, None, None, None).await.2["watching"],
+        false
+    );
+    assert_eq!(
+        invoke(
+            &app,
+            "PUT",
+            "/slack/conversations/TTEAM.DDIRECT/watch",
+            None,
+            None,
+            Some(json!({"watching":true}))
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    for _ in 0..2 {
+        let (status, headers, body) = invoke(
+            &app,
+            "PUT",
+            watch_path,
+            None,
+            None,
+            Some(json!({"watching":true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(body["watching"], true);
+    }
+    assert_eq!(
+        invoke(&app, "GET", list_path, None, None, None).await.2,
+        json!({"api_version":"1","items":[{"conversation_id":"TTEAM.CWORK"}]})
+    );
+    let reopened = ConfigService::load(directory.0.join("config.yml")).unwrap();
+    assert_eq!(
+        reopened.value("slack", "watches").await.unwrap().value,
+        json!([{"id":"TTEAM.CWORK","display_name":"#产品讨论"}])
+    );
+    let top = format!("{now}.100001");
+    let reply = format!("{now}.100002");
+    let self_reply = format!("{now}.100003");
+    let mention_ts = format!("{now}.100004");
+    for event in [
+        json!({"type":"message","channel":"CWORK","ts":top,"user":"UYOU","text":"普通消息"}),
+        json!({"type":"message","channel":"CWORK","ts":reply,"thread_ts":"1.0",
+               "user":"UYOU","text":"未打开线索的普通回复"}),
+        json!({"type":"message","subtype":"thread_broadcast","channel":"CWORK","ts":reply,
+               "event_ts":format!("{now}.200002"),"root":{"ts":"1.0"},"user":"UYOU","text":"同一条回复"}),
+        json!({"type":"message","channel":"CWORK","ts":self_reply,"thread_ts":"1.0",
+               "user":"UME","text":"自己的回复"}),
+        json!({"type":"message","channel":"CWORK","ts":mention_ts,"user":"UYOU","text":"<@UME>"}),
+    ] {
+        watch_events.send(event).unwrap();
+    }
+    timeout(Duration::from_secs(3), async {
+        while alerts.0.lock().unwrap().len() < 5 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let callbacks: Vec<_> = alerts
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(2)
+        .map(|alert| {
+            url::Url::parse(alert.navigation_url.as_ref().unwrap())
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "callback")
+                .unwrap()
+                .1
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        callbacks,
+        [
+            format!("/slack/conversations/TTEAM.CWORK/open?message_ts={top}"),
+            format!("/slack/conversations/TTEAM.CWORK/open?message_ts={reply}&thread_ts=1.0"),
+            format!("/slack/conversations/TTEAM.CWORK/open?message_ts={mention_ts}"),
+        ]
+    );
+    let disabled = invoke(
+        &app,
+        "PUT",
+        watch_path,
+        None,
+        None,
+        Some(json!({"watching":false})),
+    )
+    .await;
+    assert_eq!(disabled.0, StatusCode::OK, "{}", disabled.2);
+    assert_eq!(disabled.2["watching"], false);
+    assert_eq!(
+        invoke(&app, "GET", list_path, None, None, None).await.2["items"],
+        json!([])
+    );
+    for event in [
+        json!({"type":"message","channel":"CWORK","ts":format!("{now}.300001"),
+               "user":"UYOU","text":"取消关注后的普通消息"}),
+        json!({"type":"message","channel":"CWORK","ts":format!("{now}.300002"),
+               "user":"UYOU","text":"<@UME>"}),
+    ] {
+        watch_events.send(event).unwrap();
+    }
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let alerts = alerts.0.lock().unwrap();
+            assert!(alerts.len() <= 6);
+            if let Some(alert) = alerts.get(5) {
+                assert!(alert.navigation_url.as_ref().unwrap().contains("300002"));
+                break;
+            }
+            drop(alerts);
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     projects.stop().await;
     worker.await.unwrap();
 
@@ -1398,7 +1531,20 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
 
     assert!(teams.get("actions").is_none());
     let items = module["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3);
+    let watches = items.iter().find(|item| item["key"] == "watches").unwrap();
+    assert_eq!(watches["read_only"], true);
+    assert_eq!(watches["structure"]["type_name"], "SlackWatch");
+    let (_, _, blocked) = invoke(
+        &app,
+        "PUT",
+        "/data/slack/watches",
+        None,
+        None,
+        Some(json!([])),
+    )
+    .await;
+    assert_eq!(blocked["error"]["code"], "config-read-only");
     let retention = items
         .iter()
         .find(|item| item["key"] == "cache_retention_days")

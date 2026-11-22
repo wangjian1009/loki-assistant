@@ -8,7 +8,7 @@
 
 - services 将用户资料、会话、消息和按需下载的文件保存到本地缓存。发送请求和通知去重状态保存在内存中。
 - 会话选择数据由 services 在工作区预热时准备，并随会话、用户和消息状态变化更新。查询直接读取当前内存快照，不等待预热或向 Slack 补查。Emacs 每次打开选择器重新获取一次，响应仅在本次选择期间使用。
-- 桌面通知采用「提及和私信」。他人发来的未读私信（含群组私信）和直接 ~@~ 当前用户的未读频道消息会触发通知。线程回复沿用所属会话的规则。
+- 他人发来的未读私信（含群组私信）、直接 ~@~ 当前用户的未读频道消息和已关注主题的普通未读消息会触发桌面通知。线程回复沿用所属会话的规则。 [[file:slack-services.org::#conversation-watches][主题聊天关注队列]]
 - 已读位置由客户端显式提交 ~through_ts~ 推进。顶层消息和各线程的游标只向前移动，连同初始未读基准写入会话的 ~info.txt~ ，重启后恢复。
 
 * 缓存设计
@@ -52,6 +52,8 @@
 | GET    | ~/slack/users/{id}/avatar~                                    | [[file:slack-services.org::*用户目录][获取头像缓存路径]] |
 | GET    | ~/slack/conversations~                                        | [[file:slack-services.org::*会话目录][分页查询会话]]         |
 | GET    | ~/slack/conversations/picker~                                 | [[file:slack-services.org::*会话选择][一次读取会话候选]]     |
+| GET    | ~/slack/watches~                                              | [[file:slack-services.org::#conversation-watches][一次读取全部主题关注]] |
+| GET、PUT | ~/slack/conversations/{id}/watch~                            | [[file:slack-services.org::#conversation-watches][查询或设置主题关注]] |
 | GET    | ~/slack/conversations/{id}/messages~                          | [[file:slack-services.org::*消息读取][分页读取顶层消息]]     |
 | GET    | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | [[file:slack-services.org::*消息读取][分页读取线程回复]]     |
 | GET    | ~/slack/conversations/{id}/messages/{ts}/attachments/{index}/preview~ | [[file:slack-services.org::*消息读取][读取图片附件预览]] |

@@ -230,6 +230,85 @@ fn split_id(id: &str) -> Result<(&str, &str), Error> {
     Ok((team_id, id))
 }
 
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "watches",
+    method = "GET",
+    path = "/slack/watches",
+    summary = "列出所有关注的 Slack 主题聊天",
+    description = "一次返回本机关注的全部主题聊天。"
+)]
+async fn watches(State(projects): Service, uri: Uri) -> Result<Json<Value>, Error> {
+    if uri.query().is_some_and(|query| !query.is_empty()) {
+        return Err(Error::Invalid);
+    }
+    let mut watches = projects.watches().await?;
+    watches.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    let items: Vec<_> = watches
+        .into_iter()
+        .map(|watch| json!({"conversation_id": watch.id}))
+        .collect();
+    Ok(Json(json!({"api_version": "1", "items": items})))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "get-watch",
+    method = "GET",
+    path = "/slack/conversations/{id}/watch",
+    summary = "查看 Slack 主题聊天的关注状态",
+    description = "从本机配置读取指定会话的关注状态。"
+)]
+async fn get_watch(State(projects): Service, id: Segment<String>) -> Result<Json<Value>, Error> {
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    split_id(&id)?;
+    let watching = projects.watches().await?.iter().any(|watch| watch.id == id);
+    Ok(Json(
+        json!({"api_version": "1", "conversation_id": id, "watching": watching}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchInput {
+    watching: bool,
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "set-watch",
+    method = "PUT",
+    path = "/slack/conversations/{id}/watch",
+    summary = "设置 Slack 主题聊天的关注状态",
+    description = "在本机配置中开启或取消指定主题聊天的关注。"
+)]
+async fn set_watch(
+    State(projects): Service,
+    id: Segment<String>,
+    input: JsonInput<WatchInput>,
+) -> Result<Json<Value>, Error> {
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    let Json(WatchInput { watching }) = input.map_err(|_| Error::Invalid)?;
+    // 已收到的设置请求独立完成提交与通知队列清理。
+    tokio::spawn(async move {
+        let (team, conversation) = split_id(&id)?;
+        projects
+            .set_watch(id.clone(), team, conversation, watching)
+            .await?;
+        Ok(Json(
+            json!({"api_version": "1", "conversation_id": id, "watching": watching}),
+        ))
+    })
+    .await
+    .map_err(|_| Error::WatchStorage)?
+}
+
 async fn scoped(
     projects: &Projects,
     scope: Params<Scope>,

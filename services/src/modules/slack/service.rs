@@ -17,7 +17,7 @@ use super::{
     disk::DiskCache,
     mailbox::UserDirectory,
     picker::PickerItem,
-    projects::{Backend, SlackTeam},
+    projects::{Backend, SlackTeam, read_watches},
     protocol::{Error, Identity, valid_id},
     status::ProjectsStatus,
     store::{Account, Cache, Secrets},
@@ -66,7 +66,7 @@ pub struct SlackService {
     pub(super) preview_downloads: Semaphore,
     pub(super) subscriptions_changed: Notify,
     project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
-    imported_token: Option<Arc<ConfigService>>,
+    config: Arc<ConfigService>,
     imported_token_lock: Mutex<()>,
 }
 
@@ -88,7 +88,6 @@ impl SlackService {
         backend: &Backend,
         config: Arc<ConfigService>,
     ) -> Self {
-        let imported_token = settings.token.is_some().then_some(config);
         Self {
             state: Arc::new(Mutex::new(State {
                 socket_state: "stopped",
@@ -107,9 +106,33 @@ impl SlackService {
             preview_downloads: Semaphore::new(4),
             subscriptions_changed: Notify::new(),
             project: (id, settings, generation, reporter),
-            imported_token,
+            config,
             imported_token_lock: Mutex::new(()),
         }
+    }
+
+    pub(super) async fn watching(&self, id: &str) -> bool {
+        read_watches(&self.config)
+            .await
+            .is_ok_and(|watches| watches.iter().any(|watch| watch.id == id))
+    }
+
+    pub(super) async fn watch_conversation_name(&self, id: &str) -> Result<String, Error> {
+        let session = self.session_id().await.ok_or(Error::Session)?;
+        if !self.state.lock().await.cache.conversations.contains_key(id) {
+            self.refresh_directory(session).await?;
+        }
+        let state = self.state.lock().await;
+        state.account(session)?;
+        let room = state
+            .cache
+            .conversations
+            .get(id)
+            .ok_or(Error::Conversation)?;
+        if !matches!(room.kind.as_str(), "public_channel" | "private_channel") {
+            return Err(Error::WatchUnsupported);
+        }
+        Ok(format!("#{}", room.title))
     }
 
     pub(super) fn signal_change(&self) {
@@ -285,7 +308,7 @@ impl SlackService {
     }
 
     pub(super) async fn restore_imported_token(&self) -> Result<(), Error> {
-        if self.imported_token.is_none() {
+        if self.project.1.token.is_none() {
             return Ok(());
         }
         let _lock = self.imported_token_lock.lock().await;
@@ -438,9 +461,11 @@ impl SlackService {
     }
 
     async fn read_passwords(&self) -> Result<[Option<String>; 2], Error> {
-        let config = self.imported_token.as_ref().ok_or(Error::Configuration)?;
-        let (team, _, _, _) = &self.project;
-        config
+        let (team, settings, _, _) = &self.project;
+        if settings.token.is_none() {
+            return Err(Error::Configuration);
+        }
+        self.config
             .read_record_passwords("slack", "teams", team, SlackTeam::PASSWORD_FIELDS)
             .await
             .map_err(|_| Error::PasswordRead)

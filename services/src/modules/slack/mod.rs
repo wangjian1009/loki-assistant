@@ -37,11 +37,12 @@ pub use projects::Projects;
 static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "slack",
     name: "Slack",
-    description: "提供 Slack 提及和私信通知、会话查询和消息收发。",
+    description: "提供 Slack 提及、私信和主题关注通知、会话查询和消息收发。",
     version: env!("CARGO_PKG_VERSION"),
 };
 
 const TEAM_NOTIFICATION_ENDPOINT: &str = "/slack/config/teams";
+const WATCHES: &str = "watches";
 const CACHE_RETENTION_DAYS: &str = "cache_retention_days";
 const DEFAULT_CACHE_RETENTION_DAYS: u64 = 30;
 
@@ -144,6 +145,40 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     },
 };
 
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static WATCH_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: "slack",
+    key: WATCHES,
+    options: || ConfigItemOptions {
+        read_only: true,
+        structure: Some(StructureMetadata {
+            id_field: Some("id".into()),
+            label_field: Some("display_name".into()),
+            add_label: None,
+            legacy_dictionary: None,
+            type_name: "SlackWatch".into(),
+            show_all_fields: false,
+            fields: [
+                ("id", "会话 ID", ConfigDataType::Key),
+                ("display_name", "显示名称", ConfigDataType::String),
+            ]
+            .into_iter()
+            .map(|(key, label, data_type)| StructureField {
+                key: key.into(),
+                label: label.into(),
+                data_type,
+                required: true,
+                default_template: None,
+                checker: None,
+                read_only: false,
+                options: None,
+            })
+            .collect(),
+        }),
+        ..ConfigItemOptions::default()
+    },
+};
+
 #[loki_config]
 fn slack_configuration() -> ConfigModuleMetadata {
     ConfigModuleMetadata {
@@ -155,6 +190,23 @@ fn slack_configuration() -> ConfigModuleMetadata {
             key: "teams".into(),
             name: "Slack 工作区".into(),
             description: "每个工作区保存固定的 Team ID 和本地显示名称。".into(),
+            data_type: ConfigDataType::List,
+            remote_access: ConfigRemoteAccess::Local,
+            required: false,
+            default: Some(serde_json::json!([])),
+            dictionary: None,
+            list: Some(ListMetadata {
+                item_type: ConfigDataType::Structure,
+                min_items: None,
+                max_items: None,
+            }),
+            checker: None,
+            file_path: None,
+            executable: None,
+        }, ConfigItemMetadata {
+            key: WATCHES.into(),
+            name: "关注的主题聊天".into(),
+            description: "由 Slack 模块通过主题聊天的关注操作维护。".into(),
             data_type: ConfigDataType::List,
             remote_access: ConfigRemoteAccess::Local,
             required: false,

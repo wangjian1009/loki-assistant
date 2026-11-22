@@ -121,6 +121,8 @@ Slack HTTP 接口和 ~slack~ 配置仅限本机调用。本机请求可直接调
 
 Slack 顶层消息和线程回复通过同一会话订阅推送到 Emacs。Slack 模块管理本机订阅，Emacs gateway 连接已运行的 Emacs server，调用固定的消息分发函数并读取回执。 [[file:slack-services.org::*会话消息订阅][会话消息订阅接口]]
 
+Slack 模块通过只读配置 ~slack/watches~ 持久化全局主题聊天关注队列，为关注主题中的普通新消息及线索回复提供系统通知。 [[file:slack-services.org::#conversation-watches][主题聊天关注队列]]
+
 ~slack/cache_retention_days~ 通过通用配置接口读取和保存，适用于消息和附件。 [[file:slack.org::*缓存设计][缓存设计]]
 
 * 控制中心模块
