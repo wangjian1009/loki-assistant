@@ -578,7 +578,7 @@
          windows)
     (unwind-protect
         (save-window-excursion
-          (when-let ((window (minibuffer-selected-window)))
+          (when-let* ((window (minibuffer-selected-window)))
             (select-window window))
           (cl-letf (((symbol-function 'active-minibuffer-window) #'ignore)
                     ((symbol-function 'loki-assistant-slack--request)
@@ -597,7 +597,8 @@
             (should (eq (nth 0 windows) (nth 2 windows)))
             (should-not (eq (nth 0 windows) (nth 1 windows)))))
       (dolist (id '("TTEST.DONE" "TTEST.DTWO"))
-        (when-let ((buffer (loki-assistant-slack--find-buffer id))) (kill-buffer buffer)))
+        (when-let* ((buffer (loki-assistant-slack--find-buffer id)))
+          (kill-buffer buffer)))
       (delete-directory shell-maker-root-path t))))
 
 (ert-deftest loki-assistant-slack-chat-test-picker-groups-and-matches-pinyin ()
@@ -678,21 +679,40 @@
   (skip-unless (and (display-graphic-p) (require 'shell-maker nil t)))
   (let* ((shell-maker-root-path (make-temp-file "loki-slack-notification-test-" t))
          (shell-maker-prompt-before-killing-buffer nil)
+         connection-callback
          (payload (json-serialize
-                   '((room . ((id . "TTEST.DNOTIFY") (title . "通知测试") (session_id . "one")))
+                   '((room . ((id . "TTEST.DCHAT") (title . "通知测试") (session_id . "one")))
                      (root . ((ts . "101.0") (text . "根消息") (reply_count . 1)))
                      (reply . ((ts . "102.0") (thread_ts . "101.0") (text . "定位回复")))
                      (thread_ts . "101.0") (message_ts . "102.0")))))
     (unwind-protect
         (save-window-excursion
-          (cl-letf (((symbol-function 'loki-assistant-slack--request) #'ignore))
+          (cl-letf (((symbol-function 'loki-assistant-slack--request)
+                     (lambda (method path callback &rest _)
+                       (when (and (equal method "GET") (equal path "/status/slack/connections"))
+                         (setq connection-callback callback)))))
             (should (eq (loki-assistant-dispatch-slack-notification payload) 'message))
-            (with-current-buffer (loki-assistant-slack--find-buffer "TTEST.DNOTIFY")
+            (with-current-buffer (loki-assistant-slack--find-buffer "TTEST.DCHAT")
               (should (equal (get-text-property (point) 'loki-slack-message) "102.0"))
               (should (looking-at-p "定位回复"))
-              (loki-assistant-slack--render)
-              (should (looking-at-p "定位回复")))))
-      (when-let ((buffer (loki-assistant-slack--find-buffer "TTEST.DNOTIFY"))) (kill-buffer buffer))
+              (let ((subscription loki-assistant-slack--pending-subscription))
+                (should subscription)
+                (funcall connection-callback
+                         '(:ok t :data ((value . [((team_id . "TTEST") (session_id . "one"))]))))
+                (should
+                 (eq (loki-assistant-slack-chat-test--deliver
+                      (loki-assistant-slack--subscription-id subscription) "one" 1 "snapshot"
+                      '(snapshot . ((items . [((ts . "200.0") (text . "首屏消息"))])
+                                    (thread_items . []))))
+                     'applied))
+                (should (eq loki-assistant-slack--subscription subscription))
+                (should (loki-assistant-slack--message-position "101.0"))
+                (should (loki-assistant-slack--message-position "200.0"))
+                (should (equal (get-text-property (point) 'loki-slack-message) "102.0"))
+                (should (looking-at-p "定位回复"))))))
+      (when-let* ((buffer (loki-assistant-slack--find-buffer "TTEST.DCHAT")))
+        (cl-letf (((symbol-function 'loki-assistant-slack--request) #'ignore))
+          (kill-buffer buffer)))
       (delete-directory shell-maker-root-path t))))
 
 (provide 'loki-assistant-slack-chat-tests)
