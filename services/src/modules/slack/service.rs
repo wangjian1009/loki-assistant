@@ -162,11 +162,23 @@ impl SlackService {
             if let (Some(root), Some(identity)) = (self.cache_root.clone(), identity) {
                 tokio::task::spawn_blocking(move || {
                     if let Ok(disk) = DiskCache::open(&root, &identity.team_id, &identity.user_id) {
+                        let account = state.secrets.account.as_mut().expect("已验证的 Slack 会话");
+                        let mut rooms = disk.rooms();
+                        if let Some(baseline) = rooms
+                            .values()
+                            .filter_map(|room| room.read_positions.baseline)
+                            .min()
+                        {
+                            account.baseline = baseline;
+                        }
+                        for room in rooms.values_mut() {
+                            room.read_positions.baseline.get_or_insert(account.baseline);
+                        }
                         state.user_directory = Some(UserDirectory::from_disk(
                             identity.session_id,
                             disk.users(&identity.team_id),
                         ));
-                        state.cache.conversations = disk.rooms();
+                        state.cache.conversations = rooms;
                         state.cache.disk = Some(disk);
                     }
                 })

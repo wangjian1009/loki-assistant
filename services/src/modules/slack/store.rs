@@ -27,7 +27,6 @@ pub(super) struct Cache {
     pub session_id: Option<Uuid>,
     pub conversations: BTreeMap<String, Conversation>,
     pub directory_loaded: bool,
-    pub read_positions: BTreeMap<String, ReadPositions>,
     pub sends: BTreeMap<Uuid, SendRecord>,
     pub events: BTreeSet<String>,
     pub notifications: BTreeMap<String, String>,
@@ -42,11 +41,6 @@ impl Cache {
             };
         }
     }
-
-    pub fn positions(&self, conversation: &str) -> &ReadPositions {
-        static EMPTY: ReadPositions = ReadPositions(BTreeMap::new());
-        self.read_positions.get(conversation).unwrap_or(&EMPTY)
-    }
 }
 
 #[derive(Clone)]
@@ -56,13 +50,17 @@ pub(super) struct Conversation {
     pub kind: String,
     pub title: String,
     pub participants: Vec<String>,
+    pub read_positions: ReadPositions,
     pub messages: BTreeMap<String, Message>,
     pub deleted: BTreeSet<String>,
     pub loaded: BTreeMap<String, bool>,
 }
 
-#[derive(Default)]
-pub(super) struct ReadPositions(pub BTreeMap<String, String>);
+#[derive(Clone, Default)]
+pub(super) struct ReadPositions {
+    pub baseline: Option<u64>,
+    pub cursors: BTreeMap<String, String>,
+}
 
 impl Conversation {
     pub fn new(id: &str, kind: &str, title: &str) -> Self {
@@ -72,17 +70,14 @@ impl Conversation {
             kind: kind.into(),
             title: title.into(),
             participants: Vec::new(),
+            read_positions: ReadPositions::default(),
             messages: BTreeMap::new(),
             deleted: BTreeSet::new(),
             loaded: BTreeMap::new(),
         }
     }
 
-    pub fn summarize(
-        &self,
-        account: &Account,
-        positions: &ReadPositions,
-    ) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
+    pub fn summarize(&self, account: &Account) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
         let latest = self
             .messages
             .values()
@@ -90,7 +85,7 @@ impl Conversation {
         let mut unread: Vec<_> = self
             .messages
             .values()
-            .filter(|message| positions.unread(message, account))
+            .filter(|message| self.read_positions.unread(message, account))
             .collect();
         unread.sort_by_key(|message| timestamp(&message.ts));
         let mention = unread
@@ -134,7 +129,7 @@ impl Conversation {
             return;
         }
         if let Some(disk) = &self.disk {
-            disk.save_room(self);
+            let _ = disk.save_room(self);
             disk.save_message(&self.id, &message);
         }
         self.messages.insert(message.ts.clone(), message);
@@ -170,7 +165,9 @@ impl Conversation {
 
 impl ReadPositions {
     pub fn get(&self, thread: Option<&str>) -> Option<&str> {
-        self.0.get(thread.unwrap_or_default()).map(String::as_str)
+        self.cursors
+            .get(thread.unwrap_or_default())
+            .map(String::as_str)
     }
 
     pub fn unread(&self, message: &Message, account: &Account) -> bool {
@@ -184,7 +181,7 @@ impl ReadPositions {
         let position = self
             .get(message.thread_ts.as_deref())
             .and_then(timestamp)
-            .unwrap_or((account.baseline, 0));
+            .unwrap_or((self.baseline.unwrap_or(account.baseline), 0));
         timestamp(&message.ts).is_some_and(|value| value > position)
     }
 }

@@ -21,7 +21,7 @@
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
-| [[file:slack.org][modules/slack]] | 工作区注册、后台私信接收、系统通知与消息查询和发送 | 已实现首期与网页会话接入 |
+| [[file:slack.org][modules/slack]] | 工作区注册、实时消息接收、提及和私信通知、消息查询和发送 | 已实现首期与网页会话接入 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
 | ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |

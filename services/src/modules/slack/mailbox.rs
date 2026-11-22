@@ -11,7 +11,7 @@ use super::{
     disk,
     protocol::{Error, Message, Page, timestamp, valid_id},
     service::{SlackService, now},
-    store::{Account, Cache, Conversation, SendRecord, SendState},
+    store::{Account, Conversation, SendRecord, SendState},
 };
 
 #[derive(Deserialize, Serialize)]
@@ -401,7 +401,7 @@ impl SlackService {
             Err(Error::Permission) => self.directory(session, "im,mpim").await?,
             result => result?,
         };
-        self.update_cache(session, move |cache, _| {
+        self.update_cache(session, move |cache, account| {
             if let Some(disk) = &cache.disk {
                 for id in cache
                     .conversations
@@ -416,6 +416,7 @@ impl SlackService {
                 .retain(|id, _| directory.contains_key(id));
             for (id, mut entry) in directory {
                 entry.disk.clone_from(&cache.disk);
+                entry.read_positions.baseline = Some(account.baseline);
                 let room = cache
                     .conversations
                     .entry(id)
@@ -431,7 +432,7 @@ impl SlackService {
                     })
                     .or_insert(entry);
                 if let Some(disk) = &cache.disk {
-                    disk.save_room(room);
+                    let _ = disk.save_room(room);
                 }
             }
             cache.directory_loaded = true;
@@ -477,7 +478,7 @@ impl SlackService {
                 {
                     room.participants = users;
                     if let Some(disk) = &room.disk {
-                        disk.save_room(room);
+                        let _ = disk.save_room(room);
                     }
                 }
             }
@@ -544,8 +545,7 @@ impl SlackService {
             .values()
             .filter(|value| kind.is_empty() || value.kind == kind)
             .filter_map(|value| {
-                let (latest, unread_time, summary) =
-                    self.conversation_summary(&state.cache, account, value);
+                let (latest, unread_time, summary) = self.conversation_summary(account, value);
                 if unread && unread_time.is_none() {
                     return None;
                 }
@@ -561,16 +561,15 @@ impl SlackService {
 
     pub(super) fn conversation_summary(
         &self,
-        cache: &Cache,
         account: &Account,
         room: &Conversation,
     ) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
-        let (latest, unread, mut summary) = room.summarize(account, cache.positions(&room.id));
+        let (latest, unread, mut summary) = room.summarize(account);
         summary["id"] = json!(format!("{}.{}", account.identity.team_id, room.id));
         summary["team_id"] = json!(account.identity.team_id);
         summary["team_name"] = json!(account.identity.team_name);
         summary["session_id"] = json!(account.identity.session_id);
-        if let Some(disk) = &cache.disk {
+        if let Some(disk) = &room.disk {
             disk::add_path(&mut summary, "cache_path", disk.room_path(&room.id));
         }
         (latest, unread, summary)
@@ -604,7 +603,7 @@ impl SlackService {
                 .conversations
                 .get(id)
                 .ok_or(Error::Conversation)?;
-            self.conversation_summary(&state.cache, account, room).2
+            self.conversation_summary(account, room).2
         };
         let root = match thread.or(message) {
             Some(ts) => self.find_message(session, id, None, ts).await?,
@@ -954,7 +953,7 @@ impl SlackService {
             .conversations
             .get(&id)
             .ok_or(Error::Conversation)?;
-        let positions = state.cache.positions(&id);
+        let positions = &conversation.read_positions;
         let public_message = |message: &Message| {
             let mut value = json!(message);
             if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
@@ -1203,18 +1202,25 @@ impl SlackService {
             return Err(Error::Invalid);
         }
         self.update_cache(session, move |cache, account| {
-            let conversation = cache.conversations.get(&id).ok_or(Error::Conversation)?;
-            let existing = cache.positions(&id).get(thread.as_deref()).and_then(timestamp);
+            let conversation = cache.conversations.get_mut(&id).ok_or(Error::Conversation)?;
+            let existing = conversation.read_positions.get(thread.as_deref()).and_then(timestamp);
             if existing.is_none_or(|value| position > value) {
                 if !conversation.messages.get(&target).is_some_and(|message| message.thread_ts == thread) {
                     return Err(Error::ReadPosition);
                 }
-                cache.read_positions.entry(id.clone()).or_default().0.insert(thread.clone().unwrap_or_default(), target);
+                let previous = conversation.read_positions.clone();
+                conversation.read_positions.cursors
+                    .insert(thread.clone().unwrap_or_default(), target);
+                if let Some(disk) = &conversation.disk
+                    && disk.save_room(conversation).is_err()
+                {
+                    conversation.read_positions = previous;
+                    return Err(Error::ReadPositionStorage);
+                }
             }
-            let positions = cache.positions(&id);
-            let (_, _, summary) = conversation.summarize(account, positions);
+            let (_, _, summary) = conversation.summarize(account);
             Ok(json!({"api_version":"1","conversation_id":id,"thread_ts":thread,
-                "read_through_ts":positions.get(thread.as_deref()),"unread_count":summary["unread_count"]}))
+                "read_through_ts":conversation.read_positions.get(thread.as_deref()),"unread_count":summary["unread_count"]}))
         }).await
     }
 

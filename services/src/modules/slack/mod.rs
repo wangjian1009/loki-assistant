@@ -36,7 +36,7 @@ pub use projects::Projects;
 static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "slack",
     name: "Slack",
-    description: "提供 Slack 私信通知、会话查询和消息收发。",
+    description: "提供 Slack 提及和私信通知、会话查询和消息收发。",
     version: env!("CARGO_PKG_VERSION"),
 };
 

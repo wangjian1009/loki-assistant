@@ -26,6 +26,7 @@ pub(super) enum Error {
     Session,
     Conflict,
     ReadPosition,
+    ReadPositionStorage,
     UserToken,
     WebUserToken,
     WebCookie,
@@ -92,6 +93,11 @@ impl Error {
                 422,
                 "slack-invalid-read-position",
                 "此消息不属于指定的时间线。",
+            ),
+            Self::ReadPositionStorage => (
+                503,
+                "slack-read-position-storage-error",
+                "无法将 Slack 已读位置保存到本地缓存。",
             ),
             Self::UserToken => (
                 422,

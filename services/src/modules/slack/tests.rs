@@ -138,8 +138,21 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
 
     let directory = Directory::new();
     let cache = DiskCache::open(&directory.0, "TTEAM", "UME").unwrap();
-    let room = super::store::Conversation::new("CROOM", "public_channel", "频道");
-    cache.save_room(&room);
+    let mut room = super::store::Conversation::new("CROOM", "public_channel", "频道");
+    super::disk::atomic_write(
+        &cache.room_path("CROOM"),
+        b"((id . \"CROOM\") (kind . \"public_channel\") (title . \"Room\") (participants . []))\n",
+    )
+    .unwrap();
+    assert!(cache.rooms()["CROOM"].read_positions.baseline.is_none());
+    room.read_positions.baseline = Some(10);
+    room.read_positions
+        .cursors
+        .insert(String::new(), "10.000001".into());
+    room.read_positions
+        .cursors
+        .insert("10.000001".into(), "11.000002".into());
+    cache.save_room(&room).unwrap();
     let root = Message::from_slack(
         &json!({
             "ts":"10.000001", "text":"UTF-8 文本\n引号\"与反斜杠\\",
@@ -194,6 +207,11 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
     DiskCache::clean(&directory.0, Duration::from_secs(86_400));
     assert!(!root_path.exists() && !reply_path.exists());
     assert!(cache.room_path("CROOM").is_file());
+    let rooms = cache.rooms();
+    let restored = &rooms["CROOM"].read_positions;
+    assert_eq!(restored.baseline, Some(10));
+    assert_eq!(restored.get(None), Some("10.000001"));
+    assert_eq!(restored.get(Some("10.000001")), Some("11.000002"));
     let other = DiskCache::open(&directory.0, "TTEAM", "UOTHER").unwrap();
     assert!(other.rooms().is_empty());
 }
@@ -359,15 +377,16 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         stream.send(message).await.unwrap();
         let _ = done.send(());
         channel_ready.await.unwrap();
-        stream
-            .send(Message::Text(
-                json!({"type":"message","channel":"CWORK","ts":socket_mock.reply,
-            "user":"UYOU","text":"请 <@UME> 看一下"})
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
+        let ordinary = json!({"type":"message","channel":"CWORK","ts":socket_mock.root,
+            "user":"UYOU","text":"<!channel> 请 <@UMEOTHER> 看一下"});
+        let mention = json!({"type":"message","channel":"CWORK","ts":socket_mock.reply,
+            "thread_ts":socket_mock.root,"user":"UYOU","text":"请 <@UME> 看一下"});
+        for payload in [&ordinary, &mention, &mention] {
+            stream
+                .send(Message::Text(payload.to_string().into()))
+                .await
+                .unwrap();
+        }
         std::future::pending::<()>().await;
     });
 
@@ -598,10 +617,31 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     })
     .await
     .expect("实时频道提及进入会话摘要");
-    assert_eq!(channel["unread_count"], 1);
+    assert_eq!(channel["unread_count"], 2);
     assert_eq!(channel["last_message"]["author"]["id"], "TTEAM.UYOU");
     assert_eq!(channel["last_message"]["preview"], "请 <@UME> 看一下");
-    assert_eq!(alerts.0.lock().unwrap().len(), 1);
+    let navigation = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(alert) = alerts.0.lock().unwrap().get(1) {
+                break alert.navigation_url.clone().unwrap();
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("频道提及触发通知");
+    let navigation = url::Url::parse(&navigation).unwrap();
+    let (_, callback) = navigation
+        .query_pairs()
+        .find(|(key, _)| key == "callback")
+        .unwrap();
+    assert_eq!(
+        callback,
+        format!(
+            "/slack/conversations/TTEAM.CWORK/open?message_ts={}&thread_ts={}",
+            mock.reply, mock.root
+        )
+    );
 
     // 已翻阅的旧线程根消息可能已经被逐出缓存，发送前向 Slack 核对。
     let root = mock.root.clone();
@@ -654,6 +694,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await
     .unwrap();
     assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(alerts.0.lock().unwrap().len(), 2);
     assert_eq!(
         invoke(
             &app,
@@ -678,12 +719,18 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let (code, _, restored) = invoke(&app, "GET", timeline, fresh_session, None, None).await;
     assert_eq!(code, StatusCode::OK, "{restored}");
     assert_eq!(restored["sync_state"], "cached");
+    assert!(restored["read_through_ts"].is_null());
+    assert_eq!(restored["first_unread_ts"], mock.root);
     assert!(restored["items"].as_array().unwrap().iter().any(|item| {
         item["ts"] == mock.root
             && item["cache_path"]
                 .as_str()
                 .is_some_and(|path| std::path::Path::new(path).is_file())
     }));
+    let (code, _, restored_thread) = invoke(&app, "GET", &thread, fresh_session, None, None).await;
+    assert_eq!(code, StatusCode::OK, "{restored_thread}");
+    assert_eq!(restored_thread["read_through_ts"], mock.reply);
+    assert!(restored_thread["first_unread_ts"].is_null());
     assert_eq!(
         invoke(&app, "GET", send, session, None, None).await.0,
         StatusCode::CONFLICT
@@ -1795,7 +1842,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
 fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     use super::{
         protocol::{Identity, Message},
-        store::{Account, Conversation, ReadPositions},
+        store::{Account, Conversation},
     };
 
     let account = Account {
@@ -1827,8 +1874,7 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     ] {
         room.ingest(Message::from_slack(&message, None).unwrap());
     }
-    let mut positions = ReadPositions::default();
-    let (_, _, summary) = room.summarize(&account, &positions);
+    let (_, _, summary) = room.summarize(&account);
     assert_eq!(summary["participant_ids"], json!(["TTEAM.UYOU"]));
     assert_eq!(summary["unread_count"], 3);
     assert_eq!(summary["last_unread_mention_ts"], "103.0");
@@ -1842,8 +1888,10 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     assert_eq!(wire["attachments"][0]["size"], 4096);
     assert!(wire["attachments"][0].get("image_url").is_none());
 
-    positions.0.insert("101.0".into(), "104.0".into());
-    let (_, _, summary) = room.summarize(&account, &positions);
+    room.read_positions
+        .cursors
+        .insert("101.0".into(), "104.0".into());
+    let (_, _, summary) = room.summarize(&account);
     assert_eq!(summary["last_unread_mention_ts"], "101.0");
 }
 

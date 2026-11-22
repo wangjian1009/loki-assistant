@@ -148,10 +148,7 @@ impl SlackService {
                 .conversations
                 .values()
                 .map(|room| {
-                    PickerItem::from_summary(
-                        self.conversation_summary(&state.cache, account, room).2,
-                        users,
-                    )
+                    PickerItem::from_summary(self.conversation_summary(account, room).2, users)
                 })
                 .collect();
             state.picker_items = items;

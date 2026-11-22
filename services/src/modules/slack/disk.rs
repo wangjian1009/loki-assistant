@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::{
     mailbox::UserProfile,
     protocol::{Attachment, Message, timestamp, valid_id},
-    store::Conversation,
+    store::{Conversation, ReadPositions},
 };
 
 #[derive(Clone)]
@@ -46,6 +46,16 @@ struct RoomInfo {
     kind: String,
     title: String,
     participants: Vec<String>,
+    #[serde(default)]
+    read_baseline: Option<u64>,
+    #[serde(default)]
+    read_positions: Vec<ReadCursor>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReadCursor {
+    thread_ts: Option<String>,
+    through_ts: String,
 }
 
 impl DiskCache {
@@ -127,16 +137,27 @@ impl DiskCache {
         self.0.join("conversations").join(id).join("info.txt")
     }
 
-    pub fn save_room(&self, room: &Conversation) {
-        save_record(
+    pub fn save_room(&self, room: &Conversation) -> io::Result<()> {
+        let read_positions = room
+            .read_positions
+            .cursors
+            .iter()
+            .map(|(thread, target)| ReadCursor {
+                thread_ts: (!thread.is_empty()).then(|| thread.clone()),
+                through_ts: target.clone(),
+            })
+            .collect();
+        write_record(
             &self.room_path(&room.id),
             &RoomInfo {
                 id: room.id.clone(),
                 kind: room.kind.clone(),
                 title: room.title.clone(),
                 participants: room.participants.clone(),
+                read_baseline: room.read_positions.baseline,
+                read_positions,
             },
-        );
+        )
     }
 
     pub fn remove_room(&self, id: &str) {
@@ -153,6 +174,21 @@ impl DiskCache {
                 }
                 let mut room = Conversation::new(id, &info.kind, &info.title);
                 room.participants = info.participants;
+                room.read_positions = ReadPositions {
+                    baseline: info.read_baseline,
+                    cursors: info
+                        .read_positions
+                        .into_iter()
+                        .filter(|cursor| {
+                            timestamp(&cursor.through_ts).is_some()
+                                && cursor
+                                    .thread_ts
+                                    .as_deref()
+                                    .is_none_or(|ts| timestamp(ts).is_some())
+                        })
+                        .map(|cursor| (cursor.thread_ts.unwrap_or_default(), cursor.through_ts))
+                        .collect(),
+                };
                 let mut paths: Vec<_> = message_paths(&path.join("messages")).collect();
                 for thread in entries(&path.join("threads"), true) {
                     paths.extend(message_paths(&thread));
@@ -493,15 +529,22 @@ fn read_message(path: &Path) -> Option<Message> {
 }
 
 fn save_record(path: &Path, value: &impl Serialize) {
-    if let Ok(value) = serde_json::to_value(value)
-        && let Ok(mut text) =
-            lexpr::to_string_custom(&to_sexp(&value), lexpr::print::Options::elisp())
-    {
-        text.push('\n');
-        if !regular_file(path) || !fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
-            let _ = atomic_write(path, text.as_bytes());
-        }
+    let _ = write_record(path, value);
+}
+
+fn write_record(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let text = encode_record(value)?;
+    if !regular_file(path) || !fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
+        atomic_write(path, text.as_bytes())?;
     }
+    Ok(())
+}
+
+fn encode_record(value: &impl Serialize) -> io::Result<String> {
+    let value = serde_json::to_value(value).map_err(io::Error::other)?;
+    let mut text = lexpr::to_string_custom(&to_sexp(&value), lexpr::print::Options::elisp())?;
+    text.push('\n');
+    Ok(text)
 }
 
 fn read_record<T: DeserializeOwned>(path: &Path) -> Option<T> {

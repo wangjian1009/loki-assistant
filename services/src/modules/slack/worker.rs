@@ -257,24 +257,22 @@ impl SlackService {
                 Some(room) => room.kind.as_str(),
                 None if id.starts_with('D') || channel_type.as_deref() == Some("im") => "im",
                 None if channel_type.as_deref() == Some("mpim") => "mpim",
+                None if channel_type.as_deref() == Some("channel") => "public_channel",
+                None if channel_type.as_deref() == Some("group") => "private_channel",
                 None => return Ok(false),
             }
             .to_owned();
-            let private = matches!(kind.as_str(), "im" | "mpim");
+            let direct_message = matches!(kind.as_str(), "im" | "mpim");
             if !cache.events.insert(event_id.clone()) {
                 return Ok(false);
             }
             if cache.events.len() > 10_000 {
                 cache.events.pop_first();
             }
-            let unread = private
-                && new
-                && message
-                    .as_ref()
-                    .is_some_and(|message| cache.positions(&id).unread(message, account));
             let conversation = cache.conversations.entry(id.clone()).or_insert_with(|| {
                 let mut room = Conversation::new(&id, &kind, &id);
                 room.disk.clone_from(&cache.disk);
+                room.read_positions.baseline = Some(account.baseline);
                 room
             });
             if subtype == "message_deleted" {
@@ -286,7 +284,10 @@ impl SlackService {
             let Some(message) = message else {
                 return Ok(false);
             };
-            let notify = unread && !conversation.deleted.contains(&message.ts);
+            let notify = new
+                && (direct_message || message.mentions(&account.identity.user_id))
+                && conversation.read_positions.unread(&message, account)
+                && !conversation.deleted.contains(&message.ts);
             if let Some(root) = &message.thread_ts {
                 let count = conversation
                     .messages
@@ -505,7 +506,7 @@ impl SlackService {
                     if !labels.is_empty() && matches!(conversation.kind.as_str(), "im" | "mpim") {
                         conversation.title = labels.join("、");
                         if let Some(disk) = &conversation.disk {
-                            disk.save_room(conversation);
+                            let _ = disk.save_room(conversation);
                         }
                     }
                     for message in conversation.messages.values_mut() {
