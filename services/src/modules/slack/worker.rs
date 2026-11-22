@@ -25,6 +25,7 @@ impl SlackService {
             self.sending(),
             self.synchronizing(),
             self.warming_users(),
+            self.refreshing_picker(),
             self.notifications()
         );
     }
@@ -41,7 +42,10 @@ impl SlackService {
             let delay = match self.session_id().await {
                 Some(session) => match self.users(session).await {
                     Ok(_) => 300,
-                    Err(error) => error.retry_after().unwrap_or(60),
+                    Err(error) => {
+                        self.picker_failure(session).await;
+                        error.retry_after().unwrap_or(60)
+                    }
                 },
                 None => 60,
             };
@@ -64,12 +68,11 @@ impl SlackService {
                         state
                             .cache
                             .notifications
-                            .first()
-                            .cloned()
-                            .map(|id| (session, id))
+                            .first_key_value()
+                            .map(|(id, callback)| (session, id.clone(), callback.clone()))
                     })
             };
-            let Some((session, id)) = pending else {
+            let Some((session, id, callback)) = pending else {
                 self.alerts.notified().await;
                 continue;
             };
@@ -78,8 +81,8 @@ impl SlackService {
                 .send(NotificationRequest {
                     title: "Slack 新消息".into(),
                     body: None,
-                    app: None,
-                    callback_url: None,
+                    app: Some("slack".into()),
+                    callback_url: Some(callback),
                 })
                 .await;
             if delivered.is_ok() {
@@ -294,13 +297,21 @@ impl SlackService {
                     parent.reply_count = parent.reply_count.max(count as u64);
                 }
             }
-            conversation.ingest(message);
             if notify {
-                cache.notifications.insert(event_id);
+                let mut callback = format!(
+                    "/slack/conversations/{}.{id}/open?message_ts={}",
+                    account.identity.team_id, message.ts
+                );
+                if let Some(thread) = &message.thread_ts {
+                    callback.push_str("&thread_ts=");
+                    callback.push_str(thread);
+                }
+                cache.notifications.insert(event_id, callback);
                 if cache.notifications.len() > 512 {
                     cache.notifications.pop_first();
                 }
             }
+            conversation.ingest(message);
             Ok(notify)
         })
         .await
@@ -318,6 +329,7 @@ impl SlackService {
                 continue;
             };
             if self.refresh_directory(session).await.is_err() {
+                self.picker_failure(session).await;
                 continue;
             }
             self.refresh_recent_messages(session, reconnect).await;
@@ -365,14 +377,17 @@ impl SlackService {
             } else {
                 self.refresh_latest(session, &id).await
             };
-            match result {
-                Err(
+            if let Err(error) = result {
+                self.picker_failure(session).await;
+                if matches!(
+                    error,
                     Error::RateLimited(_)
-                    | Error::Session
-                    | Error::Authorization
-                    | Error::Unavailable,
-                ) => break,
-                _ => {}
+                        | Error::Session
+                        | Error::Authorization
+                        | Error::Unavailable
+                ) {
+                    break;
+                }
             }
             for thread in threads {
                 let _ = self.catch_up(session, &id, Some(thread), None).await;

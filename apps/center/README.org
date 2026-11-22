@@ -37,6 +37,8 @@ make restart-center
 
 通知图标按 ~mac/Resources/NotificationAppIcons/<app>.png~ 命名并由 CMake 打包到应用内的 ~Contents/Resources/NotificationAppIcons/~ 。~app~ 是仅含小写字母、数字、~-~ 或 ~_~ 的非空标识；已内置 ~emacs.png~ ，对应 ~app: "emacs"~ 。该资源取自 GNU Emacs 随附的 ~share/icons/hicolor/128x128/apps/emacs.png~ 。新增应用时按同一规则加入 PNG 资源并重新构建，无需维护代码映射表。
 
+Slack 通知使用 ~app: "slack"~ 和内置的 ~slack.png~ 。使用 ~make export-icons~ 从公共 SVG 母版生成 Slack 通知图标。 [[https://commons.wikimedia.org/wiki/File:Slack_icon_2019.svg][Slack 图标来源]]
+
 未提供 ~app~ 或找不到对应资源时继续展示文字通知；图标附件不改变系统通知来源名称及来源应用图标。
 
 * 构建与运行

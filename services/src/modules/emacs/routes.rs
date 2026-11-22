@@ -271,7 +271,7 @@ fn json_error(error: JsonRejection) -> Response {
     error_response(EmacsError::InvalidRequest(error.body_text()))
 }
 
-fn error_response(error: EmacsError) -> Response {
+pub(crate) fn error_response(error: EmacsError) -> Response {
     let (status, source, code) = match &error {
         EmacsError::InvalidRequest(_) => (
             StatusCode::BAD_REQUEST,

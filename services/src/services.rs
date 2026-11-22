@@ -15,6 +15,7 @@ pub struct ExtensionContext<'a> {
     pub notification: &'a Arc<NotificationService>,
     pub status: &'a Arc<StatusService>,
     pub password: &'a password::Module,
+    pub emacs: &'a emacs::Module,
 }
 
 pub type ExtensionFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
@@ -97,6 +98,7 @@ impl Services {
             notification: &notification,
             status: &status,
             password: &password,
+            emacs: &emacs,
         };
         let extensions: Vec<_> = EXTENSIONS
             .iter()

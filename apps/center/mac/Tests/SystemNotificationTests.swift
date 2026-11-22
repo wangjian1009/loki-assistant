@@ -45,6 +45,18 @@ final class SystemNotificationTests: XCTestCase {
         }
     }
 
+    func testSlackNotificationResolvesBundledIcon() throws {
+        var components = URLComponents()
+        components.scheme = "loki-assistant"
+        components.host = "notification"
+        components.path = "/show"
+        components.queryItems = [URLQueryItem(name: "payload", value: #"{"title":"Slack 新消息","app":"slack"}"#)]
+        let notification = try SystemNotification(url: XCTUnwrap(components.url))
+        let icon = try XCTUnwrap(notification.appIconURL(in: Bundle(for: CenterAppDelegate.self)))
+        XCTAssertEqual(icon.lastPathComponent, "slack.png")
+        XCTAssertNotNil(NSImage(contentsOf: icon))
+    }
+
     func testGenericNotificationResolvesBundledEmacsIconAndServiceNavigation() throws {
         var components = URLComponents()
         components.scheme = "loki-assistant"

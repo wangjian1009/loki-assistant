@@ -16,6 +16,7 @@ use crate::modules::{
     notification::NotificationService, status::StatusService,
 };
 
+pub(crate) use self::routes::error_response;
 use self::{config::EmacsConfig, service::EmacsService};
 
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]

@@ -28,7 +28,7 @@ pub(super) struct Cache {
     pub read_positions: BTreeMap<String, ReadPositions>,
     pub sends: BTreeMap<Uuid, SendRecord>,
     pub events: BTreeSet<String>,
-    pub notifications: BTreeSet<String>,
+    pub notifications: BTreeMap<String, String>,
 }
 
 impl Cache {

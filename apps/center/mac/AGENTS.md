@@ -28,7 +28,7 @@ Tests/SystemNotificationTests.swift  通知数据与展示内容测试
 Tests/NotificationReceiptTests.swift 回执、重试、导航及服务发现测试
 Resources/AppIcon/                   导出的 PNG iconset、ICNS 与菜单栏图标
 Resources/Assets.xcassets/            系统应用来源图标的标准 AppIcon 资源
-Resources/NotificationAppIcons/<app>.png  按应用标识命名的内置通知图标（已提供 emacs）
+Resources/NotificationAppIcons/<app>.png  按应用标识命名的内置通知图标（已提供 emacs、slack）
 ```
 
 增加 Swift 源文件时同步修改 `CMakeLists.txt`，不要直接修改生成的 Xcode 工程。

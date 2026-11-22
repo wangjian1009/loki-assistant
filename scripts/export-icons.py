@@ -86,6 +86,9 @@ def main() -> None:
                                sources / "loki-assistant-menu-sleep-v1.svg", staging / mac_resources)
         export_harmony(app_png, staging / harmony_media)
         export_chrome(sources / "loki-assistant-chrome-v1.svg", staging / chrome_icons)
+        notifications = staging / mac_resources / "NotificationAppIcons"
+        notifications.mkdir()
+        render(sources / "slack.svg", notifications / "slack.png", 128)
         for generated in staging.rglob("*"):
             if generated.is_file():
                 output = root / generated.relative_to(staging)

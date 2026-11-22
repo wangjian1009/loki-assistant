@@ -40,6 +40,56 @@ use crate::{
     },
 };
 
+#[derive(Debug)]
+struct OpenSlackRunner;
+
+impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
+    fn run<'a>(
+        &'a self,
+        _: &'a str,
+        args: &'a [String],
+    ) -> crate::modules::emacs::service::ServiceFuture<
+        'a,
+        crate::modules::emacs::service::CommandOutput,
+    > {
+        Box::pin(async move {
+            assert_eq!(args[0], "--alternate-editor=/usr/bin/false");
+            assert!(args[3].contains("loki-assistant-slack-open-notification"));
+            assert!(args[3].contains("TTEAM.DDIRECT"));
+            let decode_string = |source: &str| {
+                serde_json::Deserializer::from_str(source)
+                    .into_iter::<String>()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+            };
+            let script = decode_string(args[3].split_once("((source ").unwrap().1);
+            let target = decode_string(
+                script
+                    .split_once("(loki-assistant-slack-open-notification ")
+                    .unwrap()
+                    .1,
+            );
+            let target: Value = serde_json::from_str(&target).unwrap();
+            let result = if target["message_ts"].is_string() {
+                assert_eq!(target["reply"]["text"], "线程回复");
+                "message"
+            } else if target["thread_ts"].is_string() {
+                assert_eq!(target["root"]["text"], "问候");
+                "thread"
+            } else {
+                "conversation"
+            };
+            Ok(crate::modules::emacs::service::CommandOutput {
+                success: true,
+                status: Some(0),
+                stdout: json!(json!({"result":result}).to_string()).to_string(),
+                stderr: String::new(),
+            })
+        })
+    }
+}
+
 use super::{
     projects::{Backend, Projects},
     service::now,
@@ -170,7 +220,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 return Json(json!({"ok":true,"messages":[]}));
             }
             let root = json!({"ts":mock.root,"text":"问候","user":"UYOU","reply_count":2});
-            let response = if query.get("latest") == Some(&mock.root) {
+            let response = if query.contains_key("inclusive") {
+                if query.get("latest") == Some(&mock.root) { json!({"ok":true,"messages":[root]}) }
+                else { json!({"ok":true,"messages":[]}) }
+            } else if query.get("latest") == Some(&mock.root) {
                 json!({"ok":true,"messages":[{"ts":"1.000001","text":"更早的顶层消息","user":"UYOU"}]})
             } else if query.get("cursor").is_some_and(|cursor| cursor == "after-broadcast") {
                 json!({"ok":true,"has_more":true,"messages":[root]})
@@ -184,7 +237,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         }))
         .route("/conversations.replies", get(|State(mock): State<Arc<Mock>>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
             let earlier = format!("{}5", mock.root);
-            let response = if query.get("oldest") == Some(&earlier) {
+            let response = if query.get("oldest") == Some(&earlier) || query.get("oldest") == Some(&mock.reply) {
                 json!({"ok":true,"messages":[{"ts":mock.reply,"thread_ts":mock.root,"text":"线程回复","user":"UYOU"}]})
             } else {
                 json!({"ok":true,"has_more":!query.contains_key("latest"),"messages":[
@@ -268,11 +321,22 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .await
         .unwrap();
     let status = Arc::new(StatusService::new());
+    config
+        .replace("emacs", "emacsclient_path", json!("/usr/bin/true"))
+        .await
+        .unwrap();
     let start = || {
         let projects = Arc::new(Projects::with_backend(
             Arc::clone(&config),
             Arc::clone(&notification),
             Arc::clone(&status),
+            Arc::new(crate::modules::emacs::service::EmacsService::with_runner(
+                crate::modules::emacs::config::EmacsConfig::new(config.clone()),
+                notification.clone(),
+                status.clone(),
+                Arc::new(OpenSlackRunner),
+                Duration::from_secs(1),
+            )),
             Backend {
                 api: api.clone(),
                 open_browser: Arc::new(|_| unreachable!()),
@@ -300,6 +364,40 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await
     .unwrap();
     assert_eq!(alerts.0.lock().unwrap().len(), 1);
+    assert_eq!(alerts.0.lock().unwrap()[0].app.as_deref(), Some("slack"));
+    let navigation = alerts.0.lock().unwrap()[0].navigation_url.clone().unwrap();
+    let navigation = url::Url::parse(&navigation).unwrap();
+    let (_, callback) = navigation
+        .query_pairs()
+        .find(|(key, _)| key == "callback")
+        .unwrap();
+    assert_eq!(
+        callback,
+        format!(
+            "/slack/conversations/TTEAM.DDIRECT/open?message_ts={}",
+            mock.root
+        )
+    );
+    for (query, expected) in [
+        (
+            format!("thread_ts={}&message_ts={}", mock.root, mock.reply),
+            "message",
+        ),
+        (format!("thread_ts={}&message_ts=1.0", mock.root), "thread"),
+        ("thread_ts=1.0".into(), "conversation"),
+    ] {
+        let (status, _, body) = invoke(
+            &app,
+            "POST",
+            &format!("/slack/conversations/TTEAM.DDIRECT/open?{query}"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["target"], expected);
+    }
 
     let data = invoke(&app, "GET", "/status/slack/connections", None, None, None)
         .await
@@ -659,9 +757,26 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let api = format!("http://{}", listener.local_addr().unwrap());
     let user_directory_requests = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let requested_teams = Arc::clone(&user_directory_requests);
+    let user_info_requests = Arc::new(Mutex::new(Vec::new()));
+    let requested_users = Arc::clone(&user_info_requests);
     let history_requests = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let requested_rooms = Arc::clone(&history_requests);
     let slack = Router::new()
+        .route(
+            "/users.info",
+            get(move |headers: HeaderMap, Query(query): Query<std::collections::BTreeMap<String, String>>| {
+                let requested_users = Arc::clone(&requested_users);
+                async move {
+                    let user = &query["user"];
+                    requested_users.lock().unwrap().push((headers["authorization"].to_str().unwrap().to_owned(), user.clone()));
+                    Json(match user.as_str() {
+                        "UADDED" => json!({"ok":true,"user":{"id":user,"real_name":"补查用户"}}),
+                        "UMISSING" => json!({"ok":false,"error":"user_not_found"}),
+                        _ => json!({"ok":false,"error":"internal_error"}),
+                    })
+                }
+            }),
+        )
         .route(
             "/users.list",
             get(move |headers: HeaderMap| {
@@ -670,6 +785,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
                     requested_teams.lock().unwrap().insert(headers["authorization"].to_str().unwrap().to_owned());
                     Json(json!({"ok":true,"members":[
                         {"id":"U1","name":"linzhou","profile":{"display_name":"林舟","image_48":"https://avatars.slack-edge.com/avatar.png"}},
+                        {"id":"U2","name":"linzhou","profile":{"display_name":"林舟","image_48":"https://avatars.slack-edge.com/avatar.png"}},
                         {"id":"UOLD","deleted":true}
                     ]}))
                 }
@@ -679,7 +795,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             "/users.conversations",
             get(|| async {
                 Json(json!({"ok":true,"channels":[
-                    {"id":"DSHARED","user":"U1","is_im":true},
+                    {"id":"DSHARED","user":"U2","is_im":true},
                     {"id":"CCHAT","name":"项目讨论","is_channel":true},
                     {"id":"GCHAT","name":"内部讨论","is_channel":true,"is_private":true}
                 ]}))
@@ -728,6 +844,12 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         base.clone(),
         Arc::new(NotificationService::new()),
         status.clone(),
+        crate::modules::emacs::Module::new(
+            base.clone(),
+            Arc::new(NotificationService::new()),
+            status.clone(),
+        )
+        .service(),
         Backend {
             api,
             open_browser: Arc::new(move |url| {
@@ -941,6 +1063,44 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     })
     .await
     .expect("WebSocket 不可用时，两个工作区仍在首次查询前预热用户目录与会话消息");
+    let picker = timeout(Duration::from_secs(3), async {
+        loop {
+            let (status, headers, body) =
+                invoke(&app, "GET", "/slack/conversations/picker", None, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers["cache-control"], "no-store");
+            if body["workspaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|team| team["state"] == "ready")
+                && body["items"].as_array().unwrap().len() == 6
+            {
+                break body;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let im = picker["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "im")
+        .unwrap();
+    assert_eq!(im["participants"][0]["name"], "林舟");
+    assert_eq!(
+        im["participants"][0]["avatar_url"],
+        "https://avatars.slack-edge.com/avatar.png"
+    );
+    assert!(
+        im["search_terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|term| term == "lz")
+    );
     let (_, _, users) = invoke(&app, "GET", "/slack/users?limit=1", None, None, None).await;
     assert_eq!(users["items"][0]["id"], "TALPHA.U1");
     assert_eq!(users["items"][0]["name"], "林舟");
@@ -959,9 +1119,89 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         None,
     )
     .await;
-    assert_eq!(users["items"][0]["id"], "TBETA.U1");
-    assert_eq!(users["items"].as_array().unwrap().len(), 1);
+    assert_eq!(users["items"][0]["id"], "TALPHA.U2");
+    assert_eq!(users["items"][1]["id"], "TBETA.U1");
+    assert_eq!(users["items"][2]["id"], "TBETA.U2");
+    assert_eq!(users["items"].as_array().unwrap().len(), 3);
     assert!(users["next_cursor"].is_null());
+
+    for query in [
+        "id=".to_owned(),
+        "id=U1".to_owned(),
+        "id=TALPHA.U1&id=wrong".to_owned(),
+        "id=TALPHA.U1&limit=1".to_owned(),
+        "id=TALPHA.U1&cursor=page".to_owned(),
+        vec!["id=TALPHA.U1"; 101].join("&"),
+    ] {
+        let (code, _, body) = invoke(
+            &app,
+            "GET",
+            &format!("/slack/users?{query}"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid-request");
+    }
+    let (code, headers, batch) = invoke(&app, "GET",
+        "/slack/users?id=TBETA.U2&id=TALPHA.UADDED&id=TOTHER.U1&id=TBETA.UMISSING&id=TALPHA.UADDED&id=TALPHA.U1&id=TBETA.UBROKEN",
+        None, None, None).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(batch["api_version"], "1");
+    assert!(batch["next_cursor"].is_null());
+    let ids: Vec<_> = batch["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["TBETA.U2", "TALPHA.UADDED", "TALPHA.U1"]);
+    assert_eq!(batch["items"][1]["name"], "补查用户");
+    let issues: Vec<_> = batch["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["id"].as_str().unwrap(),
+                item["error"]["code"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        issues,
+        [
+            ("TOTHER.U1", "slack-project-not-found"),
+            ("TBETA.UMISSING", "slack-user-not-found"),
+            ("TBETA.UBROKEN", "slack-upstream-error")
+        ]
+    );
+    assert_eq!(batch["issues"][1]["team_id"], "TBETA");
+
+    let (code, _, cached) = invoke(
+        &app,
+        "GET",
+        "/slack/users?id=TALPHA%2EUADDED",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(cached["items"][0]["name"], "补查用户");
+    let mut requested = user_info_requests.lock().unwrap().clone();
+    requested.sort_unstable();
+    assert_eq!(
+        requested,
+        [
+            ("Bearer xoxc-TALPHA".into(), "UADDED".into()),
+            ("Bearer xoxc-TBETA".into(), "UBROKEN".into()),
+            ("Bearer xoxc-TBETA".into(), "UMISSING".into())
+        ]
+    );
 
     let (_, _, first) = invoke(
         &app,

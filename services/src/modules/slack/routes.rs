@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -7,7 +7,7 @@ use axum::{
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode, Uri,
         header::{CACHE_CONTROL, LOCATION},
     },
     middleware,
@@ -220,6 +220,15 @@ fn validate_team_id(team_id: &str) -> Result<(), Error> {
     }
 }
 
+fn split_id(id: &str) -> Result<(&str, &str), Error> {
+    let (team_id, id) = id.split_once('.').ok_or(Error::Invalid)?;
+    validate_team_id(team_id)?;
+    if !super::protocol::valid_id(id) {
+        return Err(Error::Invalid);
+    }
+    Ok((team_id, id))
+}
+
 async fn scoped(
     projects: &Projects,
     scope: Params<Scope>,
@@ -234,11 +243,7 @@ async fn conversation(
     projects: &Projects,
     composite_id: String,
 ) -> Result<(String, String, Arc<SlackService>), Error> {
-    let (team_id, id) = composite_id.split_once('.').ok_or(Error::Invalid)?;
-    validate_team_id(team_id)?;
-    if !super::protocol::valid_id(id) {
-        return Err(Error::Invalid);
-    }
+    let (team_id, id) = split_id(&composite_id)?;
     let service = projects.service(team_id).await?;
     Ok((team_id.to_owned(), id.to_owned(), service))
 }
@@ -350,14 +355,117 @@ async fn conversations(
     id = "users",
     method = "GET",
     path = "/slack/users",
-    summary = "分页读取 Slack 用户",
-    description = "合并已授权工作区的用户目录。"
+    summary = "查询 Slack 用户",
+    description = "使用重复的 id 参数筛选用户，省略 id 时分页读取用户目录。"
 )]
-async fn users(State(projects): Service, query: Params<MessagePage>) -> Result<Json<Value>, Error> {
-    projects
-        .users(query.map_err(|_| Error::Invalid)?.0.into())
+async fn users(State(projects): Service, uri: Uri) -> Result<Json<Value>, Error> {
+    let query = uri.query().unwrap_or_default();
+    let mut ids = Vec::new();
+    let mut has_other_params = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "id" {
+            if ids.len() == 100 {
+                return Err(Error::Invalid);
+            }
+            ids.push(value);
+        } else {
+            has_other_params = true;
+        }
+    }
+    if ids.is_empty() {
+        let Query(page) = Query::<MessagePage>::try_from_uri(&uri).map_err(|_| Error::Invalid)?;
+        return projects.users(page.into()).await.map(Json);
+    }
+    if has_other_params {
+        return Err(Error::Invalid);
+    }
+    let mut seen = BTreeSet::new();
+    let users = ids
+        .iter()
+        .map(|id| id.as_ref())
+        .filter(|id| seen.insert(*id))
+        .map(|id| split_id(id).map(|(team, user)| (team.to_owned(), user.to_owned())))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(projects.lookup_users(users).await))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PickerQuery {}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "conversation-picker",
+    method = "GET",
+    path = "/slack/conversations/picker",
+    summary = "读取 Slack 会话候选",
+    description = "一次读取全部工作区的会话候选内存快照。"
+)]
+async fn picker(
+    State(projects): Service,
+    query: Params<PickerQuery>,
+) -> Result<Json<Value>, Error> {
+    query.map_err(|_| Error::Invalid)?;
+    Ok(Json(projects.picker().await))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenQuery {
+    thread_ts: Option<String>,
+    message_ts: Option<String>,
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "open-conversation",
+    method = "POST",
+    path = "/slack/conversations/{id}/open",
+    summary = "打开 Slack 会话",
+    description = "在 Emacs 中打开会话，可定位线程或消息。"
+)]
+async fn open_conversation(
+    State(projects): Service,
+    headers: HeaderMap,
+    id: Segment<String>,
+    query: Params<OpenQuery>,
+) -> Result<Json<Value>, Response> {
+    let Query(query) = query.map_err(|_| Error::Invalid.into_response())?;
+    if [query.thread_ts.as_deref(), query.message_ts.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|ts| super::protocol::timestamp(ts).is_none())
+    {
+        return Err(Error::Invalid.into_response());
+    }
+    let Path(id) = id.map_err(|_| Error::Invalid.into_response())?;
+    let (_, raw_id, service) = conversation(&projects, id.clone())
         .await
-        .map(Json)
+        .map_err(IntoResponse::into_response)?;
+    let session = session(&headers, &service)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let target = service
+        .open_target(
+            session,
+            &raw_id,
+            query.thread_ts.as_deref(),
+            query.message_ts.as_deref(),
+        )
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let target = projects
+        .emacs
+        .open_slack_conversation(&target)
+        .await
+        .map_err(crate::modules::emacs::error_response)?;
+    Ok(Json(
+        json!({"api_version":"1", "conversation_id":id, "target":target}),
+    ))
 }
 
 #[loki_api(

@@ -331,6 +331,35 @@ impl EmacsService {
         }
     }
 
+    pub(crate) async fn open_slack_conversation(
+        &self,
+        target: &Value,
+    ) -> Result<String, EmacsError> {
+        let argument = serde_json::to_string(&target.to_string()).expect("JSON 字符串可序列化");
+        let script = format!(
+            "(when (require 'loki-assistant-slack-chat nil t) (loki-assistant-slack-open-notification {argument}))"
+        );
+        let output = timeout(
+            Duration::from_secs(10),
+            self.eval_with_startup(&script, false),
+        )
+        .await
+        .map_err(|_| EmacsError::Timeout)?
+        .map_err(|error| match error {
+            EmacsError::Process(_) | EmacsError::CommandFailed { .. } => {
+                EmacsError::ConnectionFailed(error.to_string())
+            }
+            error => error,
+        })?;
+        match output.as_str() {
+            "conversation" | "thread" | "message" => Ok(output),
+            "nil" => Err(EmacsError::AppNotFound("slack".into())),
+            _ => Err(EmacsError::InvalidResponse(
+                "Slack 会话跳转结果无效。".into(),
+            )),
+        }
+    }
+
     pub async fn register_notification_handler(
         &self,
         module_id: impl Into<String>,

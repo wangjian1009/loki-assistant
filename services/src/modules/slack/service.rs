@@ -14,6 +14,7 @@ use crate::modules::{config::service::ConfigService, notification::NotificationS
 use super::{
     client::{SlackClient, WebSession},
     mailbox::UserDirectory,
+    picker::PickerItem,
     projects::{Backend, SlackTeam},
     protocol::{Error, Identity, valid_id},
     status::ProjectsStatus,
@@ -22,11 +23,14 @@ use super::{
 
 #[derive(Default)]
 pub(super) struct State {
+    pub user_directory: Option<UserDirectory>,
+    pub picker_items: Arc<[PickerItem]>,
+    pub picker_failed: bool,
     pub secrets: Secrets,
     pub cache: Cache,
     pub socket_state: &'static str,
     pub issue: Option<Error>,
-    retired: bool,
+    pub(super) retired: bool,
 }
 
 impl State {
@@ -53,7 +57,8 @@ pub struct SlackService {
     pub(super) outgoing: Notify,
     pub(super) sync: Notify,
     pub(super) alerts: Notify,
-    pub(super) user_directory: Mutex<Option<UserDirectory>>,
+    pub(super) user_fetch: Mutex<()>,
+    pub(super) picker_changed: Notify,
     project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     imported_token: Option<Arc<ConfigService>>,
     imported_token_lock: Mutex<()>,
@@ -89,7 +94,8 @@ impl SlackService {
             outgoing: Notify::new(),
             sync: Notify::new(),
             alerts: Notify::new(),
-            user_directory: Mutex::default(),
+            user_fetch: Mutex::default(),
+            picker_changed: Notify::new(),
             project: (id, settings, generation, reporter),
             imported_token,
             imported_token_lock: Mutex::new(()),
@@ -115,10 +121,14 @@ impl SlackService {
         let mut state = self.state.lock().await;
         state.account(session)?;
         let State { cache, secrets, .. } = &mut *state;
-        operation(
+        let result = operation(
             cache,
             secrets.account.as_ref().expect("已验证的 Slack 会话"),
-        )
+        );
+        if result.is_ok() {
+            self.picker_changed.notify_one();
+        }
+        result
     }
 
     async fn update_secrets<T>(
@@ -135,7 +145,13 @@ impl SlackService {
             .account
             .as_ref()
             .map(|account| account.identity.session_id);
+        if state.cache.session_id != session {
+            state.user_directory = None;
+            state.picker_items = Arc::default();
+            state.picker_failed = false;
+        }
         state.cache.reset(session);
+        self.picker_changed.notify_one();
         Ok(result)
     }
 

@@ -4,63 +4,27 @@
 * 技术选型
 工作区接入沿用 Emacs ~slack.el~ 的做法，使用同一网页会话的 ~xoxc-~ 用户令牌和 ~d~ Cookie。services 用 ~auth.test~ 核对用户和 Team ID，通过 ~rtm.connect~ 获取并管理 WebSocket 连接地址。
 
-* Team 配置
+* 核心设计
 
-~slack/teams~ 的配置类型为 ~Vec<SlackTeam>~ 。元数据声明 ~notification_endpoint~ 为 ~/slack/config/teams~ ，以 ~team_id~ 作为 ~Key~ 字段。首次新增只填 Team ID。配置模块通过该接入点通知新增和删除，并查询待确认记录的处理结果。 [[file:config-module.org::*配置项通知接入点][配置项通知接入点]] · [[file:slack-development.org::*Team 注册流程图][Team 注册流程图]]
-
-| 字段        | 类型       | 用途                                                               |
-|-------------+------------+--------------------------------------------------------------------|
-| ~team_id~   | ~Key~      | 从工作区 URL 的 ~/client/~ 路径取得，格式为 ~^T[A-Z0-9]{1,47}$~ 。 |
-| ~name~      | ~string~   | 本地显示名称，可选，默认显示 Team ID。                             |
-| ~team_name~ | ~string~   | Slack 返回的工作区名称，校验成功后写入，只读。                     |
-| ~user_id~   | ~string~   | Slack 返回的用户 ID，校验成功后写入，只读。                        |
-| ~token~     | ~Password~ | 网页会话的 ~xoxc-~ 用户令牌。                                      |
-| ~d_cookie~  | ~Password~ | 同一网页会话的 ~d~ Cookie。                                        |
-
-每个 Team 的两项已确认凭据共用一个 pass 条目。~Password.path~ 声明为 ~loki-assistant/slack/{key}.gpg~ ，其中 ~{key}~ 展开为这条记录的 ~team_id~ 。
-~token~ 省略 ~Password.key~ ，保存于首行。~d_cookie~ 指定同名的 ~Password.key~ ，保存于后续的 ~d_cookie:~ 行。配置和查询结果只包含条目引用。
-
-通过 ~PATCH~ 将 ~token~ 设为 ~null~ 时，配置模块删除整个 pass 条目并清除两个凭据字段。工作区记录保留。
-
-#+begin_example
-xoxc-…
-d_cookie: …
-#+end_example
-
-** 配置模块交互
-
-| 操作 | 接口                                                                                   | 响应                                                                                                                |
-|------+----------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------|
-| 新增 | ~PUT /data/slack/teams/{team_id}~ ，带 ~If-None-Match: *~ ，请求体为 ~{}~              | ~202~ 和 ~status: pending~ 。Slack 模块打开配置页。                                                                 |
-| 保存 | ~PATCH /data/slack/teams/{team_id}~ ，以 ~application/merge-patch+json~ 发送更改的字段 | 数据不全或 Slack 暂不可达时返回 ~202~ 。校验成功返回 ~200~ 和 ~status: confirmed~ 。明确失败返回 ~422~ 和错误。     |
-| 重试 | ~PUT /data/slack/teams/{team_id}~ ，零字节请求体                                       | 重新通知 Slack 处理同一份待确认数据，按当前结果返回 ~200~、~202~ 或 ~422~ 。                                        |
-| 查询 | ~GET /data/slack/teams~                                                                | ~value~ 为生效记录，~pending~ 为可编辑的待确认记录。失败记录的 ~status~ 为 ~invalid~ ，~error~ 包含错误代码和说明。 |
-| 删除 | ~DELETE /data/slack/teams/{team_id}~                                                   | 配置模块等待 Slack 结果，确认后移除记录与对应的 pass 条目。                                                         |
-
-配置模块暂存更新后，调用内部 ~POST /slack/config/teams/{team_id}~ 通知 Slack，密码值通过 Rust API 单独读取。待确认凭据缺项时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 并返回 ~202~ 。用户按页面提示在目标 Slack 工作区获取凭据，回到配置页填写并保存。
-
-用户令牌和 Cookie d 齐全后，Slack 通过 ~auth.test~ 核对身份。校验成功后，配置模块将 ~team_name~ 和 ~user_id~ 与候选记录一起保存，设置界面可查看这两个只读字段。旧工作区会在下次成功校验凭据时补齐。明确失败时配置模块保留错误提示，清除候选记录中的 ~token~ 和 ~d_cookie~ ，并删除暂存条目。下一次校验需要重新填写这两项。已有的生效记录继续服务。 [[file:config-module.org::*配置项通知接入点][配置项通知协议]]
-
-工作区配置生效后，services 使用同一凭据启动实时连接。连接结果通过 ~socket_state~ 和 ~issue_code~ 查询。
+- 缓存数据不落盘。用户资料、会话、消息、已读位置、发送请求和通知去重状态只保存在内存中，随 services 进程退出清空。
+- 会话选择数据由 services 在工作区预热时准备，并随会话、用户和消息状态变化更新。查询直接读取当前内存快照，不等待预热或向 Slack 补查。Emacs 每次打开选择器重新获取一次，响应仅在本次选择期间使用。
 
 * services RESTful 接口
 
-Slack 业务接口和工作区配置只接受本机调用，客户端可直接发起请求。按会话或工作区操作时，services 使用当前会话。客户端也可用 ~X-Loki-Slack-Session~ 携带响应中的 ~session_id~ ，以便会话变更时收到冲突错误。
-
-| 方法 | 路径                                                          | 请求与结果                                                                                                                     |
-|------+---------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------|
-| GET  | ~/status/slack/connections~                                   | 从通用状态中心读取 ~authorization_state~、~socket_state~ 和 ~session_id~                                                       |
-| GET  | ~/slack/users~                                                | 通过 ~limit~ 和 ~cursor~ 分页查询全部已授权工作区的用户目录。返回用户标识、工作区、显示名称、用户名和头像 URL。 |
-| GET  | ~/slack/users/{id}~                                            | 查询单个 Slack 用户的资料（计划）。 |
-| GET  | ~/slack/conversations~                                        | 筛选参数为 ~team_id~ 、~kind~ 和 ~unread~ 。分页参数为 ~limit~ 和 ~cursor~ 。~limit~ 默认 50，范围 1–100。返回 ~id~ 、~session_id~ 和 ~next_cursor~ 。会话 ~id~ 格式为 ~team_id.聊天ID~ 。 |
-| GET  | ~/slack/conversations/{id}/messages~                          | 支持 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。 |
-| GET  | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | ~thread_ts~ 取根消息的 ~ts~ 。返回 ~root~ 、分页回复 ~items~ 和 ~next_cursor~ 。 |
-| POST | ~/slack/conversations/{id}/messages~                          | 用 ~Idempotency-Key~（UUID）及 ~text~ 发送顶层消息，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
-| POST | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | 用 ~Idempotency-Key~（UUID）及 ~text~ 发送线程回复，返回 ~202~ 或 ~200~ ，~Location~ 指向发送记录             |
-| PUT  | ~/slack/conversations/{id}/read-position~                     | 用 ~through_ts~ 推进顶层聊天的本机已读位置                                                                    |
-| PUT  | ~/slack/conversations/{id}/threads/{thread_ts}/read-position~ | 用 ~through_ts~ 推进线程的本机已读位置                                                                        |
-| GET  | ~/slack/send-requests/{request_id}~                           | 查询参数 ~team_id~ 必填，返回 ~pending~、~sent~、~failed~ 或 ~unknown~                                        |
-
-services 启动并恢复工作区授权后，在后台预热用户目录、会话目录和最近一页消息。参照 emacs-slack，缺失的私聊用户资料按需补查，用户变更与加入事件更新内存中的用户目录。查看更早消息和线程时按需分页。
-
-用户资料、会话、消息、已读位置、发送请求和通知去重状态只存于内存。重启后，services 用 ~pass~ 中的配置凭据重新授权并建立会话。会话列表同时返回所属工作区、私聊参与者、最后一条消息摘要和最近未读提及时间。未读状态根据 Loki 已获取的消息与本机已读位置计算。Emacs 选择界面的需求见 [[file:emacs-slack.org][Emacs Slack 聊天选择需求]]。
+| 方法   | 路径                                                          | 用途                 |
+|--------+---------------------------------------------------------------+----------------------|
+| GET    | ~/status/slack/connections~                                   | [[file:slack-services.org::*工作区状态与会话][查看授权和连接状态]]   |
+| GET    | ~/slack/team-setup/{team_id}~                                 | [[file:slack-services.org::*工作区状态与会话][打开工作区配置页]]     |
+| DELETE | ~/slack/session~                                              | [[file:slack-services.org::*工作区状态与会话][断开本机 Slack 会话]]  |
+| GET    | ~/slack/users~                                                | [[file:slack-services.org::*用户目录][分页查询用户目录]]，[[file:slack-services.org::*批量查询用户][按 ID 筛选]] |
+| GET    | ~/slack/users/{id}~                                           | [[file:slack-services.org::*用户目录][查询单个用户（计划）]] |
+| GET    | ~/slack/conversations~                                        | [[file:slack-services.org::*会话目录][分页查询会话]]         |
+| GET    | ~/slack/conversations/picker~                                 | [[file:slack-services.org::*会话选择][一次读取会话候选]]     |
+| GET    | ~/slack/conversations/{id}/messages~                          | [[file:slack-services.org::*消息读取][分页读取顶层消息]]     |
+| GET    | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | [[file:slack-services.org::*消息读取][分页读取线程回复]]     |
+| POST   | ~/slack/conversations/{id}/messages~                          | [[file:slack-services.org::*消息发送与发送记录][发送顶层消息]]         |
+| POST   | ~/slack/conversations/{id}/threads/{thread_ts}/messages~      | [[file:slack-services.org::*消息发送与发送记录][发送线程回复]]         |
+| POST   | ~/slack/conversations/{id}/open~                              | [[file:slack-services.org::*通知点击跳转][打开通知对应的会话]]   |
+| PUT    | ~/slack/conversations/{id}/read-position~                     | [[file:slack-services.org::*已读位置][更新会话已读位置]]     |
+| PUT    | ~/slack/conversations/{id}/threads/{thread_ts}/read-position~ | [[file:slack-services.org::*已读位置][更新线程已读位置]]     |
+| GET    | ~/slack/send-requests/{request_id}~                           | [[file:slack-services.org::*消息发送与发送记录][查询发送请求结果]]     |

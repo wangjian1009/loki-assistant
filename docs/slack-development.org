@@ -71,8 +71,8 @@
 
 * 当前工作区配置
 
-配置界面按 ~SlackTeam~ 元数据生成表单，新增时只显示 Team ID。待确认记录可继续编辑凭据。 [[file:slack.org::*Team 配置][SlackTeam 字段与配置接口]]
+配置界面按 ~SlackTeam~ 元数据生成表单，新增时只显示 Team ID。待确认记录可继续编辑凭据。 [[file:slack-services.org::*Team 配置][SlackTeam 字段与配置接口]]
 
 后台实时通知通过 Slack RTM WebSocket 接收私信。连接使用与 HTTP API 相同的工作区凭据，状态通过 ~socket_state~ 查询。模拟集成测试覆盖 WebSocket 握手、重复消息去重、私信通知和网页会话发送。
 
-现有 API 契约见 [[file:slack.org::*services RESTful 接口][services RESTful 接口]]。
+现有 API 契约见 [[file:slack-services.org][Slack services 接口]]。

@@ -189,6 +189,7 @@ impl SlackClient {
                 | "not_authed",
             ) => Error::Authorization,
             Some("channel_not_found") => Error::Conversation,
+            Some("user_not_found") => Error::UserNotFound,
             Some("thread_not_found") => Error::Thread,
             Some("invalid_arguments" | "msg_too_long" | "no_text") => Error::Invalid,
             _ => Error::Upstream,

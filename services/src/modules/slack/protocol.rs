@@ -15,6 +15,7 @@ pub(super) enum Error {
     Cursor,
     Permission,
     Conversation,
+    UserNotFound,
     Project,
     TeamMismatch,
     Thread,
@@ -47,6 +48,7 @@ impl Error {
             ),
             Self::Permission => (403, "slack-permission-denied", "Slack 应用缺少所需权限。"),
             Self::Conversation => (404, "slack-conversation-not-found", "找不到 Slack 会话。"),
+            Self::UserNotFound => (404, "slack-user-not-found", "找不到 Slack 用户。"),
             Self::Project => (404, "slack-project-not-found", "请选择有效的 Slack 项目。"),
             Self::TeamMismatch => (
                 409,

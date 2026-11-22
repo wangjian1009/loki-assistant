@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use axum::Router;
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::modules::{
     config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService},
+    emacs::service::EmacsService,
     notification::NotificationService,
     status::StatusService,
 };
@@ -102,6 +104,7 @@ impl Drop for Project {
 }
 
 pub struct Projects {
+    pub(super) emacs: Arc<EmacsService>,
     config: Arc<ConfigService>,
     notification: Arc<NotificationService>,
     pub(super) status: Arc<ProjectsStatus>,
@@ -125,11 +128,13 @@ impl Projects {
         config: Arc<ConfigService>,
         notification: Arc<NotificationService>,
         status: Arc<StatusService>,
+        emacs: Arc<EmacsService>,
     ) -> Self {
         Self::with_backend(
             config,
             notification,
             status,
+            emacs,
             Backend {
                 api: "https://slack.com/api".into(),
                 open_browser: Arc::new(|url| {
@@ -156,9 +161,11 @@ impl Projects {
         config: Arc<ConfigService>,
         notification: Arc<NotificationService>,
         status: Arc<StatusService>,
+        emacs: Arc<EmacsService>,
         backend: Backend,
     ) -> Self {
         Self {
+            emacs,
             config,
             notification,
             status: Arc::new(ProjectsStatus::new(status)),
@@ -266,6 +273,58 @@ impl Projects {
             .then(|| next_cursor(Uuid::nil(), target, users[limit - 1].id.clone()));
         users.truncate(limit);
         Ok(json!({"api_version":"1","items":users,"next_cursor":next_cursor,"issues":issues}))
+    }
+
+    pub(super) async fn lookup_users(&self, ids: Vec<(String, String)>) -> Value {
+        let results = stream::iter(ids)
+            .map(|(team, id)| async move {
+                let result = async {
+                    let service = self.service(&team).await?;
+                    let session = service.session_id().await.ok_or(Error::Authorization)?;
+                    service.lookup_user(session, &id).await
+                }
+                .await;
+                (team, id, result)
+            })
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await;
+        let mut items = Vec::new();
+        let mut issues = Vec::new();
+        for (team, id, result) in results {
+            match result {
+                Ok(profile) => items.push(profile),
+                Err(error) => issues.push(
+                    json!({"id":format!("{team}.{id}"),"team_id":team,"error":error.object()}),
+                ),
+            }
+        }
+        json!({"api_version":"1","items":items,"next_cursor":null,"issues":issues})
+    }
+
+    pub(super) async fn picker(&self) -> Value {
+        let projects: Vec<_> = self
+            .projects
+            .read()
+            .await
+            .iter()
+            .map(|(id, project)| {
+                (
+                    id.clone(),
+                    project.settings.name.clone(),
+                    Arc::clone(&project.service),
+                )
+            })
+            .collect();
+        let mut workspaces = Vec::with_capacity(projects.len());
+        let mut snapshots = Vec::with_capacity(projects.len());
+        for (id, name, service) in projects {
+            let (workspace, items) = service.picker_workspace(&id, &name).await;
+            workspaces.push(workspace);
+            snapshots.push(items);
+        }
+        let items: Vec<_> = snapshots.iter().flat_map(|items| items.iter()).collect();
+        json!({"api_version":"1", "workspaces":workspaces, "items":items})
     }
 
     pub(super) async fn conversations(

@@ -1,5 +1,6 @@
 mod client;
 mod mailbox;
+mod picker;
 mod projects;
 mod protocol;
 mod routes;
@@ -177,6 +178,7 @@ static EXTENSION: crate::services::ExtensionRegistration = crate::services::Exte
             Arc::clone(context.config),
             Arc::clone(context.notification),
             Arc::clone(context.status),
+            context.emacs.service(),
         ))))
     },
 };

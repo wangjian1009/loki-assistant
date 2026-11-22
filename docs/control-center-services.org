@@ -111,13 +111,13 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/emacs/buffers~ | 查询当前 Emacs buffer 列表 |
 | GET | ~/password/entries~ | 查询密码条目，可选 query 按路径过滤 |
 | GET | ~/password/entries/{*file}~ | 按相对 .gpg 路径读取单条密码原文 |
-| GET | ~/slack/users~ | 分页读取已授权工作区的用户目录，仅限本机。见 [[file:slack.org::*services RESTful 接口][Slack 接口]] |
+| GET | ~/slack/users~ | 本机分页读取 Slack 用户目录或按 ID 批量查询。见 [[file:slack-services.org::*用户目录][Slack 用户目录接口]] |
 
 * 配置中心
 
 配置模型、数组操作、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
-Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /data/slack/teams/{team_id}~ 保存凭据。 [[file:slack.org::*Team 配置][Slack 工作区配置]]
+Slack HTTP 接口和 ~slack/teams~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /data/slack/teams/{team_id}~ 保存凭据。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
 
 * 控制中心模块
 
@@ -709,7 +709,7 @@ services 通过独立参数调用 ~/usr/bin/open -g~ ，将通知 JSON 编码到
 
 点击后，App 只解包通用导航 URL，检查服务文件锁、读取 pfile 并请求健康接口，然后向当前 services 地址的回调路径发送一次 ~POST~ 。Emacs 模块生成的回调由 ~/emacs/activate~ 执行。点击调用不自动重试，失败显示提示并写入系统日志；成功日志包含通知 ID。导航 URL 不依赖内存回执记录，services 或 App 重启、回执记录过期后仍可发起跳转，实际目标是否有效由业务模块判断。
 
-~app~ 只表示应用，不接受图片路径、URL、Bundle ID 图标引用或标题前缀文本。标识必须非空，且仅含小写字母、数字、~-~ 或 ~_~ 。图标由 center 维护于 ~apps/center/mac/Resources/NotificationAppIcons/<app>.png~ ，CMake 将该目录的 PNG 打包到应用内的 ~Contents/Resources/NotificationAppIcons/~ 。当前内置 ~emacs.png~ ，对应 ~app: "emacs"~ 。未提供 ~app~ 、没有对应资源或附件读取失败时继续发送文字通知；通用通知模块不补默认应用标识。通知来源名称与系统应用图标属于 Loki Assistant，不可逐条更改为业务模块的名称或图标。
+~app~ 只表示应用，不接受图片路径、URL、Bundle ID 图标引用或标题前缀文本。标识必须非空，且仅含小写字母、数字、~-~ 或 ~_~ 。图标由 center 维护于 ~apps/center/mac/Resources/NotificationAppIcons/<app>.png~ ，CMake 将该目录的 PNG 打包到应用内的 ~Contents/Resources/NotificationAppIcons/~ 。当前内置 ~emacs.png~ 和 ~slack.png~ ，分别对应 ~app: "emacs"~ 和 ~app: "slack"~ 。未提供 ~app~ 、没有对应资源或附件读取失败时继续发送文字通知；通用通知模块不补默认应用标识。通知来源名称与系统应用图标属于 Loki Assistant，不可逐条更改为业务模块的名称或图标。
 
 使用前通过已有的 ~make restart-service~ 和 ~make restart-center~ 加载新版服务与 App。首次由 App 请求系统通知权限；拒绝后需要在系统设置中开启。旧版 ~loki-assistant://emacs/notification~ URL 及已发出通知的 Emacs 元数据仍可识别，点击统一回到 services，不在 App 中执行 Emacs 激活。
 
