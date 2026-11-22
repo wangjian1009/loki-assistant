@@ -28,14 +28,14 @@ private final class CenterInstanceLock {
 private final class MenuTrackingObserver {
     private var tokens: [NSObjectProtocol] = []
 
-    init(status: EmacsReportedStatusModel) {
+    init(status: ServiceStatusModel) {
         let center = NotificationCenter.default
         tokens.append(center.addObserver(
             forName: NSMenu.didBeginTrackingNotification,
             object: nil,
             queue: .main
         ) { [weak status] _ in
-            Task { @MainActor in status?.menuTrackingDidBegin() }
+            Task { @MainActor in status?.menuDidOpen() }
         })
         tokens.append(center.addObserver(
             forName: NSMenu.didEndTrackingNotification,
@@ -58,7 +58,6 @@ struct LokiAssistantApp: App {
     private let instanceLock: CenterInstanceLock?
     private let menuTrackingObserver: MenuTrackingObserver
     @State private var status: ServiceStatusModel
-    @State private var reportedStatus: EmacsReportedStatusModel
     @State private var idleSleep: IdleSleepController
 
     private static let menuBarIcon: NSImage = {
@@ -80,12 +79,10 @@ struct LokiAssistantApp: App {
     }()
 
     init() {
-        let model = ServiceStatusModel()
+        let model = ServiceStatusModel(logger: .shared)
         _status = State(initialValue: model)
-        let reportedStatus = EmacsReportedStatusModel(status: model, logger: .shared)
-        _reportedStatus = State(initialValue: reportedStatus)
         _idleSleep = State(initialValue: IdleSleepController())
-        menuTrackingObserver = MenuTrackingObserver(status: reportedStatus)
+        menuTrackingObserver = MenuTrackingObserver(status: model)
         // XCTest 的宿主进程不参与日常实例锁，也不轮询真实 services。
         let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
             || NSClassFromString("XCTestCase") != nil
@@ -108,7 +105,7 @@ struct LokiAssistantApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            DashboardView(status: status, reportedStatus: reportedStatus, idleSleep: idleSleep)
+            DashboardView(status: status, idleSleep: idleSleep)
         } label: {
             Image(nsImage: idleSleep.isEnabled ? Self.menuBarSleepIcon : Self.menuBarIcon)
             .accessibilityLabel(idleSleep.isEnabled ? "Loki的助理，已阻止空闲休眠" : "Loki的助理")

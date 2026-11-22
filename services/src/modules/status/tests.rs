@@ -38,7 +38,7 @@ async fn rust_publishers_preserve_json_values_and_http_reads_the_shared_snapshot
         empty,
         json!({"api_version":"1","status":{},"updated_at":null})
     );
-    let values = json!({"emacs":{"buffers":[{"name":"中文 buffer"}],"runtime":{"pid":123}},
+    let values = json!({"emacs":{"runtime":{"pid":123}},
         "tools":{"enabled":false,"count":0,"empty":null,"list":[]}});
     let posted = service
         .publish_many(serde_json::from_value(values.clone()).unwrap())
@@ -69,16 +69,16 @@ async fn rust_publishers_merge_items_and_reject_invalid_batches_atomically() {
     service
         .publish_many(
             serde_json::from_value(
-                json!({"emacs":{"buffers":[1],"runtime":{"pid":123}},"tasks":{"count":2}}),
+                json!({"emacs":{"runtime":{"pid":123}},"tasks":{"count":2,"items":[1]}}),
             )
             .unwrap(),
         )
         .unwrap();
-    service.publish("emacs", "buffers", json!([])).unwrap();
+    service.publish("tasks", "items", json!([])).unwrap();
     assert_eq!(
         service.snapshot().status,
         serde_json::from_value(
-            json!({"emacs":{"buffers":[],"runtime":{"pid":123}},"tasks":{"count":2}})
+            json!({"emacs":{"runtime":{"pid":123}},"tasks":{"count":2,"items":[]}})
         )
         .unwrap()
     );
@@ -109,13 +109,13 @@ async fn status_http_is_read_only_and_cannot_overwrite_rust_published_values() {
         .publish("network", "my", json!({"status":"disconnected"}))
         .unwrap();
     service
-        .publish("emacs", "buffers", json!([{"name":"会话"}]))
+        .publish("emacs", "runtime", json!({"pid":42}))
         .unwrap();
     for (method, path) in [
         ("POST", "/stats/meta"),
         ("POST", "/status"),
         ("PUT", "/status/network/my"),
-        ("POST", "/status/emacs/buffers"),
+        ("POST", "/status/emacs/runtime"),
     ] {
         let response = service
             .router()
@@ -131,13 +131,13 @@ async fn status_http_is_read_only_and_cannot_overwrite_rust_published_values() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
-    let (_, value) = request(service.clone(), "GET", "/status/emacs/buffers", Value::Null).await;
-    assert_eq!(value["value"], json!([{"name":"会话"}]));
+    let (_, value) = request(service.clone(), "GET", "/status/emacs/runtime", Value::Null).await;
+    assert_eq!(value["value"], json!({"pid":42}));
     assert_eq!(
         service.value("network", "my").unwrap().value,
         json!({"status":"disconnected"})
     );
-    assert!(StatusService::new().value("emacs", "buffers").is_err());
+    assert!(StatusService::new().value("emacs", "runtime").is_err());
 }
 
 #[tokio::test]
@@ -146,6 +146,7 @@ async fn status_module_is_discoverable_and_old_emacs_status_routes_are_removed()
     for path in [
         "/emacs/status",
         "/emacs/status/emacs/buffer",
+        "/status/emacs/buffers",
         "/network/status/my",
     ] {
         let response = app
@@ -265,7 +266,7 @@ async fn metadata_is_complete_before_publication_and_contains_no_runtime_values(
 }
 
 #[tokio::test]
-async fn metadata_describes_buffer_fields_runtime_and_all_network_states() {
+async fn metadata_describes_emacs_runtime_and_all_network_states() {
     use crate::modules::network::protocol::ConnectionStatus;
     let service = Arc::new(StatusService::new());
     let (_, metadata) = request(service, "GET", "/stats/meta", Value::Null).await;
@@ -275,26 +276,7 @@ async fn metadata_describes_buffer_fields_runtime_and_all_network_states() {
         .find(|module| module["id"] == "emacs")
         .unwrap();
     let items = emacs["items"].as_array().unwrap();
-    let buffers = items.iter().find(|item| item["key"] == "buffers").unwrap();
-    assert_eq!(buffers["schema"]["data_type"], "array");
-    assert_eq!(buffers["schema"]["items"]["data_type"], "object");
-    let fields = buffers["schema"]["items"]["fields"].as_array().unwrap();
-    assert_eq!(
-        fields
-            .iter()
-            .map(|field| field["key"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["name", "mode", "directory", "file", "modified"]
-    );
-    let file = fields.iter().find(|field| field["key"] == "file").unwrap();
-    assert_eq!(file["schema"]["data_type"], "string");
-    assert_eq!(file["required"], true);
-    assert_eq!(file["nullable"], true);
-    let modified = fields
-        .iter()
-        .find(|field| field["key"] == "modified")
-        .unwrap();
-    assert_eq!(modified["schema"]["data_type"], "boolean");
+    assert_eq!(items.len(), 1);
     let runtime = items.iter().find(|item| item["key"] == "runtime").unwrap();
     assert_eq!(runtime["schema"]["data_type"], "object");
     assert_eq!(runtime["schema"]["fields"].as_array().unwrap().len(), 4);

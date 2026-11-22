@@ -53,15 +53,6 @@ struct ServiceStatusSnapshot: Decodable, Equatable, Sendable {
     let apiVersion: String
     let status: ServiceStatusModules
     let updatedAt: UInt64?
-    let bufferGroups: [EmacsBufferGroup]
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        apiVersion = try container.decode(String.self, forKey: .apiVersion)
-        status = try container.decode(ServiceStatusModules.self, forKey: .status)
-        updatedAt = try container.decodeIfPresent(UInt64.self, forKey: .updatedAt)
-        bufferGroups = try EmacsBufferStatus(from: decoder).bufferGroups
-    }
 
     enum CodingKeys: String, CodingKey {
         case apiVersion = "api_version"
@@ -106,17 +97,48 @@ final class ServiceStatusModel {
     }
     @ObservationIgnored private let discover: Discover
     @ObservationIgnored private let transport: Transport
+    @ObservationIgnored private let logger: CenterLog?
+    @ObservationIgnored private var menuOpen = false
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
 
     init(
         discover: @escaping Discover = { try NotificationReceiptClient.discoverEndpoint() },
-        transport: @escaping Transport = { try await URLSession.shared.data(for: $0) }
+        transport: @escaping Transport = { try await URLSession.shared.data(for: $0) },
+        logger: CenterLog? = nil
     ) {
         self.discover = discover
         self.transport = transport
+        self.logger = logger
+    }
+
+    func menuDidOpen() {
+        guard !menuOpen else { return }
+        menuOpen = true
+        let operation = logger?.start("打开托盘菜单")
+        refreshTask = Task { [weak self, logger] in
+            await self?.refresh(operation: operation)
+            guard let operation else { return }
+            if Task.isCancelled || self == nil {
+                logger?.finish(operation, result: "cancelled")
+            } else if case .healthy = self?.status {
+                logger?.finish(operation, result: "success")
+            } else if case let .unavailable(message) = self?.status {
+                logger?.finish(operation, result: "failure", details: ["error": message])
+            } else {
+                logger?.finish(operation, result: "failure")
+            }
+        }
+    }
+
+    func menuDidClose() {
+        menuOpen = false
+        refreshTask?.cancel()
+        refreshTask = nil
     }
 
     func refresh(operation: CenterLogOperation? = nil) async {
         do {
+            try Task.checkCancellation()
             // 与通知回执共用文件锁和 pfile 发现，不依赖任何服务管理器的任务名。
             let endpoint = try discover()
             let request = URLRequest(

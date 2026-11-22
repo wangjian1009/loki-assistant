@@ -207,27 +207,27 @@ mod tests {
                 .unwrap()
                 > 0
         );
-        let buffers = json!([{"name":"共享状态测试", "mode":"agent-shell-mode", "directory":"/tmp/", "file":null, "modified":false}]);
+        let runtime = json!({"pid":42,"version":"31.1","started_at":1,"reported_at":2});
         services
             .emacs
             .service()
             .receive_status(
                 serde_json::from_value(json!({
-                    "emacs": {"buffers": buffers.clone()}
+                    "emacs": {"runtime": runtime.clone()}
                 }))
                 .unwrap(),
             )
             .unwrap();
         assert_eq!(
-            services.status.value("emacs", "buffers").unwrap().value,
-            buffers
+            services.status.value("emacs", "runtime").unwrap().value,
+            runtime
         );
 
         let app = services.router(Arc::new(RuntimeState::new(Arc::clone(&services))));
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/status/emacs/buffers")
+                    .uri("/status/emacs/runtime")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -237,7 +237,7 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(body["value"], buffers);
-        assert!(Services::build().status.value("emacs", "buffers").is_err());
+        assert_eq!(body["value"], runtime);
+        assert!(Services::build().status.value("emacs", "runtime").is_err());
     }
 }

@@ -191,7 +191,7 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 网络身份只在缺失时通过系统随机源生成，以 `0600` 权限原子保存；损坏或公私钥不匹配时禁止覆盖。生成身份与注册结果均通过注入的共享通知服务发送，私钥和令牌不得进入通知、日志或 HTTP 元数据。旧的固定测试身份、验证 CLI 和手机验证桥接已删除；真实 relay 测试仅使用本机随机端口与临时身份。
 
-`StatusService` 由 `Services` 创建并共享；状态值由业务模块通过 Rust 接口发布，不在 status 模块内拉取业务值。Emacs 通过业务入口 `POST /emacs/receiver/status` 上报，由 EmacsService 使用注入的共享 StatusService 发布 `emacs/buffers`，网络模块发布 `network/my`；禁止恢复 Emacs 模块私有的状态存储。`/status` HTTP 仅提供 GET 查询，不提供 POST/PUT 发布路由。网络令牌从配置中心读取，地址与令牌都非空才注册；任意一项缺失视为未配置，不读取环境令牌，不创建 Homebrew 服务环境文件。
+`StatusService` 由 `Services` 创建并共享；状态值由业务模块通过 Rust 接口发布，不在 status 模块内拉取业务值。Emacs 通过业务入口 `POST /emacs/receiver/status` 上报，由 EmacsService 使用注入的共享 StatusService 发布 `emacs/runtime`，网络模块发布 `network/my`；禁止恢复 Emacs 模块私有的状态存储。`/status` HTTP 仅提供 GET 查询，不提供 POST/PUT 发布路由。网络令牌从配置中心读取，地址与令牌都非空才注册；任意一项缺失视为未配置，不读取环境令牌，不创建 Homebrew 服务环境文件。
 
 状态发布方必须在构造时接收并持有 `Arc<StatusService>` 字段，通过 `self.status.publish` / `self.status.publish_many` 调用实例方法。实例只由 `Services` 组合根创建，再经 `Arc::clone` 注入；业务模块不得自行创建独立实例，不使用全局或静态状态。查询路由挂载组合根持有的同一实例。
 

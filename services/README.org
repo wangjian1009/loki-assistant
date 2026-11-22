@@ -121,9 +121,9 @@ Emacs 的设备管理界面默认只显示已绑定设备；点击“新增设�
 
 ~status~ 模块提供统一的内存状态存取。~Services~ 持有共享 ~Arc<StatusService>~ ，业务模块在构造时接收并保存到 ~status~ 字段，通过 ~self.status.publish(module_id, key, value)~ 或 ~self.status.publish_many(values)~ 设置数据。状态 HTTP 路由仅提供 GET 查询，不提供通用写入接口。Emacs 程序通过所属模块的 ~POST /emacs/receiver/status~ 上报，再由 ~EmacsService~ 调用共享 ~publish_many_validated~ Rust 接口，按 ~GET /stats/meta~ 声明严格校验后发布。类型、必填、可空、枚举或嵌套元素不符，以及未声明的状态项或对象字段，均返回 HTTP 400 与字段路径；整批失败时不更新原值和时间戳。状态中心不读取业务配置、不自行抓取值。
 
-~GET /stats/meta~ 获取完整状态结构目录：包含模块和状态项名称、说明、嵌套 object 字段、array 元素类型、必填和可空标记，以及网络状态的枚举值。结构由各业务模块的 ~status.rs~ 使用 ~#[loki_status]~ 在编译期注册，当前包括 ~service~ 、 ~emacs/buffers~ 、 ~emacs/runtime~ 和 ~network/my~ ；尚未发布数据也可查看结构。元数据只描述结构，运行时值仍通过数据查询接口读取。
+~GET /stats/meta~ 获取完整状态结构目录：包含模块和状态项名称、说明、嵌套 object 字段、array 元素类型、必填和可空标记，以及网络状态的枚举值。结构由各业务模块的 ~status.rs~ 使用 ~#[loki_status]~ 在编译期注册，当前包括 ~service~ 、 ~emacs/runtime~ 和 ~network/my~ ；尚未发布数据也可查看结构。元数据只描述结构，运行时值仍通过数据查询接口读取。
 
-~GET /status~ 读取全部状态，~GET /status/service~ 读取自身运行状态对象，其中 ~start_at~ 为本次 services 启动时间，~GET /status/emacs/buffers~ 读取 Emacs 发布的关注 buffer，~GET /status/network/my/status~ 读取网络模块发布的本机连接状态。单项响应包含 ~api_version~ 、 ~module_id~ 、 ~key~ 、 ~value~ 和 ~updated_at~ 。服务自身状态模块在 services 组装时发布 ~service~ ，其响应数据包含 ~start_at~ ，数据只保存在内存，重启后由服务自身状态模块重新发布。完整协议见 [[file:../docs/control-center-services.org::*状态中心][状态中心]]。
+~GET /status~ 读取全部状态，~GET /status/service~ 读取自身运行状态对象，其中 ~start_at~ 为本次 services 启动时间，~GET /status/emacs/runtime~ 读取 Emacs 主动上报的运行信息，~GET /status/network/my/status~ 读取网络模块发布的本机连接状态。单项响应包含 ~api_version~ 、 ~module_id~ 、 ~key~ 、 ~value~ 和 ~updated_at~ 。服务自身状态模块在 services 组装时发布 ~service~ ，其响应数据包含 ~start_at~ ，数据只保存在内存，重启后由服务自身状态模块重新发布。完整协议见 [[file:../docs/control-center-services.org::*状态中心][状态中心]]。
 
 * 密码查询
 

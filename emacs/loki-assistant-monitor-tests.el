@@ -1,27 +1,21 @@
-;;; loki-assistant-monitor-tests.el --- 状态上报与关注集合验证 -*- lexical-binding: t; -*-
+;;; loki-assistant-monitor-tests.el --- 状态上报测试 -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; 临时 buffer 和 HTTP listener，不启动 Agent、不保存用户配置。
+;; 使用临时 HTTP listener 验证状态上报。
 
 ;;; Code:
 
 (require 'loki-assistant-tests)
 (require 'loki-assistant-monitor)
 
-(define-derived-mode loki-assistant-monitor-test-mode fundamental-mode "关注测试"
-  "用于验证 mode hook 注册的临时模式。")
-
 (defmacro loki-assistant-monitor-test--isolated (&rest body)
-  "在隔离的上报器状态中运行 BODY，并清理定时器与临时 buffer。"
+  "在隔离的上报器状态中运行 BODY，并清理定时器。"
   (declare (indent 0))
   `(let ((loki-assistant-monitor-mode nil)
-         (loki-assistant-monitor-buffer '(loki-assistant-monitor-test-mode))
          (loki-assistant-monitor-interval 60)
-         (loki-assistant-monitor--buffers (make-hash-table :test #'eq))
          (loki-assistant-status--store
           (loki-assistant-status-store-create :values (make-hash-table :test #'equal)))
-         (loki-assistant-monitor--hooks nil)
          (loki-assistant-monitor--timer nil)
          (loki-assistant-monitor--pending-timer nil)
          (loki-assistant-monitor--inflight nil)
@@ -31,39 +25,6 @@
      (unwind-protect (progn ,@body)
        (loki-assistant-monitor-mode -1))))
 
-(ert-deftest loki-assistant-monitor-test-hooks-and-buffer-lifecycle ()
-  (loki-assistant-monitor-test--isolated
-    (with-temp-buffer
-      ;; 启用时补注册已存在的 buffer，之后由 mode hook 维护。
-      (loki-assistant-monitor-test-mode)
-      (loki-assistant-monitor-mode 1)
-      (should (= (hash-table-count loki-assistant-monitor--buffers) 1))
-      (let ((buffer (current-buffer)))
-        (rename-buffer " *关注测试：改名*" t)
-        (should (eq (gethash buffer loki-assistant-monitor--buffers) buffer))
-        (let ((snapshot (loki-assistant-monitor--snapshot-buffers)))
-          (should (= (length snapshot) 1))
-          (should (equal (alist-get 'name (aref snapshot 0)) (buffer-name))))
-        (fundamental-mode)
-        (should (zerop (hash-table-count loki-assistant-monitor--buffers))))
-      (loki-assistant-monitor-test-mode)
-      (should (= (hash-table-count loki-assistant-monitor--buffers) 1)))
-    (should (zerop (length (loki-assistant-monitor--snapshot-buffers))))))
-
-(ert-deftest loki-assistant-monitor-test-closed-name-reuse-registers-buffer ()
-  (loki-assistant-monitor-test--isolated
-    (loki-assistant-monitor-mode 1)
-    (let ((buffer (generate-new-buffer " *关注测试复用*")) name)
-      (with-current-buffer buffer
-        (loki-assistant-monitor-test-mode)
-        (setq name (buffer-name)))
-      (kill-buffer buffer)
-      (with-temp-buffer
-        (rename-buffer name)
-        (loki-assistant-monitor-test-mode)
-        (should (eq (gethash (current-buffer) loki-assistant-monitor--buffers)
-                    (current-buffer)))))))
-
 (ert-deftest loki-assistant-monitor-test-real-http-post-groups-apps-and-items ()
   (let (received headers)
     (loki-assistant-test--with-server
@@ -72,8 +33,7 @@
                                                            :object-type 'alist :false-object :false))
           '(200 "{\"api_version\":\"1\",\"status\":{},\"updated_at\":1}"))
       (loki-assistant-monitor-test--isolated
-        (with-temp-buffer
-          (loki-assistant-monitor-test-mode)
+        (progn
           (loki-assistant-monitor-mode 1)
           (loki-assistant-status-set-value 'tools 'enabled :false)
           (loki-assistant-status-set-value 'tools 'items [])
@@ -85,12 +45,9 @@
           (should (string-prefix-p "POST /emacs/receiver/status " headers))
           (should (eq (alist-get 'enabled (alist-get 'tools received)) :false))
           (should (equal (alist-get 'items (alist-get 'tools received)) []))
-          (let* ((emacs-data (alist-get 'emacs received))
-                 (buffers (alist-get 'buffers emacs-data)))
-            (should (= (length buffers) 1))
-            (should (equal (alist-get 'name (aref buffers 0)) (buffer-name)))
-            (should (eq (alist-get 'modified (aref buffers 0)) :false))
-            (should (= (alist-get 'pid (alist-get 'runtime emacs-data)) (emacs-pid)))))))))
+          (let ((runtime (alist-get 'runtime (alist-get 'emacs received))))
+            (should (= (alist-get 'pid runtime) (emacs-pid)))
+            (should (equal (alist-get 'version runtime) emacs-version))))))))
 
 (ert-deftest loki-assistant-monitor-test-coalesces-and-ignores-old-callbacks ()
   (loki-assistant-monitor-test--isolated
@@ -136,25 +93,6 @@
         (loki-assistant-status-sync)
         (should-not loki-assistant-monitor--last-error)
         (should (= (alist-get 'count (alist-get 'tools (json-parse-string (car bodies) :object-type 'alist))) 3))))))
-
-(ert-deftest loki-assistant-monitor-test-customizing-reconciles-hooks-and-registry ()
-  (loki-assistant-monitor-test--isolated
-    (with-temp-buffer
-      (loki-assistant-monitor-test-mode)
-      (loki-assistant-monitor-mode 1)
-      (let ((original (default-value 'loki-assistant-monitor-buffer)))
-        (unwind-protect
-            (progn
-              ;; setter 使用默认值；让本测试的动态绑定同步更新。
-              (setq loki-assistant-monitor-buffer nil)
-              (loki-assistant-monitor--set-buffers 'loki-assistant-monitor-buffer nil)
-              (should (zerop (hash-table-count loki-assistant-monitor--buffers)))
-              (should-not (memq #'loki-assistant-monitor-register-buffer
-                                loki-assistant-monitor-test-mode-hook)))
-          (set-default 'loki-assistant-monitor-buffer original))))))
-
-(provide 'loki-assistant-monitor-tests)
-;;; loki-assistant-monitor-tests.el ends here
 
 (ert-deftest loki-assistant-monitor-test-status-store-symbol-list-vector-and-clear ()
   (loki-assistant-monitor-test--isolated
@@ -213,3 +151,6 @@
             (funcall (nth 2 second))
             (should (= requests 1))
             (should-not loki-assistant-monitor--pending-timer)))))))
+
+(provide 'loki-assistant-monitor-tests)
+;;; loki-assistant-monitor-tests.el ends here

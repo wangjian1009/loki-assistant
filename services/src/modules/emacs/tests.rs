@@ -1139,13 +1139,14 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
         runner.clone(),
         Duration::from_secs(1),
     ));
-    let values = json!({"emacs":{"buffers":[{"name":"会话","mode":"agent-shell-mode","directory":"/tmp/","file":null,"modified":false}],"runtime":{"pid":42,"version":"31.1","started_at":1,"reported_at":2}}});
+    let values =
+        json!({"emacs":{"runtime":{"pid":42,"version":"31.1","started_at":1,"reported_at":2}}});
     let (response, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
     assert_eq!(response, StatusCode::OK);
     assert_eq!(body["status"]["network"]["my"]["status"], "disconnected");
     assert_eq!(
-        status.value("emacs", "buffers").unwrap().value,
-        json!([{"name":"会话","mode":"agent-shell-mode","directory":"/tmp/","file":null,"modified":false}])
+        status.value("emacs", "runtime").unwrap().value,
+        json!({"pid":42,"version":"31.1","started_at":1,"reported_at":2})
     );
     let before = serde_json::to_value(status.snapshot()).unwrap();
     for values in [
@@ -1178,51 +1179,32 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
         runner.clone(),
         Duration::from_secs(1),
     ));
-    let buffer = json!({"name":"会话","mode":"agent-shell-mode","directory":"/tmp/","file":null,"modified":false});
     let runtime = json!({"pid":42,"version":"31.1","started_at":1,"reported_at":2});
     let (code, _) = request(
         service.clone(),
         "POST",
         "/emacs/receiver/status",
-        json!({"emacs":{"buffers":[buffer.clone()],"runtime":runtime.clone()}}),
+        json!({"emacs":{"runtime":runtime.clone()}}),
     )
     .await;
     assert_eq!(code, StatusCode::OK);
     let before = serde_json::to_value(status.snapshot()).unwrap();
-    let mut wrong_boolean = buffer.clone();
-    wrong_boolean["modified"] = json!("DO_NOT_ECHO_VALUE");
-    let mut non_nullable_name = buffer.clone();
-    non_nullable_name["name"] = Value::Null;
-    let mut wrong_file = buffer.clone();
-    wrong_file["file"] = json!(123);
-    let mut extra_field = buffer.clone();
+    let mut extra_field = runtime.clone();
     extra_field["unexpected"] = json!("DO_NOT_ECHO_VALUE");
     let mut wrong_pid = runtime.clone();
     wrong_pid["pid"] = json!(42.5);
     let mut wrong_version = runtime;
     wrong_version["version"] = json!(31);
     for (values, expected) in [
-        (json!({"emacs":{"buffers":{}}}), "emacs/buffers"),
-        (json!({"emacs":{"buffers":[null]}}), "emacs/buffers[0]"),
+        (json!({"emacs":{"buffers":[]}}), "emacs/buffers"),
+        (json!({"emacs":{"runtime":null}}), "emacs/runtime"),
         (
-            json!({"emacs":{"buffers":[{"name":"缺少字段"}]}}),
-            "emacs/buffers[0].mode",
+            json!({"emacs":{"runtime":{"pid":42}}}),
+            "emacs/runtime.version",
         ),
         (
-            json!({"emacs":{"buffers":[wrong_boolean]}}),
-            "emacs/buffers[0].modified",
-        ),
-        (
-            json!({"emacs":{"buffers":[non_nullable_name]}}),
-            "emacs/buffers[0].name",
-        ),
-        (
-            json!({"emacs":{"buffers":[wrong_file]}}),
-            "emacs/buffers[0].file",
-        ),
-        (
-            json!({"emacs":{"buffers":[extra_field]}}),
-            "emacs/buffers[0].unexpected",
+            json!({"emacs":{"runtime":extra_field}}),
+            "emacs/runtime.unexpected",
         ),
         (json!({"emacs":{"runtime":wrong_pid}}), "emacs/runtime.pid"),
         (
@@ -1236,7 +1218,7 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
         (json!({"unknown":{"value":1}}), "unknown/value"),
         (json!({"emacs":{"unknown":[]}}), "emacs/unknown"),
         (
-            json!({"emacs":{"buffers":[]},"network":{"my":{"status":"bad"}}}),
+            json!({"emacs":{"runtime":{"pid":43,"version":"31.1","started_at":1,"reported_at":3}},"network":{"my":{"status":"bad"}}}),
             "network/my.status",
         ),
     ] {
@@ -1268,10 +1250,9 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
         service,
         "POST",
         "/emacs/receiver/status",
-        json!({"emacs":{"buffers":[]}}),
+        json!({"emacs":{"runtime":{"pid":43,"version":"31.1","started_at":1,"reported_at":3}}}),
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    assert_eq!(status.value("emacs", "buffers").unwrap().value, json!([]));
-    assert_eq!(status.value("emacs", "runtime").unwrap().value["pid"], 42);
+    assert_eq!(status.value("emacs", "runtime").unwrap().value["pid"], 43);
 }

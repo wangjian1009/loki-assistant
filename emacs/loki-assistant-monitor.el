@@ -1,8 +1,8 @@
-;;; loki-assistant-monitor.el --- Emacs 状态主动上报与 buffer 关注 -*- lexical-binding: t; -*-
+;;; loki-assistant-monitor.el --- Emacs 状态主动上报 -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; 由主包加载；mode hook 维护关注集合，定时向 services 同步 模块/数据项快照。
+;; 由主包加载，定时向 services 同步模块状态快照。
 
 ;;; Code:
 
@@ -12,7 +12,6 @@
 (declare-function loki-assistant-request "loki-assistant")
 
 (defvar loki-assistant-monitor-mode nil)
-(defvar loki-assistant-monitor--buffers (make-hash-table :test #'eq))
 (cl-defstruct (loki-assistant-status-store
                (:constructor loki-assistant-status-store-create))
   "所有待上报 模块/数据项的结构化状态。"
@@ -28,21 +27,12 @@
   :type 'number
   :group 'loki-assistant)
 
-(defvar loki-assistant-monitor--hooks nil)
 (defvar loki-assistant-monitor--timer nil)
 (defvar loki-assistant-monitor--pending-timer nil)
 (defvar loki-assistant-monitor--inflight nil)
 (defvar loki-assistant-monitor--dirty nil)
 (defvar loki-assistant-monitor--epoch nil)
 (defvar loki-assistant-monitor--last-error nil)
-
-(defun loki-assistant-monitor--set-buffers (symbol value)
-  "设置 SYMBOL 为 mode 列表 VALUE，并更新已经安装的 hook。"
-  (unless (and (listp value) (cl-every #'symbolp value))
-    (error "关注 buffer 配置必须是 mode 符号列表"))
-  (set-default symbol value)
-  (when loki-assistant-monitor-mode
-    (loki-assistant-monitor--configure)))
 
 (defun loki-assistant-monitor--set-interval (symbol value)
   "设置 SYMBOL 为正数秒 VALUE，必要时重新启动定时器。"
@@ -51,84 +41,12 @@
   (when loki-assistant-monitor-mode
     (loki-assistant-monitor--start-timer)))
 
-(defcustom loki-assistant-monitor-buffer '(agent-shell-mode)
-  "需要关注的 major mode 列表；对应 mode 的派生 mode 也会被关注。
-通过 mode hook 注册 buffer，不依赖 agent-shell 的内部状态。"
-  :type '(repeat symbol)
-  :set #'loki-assistant-monitor--set-buffers
-  :group 'loki-assistant)
-
 (defcustom loki-assistant-monitor-interval 5
   "Emacs 状态上报间隔，单位为秒。
-发生注册、注销或状态变更时也会合并触发同步。"
+状态变更时也会合并触发同步。"
   :type 'number
   :set #'loki-assistant-monitor--set-interval
   :group 'loki-assistant)
-
-(defun loki-assistant-monitor--matches-p (buffer)
-  "BUFFER 的 mode 是否在关注范围内。"
-  (and (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (cl-some #'derived-mode-p loki-assistant-monitor-buffer))))
-
-(defun loki-assistant-monitor-register-buffer (&optional buffer)
-  "将 BUFFER（默认当前 buffer）注册到统一关注集合并触发同步。"
-  (setq buffer (or buffer (current-buffer)))
-  (when (and loki-assistant-monitor-mode
-             (loki-assistant-monitor--matches-p buffer))
-    (with-current-buffer buffer
-      (puthash buffer buffer loki-assistant-monitor--buffers)
-      (add-hook 'kill-buffer-hook #'loki-assistant-monitor-unregister-buffer nil t)
-      (add-hook 'change-major-mode-hook #'loki-assistant-monitor-unregister-buffer nil t))
-    (loki-assistant-monitor--queue)))
-
-(defun loki-assistant-monitor-unregister-buffer (&optional buffer)
-  "从关注集合注销 BUFFER（默认当前 buffer），并触发同步。"
-  (setq buffer (or buffer (current-buffer)))
-  (when (gethash buffer loki-assistant-monitor--buffers)
-    (remhash buffer loki-assistant-monitor--buffers)
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (remove-hook 'kill-buffer-hook #'loki-assistant-monitor-unregister-buffer t)
-        (remove-hook 'change-major-mode-hook #'loki-assistant-monitor-unregister-buffer t)))
-    (loki-assistant-monitor--queue)))
-
-(defun loki-assistant-monitor--configure ()
-  "按配置安装 mode hook，兼容加载前已存在的 buffer。"
-  (dolist (hook loki-assistant-monitor--hooks)
-    (remove-hook hook #'loki-assistant-monitor-register-buffer))
-  (setq loki-assistant-monitor--hooks
-        (mapcar (lambda (mode) (intern (concat (symbol-name mode) "-hook")))
-                (delete-dups (copy-sequence loki-assistant-monitor-buffer))))
-  (dolist (hook loki-assistant-monitor--hooks)
-    (add-hook hook #'loki-assistant-monitor-register-buffer))
-  (let (removed)
-    (maphash (lambda (buffer _buffer)
-               (unless (loki-assistant-monitor--matches-p buffer) (push buffer removed)))
-             loki-assistant-monitor--buffers)
-    (mapc #'loki-assistant-monitor-unregister-buffer removed))
-  ;; 仅启用和配置更新时扫描；定时上报只遍历已注册集合。
-  (dolist (buffer (buffer-list))
-    (when (loki-assistant-monitor--matches-p buffer)
-      (loki-assistant-monitor-register-buffer buffer)))
-  (loki-assistant-monitor--queue))
-
-(defun loki-assistant-monitor--snapshot-buffers ()
-  "返回关注 buffer 的 JSON 数组快照，并清理失效项。"
-  (let (entries removed)
-    (maphash
-     (lambda (buffer _buffer)
-       (if (not (loki-assistant-monitor--matches-p buffer)) (push buffer removed)
-         (with-current-buffer buffer
-           (push `((name . ,(buffer-name))
-                   (mode . ,(symbol-name major-mode))
-                   (directory . ,default-directory)
-                   (file . ,(or buffer-file-name :null))
-                   (modified . ,(if (buffer-modified-p) t :false)))
-                 entries))))
-     loki-assistant-monitor--buffers)
-    (dolist (buffer removed) (remhash buffer loki-assistant-monitor--buffers))
-    (vconcat (sort entries (lambda (a b) (string< (alist-get 'name a) (alist-get 'name b)))))))
 
 (defun loki-assistant-status--name (value label)
   "将 VALUE 转为 app 或数据项名称；LABEL 用于错误说明。"
@@ -231,8 +149,6 @@ FUNCTION 的第一个参数是当前值，后续参数为 ARGS；可用于 list/
        `((pid . ,(emacs-pid)) (version . ,emacs-version)
          (started_at . ,(floor (float-time (or before-init-time (current-time)))))
          (reported_at . ,(floor (float-time)))))
-      (loki-assistant-status--set-internal
-       "emacs" "buffers" (loki-assistant-monitor--snapshot-buffers))
       (let ((epoch loki-assistant-monitor--epoch)
             (json-null :null) (json-false :false))
         (setq loki-assistant-monitor--inflight t loki-assistant-monitor--dirty nil)
@@ -267,25 +183,21 @@ FUNCTION 的第一个参数是当前值，后续参数为 ARGS；可用于 list/
                      #'loki-assistant-status-sync)))
 
 (define-minor-mode loki-assistant-monitor-mode
-  "主动上报 Emacs 状态与配置关注的 buffer。
-关闭后停止上报并移除 hook，services 保留最后收到的数据。"
+  "主动上报 Emacs 运行状态。
+关闭后停止上报，services 保留最后收到的数据。"
   :global t :group 'loki-assistant
   (setq loki-assistant-monitor--epoch (list nil)
         loki-assistant-monitor--inflight nil)
   (if loki-assistant-monitor-mode
-      (progn (loki-assistant-monitor--configure) (loki-assistant-monitor--start-timer))
+      (progn
+        (loki-assistant-monitor--start-timer)
+        (loki-assistant-status-trigger-sync))
     (when loki-assistant-monitor--timer (cancel-timer loki-assistant-monitor--timer))
     (when loki-assistant-monitor--pending-timer (cancel-timer loki-assistant-monitor--pending-timer))
-    (setq loki-assistant-monitor--timer nil loki-assistant-monitor--pending-timer nil)
-    (dolist (hook loki-assistant-monitor--hooks)
-      (remove-hook hook #'loki-assistant-monitor-register-buffer))
-    (let (buffers)
-      (maphash (lambda (buffer _buffer) (push buffer buffers)) loki-assistant-monitor--buffers)
-      (mapc #'loki-assistant-monitor-unregister-buffer buffers))
-    (setq loki-assistant-monitor--hooks nil)))
+    (setq loki-assistant-monitor--timer nil loki-assistant-monitor--pending-timer nil)))
 
 (defun loki-assistant-monitor-unload-function ()
-  "卸载 feature 前清理定时器与 hook。"
+  "卸载 feature 前清理定时器。"
   (loki-assistant-monitor-mode -1)
   nil)
 

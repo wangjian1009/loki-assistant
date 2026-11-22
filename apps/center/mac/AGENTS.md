@@ -8,7 +8,7 @@
 - `Info.plist` 的显示名称、图标名称和版本字段使用 CMake 的 `MACOSX_BUNDLE_*` 值；不要引用本工程未设置的 Xcode `MARKETING_VERSION`、`CURRENT_PROJECT_VERSION`，否则构建时会丢失版本字段。
 - Xcode 将菜单栏的 1x/2x PNG 合并为多倍率 TIFF；通过 `Bundle.main.image(forResource:)` 加载并设置 `isTemplate = true`。菜单第一项圆点由 `MenuStatusDot` 单独生成红、黄、绿的原色图像，设置 `isTemplate = false` 后以 `.renderingMode(.original)` 显示。独立资源不使用只查找 asset catalog 的 `Image("名称")` 加载方式；资源缺失时回退到系统图标。
 - 最低支持 macOS 14；应用设置 `LSUIElement = YES`，不显示 Dock 图标。
-- 每次打开菜单仅通过 `URLSession` 请求一次 services 的 loopback `/status`，用同一快照刷新 `service` 的 `start_at`、`network/my/status` 和 buffer 列表；不安装轮询任务，不启动外部进程。
+- 每次打开菜单仅通过 `URLSession` 请求一次 services 的 loopback `/status`，用同一快照刷新 `service` 的 `start_at`和 `network/my/status`；不安装轮询任务，不启动外部进程。
 
 ## 目录
 
@@ -16,7 +16,6 @@
 Sources/
 ├── App/LokiAssistantApp.swift       菜单栏应用入口
 ├── App/ServiceSettingsClient.swift  通过 services 打开 Emacs 配置界面
-├── App/EmacsReportedStatus.swift    托盘菜单读取 Emacs 上报 buffer 状态
 ├── App/ServiceStatusModel.swift     services 状态请求和模型
 ├── App/MenuStatusDot.swift          菜单第一项红黄绿圆点图像
 ├── App/SystemNotificationController.swift  通用通知解码、系统展示与点击回调

@@ -426,7 +426,7 @@ GET /password/entries/example.com/alice.gpg
 
 ** 状态结构声明
 
-状态定义采用与配置元数据相同的编译期注册方式：业务模块在自己的 ~status.rs~ 中用 ~#[loki_status]~ 修饰无参数、无泛型的同步函数，返回 ~StatusModuleMetadata~ 。过程宏通过 ~linkme~ 注册到 ~STATUS_MODULES~ ，不在运行时注册，也不需要创建业务实例。当前服务自身状态模块声明 ~start_at~，Emacs 声明 ~buffers~ 和 ~runtime~ ，网络模块声明 ~my~ 。
+状态定义采用与配置元数据相同的编译期注册方式：业务模块在自己的 ~status.rs~ 中用 ~#[loki_status]~ 修饰无参数、无泛型的同步函数，返回 ~StatusModuleMetadata~ 。过程宏通过 ~linkme~ 注册到 ~STATUS_MODULES~ ，不在运行时注册，也不需要创建业务实例。当前服务自身状态模块声明 ~start_at~，Emacs 声明 ~runtime~ ，网络模块声明 ~my~ 。
 
 ~GET /stats/meta~ 返回 ~api_version~ 和 ~modules~ 列表。模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 、 ~remote_access~ 和递归 ~schema~ 。数据路径为 ~/status/{模块 id}/{状态项 key}~ ，嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~ 。本次 services 启动时间可通过 ~GET /status/service~ 查询。
 
@@ -449,7 +449,7 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 全部通过后才发布；任意一项错误都保留原有数据和全局、单项更新时间。HTTP 业务入口返回 400 ~invalid-request~ ，说明包含具体路径，不回显提交值。例如：
 
 #+begin_src json
-{"api_version":"1","status":400,"error":{"source":"business","code":"invalid-request","message":"请求无效：状态数据无效：emacs/buffers[0].modified：必须是 boolean"}}
+{"api_version":"1","status":400,"error":{"source":"business","code":"invalid-request","message":"请求无效：状态数据无效：emacs/runtime.pid：必须是 integer"}}
 #+end_src
 
 ~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回完整状态项；~GET /status/{module_id}/{key}/{*path}~ 返回 ~module_id~、层级 ~path~、字段 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ 。字段路径按 URL 层级编码，不使用点号；未发布或字段不存在时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
@@ -531,21 +531,13 @@ Emacs 端由 =emacs/loki-assistant-capture.el= 提供
 
 ** Emacs 主动状态上报
 
-Emacs 包向本模块的 ~POST /emacs/receiver/status~ 主动上报 ~emacs/runtime~ 和 ~emacs/buffers~ 。~EmacsService~ 接收后调用注入的共享 ~StatusService::publish_many_validated~ Rust 接口校验并发布，不保留私有状态缓存，也不为上报反向连接 Emacs。请求示例：
+Emacs 包通过 ~POST /emacs/receiver/status~ 主动上报 ~emacs/runtime~ 。 ~EmacsService~ 调用共享的 ~StatusService::publish_many_validated~ 校验和发布数据。
 
 #+begin_src json
-{"emacs":{"runtime":{"pid":20349,"version":"31.1","started_at":1794880000,"reported_at":1794890558},"buffers":[{"name":"Codex Agent @ loki-assistant","mode":"agent-shell-mode","directory":"/Users/example/project/","file":null,"modified":false}]}}
+{"emacs":{"runtime":{"pid":20349,"version":"31.1","started_at":1794880000,"reported_at":1794890558}}}
 #+end_src
 
-单独读取关注的 buffer 使用 ~GET /status/emacs/buffers~ ，返回通用状态包装；托盘使用 ~GET /status~ 读取各模块的 ~buffers~ 数据项并分组展示。读取只消费最后发布的快照，不检查 Emacs 是否仍然运行。通用读写协议见 [[*状态中心][状态中心]]。
-
-** 统一 buffer 关注
-
-Emacs 包提供 ~loki-assistant-monitor-mode~，加载 ~loki-assistant~ 时默认启用。~loki-assistant-monitor-buffer~ 默认值为 ~(agent-shell-mode)~，表示关注该 mode 及其派生 mode；可在 Emacs 配置中改为其他 mode 符号列表。对应 mode hook 注册 buffer，~kill-buffer-hook~ 和 ~change-major-mode-hook~ 注销，注册集合不扫描或复制所有 buffer 状态。
-
-关注集合按固定数据项 ~emacs/buffers~ 上报。每个条目包含 buffer 名称、mode、工作目录、文件和 modified 状态；注册、注销和数据变化合并触发同步，默认每 5 秒发送一次 ~POST /emacs/receiver/status~ ；请求失败保留本地状态，下一次周期继续尝试，不立即循环重试。
-
-状态上报开关为 ~loki-assistant-monitor-mode~；关闭后移除 mode hook 和定时器，services 保留最后一次成功上报的数据。托盘读取缓存时不要求 Emacs 在线，点击 buffer 时通过 ~POST /emacs/activate?buffer=...~ 按名称查找并聚焦第一个匹配的 buffer；名称不存在返回 404 ~buffer-not-found~ 。
+~GET /status/emacs/runtime~ 读取最近一次成功上报的运行信息。 ~loki-assistant-monitor-mode~ 默认每 5 秒上报一次，关闭后取消上报定时器。通用读写协议见 [[*状态中心][状态中心]]。
 
 ** 打开 Emacs 应用
 

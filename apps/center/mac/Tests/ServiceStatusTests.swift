@@ -1,6 +1,17 @@
 import XCTest
 @testable import LokiAssistant
 
+private actor MenuStatusTransport {
+    private(set) var paths: [String] = []
+
+    func send(_ request: URLRequest) throws -> (Data, URLResponse) {
+        let url = try XCTUnwrap(request.url)
+        paths.append(url.path)
+        let data = Data(#"{"api_version":"1","status":{"service":{"start_at":200}}}"#.utf8)
+        return (data, try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)))
+    }
+}
+
 final class ServiceStatusTests: XCTestCase {
     func testDecodesHealthResponse() throws {
         let data = Data(#"{"service":"loki-services","status":"ok","version":"0.1.0","uptime_seconds":42}"#.utf8)
@@ -64,6 +75,30 @@ final class ServiceStatusTests: XCTestCase {
         XCTAssertEqual(model.networkStatus, "connected")
         XCTAssertEqual(model.snapshot?.updatedAt, 201)
         XCTAssertEqual(model.indicator, .green)
+    }
+
+    @MainActor
+    func testMenuFetchesOneSnapshotPerOpening() async throws {
+        let transport = MenuStatusTransport()
+        let model = ServiceStatusModel(
+            discover: { ServiceEndpoint(host: "127.0.0.1", port: 45678, pid: 42, version: "test", startedAt: 100) },
+            transport: { try await transport.send($0) }
+        )
+        let beforeOpening = await transport.paths
+        XCTAssertTrue(beforeOpening.isEmpty)
+        defer { model.menuDidClose() }
+
+        for count in 1...2 {
+            model.menuDidOpen()
+            model.menuDidOpen()
+            let deadline = Date().addingTimeInterval(3)
+            while await transport.paths.count < count, Date() < deadline {
+                await Task.yield()
+            }
+            let paths = await transport.paths
+            XCTAssertEqual(paths, Array(repeating: "/status", count: count))
+            model.menuDidClose()
+        }
     }
 
     @MainActor

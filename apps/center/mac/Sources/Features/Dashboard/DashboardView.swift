@@ -3,7 +3,6 @@ import SwiftUI
 
 struct DashboardView: View {
     let status: ServiceStatusModel
-    let reportedStatus: EmacsReportedStatusModel
     let idleSleep: IdleSleepController
     @State private var openingSettings = false
     @State private var openingLog = false
@@ -34,8 +33,6 @@ struct DashboardView: View {
                     systemImage: idleSleep.isEnabled ? "moon.zzz.fill" : "moon.zzz"
                 )
             }
-            Divider()
-            monitoredBuffers
             Divider()
             Button {
                 openingSettings = true
@@ -88,8 +85,8 @@ struct DashboardView: View {
         .padding(8)
         .frame(width: 300, alignment: .leading)
         .labelStyle(.titleAndIcon)
-        .onAppear { reportedStatus.menuDidOpen() }
-        .onDisappear { reportedStatus.menuDidClose() }
+        .onAppear { status.menuDidOpen() }
+        .onDisappear { status.menuDidClose() }
         .alert(appOpenErrorTitle, isPresented: Binding(
             get: { appOpenError != nil },
             set: { if !$0 { appOpenError = nil } }
@@ -97,33 +94,6 @@ struct DashboardView: View {
             Button("好") { appOpenError = nil }
         } message: {
             Text(appOpenError ?? "")
-        }
-    }
-
-    @ViewBuilder
-    private var monitoredBuffers: some View {
-        if let error = reportedStatus.refreshError {
-            Text(error).font(.caption).foregroundStyle(.secondary)
-        } else if reportedStatus.loading {
-            Text("正在读取状态…").foregroundStyle(.secondary)
-        } else if reportedStatus.hasSnapshot && reportedStatus.bufferGroups.isEmpty {
-            Text("没有关注的 buffer").foregroundStyle(.secondary)
-        } else if !reportedStatus.hasSnapshot {
-            Text("打开菜单后读取 Emacs 上报状态").foregroundStyle(.secondary)
-        }
-        ForEach(reportedStatus.bufferGroups) { group in
-            Section(group.app) {
-                ForEach(Array(group.buffers.enumerated()), id: \.offset) { _, buffer in
-                    Button { reportedStatus.activate(buffer) } label: {
-                        Label(buffer.name, systemImage: "terminal")
-                            .lineLimit(1)
-                    }
-                    .help("\(buffer.mode)\n\(buffer.directory)")
-                    .disabled(reportedStatus.activating)
-                    .buttonStyle(.borderless)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
         }
     }
 

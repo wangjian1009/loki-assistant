@@ -20,7 +20,6 @@ set(LOKI_APP_SOURCES
     Sources/App/MenuStatusDot.swift
     Sources/App/ServiceStatusModel.swift
     Sources/App/ServiceSettingsClient.swift
-    Sources/App/EmacsReportedStatus.swift
     Sources/App/SystemNotificationController.swift
     Sources/App/NotificationReceiptClient.swift
     Sources/App/ServiceAPIError.swift
@@ -75,7 +74,6 @@ if(BUILD_TESTING)
         Tests/ServiceStatusTests.swift
         Tests/MenuStatusDotTests.swift
         Tests/ServiceSettingsTests.swift
-        Tests/EmacsReportedStatusTests.swift
         Tests/CenterLogTests.swift
         Tests/SystemNotificationTests.swift
         Tests/NotificationReceiptTests.swift
