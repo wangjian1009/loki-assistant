@@ -59,12 +59,11 @@ help:
 	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR TEST_BUILD_DIR CMAKE CTEST CARGO BREW OPEN EMACSCLIENT DEVECO_HOME HDC_TARGET'
 
 emacs-load:
-	"$(EMACSCLIENT)" --eval "(let ((command-map (and (boundp 'loki-assistant-command-map) loki-assistant-command-map))) \
+	"$(EMACSCLIENT)" --eval "(progn \
 	  (let ((directory \"$(PROJECT_ROOT)/emacs\")) \
 	    (setq load-path (cons directory (delete directory load-path)))) \
-	  (dolist (feature '(loki-assistant-slack-chat-tests loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
+	  (dolist (feature '(loki-assistant-slack-chat-tests loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant-command-menu loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
-	  (when command-map (setq loki-assistant-command-map command-map)) \
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config) \
 	  (require 'loki-assistant-devices) \

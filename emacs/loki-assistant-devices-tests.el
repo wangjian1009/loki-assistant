@@ -51,8 +51,7 @@
       (should-error (funcall command) :type 'user-error)
       (should (equal (buffer-string) "用户正在编辑的正文")))))
 
-(ert-deftest loki-assistant-devices-test-shortcut-and-home-only-loads-bound-peers ()
-  (should (eq (lookup-key loki-assistant-command-map (kbd "d")) #'loki-assistant-devices))
+(ert-deftest loki-assistant-devices-test-home-only-loads-bound-peers ()
   (let (requests)
     (loki-assistant-test--with-server
         (lambda (headers _body)
