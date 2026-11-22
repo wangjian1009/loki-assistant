@@ -36,6 +36,7 @@ pub(super) enum Error {
     Unavailable,
     PasswordRead,
     DeliveryUnknown,
+    DeliveryTargetMismatch,
     Method,
 }
 
@@ -131,6 +132,11 @@ impl Error {
                 503,
                 "slack-delivery-unknown",
                 "发送结果未知，请刷新会话核对。",
+            ),
+            Self::DeliveryTargetMismatch => (
+                503,
+                "slack-delivery-target-mismatch",
+                "Slack 返回的消息不属于所选线程，请刷新会话核对。",
             ),
         }
     }

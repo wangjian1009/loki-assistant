@@ -16,7 +16,7 @@ use crate::modules::emacs::service::EmacsService;
 
 use super::{
     mailbox::next_cursor,
-    protocol::{Error, Message, timestamp},
+    protocol::{Error, Message, Page, timestamp},
     service::SlackService,
     store::Cache,
 };
@@ -27,10 +27,28 @@ const IDLE_PROBE: Duration = Duration::from_secs(60);
 
 pub(super) type SubscriptionKey = (String, Uuid);
 
+pub(super) fn thread_roots(page: &Value) -> Vec<String> {
+    page["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter(|item| item["reply_count"].as_u64().unwrap_or_default() > 0)
+        .filter_map(|item| item["ts"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct MessageJournal {
     changed: watch::Sender<u64>,
-    entries: VecDeque<(u64, String, Option<Message>)>,
+    entries: VecDeque<MessageChange>,
+}
+
+struct MessageChange {
+    revision: u64,
+    ts: String,
+    thread_ts: Option<String>,
+    message: Option<Message>,
 }
 
 impl MessageJournal {
@@ -48,8 +66,8 @@ impl MessageJournal {
         Some(
             self.entries
                 .iter()
-                .filter(|(index, _, _)| index > revision)
-                .map(|(_, ts, _)| ts.clone())
+                .filter(|entry| entry.revision > *revision)
+                .map(|entry| entry.ts.clone())
                 .collect(),
         )
     }
@@ -57,12 +75,17 @@ impl MessageJournal {
     fn overflowed(&self, revision: u64) -> bool {
         self.entries
             .front()
-            .is_some_and(|(first, _, _)| *first > revision + 1)
+            .is_some_and(|first| first.revision > revision + 1)
     }
 
-    pub fn push(&mut self, ts: String, message: Option<Message>) {
+    pub fn push(&mut self, ts: String, thread_ts: Option<String>, message: Option<Message>) {
         let revision = *self.changed.borrow() + 1;
-        self.entries.push_back((revision, ts, message));
+        self.entries.push_back(MessageChange {
+            revision,
+            ts,
+            thread_ts,
+            message,
+        });
         if self.entries.len() > JOURNAL_LIMIT {
             self.entries.pop_front();
         }
@@ -106,6 +129,30 @@ impl Cache {
 }
 
 impl SlackService {
+    pub(super) async fn has_message_subscribers(&self, id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .cache
+            .conversations
+            .get(id)
+            .is_some_and(|room| room.journal.is_some())
+    }
+
+    pub(super) async fn refresh_threads(&self, session: Uuid, id: &str, roots: Vec<String>) {
+        for root in roots {
+            let result = self
+                .messages(session, id.to_owned(), Some(root), Page::default())
+                .await;
+            if matches!(
+                result,
+                Err(Error::Session | Error::Authorization | Error::RateLimited(_))
+            ) {
+                break;
+            }
+        }
+    }
+
     pub(super) async fn subscribe_messages(
         &self,
         session: Uuid,
@@ -203,7 +250,7 @@ impl SlackService {
     }
 
     async fn deliver_subscription(
-        &self,
+        self: &Arc<Self>,
         emacs: &EmacsService,
         session: Uuid,
         key: &SubscriptionKey,
@@ -218,6 +265,7 @@ impl SlackService {
         };
         let mut sequence = 1;
         let mut revision = None;
+        let mut thread_loads = JoinSet::new();
         loop {
             changes.borrow_and_update();
             let mut payload = json!({
@@ -243,6 +291,7 @@ impl SlackService {
                             if result.is_err() { return; }
                             continue;
                         },
+                        _ = thread_loads.join_next(), if !thread_loads.is_empty() => continue,
                         _ = sleep(IDLE_PROBE) => {},
                     }
                     (0, json!({"kind":"probe"}))
@@ -284,6 +333,17 @@ impl SlackService {
                 }
             }
             if !probe {
+                if record["kind"] == "snapshot" {
+                    let roots = thread_roots(&record["snapshot"]);
+                    thread_loads.abort_all();
+                    if !roots.is_empty() {
+                        let service = Arc::clone(self);
+                        let id = key.0.clone();
+                        thread_loads.spawn(async move {
+                            service.refresh_threads(session, &id, roots).await;
+                        });
+                    }
+                }
                 revision = Some(next);
                 sequence += 1;
             }
@@ -329,9 +389,11 @@ impl SlackService {
                 .map(|first| next_cursor(session, format!("messages:{id}:"), first.ts.clone()));
             let range = items.first().zip(items.last()).filter(|_| live)
                 .map(|(first, last)| json!({"from_ts":first.ts,"through_ts":last.ts}));
+            let replies = room.cached_replies(items, true);
             let snapshot = json!({
                 "api_version":"1", "conversation_id":id,
                 "items": items.iter().map(|message| room.message_result(message)).collect::<Vec<_>>(),
+                "thread_items": replies,
                 "next_cursor":cursor, "sync_state":if live { "live" } else { "cached" },
                 "covered_range":range, "read_through_ts":room.read_positions.get(None),
                 "first_unread_ts":room.messages.values()
@@ -367,22 +429,27 @@ impl SlackService {
             return Err(Error::Cursor);
         }
         let mut effective = BTreeMap::new();
-        for (_, ts, value) in journal
+        for entry in journal
             .entries
             .iter()
-            .filter(|(index, _, _)| *index > previous)
+            .filter(|entry| entry.revision > previous)
         {
-            effective.insert(ts, value);
+            effective.insert(&entry.ts, entry);
         }
         let (mut items, mut deleted_ts) = (Vec::new(), Vec::new());
-        for (ts, value) in effective {
-            if let Some(message) = value {
-                items.push(room.message_result(message));
-            } else {
-                deleted_ts.push(ts);
+        let (mut thread_items, mut deleted_thread_messages) = (Vec::new(), Vec::new());
+        for (ts, entry) in effective {
+            match (&entry.thread_ts, &entry.message) {
+                (None, Some(message)) => items.push(room.message_result(message)),
+                (None, None) => deleted_ts.push(ts),
+                (Some(_), Some(message)) => thread_items.push(room.message_result(message)),
+                (Some(root), None) => {
+                    deleted_thread_messages.push(json!({"thread_ts":root, "ts":ts}))
+                }
             }
         }
-        let update = json!({"kind":"changes", "items":items,"deleted_ts":deleted_ts});
+        let update = json!({"kind":"changes", "items":items, "deleted_ts":deleted_ts,
+                            "thread_items":thread_items, "deleted_thread_messages":deleted_thread_messages});
         Ok(Some((
             revision,
             super::routes::messages_result(update, team),

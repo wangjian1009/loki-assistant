@@ -992,7 +992,7 @@ impl SlackService {
             .map_or_else(|| user.result(), |cache| cache.user_result(user)))
     }
 
-    async fn find_message(
+    pub(super) async fn find_message(
         &self,
         session: Uuid,
         id: &str,
@@ -1165,6 +1165,9 @@ impl SlackService {
             .ok_or(Error::Conversation)?;
         let positions = &conversation.read_positions;
         let public_message = |message: &Message| conversation.message_result(message);
+        let thread_items = thread
+            .is_none()
+            .then(|| conversation.cached_replies(&items, false));
         let items: Vec<_> = items.iter().map(public_message).collect();
         let mut result = json!({
             "api_version":"1","conversation_id":id,"items":items,"next_cursor":next,
@@ -1176,6 +1179,8 @@ impl SlackService {
         });
         if thread.is_some() {
             result["root"] = root.as_ref().map_or(Value::Null, public_message);
+        } else {
+            result["thread_items"] = json!(thread_items.unwrap_or_default());
         }
         Ok(result)
     }
@@ -1201,7 +1206,9 @@ impl SlackService {
             }
         }
         if let Some(thread) = thread {
-            return self.fetch_thread(session, id, thread, before, limit).await;
+            return self
+                .fetch_thread(session, id, thread, before, limit, observed)
+                .await;
         }
         let number = limit.to_string();
         let mut latest = before.map(str::to_owned);
@@ -1274,6 +1281,7 @@ impl SlackService {
         thread: &str,
         before: Option<&str>,
         limit: usize,
+        observed: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
     ) -> Result<(Vec<Message>, Option<Message>, bool), Error> {
         // Slack 按从早到晚返回回复。保留最后一页所需的窗口，并始终取得根消息。
         let mut window = std::collections::VecDeque::new();
@@ -1343,8 +1351,16 @@ impl SlackService {
         self.warm_message_media(session, &items).await;
         self.warm_message_media(session, std::slice::from_ref(&root))
             .await;
-        self.store_page(session, id, Some(thread), &items, Some(&root), more, None)
-            .await?;
+        self.store_page(
+            session,
+            id,
+            Some(thread),
+            &items,
+            Some(&root),
+            more,
+            observed,
+        )
+        .await?;
         Ok((items, Some(root), more))
     }
 
@@ -1369,9 +1385,9 @@ impl SlackService {
                 .ok_or(Error::Conversation)?;
             let marker = view.clone().unwrap_or_default();
             conversation.loaded.insert(marker, more);
-            let changed = match (view.as_deref(), conversation.journal.as_ref(), observed.as_ref()) {
-                (None, Some(journal), Some(observed)) => journal.changed_since(observed),
-                (None, Some(_), None) => None,
+            let changed = match (conversation.journal.as_ref(), observed.as_ref()) {
+                (Some(journal), Some(observed)) => journal.changed_since(observed),
+                (Some(_), None) => None,
                 _ => Some(Default::default()),
             };
             // 拉取期间的实时事件优先于 Slack 分页响应。
@@ -1392,7 +1408,7 @@ impl SlackService {
                     .map(|message| message.ts.clone())
                     .collect();
                 for ts in vanished {
-                    conversation.remove(&ts);
+                    conversation.remove(&ts, view.as_deref());
                 }
             }
             for message in items.into_iter().chain(root).filter(|message| current(&message.ts)) {

@@ -146,6 +146,7 @@ struct Mock {
     reply: String,
     sent: String,
     posts: AtomicUsize,
+    misplaced_reply: AtomicBool,
     history_unavailable: AtomicBool,
 }
 
@@ -331,6 +332,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         reply: format!("{now}.000002"),
         sent: format!("{now}.000003"),
         posts: AtomicUsize::default(),
+        misplaced_reply: AtomicBool::default(),
         history_unavailable: AtomicBool::default(),
     });
     let media = get(|axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap| async move {
@@ -415,8 +417,14 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
             assert_eq!(headers["cookie"], "d=first");
             assert_eq!(body["thread_ts"], mock.root);
+            assert_eq!(body["reply_broadcast"], false);
             assert_eq!(body["text"], "收到");
             mock.posts.fetch_add(1, Ordering::SeqCst);
+            if mock.misplaced_reply.load(Ordering::SeqCst) {
+                let ts = format!("{}1", mock.sent);
+                return Json(json!({"ok":true,"ts":ts,"channel":"DDIRECT",
+                    "message":{"ts":ts,"thread_ts":ts,"text":"收到"}}));
+            }
             Json(json!({"ok":true,"ts":mock.sent,"message":{"ts":mock.sent,"thread_ts":mock.root,
                         "text":"收到"}}))
         })).with_state(Arc::clone(&mock));
@@ -459,6 +467,17 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         let mention = json!({"type":"message","channel":"CWORK","ts":socket_mock.reply,
             "thread_ts":socket_mock.root,"user":"UYOU","text":"请 <@UME> 看一下"});
         for payload in [&ordinary, &mention, &mention] {
+            stream
+                .send(Message::Text(payload.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let placeholder = json!({"type":"message","subtype":"bot_message","channel":"CWORK",
+            "ts":socket_mock.sent,"thread_ts":socket_mock.root,"bot_id":"BNEWS","text":"思考中..."});
+        let answer = json!({"type":"message","subtype":"message_changed","channel":"CWORK",
+            "ts":socket_mock.sent, "previous_message":placeholder,
+            "message":{"ts":socket_mock.sent,"bot_id":"BNEWS","text":"正式回复"}});
+        for payload in [&placeholder, &answer] {
             stream
                 .send(Message::Text(payload.to_string().into()))
                 .await
@@ -739,12 +758,26 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     timeout(Duration::from_secs(3), async {
         loop {
             let delivered = emacs.deliveries.lock().unwrap().iter().any(|batch| {
-                batch["kind"] == "changes" && batch["items"].as_array().unwrap().iter().any(|item| {
-                    item["ts"] == mock.root && item["author"]["id"] == "TTEAM.UYOU"
-                        && item["reply_count"] == 1
+                batch["kind"] == "changes"
+                    && batch["items"].as_array().unwrap().iter().any(|item| {
+                        item["ts"] == mock.root
+                            && item["author"]["id"] == "TTEAM.UYOU"
+                            && item["reply_count"].as_u64().is_some_and(|count| count >= 1)
+                    })
+            });
+            let edited = emacs.deliveries.lock().unwrap().iter().any(|batch| {
+                batch["thread_items"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["ts"] == mock.sent
+                            && item["thread_ts"] == mock.root
+                            && item["text"] == "正式回复"
+                            && item["author"]["id"] == "TTEAM.BNEWS"
+                    })
                 })
             });
-            if delivered { break; }
+            if delivered && edited {
+                break;
+            }
             sleep(Duration::from_millis(10)).await;
         }
     }).await.unwrap();
@@ -772,6 +805,35 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert!(icon.starts_with(directory.0.join("cache/TTEAM/icons")) && icon.is_file());
     assert!(first.get("icon_url").is_none());
     drop(delivered);
+    let sent = mock.sent.clone();
+    let root = mock.root.clone();
+    service
+        .update_cache(session.unwrap(), move |cache, _| {
+            cache
+                .conversations
+                .get_mut("CWORK")
+                .unwrap()
+                .remove(&sent, Some(&root));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if emacs.deliveries.lock().unwrap().iter().any(|batch| {
+                batch["deleted_thread_messages"]
+                    .as_array()
+                    .is_some_and(|items| {
+                        items.contains(&json!({"ts":mock.sent, "thread_ts":mock.root}))
+                    })
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     emacs.emacs_exited.store(true, Ordering::SeqCst);
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
@@ -901,6 +963,28 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .0,
         StatusCode::CONFLICT
     );
+    mock.misplaced_reply.store(true, Ordering::SeqCst);
+    let misplaced_key = Some(Uuid::new_v4());
+    let (status, headers, _) =
+        invoke(&app, "POST", &thread, session, misplaced_key, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let location = headers["location"].to_str().unwrap();
+    let receipt = timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, _, receipt) = invoke(&app, "GET", location, session, None, None).await;
+            if receipt["state"] != "pending" {
+                break receipt;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(receipt["state"], "unknown");
+    assert_eq!(receipt["error"]["code"], "slack-delivery-target-mismatch");
+    let (_, _, repeated) = invoke(&app, "POST", &thread, session, misplaced_key, Some(body)).await;
+    assert_eq!(repeated["state"], "unknown");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 2);
     projects.stop().await;
     worker.await.unwrap();
 
@@ -926,6 +1010,13 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 batch["subscription_id"] == json!(recovered)
                     && batch["sequence"] == 1
                     && batch["snapshot"]["sync_state"] == "cached"
+                    && batch["snapshot"]["thread_items"]
+                        .as_array()
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["ts"] == mock.sent && item["thread_ts"] == mock.root
+                            })
+                        })
             }) {
                 break;
             }

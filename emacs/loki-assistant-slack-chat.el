@@ -361,17 +361,34 @@
 
 (defun loki-assistant-slack--update-title ()
   "更新当前 Slack buffer 的名字及窗口标题。"
-  (let* ((title (concat (loki-assistant-slack--chat-title loki-assistant-slack--room)
-                        (when loki-assistant-slack--thread-root " · 线程")))
-         (name (if loki-assistant-slack--thread-root
-                   (format "*Slack %s %s*" title loki-assistant-slack--thread-root)
-                 (format "*Slack %s*" title)))
+  (let* ((thread loki-assistant-slack--thread-root)
+         (title (if thread
+                    (loki-assistant-slack--thread-title loki-assistant-slack--room
+                                                        loki-assistant-slack--thread-message)
+                  (loki-assistant-slack--chat-title loki-assistant-slack--room)))
+         (name (format "*Slack %s*" title))
          (escaped (replace-regexp-in-string "%" "%%" title t t)))
     (unless (equal name loki-assistant-slack--display-name)
       (unless (equal name (buffer-name)) (rename-buffer name t))
       (setq loki-assistant-slack--display-name name))
     (setq header-line-format (concat " " escaped))
     (setq-local frame-title-format escaped)))
+
+(defun loki-assistant-slack--thread-title (room message)
+  "将根消息 MESSAGE 的摘要追加到 ROOM 的聊天标题。"
+  (let* ((body (or (loki-assistant-slack--non-null (alist-get 'text message)) ""))
+         (body (if (string-blank-p body)
+                   (seq-some (lambda (block)
+                               (alist-get 'text (car (loki-assistant-slack--section-texts block))))
+                             (alist-get 'blocks message))
+                 body))
+         (text (when body
+                 (loki-assistant-slack--single-line
+                  (replace-regexp-in-string "<[^<>|]+|\\([^<>]+\\)>" "\\1" body)))))
+    (concat (loki-assistant-slack--chat-title room) " · "
+            (if (and text (not (string-empty-p text)))
+                (truncate-string-to-width text 48 nil nil "...")
+              "线程"))))
 
 (defun loki-assistant-slack--make-chat-buffer (name)
   "以 NAME 创建聊天共用的 shell-maker buffer。"
@@ -487,7 +504,6 @@
           (goto-char position)
           (recenter))
         (setq result (cond (message-position 'message) (thread-position 'thread) (t 'conversation))))
-      (when page (loki-assistant-slack--refresh-thread thread))
       (unless (and loki-assistant-slack--subscription
                    (equal (alist-get 'session_id room)
                           (alist-get 'session_id loki-assistant-slack--room)))
@@ -566,8 +582,8 @@
       (setq loki-assistant-slack--thread-buffers (make-hash-table :test #'equal)))
     (let ((buffer (or (loki-assistant-slack--thread-buffer root)
                       (loki-assistant-slack--make-chat-buffer
-                       (format "*Slack %s · 线程 %s*"
-                               (loki-assistant-slack--chat-title loki-assistant-slack--room) root)))))
+                       (format "*Slack %s*" (loki-assistant-slack--thread-title
+                                              loki-assistant-slack--room message))))))
       (puthash root buffer loki-assistant-slack--thread-buffers)
       (with-current-buffer buffer
         (setq loki-assistant-slack--parent-buffer parent
@@ -575,8 +591,6 @@
               loki-assistant-slack--thread-message message)
         (loki-assistant-slack--initialize-input))
       (loki-assistant-slack--render-thread buffer)
-      (unless (loki-assistant-slack--page-loading (loki-assistant-slack--thread-page root))
-        (loki-assistant-slack--refresh-thread root))
       (loki-assistant-slack--show-buffer buffer)
       (goto-char (or (loki-assistant-slack--message-position position-ts)
                      (loki-assistant-slack--message-position root)
@@ -650,99 +664,46 @@
     (format "%s-%s-4%s-8%s-%s" (substring hash 0 8) (substring hash 8 12)
             (substring hash 13 16) (substring hash 17 20) (substring hash 20 32))))
 
-(defun loki-assistant-slack--load (page &optional older thread automatic)
-  "加载 PAGE。OLDER 读取下一页，THREAD 指定线程，AUTOMATIC 表示首次自动读取。"
-  (when (and (eq page (if thread (gethash thread loki-assistant-slack--threads)
-                        loki-assistant-slack--timeline))
+(defun loki-assistant-slack--load-older (page)
+  "读取主时间线 PAGE 的更早消息。"
+  (when (and (eq page loki-assistant-slack--timeline)
              (not (loki-assistant-slack--page-loading page)))
     (let ((buffer (current-buffer))
-          (room loki-assistant-slack--room)
-          (cursor (and older (loki-assistant-slack--page-cursor page))))
+          (cursor (loki-assistant-slack--page-cursor page)))
       (setf (loki-assistant-slack--page-loading page) t)
-      (unless thread (setq loki-assistant-slack--page-changes nil))
-      (when (and thread (not automatic)) (loki-assistant-slack--render))
+      (setq loki-assistant-slack--page-changes nil)
       (loki-assistant-slack--request
-       "GET" (loki-assistant-slack--path room thread)
+       "GET" (loki-assistant-slack--path loki-assistant-slack--room nil)
        (lambda (response)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (eq page (if thread (gethash thread loki-assistant-slack--threads)
-                              loki-assistant-slack--timeline))
-               (let ((before (unless thread (copy-loki-assistant-slack--page page)))
-                     (refresh (eq (loki-assistant-slack--page-loading page) 'refresh)))
-                 (setf (loki-assistant-slack--page-loading page) nil)
-                 (if (plist-get response :ok)
-                     (let ((data (plist-get response :data)))
-                       (when-let* ((thread)
-                                   (child (loki-assistant-slack--thread-buffer thread))
-                                   (root (loki-assistant-slack--non-null (alist-get 'root data))))
-                         (with-current-buffer child
-                           (setq loki-assistant-slack--thread-message root)))
-                       (when (or older (not (loki-assistant-slack--page-loaded page)))
-                         (let ((next (alist-get 'next_cursor data)))
-                           (setf (loki-assistant-slack--page-cursor page) (and (stringp next) next))))
-                       (let ((items (loki-assistant-slack--merge
-                                     (loki-assistant-slack--page-items page) data thread)))
-                         (unless thread
-                           (let ((lower (and (loki-assistant-slack--page-cursor page)
-                                             (alist-get 'ts (car items)))))
-                             (dolist (changes (nreverse loki-assistant-slack--page-changes))
-                               (setq items (loki-assistant-slack--apply-changes items changes lower)))))
-                         (setf (loki-assistant-slack--page-loaded page) t
-                               (loki-assistant-slack--page-error page) nil
-                               (loki-assistant-slack--page-items page) items)))
-                   (setf (loki-assistant-slack--page-error page)
-                         (or (plist-get response :error-message)
-                             (if thread "Slack 回复读取失败" "Slack 消息读取失败"))))
-                 (unless thread (setq loki-assistant-slack--page-changes nil))
-                 (cond
-                  ((not thread)
-                   (setf (loki-assistant-slack--page-loading before) nil)
-                   (unless (equal before page) (loki-assistant-slack--update-history))
-                   (loki-assistant-slack--load-profiles))
-                  ((loki-assistant-slack--thread-visible-p thread page)
-                   (if refresh
-                       (loki-assistant-slack--load page nil thread)
-                     (loki-assistant-slack--render))
-                   (loki-assistant-slack--load-profiles)))
-                 (when thread (loki-assistant-slack--load-new-threads)))))))
-       :room room :params (when cursor (list (cons 'cursor cursor)))))))
-
-(defun loki-assistant-slack--load-new-threads ()
-  "从最新的线程开始，分批读取已展开的回复。"
-  (when loki-assistant-slack--threads
-    (let ((slots (- 3 (seq-count #'loki-assistant-slack--page-loading
-                                 (hash-table-values loki-assistant-slack--threads)))))
-      (dolist (message (reverse (loki-assistant-slack--page-items loki-assistant-slack--timeline)))
-        (when-let* (((> slots 0))
-                    (root (alist-get 'ts message))
-                    (page (gethash root loki-assistant-slack--threads))
-                    ((loki-assistant-slack--page-expanded page))
-                    ((not (or (loki-assistant-slack--page-loading page)
-                              (loki-assistant-slack--page-loaded page)
-                              (loki-assistant-slack--page-error page)))))
-          (cl-decf slots)
-          (loki-assistant-slack--load page nil root t))))))
+             (when (eq page loki-assistant-slack--timeline)
+               (setf (loki-assistant-slack--page-loading page) nil)
+               (if (plist-get response :ok)
+                   (let* ((data (plist-get response :data))
+                          (next (alist-get 'next_cursor data))
+                          (items (loki-assistant-slack--merge (loki-assistant-slack--page-items page) data))
+                          (lower (and (stringp next) (alist-get 'ts (car items)))))
+                     (loki-assistant-slack--apply-thread-push data)
+                     (dolist (changes (nreverse loki-assistant-slack--page-changes))
+                       (setq items (loki-assistant-slack--apply-changes items changes lower))
+                       (loki-assistant-slack--apply-thread-push changes))
+                     (setf (loki-assistant-slack--page-cursor page) (and (stringp next) next)
+                           (loki-assistant-slack--page-error page) nil
+                           (loki-assistant-slack--page-items page) items))
+                 (setf (loki-assistant-slack--page-error page)
+                       (or (plist-get response :error-message) "Slack 消息读取失败")))
+               (setq loki-assistant-slack--page-changes nil)
+               (loki-assistant-slack--update-history)
+               (loki-assistant-slack--load-profiles)))))
+       :room loki-assistant-slack--room :params (list (cons 'cursor cursor))))))
 
 (defun loki-assistant-slack--update-history ()
-  "为新出现的线程打开回复块，并更新时间线。"
+  "为有回复的消息初始化折叠状态并重绘聊天。"
   (dolist (message (loki-assistant-slack--page-items loki-assistant-slack--timeline))
     (when (> (or (loki-assistant-slack--non-null (alist-get 'reply_count message)) 0) 0)
       (loki-assistant-slack--thread-page (alist-get 'ts message))))
-  (loki-assistant-slack--render)
-  (loki-assistant-slack--load-new-threads))
-
-(defun loki-assistant-slack--refresh-thread (root)
-  "刷新 ROOT 的共享分页，合并读取期间收到的刷新请求。"
-  (when (or (not loki-assistant-slack--thread-root)
-            (buffer-live-p loki-assistant-slack--parent-buffer))
-    (with-current-buffer (or loki-assistant-slack--parent-buffer (current-buffer))
-      (when-let* ((page (and loki-assistant-slack--threads
-                            (gethash root loki-assistant-slack--threads)))
-                  ((loki-assistant-slack--thread-visible-p root page)))
-        (if (loki-assistant-slack--page-loading page)
-            (setf (loki-assistant-slack--page-loading page) 'refresh)
-          (loki-assistant-slack--load page nil root))))))
+  (loki-assistant-slack--render))
 
 (defun loki-assistant-slack--subscription-path (subscription)
   "返回 SUBSCRIPTION 的本机接口路径。"
@@ -862,6 +823,30 @@
                                (seq-some (lambda (entry) (equal ts (alist-get 'ts entry))) items)))))
                   (alist-get 'items data)))))))
 
+(defun loki-assistant-slack--apply-thread-push (data)
+  "将 DATA 内同一线程的变更一次性合并到共享回复。"
+  (let ((items (make-hash-table :test #'equal))
+        (deleted (make-hash-table :test #'equal)))
+    (seq-doseq (item (alist-get 'thread_items data))
+      (when-let* ((root (alist-get 'thread_ts item)) ((stringp root)))
+        (push item (gethash root items))))
+    (seq-doseq (item (alist-get 'deleted_thread_messages data))
+      (when-let* ((root (alist-get 'thread_ts item)) ((stringp root)))
+        (push (alist-get 'ts item) (gethash root deleted))))
+    (maphash (lambda (root timestamps)
+               (when-let ((page (and loki-assistant-slack--threads
+                                     (gethash root loki-assistant-slack--threads))))
+                 (setf (loki-assistant-slack--page-items page)
+                       (seq-remove (lambda (item) (member (alist-get 'ts item) timestamps))
+                                   (loki-assistant-slack--page-items page)))))
+             deleted)
+    (maphash (lambda (root replies)
+               (let ((page (loki-assistant-slack--thread-page root)))
+                 (setf (loki-assistant-slack--page-items page)
+                       (loki-assistant-slack--merge (loki-assistant-slack--page-items page)
+                                                    `((items . ,replies)) root))))
+             items)))
+
 (defun loki-assistant-slack--apply-snapshot (subscription snapshot)
   "将 SUBSCRIPTION 的 SNAPSHOT 安装到当前 buffer。"
   (let ((previous loki-assistant-slack--subscription)
@@ -870,13 +855,13 @@
     (unless (equal (alist-get 'session_id room)
                    (alist-get 'session_id loki-assistant-slack--room))
       (setq loki-assistant-slack--profiles (make-hash-table :test #'equal)
-            loki-assistant-slack--send-request nil)
-      (when loki-assistant-slack--threads
-        (maphash (lambda (root page)
-                   (puthash root (make-loki-assistant-slack--page
-                                  :expanded (loki-assistant-slack--page-expanded page))
-                            loki-assistant-slack--threads))
-                 loki-assistant-slack--threads)))
+            loki-assistant-slack--send-request nil))
+    (when (and loki-assistant-slack--threads (assq 'thread_items snapshot))
+      (maphash (lambda (root page)
+                 (unless (equal root (alist-get 'ts loki-assistant-slack--notification-root))
+                   (setf (loki-assistant-slack--page-items page) nil)))
+               loki-assistant-slack--threads))
+    (loki-assistant-slack--apply-thread-push snapshot)
     (setq loki-assistant-slack--timeline
           (make-loki-assistant-slack--page
            :items (loki-assistant-slack--merge
@@ -902,13 +887,6 @@
         (run-at-time
          0 nil #'loki-assistant-slack--request "DELETE"
          (loki-assistant-slack--subscription-path previous) #'ignore)))
-    (when loki-assistant-slack--threads
-      (maphash (lambda (root page)
-                 (when (or (loki-assistant-slack--thread-buffer root)
-                           (loki-assistant-slack--page-loaded page)
-                           (loki-assistant-slack--page-error page))
-                   (loki-assistant-slack--refresh-thread root)))
-               loki-assistant-slack--threads))
     (loki-assistant-slack--update-history)))
 
 (defun loki-assistant-slack-dispatch-messages (payload-file)
@@ -959,19 +937,8 @@
                    (seq-doseq (root (alist-get 'deleted_ts data))
                      (when-let ((child (loki-assistant-slack--thread-buffer root)))
                        (with-current-buffer child (setq loki-assistant-slack--thread-message nil)))
-                     (remhash root loki-assistant-slack--threads))
-                   (seq-doseq (current (alist-get 'items data))
-                     (when-let* ((root (alist-get 'ts current))
-                                 (thread-page (gethash root loki-assistant-slack--threads))
-                                 ((loki-assistant-slack--thread-visible-p root thread-page))
-                                 (previous (or (seq-find (lambda (item) (equal root (alist-get 'ts item)))
-                                                         items)
-                                               (when-let ((child (loki-assistant-slack--thread-buffer root)))
-                                                 (buffer-local-value 'loki-assistant-slack--thread-message
-                                                                     child))))
-                                 ((not (equal (alist-get 'reply_count previous)
-                                              (alist-get 'reply_count current)))))
-                       (loki-assistant-slack--refresh-thread root))))
+                     (remhash root loki-assistant-slack--threads)))
+                 (loki-assistant-slack--apply-thread-push data)
                  (loki-assistant-slack--update-history)))
               (_ (error "未知的 Slack 消息投递类型")))
             (setf (loki-assistant-slack--subscription-sequence subscription) sequence)
@@ -989,6 +956,24 @@
                        (stringp (alist-get 'text part))
                        (not (string-blank-p (alist-get 'text part)))))
                 (cons (alist-get 'text block) (append (alist-get 'fields block) nil)))))
+
+(defun loki-assistant-slack--thinking-placeholder-p (message)
+  "判断 MESSAGE 是否只包含 Slackbot 的思考占位文本。"
+  (let* ((author (loki-assistant-slack--non-null (alist-get 'author message)))
+         (id (alist-get 'id author))
+         (blocks (alist-get 'blocks message)))
+    (when (and (stringp id)
+               (or (equal id "USLACKBOT") (string-suffix-p ".USLACKBOT" id))
+               (seq-empty-p (alist-get 'attachments message))
+               (seq-empty-p (alist-get 'tables message))
+               (not (seq-some (lambda (block) (equal (alist-get 'type block) "table")) blocks)))
+      (let* ((sections (seq-mapcat #'loki-assistant-slack--section-texts blocks))
+             (text (if sections
+                       (unless (cdr sections) (alist-get 'text (car sections)))
+                     (alist-get 'text message)))
+             (trim "[_*[:space:]]+"))
+        (and (stringp text)
+             (string-match-p "\\`思考中[.。…]*\\'" (string-trim text trim trim)))))))
 
 (defun loki-assistant-slack--block-users (message team)
   "返回 MESSAGE 的 mrkdwn 区块中提及的 TEAM 用户。"
@@ -1105,10 +1090,7 @@
   (let ((page (loki-assistant-slack--thread-page root)))
     (setf (loki-assistant-slack--page-expanded page)
           (not (loki-assistant-slack--page-expanded page)))
-    (if (and (loki-assistant-slack--page-expanded page)
-             (not (loki-assistant-slack--page-loading page)))
-        (loki-assistant-slack--load page nil root)
-      (loki-assistant-slack--render))))
+    (loki-assistant-slack--render)))
 
 (defun loki-assistant-slack--click-thread (event)
   "在鼠标 EVENT 指向的根消息处展开或折叠线程。"
@@ -1344,25 +1326,13 @@
             (put-text-property position end 'help-echo help))
           (setq position end))))))
 
-(defun loki-assistant-slack--pagination (page &optional thread)
-  "为 PAGE 插入错误或翻页按钮。THREAD 非空时显示线程分页。"
+(defun loki-assistant-slack--pagination (page)
+  "为主时间线 PAGE 插入错误或翻页按钮。"
   (when-let ((error (loki-assistant-slack--page-error page)))
-    (insert (propertize (concat error "\n") 'face 'error))
-    (when thread
-      (insert-text-button "重试" 'face 'loki-assistant-slack-action 'follow-link t
-                          'loki-slack-thread-control (cons thread 'retry)
-                          'action (lambda (_) (loki-assistant-slack--refresh-thread thread)))
-      (insert "\n")))
+    (insert (propertize (concat error "\n") 'face 'error)))
   (when (loki-assistant-slack--page-cursor page)
-    (insert-text-button (if thread "更早的回复" "更早的消息")
-                        'face 'loki-assistant-slack-action 'follow-link t
-                        'loki-slack-thread-control (and thread (cons thread 'older))
-                        'action (lambda (_)
-                                  (with-current-buffer
-                                      (or (and (buffer-live-p loki-assistant-slack--parent-buffer)
-                                               loki-assistant-slack--parent-buffer)
-                                          (current-buffer))
-                                    (loki-assistant-slack--load page t thread))))
+    (insert-text-button "更早的消息" 'face 'loki-assistant-slack-action 'follow-link t
+                        'action (lambda (_) (loki-assistant-slack--load-older page)))
     (insert "\n\n")))
 
 (defun loki-assistant-slack--insert-author-label (author profiles)
@@ -1385,26 +1355,10 @@
          (replies (and page (loki-assistant-slack--page-items page))))
     (when (and page (or replies (> (or (loki-assistant-slack--non-null
                                           (alist-get 'reply_count message)) 0) 0)))
-      (let* ((native (require 'agent-shell-ui nil t))
-             (start (point))
-             sender)
+      (let ((native (require 'agent-shell-ui nil t))
+            (start (point)))
         (when (or native expanded)
-          (loki-assistant-slack--pagination page root)
-          (dolist (reply replies)
-            (let* ((author (loki-assistant-slack--non-null (alist-get 'author reply)))
-                   (id (alist-get 'id author)))
-              (unless (and id (equal sender id))
-                (loki-assistant-slack--insert-author-label author profiles))
-              (loki-assistant-slack--message reply room profiles)
-              (insert "\n")
-              (setq sender id)))
-          (cond ((or (loki-assistant-slack--page-loading page)
-                     (not (or (loki-assistant-slack--page-loaded page)
-                              (loki-assistant-slack--page-error page))))
-                 (insert (propertize "正在读取回复…\n" 'face 'shadow)))
-                ((and (loki-assistant-slack--page-loaded page) (not replies)
-                      (not (loki-assistant-slack--page-error page)))
-                  (insert (propertize "暂无回复\n" 'face 'shadow))))
+          (loki-assistant-slack--insert-messages replies room profiles)
           (put-text-property start (point) 'loki-slack-root root))
         ;; agent-shell 会裁去正文开头的换行。保留第一条回复的身份色块锚点。
         (when (and native (get-text-property start 'loki-slack-label))
@@ -1420,7 +1374,7 @@
               (let ((fragment (agent-shell-ui-update-fragment
                                (agent-shell-ui-make-fragment-model
                                 :namespace-id "loki-slack" :block-id root
-                                :label-left label :body body)
+                                :label-left label :body (if (string-empty-p body) " " body))
                                :create-new t :expanded expanded :no-undo t)))
                 (goto-char (point-max))
                 (delete-char -1)
@@ -1442,7 +1396,7 @@
 (defun loki-assistant-slack--insert-messages (items room profiles &optional inline-threads)
   "显示 ITEMS，按发送者分组。INLINE-THREADS 非空时内嵌回复。"
   (let (sender)
-    (dolist (message items)
+    (dolist (message (seq-remove #'loki-assistant-slack--thinking-placeholder-p items))
       (let* ((author (loki-assistant-slack--non-null (alist-get 'author message)))
            (id (alist-get 'id author)))
         (unless (and (stringp id) (not (string-empty-p id)) (equal sender id))
@@ -1465,10 +1419,7 @@
      (root
       (loki-assistant-slack--insert-messages (list root) room profiles)
       (when-let ((page (gethash thread loki-assistant-slack--threads)))
-        (loki-assistant-slack--pagination page thread)
-        (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items page) room profiles)
-        (when (loki-assistant-slack--page-loading page)
-          (insert (propertize "正在读取回复…\n\n" 'face 'shadow)))))
+        (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items page) room profiles)))
      (t (insert (propertize "线程已不可用\n\n" 'face 'shadow))))
     (loki-assistant-slack--insert-label (if loki-assistant-slack--reply "我 · 线程回复" "我")
                                        'loki-assistant-slack-self-label
@@ -1547,7 +1498,6 @@
   (let* ((timeline loki-assistant-slack--timeline)
          (message (get-text-property (point) 'loki-slack-message))
          (root (get-text-property (point) 'loki-slack-root))
-         (control (get-text-property (point) 'loki-slack-thread-control))
          (offset (when message
                    (- (next-single-property-change (point) 'loki-slack-message nil (point-max))
                       (point))))
@@ -1591,17 +1541,8 @@
                       (text-property-search-forward 'loki-slack-message message t)))))
       (if (and anchor (not (invisible-p (prop-match-beginning anchor))))
           (goto-char (max (prop-match-beginning anchor) (- (prop-match-end anchor) offset)))
-        (when-let ((button (save-excursion
-                            (goto-char (point-min))
-                            (or (when-let* ((control)
-                                           (match (text-property-search-forward
-                                                   'loki-slack-thread-control control t))
-                                           ((not (invisible-p (prop-match-beginning match)))))
-                                  match)
-                                (when root
-                                  (goto-char (point-min))
-                                  (text-property-search-forward 'loki-slack-thread-toggle root t))))))
-          (goto-char (prop-match-beginning button)))))
+        (when-let ((position (loki-assistant-slack--message-position root)))
+          (goto-char position))))
     (restore-buffer-modified-p modified)))
 
 (defun loki-assistant-slack--submit ()
@@ -1614,8 +1555,10 @@
    (t
     (when (< (point) (loki-assistant-slack--draft-start))
       (user-error "请在消息输入区发送"))
-    (when (and loki-assistant-slack--thread-root
-               (not (and loki-assistant-slack--thread-message
+    (when (and (or loki-assistant-slack--thread-root loki-assistant-slack--parent-buffer)
+               (not (and loki-assistant-slack--thread-root
+                         (equal (alist-get 'ts loki-assistant-slack--thread-message)
+                                loki-assistant-slack--thread-root)
                          (buffer-live-p loki-assistant-slack--parent-buffer))))
       (user-error "线程不可用，请从 Slack 主聊天重新打开"))
     (when (plist-get loki-assistant-slack--send-request :busy)
@@ -1658,9 +1601,9 @@
                 (when loki-assistant-slack--reply
                   (setq loki-assistant-slack--reply nil)
                   (loki-assistant-slack--render))))
-            (when-let ((thread (plist-get request :thread)))
-              (loki-assistant-slack--thread-sent request data thread))
-            (message "Slack 消息已发送"))
+            (message (if (plist-get request :thread)
+                         "Slack 线程回复已发送"
+                       "Slack 消息已发送")))
            ((and ok (equal state "pending") (< polls 20))
             (run-at-time
              1 nil
@@ -1683,24 +1626,6 @@
                                          (loki-assistant-slack--non-null (alist-get 'error data)))
                               (plist-get response :error-message)
                               "发送结果待确认，草稿已保留。")))))))))
-
-(defun loki-assistant-slack--thread-sent (request data thread)
-  "用 REQUEST 的成功回执 DATA 更新共享的 THREAD，并读取完整回复。"
-  (let ((parent (or loki-assistant-slack--parent-buffer (current-buffer)))
-        (ts (alist-get 'ts (loki-assistant-slack--non-null (alist-get 'result data)))))
-    (when (buffer-live-p parent)
-      (with-current-buffer parent
-        (when-let* (((stringp ts))
-                    (page (and loki-assistant-slack--threads
-                               (gethash thread loki-assistant-slack--threads))))
-          (let ((items (loki-assistant-slack--page-items page)))
-            (unless (seq-some (lambda (item) (equal ts (alist-get 'ts item))) items)
-              (let ((item `((ts . ,ts) (thread_ts . ,thread) (text . ,(plist-get request :text))
-                            (author . ((id . ,loki-assistant-slack--self-id))))))
-                (setf (loki-assistant-slack--page-items page)
-                      (loki-assistant-slack--merge items `((items . (,item))) thread))
-                (loki-assistant-slack--render)))))
-        (loki-assistant-slack--refresh-thread thread)))))
 
 (defvar loki-assistant-slack-input-mode-map nil
   "Slack 聊天输入和历史导航的按键映射。")

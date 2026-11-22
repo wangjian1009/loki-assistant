@@ -239,13 +239,17 @@ impl SlackService {
         let team = event["team"].as_str().map(str::to_owned);
         let channel_type = event["channel_type"].as_str().map(str::to_owned);
         let subtype = event["subtype"].as_str().unwrap_or_default().to_owned();
+        let prior_thread = event["previous_message"]["thread_ts"]
+            .as_str()
+            .filter(|ts| timestamp(ts).is_some())
+            .map(str::to_owned);
         let message = Message::from_slack(
             if subtype == "message_changed" {
                 &event["message"]
             } else {
                 event
             },
-            None,
+            prior_thread.as_deref(),
         );
         let deleted = event["deleted_ts"]
             .as_str()
@@ -311,13 +315,23 @@ impl SlackService {
             });
             if subtype == "message_deleted" {
                 if let Some(deleted) = deleted {
-                    conversation.remove(&deleted);
+                    conversation.remove(&deleted, prior_thread.as_deref());
                 }
                 return Ok(false);
             }
-            let Some(message) = message else {
+            let Some(mut message) = message else {
                 return Ok(false);
             };
+            if subtype == "message_changed" {
+                let previous = conversation.messages.get(&message.ts).cloned()
+                    .or_else(|| conversation.disk.as_ref()?.find_message(&id, &message.ts));
+                if let Some(previous) = previous {
+                    message.edited |= previous.edited;
+                    if message.thread_ts.is_none() {
+                        message.thread_ts = previous.thread_ts;
+                    }
+                }
+            }
             let notify = new
                 && (direct_message || message.mentions(&account.identity.user_id))
                 && conversation.read_positions.unread(&message, account)
@@ -610,15 +624,13 @@ impl SlackService {
                     "mrkdwn":false,"unfurl_links":false,"unfurl_media":false});
             if let Some(thread) = &record.thread {
                 body["thread_ts"] = json!(thread);
+                body["reply_broadcast"] = json!(false);
             }
             tokio::select! {
                 _ = changes.changed() => Err(Error::DeliveryUnknown),
                 result = self.slack_post(session, "chat.postMessage", &body) => {
                     match result {
-                        Ok(value) => value["ts"].as_str().filter(|ts| timestamp(ts).is_some()).map(|ts| {
-                            let message = Message::from_slack(&value["message"], record.thread.as_deref());
-                            (ts.to_owned(), message)
-                        }).ok_or(Error::DeliveryUnknown),
+                        Ok(value) => self.verify_send(session, &record.conversation, record.thread.as_deref(), &value).await,
                         Err(Error::Upstream | Error::Unavailable) => Err(Error::DeliveryUnknown),
                         Err(error) => Err(error)
                     }
@@ -647,7 +659,7 @@ impl SlackService {
                         }
                     }
                     Err(error) => {
-                        record.state = if error == Error::DeliveryUnknown {
+                        record.state = if matches!(error, Error::DeliveryUnknown | Error::DeliveryTargetMismatch) {
                             SendState::Unknown
                         } else {
                             SendState::Failed
@@ -659,5 +671,41 @@ impl SlackService {
                 Ok(())
             })
             .await;
+    }
+
+    async fn verify_send(
+        &self,
+        session: Uuid,
+        conversation: &str,
+        thread: Option<&str>,
+        response: &Value,
+    ) -> Result<(String, Option<Message>), Error> {
+        let ts = response["ts"]
+            .as_str()
+            .filter(|ts| timestamp(ts).is_some())
+            .ok_or(Error::DeliveryUnknown)?;
+        let message = Message::from_slack(&response["message"], None)
+            .filter(|message| message.ts == ts);
+        let Some(thread) = thread else {
+            return Ok((ts.to_owned(), message));
+        };
+        if response["channel"].as_str().is_some_and(|channel| channel != conversation) {
+            return Err(Error::DeliveryTargetMismatch);
+        }
+        if let Some(root) = response["message"]["thread_ts"].as_str() {
+            if root != thread || ts == root {
+                return Err(Error::DeliveryTargetMismatch);
+            }
+            if message.is_some() {
+                return Ok((ts.to_owned(), message));
+            }
+        }
+        let message = self
+            .find_message(session, conversation, Some(thread), ts)
+            .await
+            .ok()
+            .flatten()
+            .ok_or(Error::DeliveryUnknown)?;
+        Ok((ts.to_owned(), Some(message)))
     }
 }

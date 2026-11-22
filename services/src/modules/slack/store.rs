@@ -93,6 +93,30 @@ impl Conversation {
         }
     }
 
+    pub fn cached_replies(&self, roots: &[Message], include_other: bool) -> Vec<Value> {
+        let mut replies = BTreeMap::new();
+        if let Some(disk) = &self.disk {
+            for root in roots.iter().filter(|root| root.reply_count > 0) {
+                let mut items: Vec<_> = disk
+                    .messages(&self.id, Some(&root.ts))
+                    .filter(|message| !self.deleted.contains(&message.ts))
+                    .collect();
+                items.sort_unstable_by_key(|message| timestamp(&message.ts));
+                for message in items.into_iter().rev().take(50) {
+                    replies.insert(message.ts.clone(), self.message_result(&message));
+                }
+            }
+        }
+        for message in self.messages.values() {
+            if let Some(thread) = &message.thread_ts
+                && (include_other || roots.iter().any(|root| &root.ts == thread))
+            {
+                replies.insert(message.ts.clone(), self.message_result(message));
+            }
+        }
+        replies.into_values().collect()
+    }
+
     pub fn summarize(&self, account: &Account) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
         let latest = self
             .messages
@@ -148,8 +172,12 @@ impl Conversation {
             let _ = disk.save_room(self);
             disk.save_message(&self.id, &message);
         }
-        if message.thread_ts.is_none() && let Some(journal) = &mut self.journal {
-            journal.push(message.ts.clone(), Some(message.clone()));
+        if let Some(journal) = &mut self.journal {
+            journal.push(
+                message.ts.clone(),
+                message.thread_ts.clone(),
+                Some(message.clone()),
+            );
         }
         self.messages.insert(message.ts.clone(), message);
         if self.messages.len() > 1_000 {
@@ -164,24 +192,20 @@ impl Conversation {
         }
     }
 
-    pub fn remove(&mut self, ts: &str) {
+    pub fn remove(&mut self, ts: &str, thread: Option<&str>) {
         if !self.deleted.insert(ts.into()) {
             return;
         }
         let removed = self.messages.remove(ts);
+        let thread = removed
+            .and_then(|message| message.thread_ts)
+            .or_else(|| thread.map(str::to_owned))
+            .or_else(|| self.disk.as_ref()?.find_message(&self.id, ts)?.thread_ts);
         if let Some(disk) = &self.disk {
-            disk.remove_message(
-                &self.id,
-                ts,
-                removed
-                    .as_ref()
-                    .and_then(|message| message.thread_ts.as_deref()),
-            );
+            disk.remove_message(&self.id, ts, thread.as_deref());
         }
-        if removed.as_ref().is_none_or(|message| message.thread_ts.is_none())
-            && let Some(journal) = &mut self.journal
-        {
-            journal.push(ts.to_owned(), None);
+        if let Some(journal) = &mut self.journal {
+            journal.push(ts.to_owned(), thread, None);
         }
         if self.deleted.len() > 2_000 {
             self.deleted.pop_first();

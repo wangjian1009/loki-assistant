@@ -268,8 +268,13 @@ pub(super) fn messages_result(mut value: Value, team_id: &str) -> Value {
         }
     }
 
-    if let Some(messages) = value["items"].as_array_mut() {
-        for message in messages {
+    for key in ["items", "thread_items"] {
+        for message in value
+            .get_mut(key)
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
             qualify_author(message, team_id);
         }
     }
@@ -545,10 +550,13 @@ async fn timeline(
 ) -> Result<Json<Value>, Error> {
     let page = query.map_err(|_| Error::Invalid)?.0.into();
     let (team_id, id, service) = conversation(&projects, id.map_err(|_| Error::Invalid)?.0).await?;
-    service
-        .messages(session(&headers, &service).await?, id, None, page)
-        .await
-        .map(|value| Json(messages_result(value, &team_id)))
+    let session = session(&headers, &service).await?;
+    let value = service.messages(session, id.clone(), None, page).await?;
+    let roots = super::subscriptions::thread_roots(&value);
+    if !roots.is_empty() && service.has_message_subscribers(&id).await {
+        tokio::spawn(async move { service.refresh_threads(session, &id, roots).await });
+    }
+    Ok(Json(messages_result(value, &team_id)))
 }
 
 #[derive(Default, Deserialize)]

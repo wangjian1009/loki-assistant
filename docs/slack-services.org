@@ -204,8 +204,8 @@ services 通过现有 Emacs gateway 调用 ~loki-assistant-dispatch~ 的固定�
 
 每次投递包含 ~api_version~ 、 ~subscription_id~ 、 ~conversation_id~ 、 ~session_id~ 、 ~sequence~ 和 ~kind~ 。每个订阅的 ~sequence~ 从 1 开始递增，同一批次重试沿用原序号和数据。
 
-- ~kind=snapshot~ 时， ~snapshot~ 携带会话顶层消息的第一页，字段及格式沿用 ~GET /slack/conversations/{id}/messages~ 响应。注册成功后由后台投递首次快照。buffer 用它初始化时间线和翻页游标，读取更早消息仍使用现有分页接口。
-- ~kind=changes~ 时， ~items~ 携带新增或更新的完整顶层消息， ~deleted_ts~ 携带已删除的顶层消息时间戳。两个字段均为数组，任一数组可以为空。消息标识与历史列表一致。线程回复使顶层消息的摘要变化时，投递更新后的顶层消息。
+- ~kind=snapshot~ 时， ~snapshot~ 携带会话顶层消息的第一页，字段及格式沿用 ~GET /slack/conversations/{id}/messages~ 响应。 ~thread_items~ 携带 services 已缓存的线程回复，每条回复带根消息的 ~thread_ts~ 。services 在快照送达后补拉首屏线程，缓存的新增、编辑和删除继续通过同一订阅投递。
+- ~kind=changes~ 时， ~items~ 和 ~deleted_ts~ 分别携带顶层消息的新增或更新、删除时间戳。 ~thread_items~ 携带新增或更新的完整线程回复， ~deleted_thread_messages~ 携带删除记录，每条包含 ~thread_ts~ 和 ~ts~ 。四个字段均为数组，任一数组可以为空。同一回复编辑后沿用原有 ~ts~ ，无需等待根消息的回复数变化。
 - ~kind=probe~ 用于确认 buffer 仍存活。它使用下一条消息的 ~sequence~ ，只核对订阅，收到回执后消息序号保持原值。
 
 #+begin_src json
@@ -217,11 +217,15 @@ services 通过现有 Emacs gateway 调用 ~loki-assistant-dispatch~ 的固定�
   "sequence": 2,
   "kind": "changes",
   "items": [],
-  "deleted_ts": ["1795074000.000001"]
+  "deleted_ts": [],
+  "thread_items": [],
+  "deleted_thread_messages": [
+    {"thread_ts": "1795073990.000001", "ts": "1795074000.000001"}
+  ]
 }
 #+end_src
 
-Emacs 按订阅 UUID 查找仍存活的 buffer，并核对会话和会话代次。分发函数应用消息或确认探测后返回 Lisp 符号 ~applied~ ，已应用的同序号重试也返回 ~applied~ 。找不到匹配的 buffer 时返回 ~buffer-closed~ ，services 据此删除对应订阅。分发流程直接更新 buffer 数据并重绘，保留当前草稿。
+Emacs 按订阅 UUID 查找仍存活的主聊天 buffer，并核对会话和会话代次。分发函数一次合并每批回复，再更新主聊天及打开的独立线程 buffer，保留当前草稿。打开线程直接显示共享数据。分发函数应用消息或确认探测后返回 Lisp 符号 ~applied~ ，已应用的同序号重试也返回 ~applied~ 。找不到匹配的 buffer 时返回 ~buffer-closed~ ，services 据此删除对应订阅。
 
 ** 投递时序与恢复
 
@@ -249,6 +253,8 @@ Emacs 按订阅 UUID 查找仍存活的 buffer，并核对会话和会话代次�
 请求排队时返回 HTTP 202，已有最终结果时返回 HTTP 200。 ~Location~ 指向 ~GET /slack/send-requests/{request_id}?team_id={team_id}~ 。同一会话内重复提交同一标识和内容时返回已有记录，提交不同内容时返回 HTTP 409。
 
 ~GET /slack/send-requests/{request_id}~ 要求查询参数 ~team_id~ 。 ~state~ 为 ~pending~ 、 ~sent~ 、 ~failed~ 或 ~unknown~ 。成功发送时 ~result.ts~ 为 Slack 消息时间戳。
+
+发送线程回复时，services 核对 Slack 回执中的线程根时间戳。回执缺少线程信息时，services 在原线程核对消息。若 Slack 返回的消息属于其他位置，则发送记录返回 ~unknown~ 和 ~slack-delivery-target-mismatch~ 。
 
 * 已读位置
 
