@@ -19,6 +19,7 @@
 (declare-function emojify-create-emojify-emojis "emojify")
 (declare-function emojify-get-emoji "emojify")
 (defvar agent-shell-markdown-render-functions)
+(defvar shell-maker-prompt-before-killing-buffer)
 
 (defconst loki-assistant-slack--prompt "消息> ")
 
@@ -397,6 +398,7 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                              :prompt-regexp (concat "^" (regexp-quote loki-assistant-slack--prompt)))
                     :no-focus t :buffer-name name :alias-commands nil))))
     (with-current-buffer buffer
+      (setq-local shell-maker-prompt-before-killing-buffer nil)
       (unless loki-assistant-slack--history-end
         (setq loki-assistant-slack--history-end (copy-marker (loki-assistant-slack--prompt-start)))
         (loki-assistant-slack-input-mode 1)
@@ -1081,7 +1083,10 @@ PARAMS 和 ROOM 用于查询，IMAGES 保存状态，UPDATE 刷新显示。"
                               (plist-get response :error-message)
                               "发送结果待确认，草稿已保留。")))))))))
 
-(defvar loki-assistant-slack-input-mode-map
+(defvar loki-assistant-slack-input-mode-map nil
+  "Slack 聊天输入和历史导航的按键映射。")
+
+(setq loki-assistant-slack-input-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "n") #'loki-assistant-slack-next-item)
     (define-key map (kbd "p") #'loki-assistant-slack-previous-item)

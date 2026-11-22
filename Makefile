@@ -62,13 +62,15 @@ emacs-load:
 	"$(EMACSCLIENT)" --eval "(let ((command-map (and (boundp 'loki-assistant-command-map) loki-assistant-command-map))) \
 	  (let ((directory \"$(PROJECT_ROOT)/emacs\")) \
 	    (setq load-path (cons directory (delete directory load-path)))) \
-	  (dolist (feature '(loki-assistant-slack-chat-tests loki-assistant-slack-chat loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
+	  (dolist (feature '(loki-assistant-slack-chat-tests loki-assistant-devices-tests loki-assistant-devices loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
 	  (when command-map (setq loki-assistant-command-map command-map)) \
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config) \
 	  (require 'loki-assistant-devices) \
-	  (require 'loki-assistant-slack-chat))"
+	  (if (featurep 'loki-assistant-slack-chat) \
+	      (load \"$(PROJECT_ROOT)/emacs/loki-assistant-slack-chat.el\" nil t) \
+	    (require 'loki-assistant-slack-chat)))"
 
 emacs-config: emacs-load
 	"$(EMACSCLIENT)" --eval "(progn \

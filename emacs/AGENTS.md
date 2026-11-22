@@ -19,6 +19,7 @@
 
 - 修改 Emacs Lisp 后，必须通过 `emacsclient --eval` 在正在运行的 Emacs 中执行 `require` 加载验证，不得仅检查文件内容。
 - 从仓库根目录执行 `make emacs-load`：将本目录加入 `load-path`，若已加载则先执行 `unload-feature`，再执行 `(require 'loki-assistant)` 和 `(require 'loki-assistant-config)`，确保加载修改后的源码。
+- 已加载的 Slack 聊天模块直接重载源码，保留现有缓冲区的按键、草稿、线程和发送状态。
 - 所有 Emacs 操作均使用 `emacsclient`，不得使用 `emacs` 或 `emacs --batch`；`--eval` 中的 Lisp 按多行缩进书写。
 - 加载失败时修复错误并重新验证；若 Emacs server 不可连接，应明确报告未完成加载验证。
 - 仅运行与改动相关的检查，不运行无关的 Mac 或 services 测试。
