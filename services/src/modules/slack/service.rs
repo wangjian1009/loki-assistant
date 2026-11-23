@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use uuid::Uuid;
 
-use crate::modules::{config::service::ConfigService, notification::NotificationService};
+use crate::modules::{
+    config::service::ConfigService,
+    notification::{NotificationService, protocol::NotificationRequest},
+};
 
 use super::{
     client::{SlackClient, WebSession},
@@ -32,6 +35,7 @@ pub(super) struct State {
     pub cache: Cache,
     pub socket_state: &'static str,
     pub issue: Option<Error>,
+    rejected_credentials: Option<String>,
     pub(super) retired: bool,
 }
 
@@ -293,6 +297,9 @@ impl SlackService {
         match account {
             Some(account) if account.revoked => "reauthorization_required",
             Some(account) if !account.access.is_empty() || account.web_session => "authorized",
+            _ if state.issue.is_some_and(Error::requires_reauthorization) => {
+                "reauthorization_required"
+            }
             _ => "unconfigured",
         }
     }
@@ -301,6 +308,10 @@ impl SlackService {
         let state = self.state.lock().await;
         let session = state.secrets.account.as_ref()?.identity.session_id;
         state.account(session).ok().map(|_| session)
+    }
+
+    pub(super) async fn needs_reauthorization(&self) -> bool {
+        Self::authorization_state(&*self.state.lock().await) == "reauthorization_required"
     }
 
     pub(super) async fn public_status(&self) -> Value {
@@ -321,6 +332,19 @@ impl SlackService {
     pub(super) async fn publish_status(&self) {
         let (id, _, generation, reporter) = &self.project;
         reporter.update(id, *generation, self.public_status().await);
+    }
+
+    pub(super) async fn notify_reauthorization(&self) -> bool {
+        let (id, settings, _, _) = &self.project;
+        self.notification
+            .send(NotificationRequest {
+                title: "Slack 需要重新授权".into(),
+                body: Some(format!("点击为「{}」重新填写 Slack 凭据。", settings.name)),
+                app: Some("slack".into()),
+                callback_url: Some(super::routes::credential_reset_path(id)),
+            })
+            .await
+            .is_ok()
     }
 
     async fn verify_user_token(&self, token: &str) -> Result<Identity, Error> {
@@ -373,66 +397,92 @@ impl SlackService {
     }
 
     pub(super) async fn restore_imported_token(&self) -> Result<(), Error> {
-        if self.project.1.token.is_none() {
+        if self.project.1.token.is_none() && self.project.1.d_cookie.is_none() {
             return Ok(());
         }
         let _lock = self.imported_token_lock.lock().await;
         let passwords = self.read_passwords().await?;
-        let token = passwords[0]
-            .as_deref()
-            .ok_or(Error::PasswordRead)?
-            .trim_end_matches('\n');
-        let mut digest = Sha256::new();
-        digest.update(token.as_bytes());
-        for secret in &passwords[1..] {
-            digest.update([0]);
-            if let Some(secret) = secret {
-                digest.update(secret.trim().as_bytes());
-            }
-        }
-        let hash = if passwords[1..].iter().all(Option::is_none) {
-            format!("{:x}", Sha256::digest(token.as_bytes()))
-        } else {
-            format!("{:x}", digest.finalize())
-        };
+        let token = imported_token(&passwords)?;
+        let hash = imported_token_hash(token, &passwords);
+        let result = self.restore_credentials(token, &passwords, &hash).await;
+        self.state.lock().await.rejected_credentials =
+            (result == Err(Error::Authorization)).then_some(hash);
+        result
+    }
+
+    async fn restore_credentials(
+        &self,
+        token: &str,
+        passwords: &[Option<String>; 2],
+        hash: &str,
+    ) -> Result<(), Error> {
         let identity = {
             let state = self.state.lock().await;
-            if state.secrets.disabled_token.as_deref() == Some(&hash) {
+            if state.secrets.disabled_token.as_deref() == Some(hash) {
                 return Ok(());
             }
             let previous = state
                 .secrets
                 .account
                 .as_ref()
-                .filter(|account| account.imported_token_hash.as_deref() == Some(&hash));
-            if previous.is_some_and(|account| {
-                account.revoked || !account.access.is_empty() || account.web_session
-            }) {
+                .filter(|account| account.imported_token_hash.as_deref() == Some(hash));
+            if previous.is_some_and(|account| account.revoked) {
+                return Err(Error::Authorization);
+            }
+            if previous.is_some_and(|account| !account.access.is_empty() || account.web_session) {
                 return Ok(());
             }
             previous.map(|account| account.identity.clone())
         };
+        let web_session = token.starts_with("xoxc-");
+        let identity = match identity {
+            Some(identity) => identity,
+            None => self.verify_imported_credentials(token, passwords).await?,
+        };
+        let access = if web_session {
+            String::new()
+        } else {
+            token.to_owned()
+        };
+        self.save_user(identity, access, hash.to_owned(), web_session)
+            .await
+    }
+
+    async fn verify_imported_credentials(
+        &self,
+        token: &str,
+        passwords: &[Option<String>; 2],
+    ) -> Result<Identity, Error> {
         if token.starts_with("xoxc-") {
             let session =
-                WebSession::from_passwords(&passwords)?.ok_or(Error::WebSessionIncomplete)?;
-            let identity = match identity {
-                Some(identity) => identity,
-                None => {
-                    let response = self
-                        .client
-                        .web_call("auth.test", &session, &[], None)
-                        .await?;
-                    self.identity_from_response(response)?
-                }
-            };
-            self.save_user(identity, String::new(), hash, true).await
+                WebSession::from_passwords(passwords)?.ok_or(Error::WebSessionIncomplete)?;
+            let response = self
+                .client
+                .web_call("auth.test", &session, &[], None)
+                .await?;
+            self.identity_from_response(response)
         } else {
-            let identity = match identity {
-                Some(identity) => identity,
-                None => self.verify_user_token(token).await?,
-            };
-            self.save_user(identity, token.to_owned(), hash, false)
-                .await
+            self.verify_user_token(token).await
+        }
+    }
+
+    pub(super) async fn credentials_for_reset(&self) -> Result<[Option<String>; 2], Error> {
+        let passwords = self.read_passwords().await?;
+        let state = self.state.lock().await;
+        let resettable = match imported_token(&passwords) {
+            Ok(token) => {
+                let hash = imported_token_hash(token, &passwords);
+                state.rejected_credentials.as_deref() == Some(&hash)
+                    || state.secrets.account.as_ref().is_some_and(|account| {
+                        account.revoked && account.imported_token_hash.as_deref() == Some(&hash)
+                    })
+            }
+            Err(_) => state.issue == Some(Error::WebSessionIncomplete),
+        };
+        if resettable {
+            Ok(passwords)
+        } else {
+            Err(Error::CredentialsCurrent)
         }
     }
 
@@ -527,10 +577,7 @@ impl SlackService {
     }
 
     async fn read_passwords(&self) -> Result<[Option<String>; 2], Error> {
-        let (team, settings, _, _) = &self.project;
-        if settings.token.is_none() {
-            return Err(Error::Configuration);
-        }
+        let (team, _, _, _) = &self.project;
         self.config
             .read_record_passwords("slack", "teams", team, SlackTeam::PASSWORD_FIELDS)
             .await
@@ -570,6 +617,27 @@ impl SlackService {
         }
         result
     }
+}
+
+fn imported_token(passwords: &[Option<String>; 2]) -> Result<&str, Error> {
+    let token = passwords[0]
+        .as_deref()
+        .ok_or(Error::WebSessionIncomplete)?
+        .trim_end_matches('\n');
+    if token.starts_with("xoxc-") && passwords[1].is_none() {
+        return Err(Error::WebSessionIncomplete);
+    }
+    Ok(token)
+}
+
+fn imported_token_hash(token: &str, passwords: &[Option<String>; 2]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(token.as_bytes());
+    if let Some(cookie) = &passwords[1] {
+        digest.update([0]);
+        digest.update(cookie.trim().as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 pub(super) fn now() -> u64 {

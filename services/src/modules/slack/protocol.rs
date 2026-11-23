@@ -26,6 +26,8 @@ pub(super) enum Error {
     Thread,
     SendRecord,
     Authorization,
+    CredentialsCurrent,
+    CredentialReset,
     Configuration,
     Session,
     Conflict,
@@ -82,6 +84,16 @@ impl Error {
                 409,
                 "slack-authorization-required",
                 "Slack 拒绝了当前凭据，请检查或更新。",
+            ),
+            Self::CredentialsCurrent => (
+                409,
+                "slack-credentials-current",
+                "Slack 工作区凭据有效或已变更，请刷新状态。",
+            ),
+            Self::CredentialReset => (
+                503,
+                "slack-credential-reset-failed",
+                "暂时无法重置 Slack 凭据，请稍后重试。",
             ),
             Self::Configuration => (
                 409,
@@ -181,6 +193,10 @@ impl Error {
             Self::RateLimited(seconds) => Some(seconds),
             _ => None,
         }
+    }
+
+    pub fn requires_reauthorization(self) -> bool {
+        matches!(self, Self::Authorization | Self::WebSessionIncomplete)
     }
 }
 

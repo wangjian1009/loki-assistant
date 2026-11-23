@@ -626,6 +626,30 @@ impl Projects {
             .await
     }
 
+    pub(super) async fn reset_credentials(&self, team: &str) -> Result<(), Error> {
+        let credentials = self.service(team).await?.credentials_for_reset().await?;
+        match self
+            .config
+            .notify_patch_if_passwords_match(
+                "slack",
+                "teams",
+                team,
+                json!({"token":null}),
+                SlackTeam::PASSWORD_FIELDS,
+                credentials,
+            )
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false)
+            | Err(ConfigServiceError::ChangePending | ConfigServiceError::RetryInProgress) => {
+                Err(Error::CredentialsCurrent)
+            }
+            Err(ConfigServiceError::ActionNotFound) => Err(Error::Project),
+            Err(_) => Err(Error::CredentialReset),
+        }
+    }
+
     pub(super) async fn registration_status(&self, id: Uuid, team: &str) -> RegistrationStatus {
         let passwords = match self
             .config

@@ -20,11 +20,11 @@ use super::{
 
 impl SlackService {
     pub async fn run(self: Arc<Self>, emacs: Arc<EmacsService>) {
-        self.restore_user_token().await;
-        self.publish_status().await;
+        let mut reauthorization_notified = false;
+        self.restore_user_token(&mut reauthorization_notified).await;
         self.sync.notify_one();
         tokio::join!(
-            self.sockets(),
+            self.sockets(reauthorization_notified),
             self.sending(),
             self.synchronizing(),
             self.warming_users(),
@@ -35,9 +35,14 @@ impl SlackService {
         );
     }
 
-    async fn restore_user_token(&self) {
-        if let Err(error) = self.restore_imported_token().await {
-            self.state.lock().await.issue = Some(error);
+    async fn restore_user_token(&self, notified: &mut bool) {
+        let issue = self.restore_imported_token().await.err();
+        self.state.lock().await.issue = issue;
+        self.publish_status().await;
+        if self.session_id().await.is_some() {
+            *notified = false;
+        } else if !*notified && issue.is_some_and(Error::requires_reauthorization) {
+            *notified = self.notify_reauthorization().await;
         }
     }
 
@@ -133,7 +138,7 @@ impl SlackService {
         }
     }
 
-    async fn sockets(&self) {
+    async fn sockets(&self, mut reauthorization_notified: bool) {
         let mut changes = self.change.subscribe();
         let mut backoff = 1;
         loop {
@@ -143,8 +148,7 @@ impl SlackService {
                 tokio::select! {
                     _ = changes.changed() => { backoff = 1; }
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        self.restore_user_token().await;
-                        self.publish_status().await;
+                        self.restore_user_token(&mut reauthorization_notified).await;
                     }
                 }
                 continue;

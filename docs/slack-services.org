@@ -40,6 +40,14 @@ d_cookie: …
 
 工作区配置生效后，services 使用同一凭据启动实时连接。连接结果通过 ~socket_state~ 和 ~issue_code~ 查询。
 
+** 工作区重新授权
+
+services 启动后检查已配置的工作区。发现凭据缺失（例如 ~pass~ 条目缺失或缺少 Cookie d）或 Slack 明确拒绝当前凭据时，发布 ~reauthorization_required~ 并发送系统通知。凭据读取失败时发布 ~slack-password-unavailable~ ，保留凭据并重试读取。
+
+点击系统通知发送本机 ~POST /slack/teams/{team_id}/reset-credentials~ ，请求体为空。接口依据 Slack 后台记录的凭据状态提交 ~token=null~ 配置变更。配置模块清理共用的 ~pass~ 条目及两个配置字段，并通知 Slack 配置变更处理器。提交成功后，处理器打开新建工作区时使用的 ~/slack/team-setup/{team_id}~ 授权网页。该网页通过原有配置接口提交并验证新凭据。
+
+接口成功时返回 HTTP 200 和包含 ~api_version~ 、 ~team_id~ 的 JSON 对象。工作区不存在时返回 404 ~slack-project-not-found~ 。凭据有效、已在请求期间变化或有待确认的配置变更时，返回 409 ~slack-credentials-current~ 。凭据无法读取时返回 503 ~slack-password-unavailable~ 。
+
 * 通用约定
 
 Slack 业务接口和工作区配置只接受本机调用，客户端可直接发起请求。按会话或工作区操作时，services 使用当前会话。客户端也可用 ~X-Loki-Slack-Session~ 携带响应中的 ~session_id~ ，以便会话变更时收到冲突错误。

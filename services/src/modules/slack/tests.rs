@@ -1577,12 +1577,219 @@ impl crate::modules::password::service::CommandRunner for FakePass {
             }
             assert_eq!(&args[..2], ["show", "--"]);
             let stdout = fs::read(store.join(format!("{}.gpg", args[2]))).unwrap();
+            if stdout.starts_with("模拟解密失败".as_bytes()) {
+                return Ok(crate::modules::password::service::CommandOutput {
+                    status: Some(1),
+                    stdout: Vec::new(),
+                });
+            }
             Ok(crate::modules::password::service::CommandOutput {
                 status: Some(0),
                 stdout,
             })
         })
     }
+}
+
+#[tokio::test]
+async fn startup_credential_notifications_use_config_reset_and_team_setup() {
+    let directory = Directory::new();
+    let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0).await;
+    let invalid_path = "loki-assistant/slack/TINVALID.gpg";
+    let missing_path = "loki-assistant/slack/TMISSING.gpg";
+    let unreadable_path = "loki-assistant/slack/TUNREADABLE.gpg";
+    for (team, path, entry) in [
+        ("TINVALID", invalid_path, "xoxc-expired\nd_cookie: cookie"),
+        ("TMISSING", missing_path, "xoxc-missing-cookie"),
+        ("TUNREADABLE", unreadable_path, "模拟解密失败"),
+    ] {
+        passwords.save_multiline(path, entry).await.unwrap();
+        config
+            .replace_record(
+                "slack".into(),
+                "teams".into(),
+                team.into(),
+                json!({"token":path,"d_cookie":path}),
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    // 启动后从持久化配置加载仍存在的凭据引用。
+    let (config, _) = password_config(&directory.0.join("config.yml"), &directory.0).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let expired_auth_checks = Arc::new(AtomicUsize::new(0));
+    let upstream_checks = Arc::clone(&expired_auth_checks);
+    let upstream = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/auth.test",
+            post(move |headers: HeaderMap| {
+                let checks = Arc::clone(&upstream_checks);
+                async move {
+                    Json(match headers["authorization"].to_str().unwrap() {
+                        "Bearer xoxc-expired" => {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            json!({"ok":false,"error":"invalid_auth"})
+                        }
+                        "Bearer xoxc-renewed" => {
+                            json!({"ok":true,"team_id":"TINVALID","team":"工作区","user_id":"U1"})
+                        }
+                        _ => panic!("仅应校验完整可读的凭据"),
+                    })
+                }
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let alerts = Arc::new(Alerts::default());
+    let notification = Arc::new(NotificationService::with_launcher(
+        alerts.clone(),
+        Duration::from_secs(1),
+    ));
+    let status = Arc::new(StatusService::new());
+    let (browser, mut opened) = tokio::sync::mpsc::unbounded_channel();
+    let projects = Arc::new(Projects::with_backend(
+        config.clone(),
+        notification.clone(),
+        status.clone(),
+        crate::modules::emacs::Module::new(config.clone(), notification, status.clone()).service(),
+        Backend {
+            api,
+            cache_root: None,
+            open_browser: Arc::new(move |url| {
+                let browser = browser.clone();
+                Box::pin(async move {
+                    browser.send(url).unwrap();
+                    Ok(())
+                })
+            }),
+        },
+    ));
+    let config_module = crate::modules::config::Module::from_service(
+        (*config)
+            .clone()
+            .with_change_handler("slack", projects.clone()),
+    );
+    let notification_router = Arc::new(super::routes::config_notification_router(projects.clone()));
+    config_module
+        .service()
+        .attach_notifications(&notification_router);
+    let app = projects
+        .router()
+        .merge(status.router())
+        .merge(config_module.router());
+    let worker = tokio::spawn(Arc::clone(&projects).run(47321));
+
+    let states = timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, _, response) =
+                invoke(&app, "GET", "/status/slack/connections", None, None, None).await;
+            if let Some(states) = response["value"].as_array()
+                && states.len() == 3
+                && states.iter().all(|state| state["issue_code"].is_string())
+                && alerts.attempts.lock().unwrap().len() == 2
+            {
+                break states.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for (state, (team, code)) in states.iter().zip([
+        ("TINVALID", "slack-authorization-required"),
+        ("TMISSING", "slack-web-session-incomplete"),
+        ("TUNREADABLE", "slack-password-unavailable"),
+    ]) {
+        assert_eq!(state["team_id"], team);
+        assert_eq!(state["issue_code"], code);
+    }
+    assert_eq!(states[0]["authorization_state"], "reauthorization_required");
+    assert_eq!(states[1]["authorization_state"], "reauthorization_required");
+    assert_eq!(states[2]["authorization_state"], "unconfigured");
+    assert!(opened.try_recv().is_err());
+    assert!(directory.0.join(invalid_path).is_file());
+    assert!(directory.0.join(missing_path).is_file());
+
+    let mut callbacks: Vec<_> = alerts
+        .attempts
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|alert| {
+            assert_eq!(alert.title, "Slack 需要重新授权");
+            url::Url::parse(alert.navigation_url.as_deref().unwrap())
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "callback")
+                .unwrap()
+                .1
+                .into_owned()
+        })
+        .collect();
+    callbacks.sort();
+    for (callback, team, path) in [
+        (&callbacks[0], "TINVALID", invalid_path),
+        (&callbacks[1], "TMISSING", missing_path),
+    ] {
+        assert_eq!(callback, &format!("/slack/teams/{team}/reset-credentials"));
+        let (status, _, response) = invoke(&app, "POST", callback, None, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response, json!({"api_version":"1","team_id":team}));
+        let setup = timeout(Duration::from_secs(2), opened.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            setup,
+            format!("http://127.0.0.1:47321/slack/team-setup/{team}")
+        );
+        let (_, _, response) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+        let record = response["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["team_id"] == team)
+            .unwrap();
+        assert!(record.get("token").is_none() && record.get("d_cookie").is_none());
+        assert!(!directory.0.join(path).exists());
+    }
+    assert_eq!(expired_auth_checks.load(Ordering::SeqCst), 1);
+
+    let (status, _, response) = invoke(
+        &app,
+        "POST",
+        "/slack/teams/TUNREADABLE/reset-credentials",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response["error"]["code"], "slack-password-unavailable");
+    assert!(directory.0.join(unreadable_path).is_file());
+
+    let (status, _, _) = invoke(
+        &app,
+        "PATCH",
+        "/data/slack/teams/TINVALID",
+        None,
+        None,
+        Some(json!({"token":"xoxc-renewed","d_cookie":"cookie"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, response) = invoke(&app, "POST", &callbacks[0], None, None, None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response["error"]["code"], "slack-credentials-current");
+    assert!(directory.0.join(invalid_path).is_file());
+    assert!(opened.try_recv().is_err());
+
+    projects.stop().await;
+    worker.await.unwrap();
+    upstream.abort();
 }
 
 fn fake_pass_write<'a>(
@@ -2836,8 +3043,11 @@ async fn composition_mounts_flat_slack_routes() {
     }));
     let (status, _, _) = invoke(&app, "POST", "/slack/open", None, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(meta["apis"].as_array().unwrap().iter().all(|api| {
-        let path = api["path"].as_str().unwrap();
-        path != "/slack/status" && !path.starts_with("/slack/teams/")
+    let apis = meta["apis"].as_array().unwrap();
+    assert!(apis.iter().all(|api| api["path"] != "/slack/status"));
+    assert!(apis.iter().any(|api| {
+        api["method"] == "POST"
+            && api["path"] == "/slack/teams/{team_id}/reset-credentials"
+            && api["access"] == "local"
     }));
 }

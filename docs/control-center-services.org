@@ -113,6 +113,7 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/password/entries/{*file}~ | 按相对 .gpg 路径读取单条密码原文 |
 | GET | ~/slack/users~ | 本机一次读取 Slack 用户目录，支持按 ID 批量筛选。见 [[file:slack-services.org::*用户目录][Slack 用户目录接口]] |
 | POST | ~/slack/users/{id}/dm~ | 本机按工作区用户打开 Slack 私聊。见 [[file:slack-services.org::*按用户打开私聊][私聊接口]] |
+| POST | ~/slack/teams/{team_id}/reset-credentials~ | 本机确认工作区凭据缺失或失效后重置凭据，配置变更处理器打开授权网页。见 [[file:slack-services.org::*工作区重新授权][重新授权接口]] |
 
 * 配置中心
 

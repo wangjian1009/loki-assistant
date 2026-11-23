@@ -827,7 +827,7 @@ impl ConfigService {
                     entries.insert(path, self.load_password_entry(path).await?);
                 }
                 if let Some(contents) = &entries[path] {
-                    *password = Some(options.read_password_line(field, contents)?);
+                    *password = options.password_line(field, contents)?.map(str::to_owned);
                 }
             }
         }
@@ -1664,6 +1664,16 @@ impl ConfigItemOptions {
     }
 
     fn read_password_line(&self, key: &str, contents: &str) -> Result<String, ConfigServiceError> {
+        self.password_line(key, contents)?
+            .map(str::to_owned)
+            .ok_or_else(|| ConfigServiceError::Storage("密码条目缺少配置字段。".into()))
+    }
+
+    fn password_line<'a>(
+        &self,
+        key: &str,
+        contents: &'a str,
+    ) -> Result<Option<&'a str>, ConfigServiceError> {
         let field = self
             .password_field(key)
             .ok_or(ConfigServiceError::ActionNotFound)?;
@@ -1674,10 +1684,7 @@ impl ConfigItemOptions {
                 (key == name).then(|| value.trim_start())
             }),
         };
-        value
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| ConfigServiceError::Storage("密码条目缺少配置字段。".into()))
+        Ok(value.filter(|value| !value.trim().is_empty()))
     }
 
     fn notification_key_field(&self) -> Result<&str, ConfigServiceError> {

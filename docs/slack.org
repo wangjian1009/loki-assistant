@@ -47,6 +47,7 @@
 |--------+---------------------------------------------------------------+----------------------|
 | GET    | ~/status/slack/connections~                                   | [[file:slack-services.org::*工作区状态与会话][查看授权和连接状态]]   |
 | GET    | ~/slack/team-setup/{team_id}~                                 | [[file:slack-services.org::*工作区状态与会话][打开工作区配置页]]     |
+| POST   | ~/slack/teams/{team_id}/reset-credentials~                    | [[file:slack-services.org::*工作区重新授权][重置工作区凭据并打开授权网页]] |
 | DELETE | ~/slack/session~                                              | [[file:slack-services.org::*工作区状态与会话][断开本机 Slack 会话]]  |
 | GET    | ~/slack/users~                                                | [[file:slack-services.org::*用户目录][一次读取用户目录]]，[[file:slack-services.org::*批量查询用户][按 ID 筛选]] |
 | GET    | ~/slack/users/{id}~                                           | [[file:slack-services.org::*用户目录][查询单个用户（计划）]] |

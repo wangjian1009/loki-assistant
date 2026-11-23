@@ -241,6 +241,37 @@ impl ConfigService {
             .await
     }
 
+    pub(crate) async fn notify_patch_if_passwords_match<const N: usize>(
+        &self,
+        module: &str,
+        item: &str,
+        instance: &str,
+        patch: Value,
+        fields: [&str; N],
+        expected: [Option<String>; N],
+    ) -> Result<bool, ConfigServiceError> {
+        let guard = self.reserve_notification(module, item, Some(instance))?;
+        if self
+            .read_record_passwords(module, item, instance, fields)
+            .await?
+            != expected
+        {
+            return Ok(false);
+        }
+        let service = self.clone();
+        let (module, item, instance) = (module.to_owned(), item.to_owned(), instance.to_owned());
+        tokio::spawn(async move {
+            let _guard = guard;
+            let mut entry = service
+                .stage_notification(module, item, Some(instance), Some(patch), false, true, true)
+                .await?
+                .ok_or(ConfigServiceError::ActionNotFound)?;
+            Ok(!service.send_notification(&mut entry).await?)
+        })
+        .await
+        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+    }
+
     async fn notify_change(
         &self,
         module: String,
@@ -255,7 +286,7 @@ impl ConfigService {
         tokio::spawn(async move {
             let _guard = guard;
             let Some(mut entry) = service
-                .stage_notification(module, item, instance, input, create_only, patch)
+                .stage_notification(module, item, instance, input, create_only, patch, false)
                 .await?
             else {
                 return Ok(None);
@@ -311,6 +342,7 @@ impl ConfigService {
         input: Option<Value>,
         create_only: bool,
         patch: bool,
+        preserve_pending: bool,
     ) -> Result<Option<Pending>, ConfigServiceError> {
         let metadata = self.module_metadata(&module).await?;
         let item_metadata =
@@ -327,7 +359,11 @@ impl ConfigService {
             entry.module == module && entry.item == item && entry.instance == instance
         });
         if let Some(entry) = &existing {
-            if create_only || (instance.is_none() && !patch) || entry.delete {
+            if create_only
+                || (instance.is_none() && !patch)
+                || entry.delete
+                || (preserve_pending && entry.validation_error.is_none())
+            {
                 return Err(ConfigServiceError::ChangePending);
             }
             values

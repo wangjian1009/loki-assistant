@@ -63,7 +63,15 @@ async fn team_config_changed(
 ) -> Result<Response, Error> {
     validate_team_id(&team_id)?;
     if request.deleted || request.password_entry_removed {
-        sync_after_confirmation(projects, request, None);
+        let setup_team = if request.password_entry_removed
+            && let Ok(service) = projects.service(&team_id).await
+            && service.needs_reauthorization().await
+        {
+            Some(team_id)
+        } else {
+            None
+        };
+        sync_after_confirmation(projects, request, None, setup_team);
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     match projects.registration_status(request.id, &team_id).await {
@@ -81,7 +89,7 @@ async fn team_config_changed(
                     .extensions_mut()
                     .insert(NotificationConfirmedFields(fields));
             }
-            sync_after_confirmation(projects, request, reload_team);
+            sync_after_confirmation(projects, request, reload_team, None);
             Ok(response)
         }
         RegistrationStatus::Invalid(error) => {
@@ -106,9 +114,7 @@ async fn team_config_changed(
             Ok(response)
         }
         RegistrationStatus::NeedsCredentials => {
-            if let Err(error) = projects.open_team(&team_id).await {
-                eprintln!("打开 Slack 工作区配置页失败：{error}");
-            }
+            open_team_setup(&projects, &team_id).await;
             Ok(StatusCode::ACCEPTED.into_response())
         }
         RegistrationStatus::Pending => Ok(StatusCode::ACCEPTED.into_response()),
@@ -119,14 +125,25 @@ fn sync_after_confirmation(
     projects: Arc<Projects>,
     request: crate::modules::config::service::NotificationRequest,
     reload_team: Option<String>,
+    setup_team: Option<String>,
 ) {
     tokio::spawn(async move {
-        if request.confirmed().await
-            && let Err(error) = projects.sync_projects(reload_team.as_deref()).await
-        {
+        if !request.confirmed().await {
+            return;
+        }
+        if let Err(error) = projects.sync_projects(reload_team.as_deref()).await {
             eprintln!("同步 Slack 工作区失败：{error}");
         }
+        if let Some(team) = setup_team {
+            open_team_setup(&projects, &team).await;
+        }
     });
+}
+
+async fn open_team_setup(projects: &Projects, team: &str) {
+    if let Err(error) = projects.open_team(team).await {
+        eprintln!("打开 Slack 工作区配置页失败：{error}");
+    }
 }
 
 fn header_uuid(headers: &HeaderMap, name: &'static str) -> Result<Uuid, Error> {
@@ -448,6 +465,30 @@ async fn team_setup(team: Segment<String>) -> Result<Response, Error> {
         ],
         Html(page),
     ).into_response())
+}
+
+pub(super) fn credential_reset_path(team: &str) -> String {
+    format!("/slack/teams/{team}/reset-credentials")
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "reset-team-credentials",
+    method = "POST",
+    path = "/slack/teams/{team_id}/reset-credentials",
+    summary = "重置 Slack 工作区凭据",
+    description = "清除后台已判定缺失或失效的工作区凭据配置。请求体为空。"
+)]
+async fn reset_team_credentials(
+    State(projects): Service,
+    team: Segment<String>,
+) -> Result<Json<Value>, Error> {
+    let Path(team) = team.map_err(|_| Error::Invalid)?;
+    validate_team_id(&team)?;
+    projects.reset_credentials(&team).await?;
+    Ok(Json(json!({"api_version":"1","team_id":team})))
 }
 
 #[loki_api(
