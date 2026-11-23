@@ -44,6 +44,29 @@ struct NetworkStatusModule: Decodable, Equatable, Sendable {
     let my: NetworkStatusValue?
 }
 
+struct ActiveAlert: Decodable, Equatable, Identifiable, Sendable {
+    let id: String
+    let title: String
+    let body: String?
+    let callbackURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, body
+        case callbackURL = "callback_url"
+    }
+
+    var menuTitle: String {
+        guard let body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return title
+        }
+        return "\(title) · \(body)"
+    }
+}
+
+struct AlertStatusModule: Decodable, Equatable, Sendable {
+    let active: [ActiveAlert]
+}
+
 struct SlackNewConversation: Decodable, Equatable, Identifiable, Sendable {
     let id: String
     let title: String
@@ -71,6 +94,7 @@ struct SlackStatusModule: Decodable, Equatable, Sendable {
 struct ServiceStatusModules: Decodable, Equatable, Sendable {
     let service: SelfServiceStatusModule?
     let network: NetworkStatusModule?
+    let alert: AlertStatusModule?
     let slack: SlackStatusModule?
 }
 
@@ -108,6 +132,10 @@ final class ServiceStatusModel {
     private(set) var startedAt: Date?
     private(set) var networkStatus: String?
     private(set) var snapshot: ServiceStatusSnapshot?
+
+    var activeAlerts: [ActiveAlert] {
+        snapshot?.status.alert?.active ?? []
+    }
 
     var slackNewConversations: [SlackNewConversation] {
         snapshot?.status.slack?.newConversations ?? []

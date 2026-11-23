@@ -56,11 +56,15 @@ struct SystemNotification: Codable, Equatable, Sendable {
         if let buffer { callback.queryItems = [URLQueryItem(name: "buffer", value: buffer)] }
         // services 的查询解析将 + 视为空格，名称中的字面 + 必须单独编码。
         callback.percentEncodedQuery = callback.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        return navigationURL(callback: callback.string!)
+    }
+
+    static func navigationURL(callback: String) -> URL {
         var navigation = URLComponents()
         navigation.scheme = "loki-assistant"
         navigation.host = "notification"
         navigation.path = "/activate"
-        navigation.queryItems = [URLQueryItem(name: "callback", value: callback.string!)]
+        navigation.queryItems = [URLQueryItem(name: "callback", value: callback)]
         return navigation.url!
     }
 
@@ -233,6 +237,12 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         }
         guard let navigation else { return }
         await followNotificationNavigation(navigation, notificationID: response.notification.request.identifier)
+    }
+
+    func openAlert(callback: String, id: String) {
+        Task {
+            await followNotificationNavigation(SystemNotification.navigationURL(callback: callback), notificationID: id)
+        }
     }
 
     private func followNotificationNavigation(_ navigation: URL, notificationID: String) async {

@@ -368,9 +368,6 @@ impl SlackService {
                 }
             }
             "authorized" => self.clear_reauthorization_alert().await,
-            _ if settings.token.is_none() && settings.d_cookie.is_none() => {
-                self.clear_reauthorization_alert().await;
-            }
             _ => {}
         }
     }

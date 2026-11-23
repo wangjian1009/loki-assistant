@@ -4,7 +4,9 @@
 
 当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本、网络连接状态和启动时间；启动时间与网络连接状态来自每次打开菜单时读取的完整 ~GET /status~ 快照，其中启动时间读取 ~service~ 数据中的 ~start_at~ ，不逐秒更新运行时长。services 不可达时显示不可用状态。
 
-每次打开菜单时，应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，只请求一次 ~GET /status~ 。同一快照用于刷新启动时间、网络连接状态和 Slack 未读会话。顶部图标保持单色，只有菜单第一项圆点着色：服务未运行或不可达为红色，注册失败、断开或连接中为黄色，注册成功和未配置的 ~offline~ 为绿色。services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。
+每次打开菜单时，应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，只请求一次 ~GET /status~ 。同一快照用于刷新启动时间、网络连接状态、活跃告警和 Slack 未读会话。顶部图标保持单色，只有菜单第一项圆点着色：服务未运行或不可达为红色，注册失败、断开或连接中为黄色，注册成功和未配置的 ~offline~ 为绿色。services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。
+
+「告警」从同一快照的 ~alert/active~ 逐条显示标题和可选正文。带 ~callback_url~ 的告警可点击，点击后沿用系统通知的本机 services 回调流程。没有回调路径的告警仅显示文字。没有活跃告警时隐藏该区域。 [[file:../../docs/control-center-services.org::*告警模块][告警协议]]
 
 「Slack 未读会话」显示已有未读消息的会话，按最新未读消息从新到旧排列。每行显示会话名、工作区和未读数，点击后在 Emacs 定位消息或线程。 [[file:../../docs/slack-services.org::*托盘未读会话][Slack 状态和跳转协议]]
 

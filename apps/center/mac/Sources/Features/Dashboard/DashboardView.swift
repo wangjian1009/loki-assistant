@@ -4,6 +4,7 @@ import SwiftUI
 struct DashboardView: View {
     let status: ServiceStatusModel
     let idleSleep: IdleSleepController
+    let openAlert: @MainActor (String, String) -> Void
     @State private var openingSettings = false
     @State private var appOpenError: String?
 
@@ -32,6 +33,21 @@ struct DashboardView: View {
                 )
             }
             Divider()
+            if !status.activeAlerts.isEmpty {
+                Section("告警") {
+                    ForEach(status.activeAlerts) { alert in
+                        if let callback = alert.callbackURL {
+                            Button {
+                                openAlert(callback, alert.id)
+                            } label: {
+                                Text(alert.menuTitle)
+                            }
+                        } else {
+                            Text(alert.menuTitle)
+                        }
+                    }
+                }
+            }
             if !status.slackNewConversations.isEmpty {
                 Section("Slack 未读会话") {
                     ForEach(status.slackNewConversations) { conversation in

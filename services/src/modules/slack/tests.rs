@@ -1789,8 +1789,16 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
             .unwrap();
         assert!(record.get("token").is_none() && record.get("d_cookie").is_none());
         assert!(!directory.0.join(path).exists());
+        projects
+            .service(team)
+            .await
+            .unwrap()
+            .sync_reauthorization_alert()
+            .await;
     }
     assert_eq!(expired_auth_checks.load(Ordering::SeqCst), 1);
+    let (_, _, after_click) = invoke(&app, "GET", "/status/alert/active", None, None, None).await;
+    assert_eq!(after_click["value"], json!(active));
 
     let (status, _, response) = invoke(
         &app,
@@ -1811,6 +1819,20 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
         "/data/slack/teams/TINVALID",
         None,
         None,
+        Some(json!({"token":"xoxc-expired","d_cookie":"wrong-cookie"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, _, after_failure) = invoke(&app, "GET", "/status/alert/active", None, None, None).await;
+    assert_eq!(after_failure["value"], json!(active));
+    assert_eq!(alerts.attempts.lock().unwrap().len(), 2);
+
+    let (status, _, _) = invoke(
+        &app,
+        "PATCH",
+        "/data/slack/teams/TINVALID",
+        None,
+        None,
         Some(json!({"token":"xoxc-renewed","d_cookie":"cookie"})),
     )
     .await;
@@ -1819,7 +1841,9 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
         loop {
             let (_, _, active) =
                 invoke(&app, "GET", "/status/alert/active", None, None, None).await;
-            if active["value"] == json!([]) {
+            if active["value"].as_array().is_some_and(|alerts| {
+                alerts.len() == 1 && alerts[0]["id"] == "slack.TMISSING.reauthorization"
+            }) {
                 break;
             }
             sleep(Duration::from_millis(10)).await;

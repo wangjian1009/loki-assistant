@@ -7,7 +7,10 @@ private actor MenuStatusTransport {
     func send(_ request: URLRequest) throws -> (Data, URLResponse) {
         let url = try XCTUnwrap(request.url)
         paths.append(url.path)
-        let data = Data(#"{"api_version":"1","status":{"service":{"start_at":200},"slack":{"new_conversations":[{"id":"TTEAM.CWORK","title":"产品讨论","team_name":"工作区","unread_count":3,"session_id":"550e8400-e29b-41d4-a716-446655440000","callback":"/slack/conversations/TTEAM.CWORK/open?message_ts=200.1"}]}}}"#.utf8)
+        let alerts = paths.count == 1
+            ? #"[{"id":"backup.disk-space","title":"备份磁盘空间不足","body":"剩余空间低于 10 GB","level":"warning","app":"backup"},{"id":"slack.reauthorize","title":"Slack 需要重新授权","body":null,"callback_url":"/slack/teams/TTEAM/reset-credentials"}]"#
+            : "[]"
+        let data = Data(#"{"api_version":"1","status":{"service":{"start_at":200},"alert":{"active":\#(alerts)},"slack":{"new_conversations":[{"id":"TTEAM.CWORK","title":"产品讨论","team_name":"工作区","unread_count":3,"session_id":"550e8400-e29b-41d4-a716-446655440000","callback":"/slack/conversations/TTEAM.CWORK/open?message_ts=200.1"}]}}}"#.utf8)
         return (data, try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)))
     }
 }
@@ -73,6 +76,7 @@ final class ServiceStatusTests: XCTestCase {
         XCTAssertEqual(version, "0.1.0")
         XCTAssertEqual(model.startedAt, Date(timeIntervalSince1970: 200))
         XCTAssertEqual(model.networkStatus, "connected")
+        XCTAssertTrue(model.activeAlerts.isEmpty)
         XCTAssertEqual(model.snapshot?.updatedAt, 201)
         XCTAssertEqual(model.indicator, .green)
     }
@@ -100,6 +104,13 @@ final class ServiceStatusTests: XCTestCase {
             XCTAssertEqual(paths, Array(repeating: "/status", count: count))
             XCTAssertEqual(model.slackNewConversations.map(\.title), ["产品讨论"])
             XCTAssertEqual(model.slackNewConversations.first?.unreadCount, 3)
+            if count == 1 {
+                XCTAssertEqual(model.activeAlerts.map(\.id), ["backup.disk-space", "slack.reauthorize"])
+                XCTAssertEqual(model.activeAlerts.map(\.menuTitle), ["备份磁盘空间不足 · 剩余空间低于 10 GB", "Slack 需要重新授权"])
+                XCTAssertEqual(model.activeAlerts.map(\.callbackURL), [nil, "/slack/teams/TTEAM/reset-credentials"])
+            } else {
+                XCTAssertTrue(model.activeAlerts.isEmpty)
+            }
             XCTAssertNotEqual(model.lastUpdated, before)
             model.menuDidClose()
         }
