@@ -106,6 +106,10 @@ enum SystemNotificationError: LocalizedError {
 final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private let logger = Logger(subsystem: "cc.loki-assistant.center", category: "notification")
     private let receiptClient = NotificationReceiptClient()
+    private lazy var delivery = NotificationDelivery(
+        present: { [unowned self] in try await self.present($0) },
+        report: { [receiptClient] in try await receiptClient.send($1, notificationID: $0) }
+    )
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
@@ -119,10 +123,6 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                         await followNotificationNavigation(url, notificationID: "URL")
                         return
                     }
-                    let delivery = NotificationDelivery(
-                        present: { try await self.present($0) },
-                        report: { try await self.receiptClient.send($1, notificationID: $0) }
-                    )
                     try await delivery.handle(url)
                 } catch {
                     logger.error("系统通知处理或回执失败：\(error.localizedDescription, privacy: .public)")
@@ -133,6 +133,14 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     private func present(_ notification: SystemNotification) async throws {
         let center = UNUserNotificationCenter.current()
+        if let id = notification.notificationID {
+            let pending = await center.pendingNotificationRequests()
+            let delivered = await center.deliveredNotifications()
+            if pending.contains(where: { $0.identifier == id })
+                || delivered.contains(where: { $0.request.identifier == id }) {
+                return
+            }
+        }
         let allowed = try await center.requestAuthorization(options: [.alert, .sound])
         guard allowed else { throw SystemNotificationError.permissionDenied }
         let content = notification.makeContent()

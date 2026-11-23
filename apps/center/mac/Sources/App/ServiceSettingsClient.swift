@@ -19,14 +19,7 @@ struct ServiceSettingsClient: Sendable {
     }
 
     func open(app: String, operation: CenterLogOperation? = nil) async throws {
-        try await open(app: app, path: "/emacs/apps/open", query: [URLQueryItem(name: "app", value: app)], operation: operation)
-    }
-
-    func activateSlack(operation: CenterLogOperation? = nil) async throws {
-        try await open(app: "slack", path: "/emacs/slack/activate", query: nil, operation: operation)
-    }
-
-    private func open(app: String, path: String, query: [URLQueryItem]?, operation: CenterLogOperation?) async throws {
+        let path = "/emacs/apps/open"
         let endpoint = try discover()
         let healthRequest = URLRequest(
             url: try NotificationReceiptClient.url(endpoint: endpoint, path: "/healthz"),
@@ -47,7 +40,7 @@ struct ServiceSettingsClient: Sendable {
         }
         let openURL = try NotificationReceiptClient.url(endpoint: endpoint, path: path)
         var components = URLComponents(url: openURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = query
+        components.queryItems = [URLQueryItem(name: "app", value: app)]
         var request = URLRequest(
             url: components.url!,
             cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 35)

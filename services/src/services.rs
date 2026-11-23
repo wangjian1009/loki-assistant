@@ -60,19 +60,33 @@ pub type CoreService = Services;
 
 impl Services {
     pub fn build() -> Self {
-        Self::with_config(config::service::ConfigService::from_registry())
+        Self::with_config(
+            config::service::ConfigService::from_registry(),
+            NotificationService::new(),
+        )
     }
 
-    pub fn load() -> Result<Self, config::service::ConfigServiceError> {
-        Ok(Self::with_config(config::service::ConfigService::load(
-            config::service::ConfigService::storage_path()?,
-        )?))
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let config_path = config::service::ConfigService::storage_path()?;
+        let home = config_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or(std::io::Error::other("无法确定本机缓存目录"))?;
+        let notification = NotificationService::load(home.join(".cache/assistant/notification"))?;
+        crate::modules::slack::migrate_legacy_cache(&home.join(".cache"))?;
+        Ok(Self::with_config(
+            config::service::ConfigService::load(config_path)?,
+            notification,
+        ))
     }
 
-    fn with_config(config: config::service::ConfigService) -> Self {
+    fn with_config(
+        config: config::service::ConfigService,
+        notification: NotificationService,
+    ) -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
-        let notification = Arc::new(NotificationService::new());
+        let notification = Arc::new(notification);
         let status = Arc::new(StatusService::new());
         let service = service::Module::new(Arc::clone(&status));
         let identity = config::service::ConfigService::storage_path()

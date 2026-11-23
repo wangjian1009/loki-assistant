@@ -525,6 +525,48 @@ async fn users(State(projects): Service, uri: Uri) -> Result<Json<Value>, Error>
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NicknameInput {
+    nickname: Value,
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "set-user-nickname",
+    method = "PUT",
+    path = "/slack/users/{id}/nickname",
+    summary = "设置本机 Slack 用户昵称",
+    description = "传入 nickname 字符串或 null，返回包含 nickname 的用户资料。"
+)]
+async fn set_user_nickname(
+    State(projects): Service,
+    headers: HeaderMap,
+    id: Segment<String>,
+    input: Result<Json<NicknameInput>, JsonRejection>,
+) -> Result<Json<Value>, Error> {
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    let Json(input) = input.map_err(|_| Error::Invalid)?;
+    let nickname = match input.nickname {
+        Value::Null => None,
+        Value::String(value) => Some(value),
+        _ => return Err(Error::Invalid),
+    };
+    let (team, _) = split_id(&id)?;
+    let service = projects.service(team).await?;
+    let session = session(&headers, &service).await?;
+    // 配置落盘后仍须刷新本机显示，即使请求方提前断开。
+    tokio::spawn(async move {
+        let (team, user) = split_id(&id)?;
+        let profile = projects.set_nickname(team, user, nickname.as_deref(), session).await?;
+        Ok(Json(json!({"api_version":"1","user":profile})))
+    })
+    .await
+    .map_err(|_| Error::Unavailable)?
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PickerQuery {}
 
 #[loki_api(

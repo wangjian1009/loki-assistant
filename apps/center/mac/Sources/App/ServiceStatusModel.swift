@@ -50,10 +50,12 @@ struct SlackNewConversation: Decodable, Equatable, Identifiable, Sendable {
     let teamName: String
     let sessionID: UUID
     let callback: String
+    let unreadCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, title, callback
         case teamName = "team_name"
+        case unreadCount = "unread_count"
         case sessionID = "session_id"
     }
 }

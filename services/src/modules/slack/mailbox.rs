@@ -488,8 +488,8 @@ impl SlackService {
                 .values()
                 .find(|room| room.kind == "im" && room.participants.iter().any(|id| id == user))
             {
-                let mut summary = self.conversation_summary(account, room).2;
-                summary["title"] = json!(profile.name);
+                let mut summary = self.conversation_summary(account, room, state.user_directory.as_ref()).2;
+                summary["title"] = json!(account.nickname(user).unwrap_or(profile.name));
                 return Ok(summary);
             }
         }
@@ -527,7 +527,7 @@ impl SlackService {
             .conversations
             .get(&id)
             .ok_or(Error::Conversation)?;
-        Ok(self.conversation_summary(account, room).2)
+        Ok(self.conversation_summary(account, room, state.user_directory.as_ref()).2)
     }
 
     pub(super) async fn refresh_group_members(&self, session: Uuid) -> Result<(), Error> {
@@ -634,7 +634,7 @@ impl SlackService {
             .values()
             .filter(|value| kind.is_empty() || value.kind == kind)
             .filter_map(|value| {
-                let (latest, unread_time, summary) = self.conversation_summary(account, value);
+                let (latest, unread_time, summary) = self.conversation_summary(account, value, state.user_directory.as_ref());
                 if unread && unread_time.is_none() {
                     return None;
                 }
@@ -652,8 +652,10 @@ impl SlackService {
         &self,
         account: &Account,
         room: &Conversation,
+        users: Option<&UserDirectory>,
     ) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
         let (latest, unread, mut summary) = room.summarize(account);
+        summary["title"] = json!(room.display_title(account, users));
         summary["id"] = json!(format!("{}.{}", account.identity.team_id, room.id));
         summary["team_id"] = json!(account.identity.team_id);
         summary["team_name"] = json!(account.identity.team_name);
@@ -692,7 +694,7 @@ impl SlackService {
                 .conversations
                 .get(id)
                 .ok_or(Error::Conversation)?;
-            self.conversation_summary(account, room).2
+            self.conversation_summary(account, room, state.user_directory.as_ref()).2
         };
         let root = match thread.or(message) {
             Some(ts) => self.find_message(session, id, None, ts).await?,
@@ -726,7 +728,7 @@ impl SlackService {
             _ => None,
         };
         let state = self.state.lock().await;
-        state.account(session)?;
+        let account = state.account(session)?;
         let conversation = state
             .cache
             .conversations
@@ -734,10 +736,10 @@ impl SlackService {
             .ok_or(Error::Conversation)?;
         let wire_root = root
             .as_ref()
-            .map(|message| conversation.message_result(message));
+            .map(|message| conversation.message_result(message, account, state.user_directory.as_ref()));
         let wire_reply = reply
             .as_ref()
-            .map(|message| conversation.message_result(message));
+            .map(|message| conversation.message_result(message, account, state.user_directory.as_ref()));
         Ok(json!({"room":room,"root":wire_root,"reply":wire_reply,
             "thread_ts":anchored_thread,"message_ts":anchored_message}))
     }
@@ -1048,14 +1050,15 @@ impl SlackService {
         session: Uuid,
         user: &UserProfile,
     ) -> Result<Value, Error> {
-        let (team_name, disk) = {
+        let (team_name, disk, nickname) = {
             let state = self.state.lock().await;
             let account = state.account(session)?;
-            (account.identity.team_name.clone(), state.cache.disk.clone())
+            (account.identity.team_name.clone(), state.cache.disk.clone(), account.nickname(user.slack_id()))
         };
         let mut item = disk
             .as_ref()
             .map_or_else(|| user.result(), |cache| cache.user_result(user));
+        item["nickname"] = json!(nickname);
         item["team_name"] = json!(team_name);
         item["session_id"] = json!(session);
         Ok(item)
@@ -1233,10 +1236,10 @@ impl SlackService {
             .get(&id)
             .ok_or(Error::Conversation)?;
         let positions = &conversation.read_positions;
-        let public_message = |message: &Message| conversation.message_result(message);
+        let public_message = |message: &Message| conversation.message_result(message, account, state.user_directory.as_ref());
         let thread_items = thread
             .is_none()
-            .then(|| conversation.cached_replies(&items, false));
+            .then(|| conversation.cached_replies(&items, false, account, state.user_directory.as_ref()));
         let items: Vec<_> = items.iter().map(public_message).collect();
         let mut result = json!({
             "api_version":"1","conversation_id":id,"items":items,"next_cursor":next,

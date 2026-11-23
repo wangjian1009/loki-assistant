@@ -1,8 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::http::Uri;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use tokio::time::timeout;
+use tokio::time::{interval, timeout};
+use uuid::Uuid;
 
 use super::{
     protocol::{
@@ -18,16 +19,20 @@ use crate::platform::macos::notification::{
 pub enum NotificationError {
     #[error("请求无效：{0}")]
     InvalidRequest(String),
-    #[error("系统通知转交失败：{0}")]
-    Launch(String),
-    #[error("系统通知转交超时，处理结果未知")]
-    Timeout,
-    #[error("通知不存在、已过期或 services 已重启")]
+    #[error("无法更新通知缓存：{0}")]
+    Storage(String),
+    #[error("通知不存在或确认记录已过期")]
     NotFound,
     #[error("通知已收到不同的处理结果")]
     ReceiptConflict,
     #[error("通知记录已满，请稍后重试")]
     Capacity,
+}
+
+impl From<io::Error> for NotificationError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
 }
 
 #[derive(Debug)]
@@ -46,6 +51,26 @@ impl Default for NotificationService {
 impl NotificationService {
     pub fn new() -> Self {
         Self::with_launcher(Arc::new(MacNotificationLauncher), Duration::from_secs(30))
+    }
+
+    pub fn load(directory: PathBuf) -> io::Result<Self> {
+        Self::load_with_launcher(
+            directory,
+            Arc::new(MacNotificationLauncher),
+            Duration::from_secs(30),
+        )
+    }
+
+    pub(super) fn load_with_launcher(
+        directory: PathBuf,
+        launcher: Arc<dyn NotificationLauncher>,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            launcher,
+            timeout,
+            tracker: NotificationTracker::load(directory)?,
+        })
     }
 
     pub fn with_launcher(launcher: Arc<dyn NotificationLauncher>, timeout: Duration) -> Self {
@@ -75,23 +100,39 @@ impl NotificationService {
             .as_deref()
             .map(Self::navigation_url)
             .transpose()?;
-        let notification_id = self.tracker.register().await?;
+        let id = Uuid::new_v4();
         let content = NotificationContent {
-            notification_id: notification_id.clone(),
+            notification_id: id.to_string(),
             title: request.title,
             body: request.body,
             app: request.app,
             navigation_url,
         };
-        let result = timeout(self.timeout, self.launcher.launch(content))
-            .await
-            .map_err(|_| NotificationError::Timeout)
-            .and_then(|result| result.map_err(NotificationError::Launch));
-        if let Err(error) = result {
-            self.tracker.remove(&notification_id).await;
-            return Err(error);
+        self.tracker.register(content.clone(), id).await?;
+        self.forward(content).await;
+        self.tracker.get(&id.to_string()).await
+    }
+
+    pub async fn retry_pending(&self) {
+        let mut ticks = interval(Duration::from_secs(15));
+        loop {
+            ticks.tick().await;
+            for id in self.tracker.due().await {
+                if let Some(content) = self.tracker.retry(id).await {
+                    self.forward(content).await;
+                }
+            }
         }
-        self.tracker.get(&notification_id).await
+    }
+
+    async fn forward(&self, content: NotificationContent) {
+        let id = content.notification_id.clone();
+        if !matches!(
+            timeout(self.timeout, self.launcher.launch(content)).await,
+            Ok(Ok(()))
+        ) {
+            eprintln!("通知 {id} 暂未转交给菜单栏应用，稍后重试");
+        }
     }
 
     pub async fn status(&self, id: &str) -> Result<NotificationStatusResponse, NotificationError> {

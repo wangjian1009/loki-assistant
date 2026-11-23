@@ -4,7 +4,7 @@
 
 本目录是控制中心的 Rust 服务层。它计划作为开机常驻的本机服务，为菜单栏应用和未来的其他客户端提供统一的 loopback HTTP 接口。
 
-当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、服务自身状态模块、状态中心、系统通知模块、密码管理模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。services 自身由 Homebrew services 管理，菜单栏应用只展示服务状态，提供设置、日志与业务入口；托盘登录启动仍由 services 的控制中心模块在配置提交时管理用户级 LaunchAgent。
+当前已完成核心服务器骨架、服务发现模块、配置模块、控制中心模块、服务自身状态模块、状态中心、系统通知模块、密码管理模块、Emacs 模块和 macOS LaunchAgent 管理器：服务默认监听 ~127.0.0.1:47321~，提供健康检查、模块发现和配置模型/数据接口，支持配置地址和 Ctrl-C 优雅退出。用户配置保存于 ~~/.assistant/config.yml~，业务模块通过 ~ConfigService~ 读取生效值及来源并订阅变化。Emacs 模块支持 Lisp 求值、buffer 列表、主动状态上报和通知分发。services 自身由 Homebrew services 管理，菜单栏应用只展示服务状态，提供设置与业务入口；托盘登录启动仍由 services 的控制中心模块在配置提交时管理用户级 LaunchAgent。
 
 服务成功启动后会写入 ~~/.assistant/service~ JSON pfile，包含 ~host~、~port~、~pid~ 和 ~version~ 。服务正常退出时删除自身文件；客户端应先读取该文件，再请求对应端口的健康接口。
 
@@ -184,9 +184,10 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 通知上报接口为 ~POST /emacs/receiver/notification~ 。Emacs 模块调用创建时注入的系统通知模块，转交菜单栏应用展示 macOS 通知。~buffer~ 可省略，点击时由 services 显示 Emacs；提供时定位对应的存活 buffer。~app~ 省略或为 ~null~ 时由 Emacs 模块补为 ~emacs~ ，center 按应用标识读取随程序打包的图标，不接受自定义图标。传入 ~module_id~ 可将上报交给已注册的 Rust 模块处理器；默认值为 ~emacs~ 。
 
-使用前先执行 ~make restart-center~ 加载新版菜单栏应用并注册通知 URL scheme。首次上报时，macOS 会请求 Loki Assistant 的通知权限；未授权时需在系统设置中允许通知。HTTP 返回 ~status: "forwarded"~ 只表示已交给菜单栏应用，不表示系统已经展示。
+使用前执行 ~make restart-center~ 加载菜单栏应用并注册通知 URL scheme。首次提交时 macOS 会请求 Loki Assistant 的通知权限。
 
-默认系统通知响应的 ~result.notification_id~ 可用于 ~GET /notification/{id}~ 查询处理结果。菜单栏应用通过 ~POST /notification/{id}/receipt~ 回报 ~submitted~ 或带 ~code~、~message~ 的 ~failed~ 。~submitted~ 表示已成功提交给系统通知中心，不代表用户已看到通知。30 秒内没有回执为 ~unconfirmed~ ，过期前仍接受迟到回执；记录保留 15 分钟，services 重启后失效。重复回执幂等，应用仅重试回执，不重发通知。自定义模块处理器的返回值保持原有约定。
+默认系统通知先写入 ~~/.cache/assistant/notification~ ，状态为 ~unconfirmed~ 。可用响应中的 ~result.notification_id~ 查询 ~GET /notification/{id}~ 。菜单栏应用成功提交给 macOS 后回报 ~submitted~ ，services 将状态更新为 ~confirmed~ 并移除对应缓存。提交失败或重启后，未确认通知会以原 ID 重试。 [[file:../docs/control-center-services.org::*系统通知模块][通知状态和回执协议]]
+
 
 使用回执能力需同时加载新版 services 和菜单栏应用；操作入口见下方服务管理以及 [[file:../apps/center/README.org][菜单栏应用说明]]。
 

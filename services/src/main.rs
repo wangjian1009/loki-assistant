@@ -31,6 +31,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
     services.attach_remote(&runtime);
     let extensions = services.start_extensions(listener.local_addr()?.port());
+    let notification = Arc::clone(&services.notification);
+    let notification_retry = tokio::spawn(async move { notification.retry_pending().await });
     let network = Arc::clone(&services.network);
     let network_start = tokio::spawn(async move {
         if let Err(error) = network.start(config).await {
@@ -51,6 +53,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(())
     };
+    notification_retry.abort();
+    let _ = notification_retry.await;
     network_start.abort();
     network_pairings.abort();
     services.stop_extensions(extensions).await;

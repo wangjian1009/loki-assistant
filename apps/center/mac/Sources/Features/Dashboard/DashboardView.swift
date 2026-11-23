@@ -5,10 +5,7 @@ struct DashboardView: View {
     let status: ServiceStatusModel
     let idleSleep: IdleSleepController
     @State private var openingSettings = false
-    @State private var openingLog = false
-    @State private var openingSlack = false
     @State private var appOpenError: String?
-    @State private var appOpenErrorTitle = "无法打开 Emacs"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -35,33 +32,17 @@ struct DashboardView: View {
                 )
             }
             Divider()
-            Button {
-                openingSlack = true
-                Task { @MainActor in
-                    defer { openingSlack = false }
-                    let operation = CenterLog.shared.start("激活 Slack 聊天")
-                    do {
-                        try await ServiceSettingsClient().activateSlack(operation: operation)
-                        CenterLog.shared.finish(operation, result: "success")
-                    } catch {
-                        CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
-                        appOpenErrorTitle = "无法激活 Slack 聊天"
-                        appOpenError = error.localizedDescription
-                    }
-                }
-            } label: {
-                Label(openingSlack ? "打开 Slack 聊天…" : "Slack 聊天", systemImage: "bubble.left.and.bubble.right")
-            }
-            .disabled(openingSlack)
-            .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
             if !status.slackNewConversations.isEmpty {
-                Section("Slack 新消息") {
+                Section("Slack 未读会话") {
                     ForEach(status.slackNewConversations) { conversation in
                         Button {
                             openSlackConversation(conversation)
                         } label: {
-                            Text("\(conversation.title) · \(conversation.teamName)")
+                            if let count = conversation.unreadCount {
+                                Text("\(conversation.title) · \(conversation.teamName) · \(count) 条未读")
+                            } else {
+                                Text("\(conversation.title) · \(conversation.teamName)")
+                            }
                         }
                     }
                 }
@@ -76,7 +57,6 @@ struct DashboardView: View {
                         CenterLog.shared.finish(operation, result: "success")
                     } catch {
                         CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
-                        appOpenErrorTitle = "无法打开设置"
                         appOpenError = error.localizedDescription
                     }
                 }
@@ -84,26 +64,6 @@ struct DashboardView: View {
                 Label(openingSettings ? "打开设置…" : "设置", systemImage: "slider.horizontal.3")
             }
             .disabled(openingSettings)
-            .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Button {
-                openingLog = true
-                Task { @MainActor in
-                    defer { openingLog = false }
-                    let operation = CenterLog.shared.start("打开日志")
-                    do {
-                        try await ServiceSettingsClient().open(app: "logs", operation: operation)
-                        CenterLog.shared.finish(operation, result: "success")
-                    } catch {
-                        CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
-                        appOpenErrorTitle = "无法打开日志"
-                        appOpenError = error.localizedDescription
-                    }
-                }
-            } label: {
-                Label(openingLog ? "打开日志…" : "日志", systemImage: "doc.text.magnifyingglass")
-            }
-            .disabled(openingLog)
             .buttonStyle(.borderless)
             .frame(maxWidth: .infinity, alignment: .leading)
             Button {
@@ -117,7 +77,7 @@ struct DashboardView: View {
         .padding(8)
         .frame(width: 300, alignment: .leading)
         .labelStyle(.titleAndIcon)
-        .alert(appOpenErrorTitle, isPresented: Binding(
+        .alert("无法打开设置", isPresented: Binding(
             get: { appOpenError != nil },
             set: { if !$0 { appOpenError = nil } }
         )) {

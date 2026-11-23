@@ -95,7 +95,7 @@ src/
     │   ├── protocol.rs  通用通知、回执与状态模型
     │   ├── routes.rs    /notification 状态与回执路由
     │   ├── service.rs   代码发送接口和应用内跳转封装
-    │   ├── tracker.rs   通知回执状态、保留期限与容量限制
+    │   ├── tracker.rs   未确认通知缓存、回执状态与容量限制
     │   └── tests.rs     通用发送与共享实例集成测试
     └── config/
         ├── mod.rs       配置模块入口和路由挂载
@@ -169,7 +169,7 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 `modules/notification` 拥有通用 `NotificationRequest`、代码发送接口、应用内跳转封装、回执与状态。它通过可注入的 `NotificationLauncher` 调用 `/usr/bin/open -g`，使用 `loki-assistant://notification/show` 转交 App；将业务提供的本机服务路径包装成 `loki-assistant://notification/activate` 导航 URL，不解释 buffer。通用路由为 `GET /notification/{id}` 和 `POST /notification/{id}/receipt`；旧 Emacs 路由只代理同一份状态。单元测试注入 fake，不发送真实通知。
 
-系统通知先登记随机 `notification_id` 再转交；相同回执幂等，冲突不覆盖，超时只表示未知，记录按访问清理。不得为状态维护另启线程，测试通过 Tokio 虚拟时间验证期限。自定义 Emacs 模块通知处理器不自动纳入系统通知状态。
+系统通知先以随机 `notification_id` 写入 `~/.cache/assistant/notification` ，再转交托盘；成功回执移除缓存并确认，失败回执保留未确认记录。由 `main.rs` 显式调度待确认通知恢复和重试。自定义 Emacs 模块通知处理器沿用各自的返回值。
 
 `POST /emacs/activate` 执行点击后的业务跳转：无 buffer 时通过独立参数打开 Emacs；有 buffer 时通过现有 gateway 定位存活目标并聚焦图形 frame，不自动启动新 daemon，不创建同名空 buffer。App 只解包通用导航 URL 并回调 services，不直接执行 Emacs 激活。
 

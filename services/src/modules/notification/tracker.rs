@@ -1,4 +1,11 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    fs::{self, DirBuilder, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
@@ -7,49 +14,123 @@ use super::{
     protocol::{API_VERSION, NotificationReceipt, NotificationStatus, NotificationStatusResponse},
     service::NotificationError,
 };
+use crate::platform::macos::notification::NotificationContent;
 
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
-const RETENTION: Duration = Duration::from_secs(15 * 60);
-const MAX_RECORDS: usize = 1024;
+const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIRMED_RETENTION: Duration = Duration::from_secs(15 * 60);
+const MAX_PENDING: usize = 1024;
+const MAX_CONFIRMED: usize = 1024;
 
 #[derive(Debug)]
-struct Record {
-    created_at: Instant,
-    receipt: Option<NotificationReceipt>,
+struct Pending {
+    content: NotificationContent,
+    retry_at: Instant,
+    failure: Option<(String, String)>,
+}
+
+#[derive(Debug, Default)]
+struct Records {
+    pending: HashMap<Uuid, Pending>,
+    confirmed: HashMap<Uuid, Instant>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct NotificationTracker {
-    records: Mutex<HashMap<String, Record>>,
+    directory: Option<PathBuf>,
+    records: Mutex<Records>,
 }
 
 impl NotificationTracker {
-    pub async fn register(&self) -> Result<String, NotificationError> {
-        let mut records = self.records.lock().await;
-        Self::prune(&mut records);
-        if records.len() >= MAX_RECORDS {
-            return Err(NotificationError::Capacity);
+    pub fn load(directory: PathBuf) -> io::Result<Self> {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+        let mut records = Records::default();
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|id| Uuid::parse_str(id).ok())
+            else {
+                continue;
+            };
+            if path != cache_path(&directory, id) || !entry.file_type()?.is_file() {
+                continue;
+            }
+            let content = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<NotificationContent>(&bytes).ok())
+                .filter(|content| content.notification_id == id.to_string());
+            if let Some(content) = content {
+                records.pending.insert(
+                    id,
+                    Pending {
+                        content,
+                        retry_at: Instant::now(),
+                        failure: None,
+                    },
+                );
+            } else {
+                eprintln!("无法恢复待确认通知 {id}");
+            }
         }
-        let id = Uuid::new_v4().to_string();
-        records.insert(
-            id.clone(),
-            Record {
-                created_at: Instant::now(),
-                receipt: None,
-            },
-        );
-        Ok(id)
+        Ok(Self {
+            directory: Some(directory),
+            records: Mutex::new(records),
+        })
     }
 
-    pub async fn remove(&self, id: &str) {
-        self.records.lock().await.remove(id);
+    pub async fn register(
+        &self,
+        content: NotificationContent,
+        id: Uuid,
+    ) -> Result<(), NotificationError> {
+        let mut records = self.records.lock().await;
+        if records.pending.len() >= MAX_PENDING {
+            return Err(NotificationError::Capacity);
+        }
+        if let Some(directory) = &self.directory {
+            write_pending(directory, id, &content)?;
+        }
+        records.pending.insert(
+            id,
+            Pending {
+                content,
+                retry_at: Instant::now() + RETRY_INTERVAL,
+                failure: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn due(&self) -> Vec<Uuid> {
+        let now = Instant::now();
+        let records = self.records.lock().await;
+        let mut due: Vec<_> = records
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.retry_at <= now)
+            .map(|(id, pending)| (pending.retry_at, *id))
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, id)| id).collect()
+    }
+
+    pub async fn retry(&self, id: Uuid) -> Option<NotificationContent> {
+        let mut records = self.records.lock().await;
+        let pending = records.pending.get_mut(&id)?;
+        pending.retry_at = Instant::now() + RETRY_INTERVAL;
+        Some(pending.content.clone())
     }
 
     pub async fn get(&self, id: &str) -> Result<NotificationStatusResponse, NotificationError> {
+        let id = parse_id(id)?;
         let mut records = self.records.lock().await;
-        Self::prune(&mut records);
-        let record = records.get(id).ok_or(NotificationError::NotFound)?;
-        Ok(Self::response(id, record))
+        records.prune_confirmed();
+        records.response(id)
     }
 
     pub async fn receive(
@@ -64,97 +145,93 @@ impl NotificationTracker {
                 "失败回执的 code 和 message 不能为空".to_owned(),
             ));
         }
+        let id = parse_id(id)?;
         let mut records = self.records.lock().await;
-        Self::prune(&mut records);
-        let record = records.get_mut(id).ok_or(NotificationError::NotFound)?;
-        match &record.receipt {
-            Some(existing) if existing != &receipt => {
-                return Err(NotificationError::ReceiptConflict);
+        records.prune_confirmed();
+        match receipt {
+            NotificationReceipt::Submitted {} if records.pending.contains_key(&id) => {
+                if let Some(directory) = &self.directory {
+                    match fs::remove_file(cache_path(directory, id)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                records.pending.remove(&id);
+                if records.confirmed.len() >= MAX_CONFIRMED
+                    && let Some(oldest) = records
+                        .confirmed
+                        .iter()
+                        .min_by_key(|(_, time)| **time)
+                        .map(|(id, _)| *id)
+                {
+                    records.confirmed.remove(&oldest);
+                }
+                records.confirmed.insert(id, Instant::now());
             }
-            Some(_) => {}
-            None => record.receipt = Some(receipt),
-        }
-        Ok(Self::response(id, record))
-    }
-
-    fn prune(records: &mut HashMap<String, Record>) {
-        // 在访问时清理，避免为通知状态启动独立线程；容量上限约束空闲期间的占用。
-        records.retain(|_, record| record.created_at.elapsed() < RETENTION);
-    }
-
-    fn response(id: &str, record: &Record) -> NotificationStatusResponse {
-        let (status, code, message) = match &record.receipt {
-            Some(NotificationReceipt::Submitted {}) => (NotificationStatus::Submitted, None, None),
-            Some(NotificationReceipt::Failed { code, message }) => (
-                NotificationStatus::Failed,
-                Some(code.clone()),
-                Some(message.clone()),
-            ),
-            None if record.created_at.elapsed() >= RECEIPT_TIMEOUT => {
-                (NotificationStatus::Unconfirmed, None, None)
+            NotificationReceipt::Failed { code, message } => {
+                if records.confirmed.contains_key(&id) {
+                    return Err(NotificationError::ReceiptConflict);
+                }
+                let pending = records
+                    .pending
+                    .get_mut(&id)
+                    .ok_or(NotificationError::NotFound)?;
+                pending.failure = Some((code, message));
             }
-            None => (NotificationStatus::Forwarded, None, None),
-        };
-        NotificationStatusResponse {
-            api_version: API_VERSION.to_owned(),
-            notification_id: id.to_owned(),
-            status,
-            code,
-            message,
+            NotificationReceipt::Submitted {} => {}
         }
+        records.response(id)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn accepts_late_receipt_until_expiry_without_extending_retention() {
-        let tracker = NotificationTracker::default();
-        let id = tracker.register().await.unwrap();
-        assert_eq!(
-            tracker.get(&id).await.unwrap().status,
-            NotificationStatus::Forwarded
-        );
-        tokio::time::advance(RECEIPT_TIMEOUT).await;
-        assert_eq!(
-            tracker.get(&id).await.unwrap().status,
-            NotificationStatus::Unconfirmed
-        );
-        assert_eq!(
-            tracker
-                .receive(&id, NotificationReceipt::Submitted {})
-                .await
-                .unwrap()
-                .status,
-            NotificationStatus::Submitted
-        );
-        tokio::time::advance(RETENTION - RECEIPT_TIMEOUT).await;
-        assert!(matches!(
-            tracker.get(&id).await,
-            Err(NotificationError::NotFound)
-        ));
-        assert!(matches!(
-            tracker
-                .receive(&id, NotificationReceipt::Submitted {})
-                .await,
-            Err(NotificationError::NotFound)
-        ));
+impl Records {
+    fn prune_confirmed(&mut self) {
+        self.confirmed
+            .retain(|_, time| time.elapsed() < CONFIRMED_RETENTION);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn bounds_memory_and_releases_expired_capacity() {
-        let tracker = NotificationTracker::default();
-        for _ in 0..MAX_RECORDS {
-            tracker.register().await.unwrap();
-        }
-        assert!(matches!(
-            tracker.register().await,
-            Err(NotificationError::Capacity)
-        ));
-        tokio::time::advance(RETENTION).await;
-        tracker.register().await.unwrap();
-        assert_eq!(tracker.records.lock().await.len(), 1);
+    fn response(&self, id: Uuid) -> Result<NotificationStatusResponse, NotificationError> {
+        let (status, failure) = if let Some(pending) = self.pending.get(&id) {
+            (NotificationStatus::Unconfirmed, pending.failure.as_ref())
+        } else if self.confirmed.contains_key(&id) {
+            (NotificationStatus::Confirmed, None)
+        } else {
+            return Err(NotificationError::NotFound);
+        };
+        Ok(NotificationStatusResponse {
+            api_version: API_VERSION.to_owned(),
+            notification_id: id.to_string(),
+            status,
+            code: failure.map(|(code, _)| code.clone()),
+            message: failure.map(|(_, message)| message.clone()),
+        })
     }
+}
+
+fn parse_id(id: &str) -> Result<Uuid, NotificationError> {
+    Uuid::parse_str(id).map_err(|_| NotificationError::NotFound)
+}
+
+fn cache_path(directory: &Path, id: Uuid) -> PathBuf {
+    directory.join(format!("{id}.json"))
+}
+
+fn write_pending(directory: &Path, id: Uuid, content: &NotificationContent) -> io::Result<()> {
+    let temporary = directory.join(format!(".{id}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = (|| {
+        serde_json::to_writer(&mut file, content)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temporary, cache_path(directory, id))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }

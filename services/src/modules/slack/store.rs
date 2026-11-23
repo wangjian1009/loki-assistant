@@ -1,9 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, RwLock},
+};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::disk::DiskCache;
+use super::mailbox::UserDirectory;
 use super::protocol::{Error, Identity, Message, timestamp};
 use super::subscriptions::{MessageJournal, Subscription, SubscriptionKey};
 
@@ -13,13 +17,37 @@ pub(super) struct Secrets {
     pub disabled_token: Option<String>,
 }
 
+pub(super) type Nicknames = Arc<RwLock<BTreeMap<String, String>>>;
+
 pub(super) struct Account {
+    pub nicknames: Nicknames,
     pub identity: Identity,
     pub access: String,
     pub web_session: bool,
     pub baseline: u64,
     pub imported_token_hash: Option<String>,
     pub revoked: bool,
+}
+
+impl Account {
+    pub fn nickname(&self, user: &str) -> Option<String> {
+        self.nicknames
+            .read()
+            .unwrap()
+            .get(&format!("{}.{user}", self.identity.team_id))
+            .cloned()
+    }
+
+    pub fn team_nicknames(&self) -> BTreeMap<String, String> {
+        let prefix = format!("{}.", self.identity.team_id);
+        self.nicknames
+            .read()
+            .unwrap()
+            .range(prefix.clone()..)
+            .take_while(|(id, _)| id.starts_with(&prefix))
+            .map(|(id, name)| (id.clone(), name.clone()))
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -42,12 +70,6 @@ pub(super) struct PendingNotification {
     pub watch: Option<String>,
 }
 
-pub(super) struct NotificationTarget {
-    pub ts: String,
-    pub thread_ts: Option<String>,
-    pub watch_only: bool,
-}
-
 impl Cache {
     pub fn reset(&mut self, session_id: Option<Uuid>) {
         if self.session_id != session_id {
@@ -67,7 +89,6 @@ pub(super) struct Conversation {
     pub participants: Vec<String>,
     pub read_positions: ReadPositions,
     pub messages: BTreeMap<String, Message>,
-    pub notification_targets: BTreeMap<(u64, u32), NotificationTarget>,
     pub deleted: BTreeSet<String>,
     pub loaded: BTreeMap<String, bool>,
     pub journal: Option<MessageJournal>,
@@ -80,8 +101,42 @@ pub(super) struct ReadPositions {
 }
 
 impl Conversation {
-    pub fn message_result(&self, message: &Message) -> Value {
+    pub fn message_result(
+        &self,
+        message: &Message,
+        account: &Account,
+        users: Option<&UserDirectory>,
+    ) -> Value {
         let mut value = json!(message);
+        if let Some(author) = &message.author {
+            value["author"]["nickname"] = json!(account.nickname(&author.id));
+        }
+        let mut mentions = BTreeMap::new();
+        for (id, label) in message.user_references() {
+            let name = users
+                .and_then(|directory| directory.find(id))
+                .map(|profile| profile.name.trim())
+                .filter(|name| !name.is_empty() && *name != id)
+                .or_else(|| label.map(str::trim).filter(|label| !label.is_empty()));
+            mentions
+                .entry(id)
+                .and_modify(|known: &mut Option<&str>| {
+                    *known = known.or(name);
+                })
+                .or_insert(name);
+        }
+        if !mentions.is_empty() {
+            value["mentions"] = json!(
+                mentions
+                    .into_iter()
+                    .map(|(id, name)| json!({
+                        "id":format!("{}.{id}", account.identity.team_id),
+                        "name":name.unwrap_or(id),
+                        "nickname":account.nickname(id),
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
         if let Some(attachments) = value.get_mut("attachments").and_then(Value::as_array_mut) {
             for (value, item) in attachments.iter_mut().zip(&message.attachments) {
                 value["original_available"] = json!(item.download_url.is_some());
@@ -102,14 +157,19 @@ impl Conversation {
             participants: Vec::new(),
             read_positions: ReadPositions::default(),
             messages: BTreeMap::new(),
-            notification_targets: BTreeMap::new(),
             deleted: BTreeSet::new(),
             loaded: BTreeMap::new(),
             journal: None,
         }
     }
 
-    pub fn cached_replies(&self, roots: &[Message], include_other: bool) -> Vec<Value> {
+    pub fn cached_replies(
+        &self,
+        roots: &[Message],
+        include_other: bool,
+        account: &Account,
+        users: Option<&UserDirectory>,
+    ) -> Vec<Value> {
         let mut replies = BTreeMap::new();
         if let Some(disk) = &self.disk {
             for root in roots.iter().filter(|root| root.reply_count > 0) {
@@ -119,7 +179,10 @@ impl Conversation {
                     .collect();
                 items.sort_unstable_by_key(|message| timestamp(&message.ts));
                 for message in items.into_iter().rev().take(50) {
-                    replies.insert(message.ts.clone(), self.message_result(&message));
+                    replies.insert(
+                        message.ts.clone(),
+                        self.message_result(&message, account, users),
+                    );
                 }
             }
         }
@@ -127,10 +190,56 @@ impl Conversation {
             if let Some(thread) = &message.thread_ts
                 && (include_other || roots.iter().any(|root| &root.ts == thread))
             {
-                replies.insert(message.ts.clone(), self.message_result(message));
+                replies.insert(
+                    message.ts.clone(),
+                    self.message_result(message, account, users),
+                );
             }
         }
         replies.into_values().collect()
+    }
+
+    pub fn unread_messages<'a>(
+        &'a self,
+        account: &'a Account,
+    ) -> impl Iterator<Item = &'a Message> {
+        self.messages
+            .values()
+            .filter(|message| self.read_positions.unread(message, account))
+    }
+
+    pub fn display_title(&self, account: &Account, users: Option<&UserDirectory>) -> String {
+        if self.kind == "im" {
+            if let Some(user) = self
+                .participants
+                .iter()
+                .find(|id| *id != &account.identity.user_id)
+            {
+                return account.nickname(user).unwrap_or_else(|| self.title.clone());
+            }
+        }
+        if self.kind == "mpim" {
+            let participants: Vec<_> = self
+                .participants
+                .iter()
+                .filter(|id| *id != &account.identity.user_id)
+                .map(|id| (id, account.nickname(id)))
+                .collect();
+            if participants.iter().any(|(_, nickname)| nickname.is_some()) {
+                return participants
+                    .into_iter()
+                    .map(|(id, nickname)| {
+                        nickname.unwrap_or_else(|| {
+                            users
+                                .and_then(|directory| directory.find(id))
+                                .map_or_else(|| id.clone(), |profile| profile.name.clone())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("、");
+            }
+        }
+        self.title.clone()
     }
 
     pub fn summarize(&self, account: &Account) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
@@ -138,16 +247,13 @@ impl Conversation {
             .messages
             .values()
             .max_by_key(|message| timestamp(&message.ts));
-        let mut unread: Vec<_> = self
-            .messages
-            .values()
-            .filter(|message| self.read_positions.unread(message, account))
-            .collect();
+        let mut unread: Vec<_> = self.unread_messages(account).collect();
         unread.sort_by_key(|message| timestamp(&message.ts));
         let mention = unread
             .iter()
             .rev()
             .find(|message| message.mentions(&account.identity.user_id));
+        let preview = latest.map(|message| message.preview(|id| account.nickname(id)));
         let participants: Vec<_> = self
             .participants
             .iter()
@@ -162,10 +268,11 @@ impl Conversation {
                 "participant_ids":participants,
                 "last_activity_ts":latest.map(|message| &message.ts),
                 "history_loaded":self.loaded.contains_key(""),
-                "preview":latest.map(Message::preview),
+                "preview":preview,
                 "last_message":latest.map(|message| json!({"author":message.author.as_ref().map(|author| json!({
-                    "id":format!("{}.{}", account.identity.team_id, author.id),"name":author.name})),
-                    "ts":message.ts,"preview":message.preview()})),
+                    "id":format!("{}.{}", account.identity.team_id, author.id),"name":author.name,
+                    "nickname":account.nickname(&author.id)})),
+                    "ts":message.ts,"preview":preview})),
                 "unread_count":unread.len(),
                 "last_unread_mention_ts":mention.map(|message| &message.ts),
                 "first_unread":unread.first().map(|message| json!({"ts":message.ts, "thread_ts":message.thread_ts}))
@@ -213,9 +320,6 @@ impl Conversation {
             return;
         }
         let removed = self.messages.remove(ts);
-        if let Some(order) = timestamp(ts) {
-            self.notification_targets.remove(&order);
-        }
         let thread = removed
             .and_then(|message| message.thread_ts)
             .or_else(|| thread.map(str::to_owned))
@@ -232,7 +336,9 @@ impl Conversation {
     }
 
     pub fn update_reply_count(&mut self, ts: &str, count: u64) {
-        if let Some(parent) = self.messages.get(ts) && parent.reply_count < count {
+        if let Some(parent) = self.messages.get(ts)
+            && parent.reply_count < count
+        {
             let mut parent = parent.clone();
             parent.reply_count = count;
             self.ingest(parent);

@@ -74,6 +74,12 @@ final class NotificationReceiptTests: XCTestCase {
         } catch is URLError {}
         XCTAssertEqual(presented, 1)
         XCTAssertEqual(reported, [.submitted])
+        do {
+            try await delivery.handle(url)
+            XCTFail("应返回重投后的回执网络错误")
+        } catch is URLError {}
+        XCTAssertEqual(presented, 1)
+        XCTAssertEqual(reported, [.submitted, .submitted])
 
         let denied = NotificationDelivery(present: { _ in throw SystemNotificationError.permissionDenied }, report: { _, receipt in reported.append(receipt) })
         try await denied.handle(url)
@@ -131,7 +137,7 @@ final class NotificationReceiptTests: XCTestCase {
         let session = try XCTUnwrap(UUID(uuidString: "550e8400-e29b-41d4-a716-446655440000"))
         let conversation = SlackNewConversation(
             id: "TTEAM.CWORK", title: "产品讨论", teamName: "工作区",
-            sessionID: session, callback: "/slack/conversations/TTEAM.CWORK/open?message_ts=200.2&thread_ts=200.1"
+            sessionID: session, callback: "/slack/conversations/TTEAM.CWORK/open?message_ts=200.2&thread_ts=200.1", unreadCount: 3
         )
         let stub = ReceiptStub(statuses: [200])
         let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })

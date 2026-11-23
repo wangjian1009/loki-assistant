@@ -26,7 +26,7 @@ pub fn router(service: Arc<NotificationService>) -> Router {
     path = "/notification/{id}",
     access = "paired",
     summary = "查询系统通知处理状态",
-    description = "协议版本 1：查询 forwarded、submitted、failed 或 unconfirmed；记录保留 15 分钟，services 重启后失效。"
+    description = "查询 unconfirmed 或 confirmed；未确认记录跨重启保留。"
 )]
 async fn status(
     State(service): State<Arc<NotificationService>>,
@@ -41,9 +41,8 @@ async fn status(
     id = "receipt",
     method = "POST",
     path = "/notification/{id}/receipt",
-    access = "paired",
     summary = "接收系统通知回执",
-    description = "协议版本 1：接收 submitted 或带 code、message 的 failed；相同回执幂等，冲突返回 409。"
+    description = "接收本机托盘回执。submitted 确认通知，failed 保留待确认记录。"
 )]
 async fn receipt(
     State(service): State<Arc<NotificationService>>,
@@ -66,14 +65,9 @@ pub(crate) fn error_response(error: NotificationError) -> Response {
             "invalid-request",
             ErrorSource::Services,
         ),
-        NotificationError::Launch(_) => (
-            StatusCode::BAD_GATEWAY,
-            "notification-failed",
-            ErrorSource::Services,
-        ),
-        NotificationError::Timeout => (
-            StatusCode::GATEWAY_TIMEOUT,
-            "notification-timeout",
+        NotificationError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "notification-storage-error",
             ErrorSource::Services,
         ),
         NotificationError::NotFound => (

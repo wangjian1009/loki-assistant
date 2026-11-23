@@ -4,9 +4,9 @@
 
 当前 Mac 应用是最小的菜单栏入口。点击菜单栏图标后，菜单显示控制中心 services 的连接状态、版本、网络连接状态和启动时间；启动时间与网络连接状态来自每次打开菜单时读取的完整 ~GET /status~ 快照，其中启动时间读取 ~service~ 数据中的 ~start_at~ ，不逐秒更新运行时长。services 不可达时显示不可用状态。
 
-每次打开菜单时，应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，只请求一次 ~GET /status~ 。同一快照用于刷新启动时间、网络连接状态和 Slack 新消息会话。顶部图标保持单色，只有菜单第一项圆点着色：服务未运行或不可达为红色，注册失败、断开或连接中为黄色，注册成功和未配置的 ~offline~ 为绿色。services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。
+每次打开菜单时，应用先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ 获取服务端口，只请求一次 ~GET /status~ 。同一快照用于刷新启动时间、网络连接状态和 Slack 未读会话。顶部图标保持单色，只有菜单第一项圆点着色：服务未运行或不可达为红色，注册失败、断开或连接中为黄色，注册成功和未配置的 ~offline~ 为绿色。services 的启动和停止由 ~brew services~ 或根目录 Makefile 管理。
 
-「Slack 新消息」显示符合通知规则且仍未读的会话，按最新匹配消息从新到旧排列。每行显示会话名和工作区，点击后在 Emacs 定位消息或线程。 [[file:../../docs/slack-services.org::*托盘新消息会话][Slack 状态和跳转协议]]
+「Slack 未读会话」显示已有未读消息的会话，按最新未读消息从新到旧排列。每行显示会话名、工作区和未读数，点击后在 Emacs 定位消息或线程。 [[file:../../docs/slack-services.org::*托盘未读会话][Slack 状态和跳转协议]]
 
 菜单中的“阻止空闲休眠”开关使用 macOS 的 ~PreventUserIdleSystemSleep~ activity。开启后阻止系统因空闲自动休眠，关闭后立即释放 activity；开关状态保存到用户默认设置并在应用下次启动时恢复。该开关不阻止用户主动睡眠、合盖或锁屏。
 
@@ -16,9 +16,9 @@
 
 通过 ~loki-assistant~ URL scheme 后台接收通知；运行新版应用后由 LaunchServices 注册该 scheme。macOS 禁止通知或启用勿扰模式时可能不显示横幅，权限与处理错误记录在系统日志中。
 
-收到带 ~notification_id~ 的通知时，应用将提交成功或明确失败的结果回报 services；提交成功不保证系统已经展示横幅。回执通过文件锁、服务发现文件和健康检查获取当前本机 HTTP 地址，网络错误时最多尝试 3 次；只重试回执，不重复发送通知。未知或已过期的通知停止回报。旧版不含 ID 的 URL 仍可展示通知，但没有回执。状态通过 ~/notification/{id}~ 查询，回执发往 ~/notification/{id}/receipt~ ，保留期限见系统通知模块协议。点击跳转每次重新发现服务，调用一次业务回调；成功或失败写入系统日志，不覆盖提交回执。失败时弹窗显示 services 返回的具体原因，例如目标 buffer 已关闭、无法连接目标 Emacs 或调用超时；services 不可用时也会提示。旧通知沿用相同流程，不在 App 中启动 Emacs。
+菜单栏应用成功向 macOS 提交通知后，通过 ~/notification/{id}/receipt~ 确认。提交失败时回报错误，services 保留未确认记录并重试。重复转交同一个 ID 时，应用检查已有提交记录并补发回执。点击时通过本机 services 调用业务回调，失败时显示具体原因。 [[file:../../docs/control-center-services.org::*系统通知模块][通知状态和回执协议]]
 
-“设置”请求 services 的 ~POST /emacs/apps/open?app=config~ ；“日志”请求 ~POST /emacs/apps/open?app=logs~ ，打开 ~~/.assistant/loki-assistant.log.org~ 。托盘菜单打开、设置和日志均写入 Org 日志；一级标题是用户操作，二级标题是本次操作的 services 调用，文件最多保留 500 条一级操作。应用不存在、服务不可用或 Emacs 出错时，弹窗显示服务返回的具体原因。界面用法见 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]。
+「设置」通过 ~POST /emacs/apps/open?app=config~ 打开 Emacs 配置界面。托盘操作记录在 ~~/.assistant/loki-assistant.log.org~ ，最多保留最近 500 条一级操作。 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]
 
 * 应用图标
 
@@ -63,4 +63,4 @@ make restart-center
 make test-mac
 #+end_src
 
-测试覆盖 services 健康响应、状态模型、设置和日志入口的 gateway 调用与错误反馈、托盘日志的 Org 层级和 500 条上限、通知 URL 解码和展示内容、回执分类、服务发现及回执重试，不要求 services 正在运行，也不发送真实系统通知。
+测试覆盖 services 健康响应、状态模型、设置入口的 gateway 调用与错误反馈、托盘日志的 Org 层级和 500 条上限、通知 URL 解码和展示内容、回执分类、服务发现及回执重试，不要求 services 正在运行，也不发送真实系统通知。

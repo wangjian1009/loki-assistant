@@ -16,7 +16,7 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::{fs, io, path::Path, sync::Arc};
 
 use axum::Router;
 use loki_services_macros::loki_config;
@@ -35,6 +35,21 @@ use crate::modules::{
 
 pub use projects::Projects;
 
+pub(crate) fn migrate_legacy_cache(cache: &Path) -> io::Result<()> {
+    let legacy = cache.join("slack");
+    let target = cache.join("assistant/slack");
+    let metadata = match fs::symlink_metadata(&legacy) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() && !target.try_exists()? {
+        fs::create_dir_all(cache.join("assistant"))?;
+        fs::rename(legacy, target)?;
+    }
+    Ok(())
+}
+
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
     id: "slack",
@@ -44,6 +59,7 @@ static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
 };
 
 const TEAM_NOTIFICATION_ENDPOINT: &str = "/slack/config/teams";
+const NICKNAMES: &str = "nicknames";
 const WATCHES: &str = "watches";
 const CACHE_RETENTION_DAYS: &str = "cache_retention_days";
 const DEFAULT_CACHE_RETENTION_DAYS: u64 = 30;
@@ -181,6 +197,40 @@ static WATCH_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     },
 };
 
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static NICKNAME_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: "slack",
+    key: NICKNAMES,
+    options: || ConfigItemOptions {
+        read_only: true,
+        structure: Some(StructureMetadata {
+            id_field: Some("id".into()),
+            label_field: Some("nickname".into()),
+            add_label: None,
+            legacy_dictionary: None,
+            type_name: "SlackNickname".into(),
+            show_all_fields: false,
+            fields: [
+                ("id", "用户 ID", ConfigDataType::Key),
+                ("nickname", "昵称", ConfigDataType::String),
+            ]
+            .into_iter()
+            .map(|(key, label, data_type)| StructureField {
+                key: key.into(),
+                label: label.into(),
+                data_type,
+                required: true,
+                default_template: None,
+                checker: None,
+                read_only: false,
+                options: None,
+            })
+            .collect(),
+        }),
+        ..ConfigItemOptions::default()
+    },
+};
+
 #[loki_config]
 fn slack_configuration() -> ConfigModuleMetadata {
     ConfigModuleMetadata {
@@ -209,6 +259,23 @@ fn slack_configuration() -> ConfigModuleMetadata {
             key: WATCHES.into(),
             name: "关注的主题聊天".into(),
             description: "由 Slack 模块通过主题聊天的关注操作维护。".into(),
+            data_type: ConfigDataType::List,
+            remote_access: ConfigRemoteAccess::Local,
+            required: false,
+            default: Some(serde_json::json!([])),
+            dictionary: None,
+            list: Some(ListMetadata {
+                item_type: ConfigDataType::Structure,
+                min_items: None,
+                max_items: None,
+            }),
+            checker: None,
+            file_path: None,
+            executable: None,
+        }, ConfigItemMetadata {
+            key: NICKNAMES.into(),
+            name: "用户昵称".into(),
+            description: "按 Slack 工作区和用户 ID 保存的本机昵称。".into(),
             data_type: ConfigDataType::List,
             remote_access: ConfigRemoteAccess::Local,
             required: false,

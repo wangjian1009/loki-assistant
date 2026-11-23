@@ -365,7 +365,7 @@ async fn http_preserves_existing_routes_with_versioned_json() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["module_id"], "emacs");
-    assert_eq!(body["result"]["status"], "forwarded");
+    assert_eq!(body["result"]["status"], "unconfirmed");
     assert_eq!(body["result"]["display"], "macos");
     assert_eq!(body["result"]["activation"], "emacs");
     assert!(uuid::Uuid::parse_str(body["result"]["notification_id"].as_str().unwrap()).is_ok());
@@ -506,8 +506,12 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
             assert_eq!(open_app["method"], "POST");
             assert_eq!(open_app["path"], "/emacs/apps/open");
             assert!(open_app["description"].as_str().unwrap().contains("app"));
-            let slack = body["apis"].as_array().unwrap().iter()
-                .find(|api| api["id"] == "activate-slack").unwrap();
+            let slack = body["apis"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|api| api["id"] == "activate-slack")
+                .unwrap();
             assert_eq!(slack["path"], "/emacs/slack/activate");
             assert_eq!(slack["access"], "local");
             let notification = body["apis"]
@@ -579,7 +583,7 @@ async fn notification_forwards_content_without_running_emacs_lisp() {
 }
 
 #[tokio::test]
-async fn notification_reports_launch_failure_as_json_error() {
+async fn notification_remains_unconfirmed_when_the_tray_cannot_be_reached() {
     let config = Arc::new(ConfigService::new(test_metadata()));
     let service = Arc::new(EmacsService::with_runner(
         EmacsConfig::new(config),
@@ -598,8 +602,8 @@ async fn notification_reports_launch_failure_as_json_error() {
         serde_json::to_value(notification("emacs")).unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["error"]["code"], "notification-failed");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["status"], "unconfirmed");
 }
 
 #[tokio::test]
@@ -619,7 +623,7 @@ async fn notification_receipts_are_queryable_idempotent_and_terminal() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         state,
-        json!({"api_version":"1", "notification_id":id, "status":"forwarded"})
+        json!({"api_version":"1", "notification_id":id, "status":"unconfirmed"})
     );
     for _ in 0..2 {
         let (status, state) = request(
@@ -630,7 +634,7 @@ async fn notification_receipts_are_queryable_idempotent_and_terminal() {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(state["status"], "submitted");
+        assert_eq!(state["status"], "confirmed");
     }
     let (status, body) = request(
         service.clone(),
@@ -642,7 +646,7 @@ async fn notification_receipts_are_queryable_idempotent_and_terminal() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "notification-receipt-conflict");
     let (_, state) = request(service, "GET", &path, Value::Null).await;
-    assert_eq!(state["status"], "submitted");
+    assert_eq!(state["status"], "confirmed");
     assert!(runner.calls.lock().unwrap().is_empty());
 }
 
@@ -668,7 +672,7 @@ async fn failed_receipt_preserves_details_and_rejects_unknown_or_invalid_results
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["code"], "permission-denied");
         assert_eq!(body["message"], "请允许通知");
-        assert_eq!(body["status"], "failed");
+        assert_eq!(body["status"], "unconfirmed");
     }
     let unknown = "/emacs/receiver/notification/550e8400-e29b-41d4-a716-446655440000";
     for (method, path, body) in [
@@ -724,7 +728,7 @@ async fn registers_before_forwarding_and_preserves_early_receipt() {
     let id = result["notification_id"].as_str().unwrap();
     assert_eq!(
         service.notification_status(id).await.unwrap().status,
-        notification::protocol::NotificationStatus::Submitted
+        notification::protocol::NotificationStatus::Confirmed
     );
 }
 
@@ -1016,7 +1020,10 @@ async fn activates_slack_through_emacs_dispatch() {
     let (service, runner, _) = service(vec![Ok(wire(json!({"result":"t"})))]);
     let (status, body) = request(service, "POST", "/emacs/slack/activate", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"api_version":"1", "app":"slack", "opened":true}));
+    assert_eq!(
+        body,
+        json!({"api_version":"1", "app":"slack", "opened":true})
+    );
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert!(calls[0].1[3].contains("loki-assistant-dispatch-activate-slack"));

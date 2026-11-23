@@ -149,6 +149,26 @@ impl Drop for Directory {
     }
 }
 
+#[test]
+fn moves_legacy_cache_with_read_positions_and_keeps_existing_target() {
+    let directory = Directory::new();
+    let legacy = directory.0.join("slack");
+    let target = directory.0.join("assistant/slack");
+    let room = "TTEAM/conversations/CWORK";
+    fs::create_dir_all(legacy.join(room)).unwrap();
+    fs::write(legacy.join(room).join("info.txt"), "原有已读位置").unwrap();
+
+    super::migrate_legacy_cache(&directory.0).unwrap();
+    assert!(!legacy.exists());
+    let info = target.join(room).join("info.txt");
+    assert_eq!(fs::read_to_string(&info).unwrap(), "原有已读位置");
+
+    fs::create_dir(&legacy).unwrap();
+    super::migrate_legacy_cache(&directory.0).unwrap();
+    assert!(legacy.is_dir());
+    assert_eq!(fs::read_to_string(&info).unwrap(), "原有已读位置");
+}
+
 struct Mock {
     socket: String,
     root: String,
@@ -733,7 +753,11 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let conversations = read_status().await;
     assert_eq!(conversations.as_array().unwrap().len(), 1);
     assert_eq!(conversations[0]["id"], "TTEAM.DDIRECT");
-    assert_eq!(conversations[0]["callback"], callback.as_ref());
+    assert_eq!(conversations[0]["unread_count"], 2);
+    assert_eq!(
+        conversations[0]["callback"],
+        format!("/slack/conversations/TTEAM.DDIRECT/open?message_ts={}&thread_ts={}", mock.reply, mock.root)
+    );
     assert_eq!(conversations[0]["team_name"], "工作区");
     assert_eq!(conversations[0]["session_id"], json!(session));
 
@@ -1232,6 +1256,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             format!("/slack/conversations/TTEAM.CWORK/open?message_ts={mention_ts}"),
         ]
     );
+    let before_unwatch = read_status().await;
     let disabled = invoke(
         &app,
         "PUT",
@@ -1247,7 +1272,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         invoke(&app, "GET", list_path, None, None, None).await.2["items"],
         json!([])
     );
-    assert_eq!(read_status().await[0]["callback"], callbacks[2]);
+    assert_eq!(read_status().await, before_unwatch);
     for event in [
         json!({"type":"message","channel":"CWORK","ts":format!("{now}.300001"),
                "user":"UYOU","text":"取消关注后的普通消息"}),
@@ -1307,8 +1332,25 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     })
     .await
     .unwrap();
+    let submitted: Vec<_> = alerts.attempts.lock().unwrap()[..6]
+        .iter()
+        .map(|alert| alert.notification_id.clone())
+        .collect();
+    for id in submitted {
+        notification
+            .receive_receipt(
+                &id,
+                crate::modules::notification::protocol::NotificationReceipt::Submitted {},
+            )
+            .await
+            .unwrap();
+    }
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let retry_worker = tokio::spawn({
+        let notification = Arc::clone(&notification);
+        async move { notification.retry_pending().await }
+    });
     tokio::time::resume();
     timeout(Duration::from_secs(3), async {
         while alerts.attempts.lock().unwrap().len() < 8 {
@@ -1320,9 +1362,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     {
         let attempts = alerts.attempts.lock().unwrap();
         assert_eq!(attempts[6].body.as_deref(), Some("林舟 · 原始告警"));
+        assert_eq!(attempts[6].notification_id, attempts[7].notification_id);
         assert_eq!(attempts[6].body, attempts[7].body);
         assert_eq!(attempts[6].navigation_url, attempts[7].navigation_url);
     }
+    retry_worker.abort();
+    let _ = retry_worker.await;
     assert_eq!(
         read_status().await[0]["callback"],
         format!("/slack/conversations/TTEAM.CWORK/open?message_ts={retry_ts}")
@@ -1337,8 +1382,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    // 顶层已读位置不影响先前的线程提及，取消关注只移除依赖关注的消息。
-    assert_eq!(read_status().await[0]["callback"], callback.as_ref());
+    // 顶层已读后，尚未阅读的线程仍列在托盘中。
+    let unread = read_status().await;
+    let channel = unread.as_array().unwrap().iter().find(|row| row["id"] == "TTEAM.CWORK").unwrap();
+    assert!(channel["callback"].as_str().unwrap().contains("&thread_ts="));
     let (code, _, _) = invoke(
         &app,
         "PUT",
@@ -1349,8 +1396,26 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    assert_eq!(read_status().await.as_array().unwrap().len(), 1);
-    assert_eq!(read_status().await[0]["id"], "TTEAM.DDIRECT");
+    // 另一条线程仍有未读消息，推进对应线程的已读位置后移除。
+    let unread = read_status().await;
+    let channel = unread.as_array().unwrap().iter().find(|row| row["id"] == "TTEAM.CWORK").unwrap();
+    assert_eq!(channel["callback"], format!("/slack/conversations/TTEAM.CWORK/open?message_ts={reply}&thread_ts=1.0"));
+    let (code, _, _) = invoke(
+        &app, "PUT", "/slack/conversations/TTEAM.CWORK/threads/1.0/read-position",
+        session, None, Some(json!({"through_ts":reply})),
+    ).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(read_status().await, json!([]));
+    let cached_unread = format!("{now}.400000");
+    let saved = cached_unread.clone();
+    service.update_cache(session.unwrap(), move |cache, _| {
+        let message = super::protocol::Message::from_slack(
+            &json!({"ts":saved,"text":"历史普通消息","user":"UYOU"}), None
+        ).unwrap();
+        cache.conversations.get_mut("CWORK").unwrap().ingest(message);
+        Ok(())
+    }).await.unwrap();
+    assert_eq!(read_status().await[0]["unread_count"], 1);
     projects.stop().await;
     worker.await.unwrap();
 
@@ -1359,6 +1424,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let service = ready_service(&projects, "TTEAM").await;
     let fresh_session = service.session_id().await;
     assert_ne!(fresh_session, session);
+    let unread_after_restart = invoke(&app, "GET", "/status/slack/new_conversations", None, None, None).await.2;
+    assert_eq!(unread_after_restart["value"][0]["id"], "TTEAM.CWORK");
+    assert_eq!(unread_after_restart["value"][0]["unread_count"], 1);
+    assert_eq!(unread_after_restart["value"][0]["callback"],
+        format!("/slack/conversations/TTEAM.CWORK/open?message_ts={cached_unread}"));
+
     let (status, _, error) = invoke(&app, "GET", &download_path, fresh_session, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["error"]["code"], "slack-download-not-found");
@@ -1809,7 +1880,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
 
     assert!(teams.get("actions").is_none());
     let items = module["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 4);
     let watches = items.iter().find(|item| item["key"] == "watches").unwrap();
     assert_eq!(watches["read_only"], true);
     assert_eq!(watches["structure"]["type_name"], "SlackWatch");
@@ -2027,6 +2098,42 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(users["items"][3]["id"], "TBETA.U2");
     assert_eq!(users["items"].as_array().unwrap().len(), 4);
     assert!(users.get("next_cursor").is_none());
+
+    let nickname_path = "/slack/users/TALPHA.U2/nickname";
+    for malformed in [json!({}), json!({"nickname":42}), json!({"nickname":"两行\n名字"})] {
+        let status = invoke(&app, "PUT", nickname_path, None, None, Some(malformed)).await.0;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (code, _, set) = invoke(&app, "PUT", nickname_path, None, None,
+        Some(json!({"nickname":" 小林 "}))).await;
+    assert_eq!(code, StatusCode::OK, "{set}");
+    assert_eq!(set["user"]["name"], "林舟");
+    assert_eq!(set["user"]["nickname"], "小林");
+    let persisted = ConfigService::load(&config_path).unwrap().value("slack", "nicknames").await.unwrap();
+    assert_eq!(persisted.value, json!([{"id":"TALPHA.U2","nickname":"小林"}]));
+    let users = invoke(&app, "GET", "/slack/users?id=TALPHA.U2&id=TBETA.U2", None, None, None).await.2;
+    assert_eq!(users["items"][0]["nickname"], "小林");
+    assert!(users["items"][1]["nickname"].is_null());
+    let timeline = invoke(&app, "GET", "/slack/conversations/TALPHA.DSHARED/messages", None, None, None).await.2;
+    assert_eq!(timeline["items"][0]["author"]["nickname"], "小林");
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let picker = invoke(&app, "GET", "/slack/conversations/picker", None, None, None).await.2;
+            if let Some(room) = picker["items"].as_array().unwrap().iter()
+                .find(|room| room["id"] == "TALPHA.DSHARED" && room["title"] == "小林") {
+                assert_eq!(room["participants"][0]["nickname"], "小林");
+                assert_eq!(room["last_message"]["author_name"], "小林");
+                assert!(room["search_terms"].as_array().unwrap().iter().any(|term| term == "小林"));
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    let (code, _, cleared) = invoke(&app, "PUT", nickname_path, None, None,
+        Some(json!({"nickname":null}))).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(cleared["user"]["nickname"].is_null());
+
 
     for query in [
         "id=".to_owned(),
@@ -2623,6 +2730,43 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     upstream.abort();
 }
 
+fn test_display_account() -> super::store::Account {
+    super::store::Account {
+        nicknames: Default::default(),
+        identity: super::protocol::Identity {
+            session_id: Uuid::new_v4(), team_id: "TTEAM".into(),
+            user_id: "UME".into(), team_name: "工作区".into(),
+        },
+        access: String::new(), web_session: true, baseline: 0, imported_token_hash: None, revoked: false,
+    }
+}
+
+#[test]
+fn message_mentions_embed_user_directory_names_and_ids() {
+    use super::{mailbox::UserDirectory, protocol::Message, store::Conversation};
+
+    let profile = serde_json::from_value(json!({
+        "id":"TTEAM.UYOU","team_id":"TTEAM","name":"林舟","is_bot":false
+    })).unwrap();
+    let users = UserDirectory::from_disk(Uuid::new_v4(), vec![profile]);
+    let message = Message::from_slack(&json!({
+        "ts":"100.000001", "text":"交给 <@UYOU> 和 <@WOTHER|替补>，代码 `<@UCODE>`",
+        "blocks":[{"type":"section","fields":[
+            {"type":"mrkdwn","text":"复核 <@UYOU>"},
+            {"type":"plain_text","text":"<@ULITERAL>"}
+        ]}]
+    }), None).unwrap();
+    let account = test_display_account();
+    account.nicknames.write().unwrap().insert("TTEAM.UYOU".into(), "小林".into());
+    let result = Conversation::new("CWORK", "public_channel", "产品讨论")
+        .message_result(&message, &account, Some(&users));
+    assert_eq!(result["text"], message.text);
+    assert_eq!(result["mentions"], json!([
+        {"id":"TTEAM.UYOU","name":"林舟","nickname":"小林"},
+        {"id":"TTEAM.WOTHER","name":"替补","nickname":null}
+    ]));
+}
+
 #[test]
 fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     use super::{
@@ -2631,6 +2775,7 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     };
 
     let account = Account {
+        nicknames: Default::default(),
         identity: Identity {
             session_id: Uuid::nil(),
             team_id: "TTEAM".into(),

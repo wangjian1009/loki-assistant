@@ -427,7 +427,7 @@ GET /password/entries/example.com/alice.gpg
 {"api_version":"1","module_id":"service","value":{"start_at":1795074000,"name":"工作电脑","device_type":"computer"},"updated_at":1795074000}
 #+end_src
 
-启动时间是响应字段，不把 ~start_at~ 附加在服务详情查询路径中。网络模块允许多个节点，保留 ~network/{节点}/status~ 层级，当前本机节点为 ~my~ 。托盘每次打开菜单时只请求一次 ~GET /status~ ，使用同一快照刷新启动时间、网络状态和 Slack 新消息会话。 [[file:slack-services.org::*托盘新消息会话][Slack 新消息会话]]
+启动时间是响应字段，不把 ~start_at~ 附加在服务详情查询路径中。网络模块允许多个节点，保留 ~network/{节点}/status~ 层级，当前本机节点为 ~my~ 。托盘每次打开菜单时只请求一次 ~GET /status~ ，使用同一快照刷新启动时间、网络状态和 Slack 未读会话。 [[file:slack-services.org::*托盘未读会话][Slack 未读会话]]
 
 ** 状态结构声明
 
@@ -605,7 +605,7 @@ Emacs 模块将应用标识映射到固定入口，通过已有 gateway 连接�
 默认处理器将 ~buffer~ 转换为 ~/emacs/activate?buffer=...~ 回调路径，省略时使用 ~/emacs/activate~ 。未收到 ~app~ 或收到 ~null~ 时，Emacs 模块将 ~app~ 补为 ~emacs~ 后提交通知模块；显式 ~app~ 按原值传递。center 按应用标识读取内置的 ~NotificationAppIcons/<app>.png~ ，已打包 ~emacs.png~ ，以 PNG 附件展示 Emacs 图标。~body~ 未提供时默认显示“点击显示 Emacs”。业务通知通过 ~NotificationService::send~ 发送，发送阶段不连接 Emacs 或执行 Lisp，避免同步上报期间回调 Emacs。
 
 #+begin_src json
-{"api_version":"1","module_id":"emacs","result":{"display":"macos","status":"forwarded","activation":"emacs","notification_id":"550e8400-e29b-41d4-a716-446655440000"}}
+{"api_version":"1","module_id":"emacs","result":{"display":"macos","status":"unconfirmed","activation":"emacs","notification_id":"550e8400-e29b-41d4-a716-446655440000"}}
 #+end_src
 
 发送响应保持原有包装，ID 位于 ~result.notification_id~ ；如应用提前回执，~status~ 可以直接反映已收到的结果。通知回执、保留期限和通用代码接口见下文“系统通知模块”。旧的 ~GET /emacs/receiver/notification/{id}~ 和 ~POST /emacs/receiver/notification/{id}/receipt~ 继续代理同一个通知模块，客户端应优先使用 ~/notification/{id}~ 及其回执接口。
@@ -668,18 +668,18 @@ Emacs 包提供异步通知函数，内部读取 services pfile 并复用通用 
 | 404 | ~buffer-not-found~ | 激活目标 buffer 已关闭 |
 | 404 | ~app-not-found~ | Emacs 应用未注册或目标 Emacs 未安装对应应用 |
 | 404 | ~notification-handler-not-found~ | 目标模块没有处理器 |
-| 404 | ~notification-not-found~ | 通知 ID 未知、过期或 services 已重启 |
+| 404 | ~notification-not-found~ | 通知 ID 未知或确认记录已过期 |
 | 409 | ~notification-handler-exists~ | Rust 接口重复注册处理器 |
-| 409 | ~notification-receipt-conflict~ | 通知已有不同的明确处理结果 |
+| 409 | ~notification-receipt-conflict~ | 已确认的通知收到失败回执 |
 | 422 | ~lisp-error~ | Lisp 读取或求值失败 |
 | 500 | ~invalid-config~ | 无法读取有效的 Emacs 配置 |
 | 502 | ~emacsclient-failed~ | 子进程失败，说明包含退出码与 stderr 或 stdout |
 | 502 | ~invalid-emacs-response~ | 子进程成功退出但响应无法解析 |
-| 502 | ~notification-failed~ | 系统通知转交失败或自定义处理器报告失败 |
+| 502 | ~notification-failed~ | 自定义处理器报告失败 |
 | 503 | ~emacs-unavailable~ | 无法执行 emacsclient |
-| 503 | ~notification-capacity-exceeded~ | 内存通知记录已满，稍后重试 |
+| 503 | ~notification-storage-error~ | 无法写入或移除未确认缓存 |
+| 503 | ~notification-capacity-exceeded~ | 未确认队列已满，稍后重试 |
 | 504 | ~emacs-timeout~ | 外部进程或通知处理器等待超时 |
-| 504 | ~notification-timeout~ | 通知模块的平台转交等待超时 |
 
 * 系统通知模块
 
@@ -714,36 +714,26 @@ services 通过独立参数调用 ~/usr/bin/open -g~ ，将通知 JSON 编码到
 
 ** 通知回执与状态查询
 
-通知模块在转交前生成随机 UUID ~notification_id~ 并登记到内存，再将 ID 连同展示内容和通用跳转 URL 交给菜单栏应用。状态不依赖 Emacs 模块。即使应用在发送返回前完成回执，结果也不会丢失或被覆盖。
+通知模块生成随机 UUID ~notification_id~ ，在 ~~/.cache/assistant/notification/<id>.json~ 原子写入未确认记录，再将同一 ID 和展示内容交给菜单栏应用。services 启动时恢复未确认记录，转交失败或等待回执时以同一 ID 重试。
 
-~GET /notification/{id}~ 返回带协议版本的当前状态：
+~GET /notification/{id}~ 返回带协议版本的当前状态。
 
 #+begin_src json
-{"api_version":"1","notification_id":"550e8400-e29b-41d4-a716-446655440000","status":"submitted"}
+{"api_version":"1","notification_id":"550e8400-e29b-41d4-a716-446655440000","status":"confirmed"}
 #+end_src
 
 | status | 含义 |
 |--------+------|
-| ~forwarded~ | 已登记并开始转交，尚未收到应用回执；发送接口成功返回表示 LaunchServices 已接受转交 |
-| ~submitted~ | 应用调用 ~UNUserNotificationCenter.add~ 成功，已提交给系统通知中心，不保证横幅展示或用户已经看到 |
-| ~failed~ | 应用明确报告授权、解析或提交失败，同时返回 ~code~ 和 ~message~ |
-| ~unconfirmed~ | 自登记起 30 秒内未收到回执，处理结果未知；等待用户授权也可能出现此状态 |
+| ~unconfirmed~ | 已写入队列，等待菜单栏应用提交和回执。有失败回执时可附带最近一次的 ~code~ 和 ~message~ 。 |
+| ~confirmed~ | 菜单栏应用已成功提交给 macOS 系统通知中心。横幅是否出现由 macOS 决定。 |
 
-菜单栏应用通过 ~POST /notification/{id}/receipt~ 回报结果。成功请求体为 ~{"status":"submitted"}~ ，失败示例如下：
+菜单栏应用通过本机 ~POST /notification/{id}/receipt~ 回报结果。 ~UNUserNotificationCenter.add~ 成功后发送 ~{"status":"submitted"}~ 。services 收到成功回执后移除缓存文件，返回 ~confirmed~ 。重复成功回执幂等。授权、解析或提交失败时回报 ~failed~ 和非空的 ~code~ 、 ~message~ ，通知仍等待确认。已确认的通知收到失败回执时返回 HTTP 409 ~notification-receipt-conflict~ 。
 
-#+begin_src json
-{"status":"failed","code":"permission-denied","message":"请在 macOS 系统设置中允许 Loki的助理 发送通知"}
-#+end_src
+未确认记录保留到收到成功回执，队列最多 1024 条。已确认状态在内存中保留 15 分钟，容量最多 1024 条。未知 ID 和过期的确认记录返回 HTTP 404 ~notification-not-found~ 。
 
-允许回报的状态仅为 ~submitted~ 和 ~failed~ ；失败时 ~code~、~message~ 必须为非空字符串。应用使用 ~invalid-payload~、~permission-denied~ 和 ~notification-submit-failed~ 区分数据、权限和系统提交错误。成功接收回执返回 HTTP 200，响应结构与状态查询相同。相同内容的重复回执幂等；已经有明确结果后，冲突回执返回 HTTP 409 ~notification-receipt-conflict~ ，不覆盖原结果。
+应用通过文件锁、pfile 和健康检查发现当前 services 地址。回执网络错误最多尝试 3 次。应用处理同一通知 ID 的重试时，先检查本次运行中已提交但未确认的记录，再检查系统通知中心中的待展示和已展示通知，已有提交记录时只补发回执。若应用重启且该通知已从系统通知中心移除，重试可能再次提交。
 
-记录自登记起保留 15 分钟，不因查询或重复回执续期；访问时清理过期记录，最多保留 1024 条，满额时新的系统通知返回 HTTP 503 ~notification-capacity-exceeded~ 。~unconfirmed~ 在过期前仍可接收迟到回执。未知、过期或 services 重启前的 ID 返回 HTTP 404 ~notification-not-found~ 。转交进程明确失败或超时后移除该记录；不会自动重发通知。
-
-应用每次发送回执都先检查 ~~/.assistant/service.lock~ 是否由服务持有，再读取 ~~/.assistant/service~ ，校验 loopback 地址并请求 ~/healthz~ 。回执不使用硬编码端口，回执接收地址也不由通知数据指定。网络错误或服务端暂时失败时，最多尝试 3 次，重试前分别等待 1 秒、2 秒；每次重新发现服务，每个 HTTP 请求最多等待 5 秒。回执接口返回 HTTP 4xx 时立即停止重试。只重试回执，不重新提交通知；重试耗尽后记录系统日志。响应丢失时客户端无法确定回执是否送达，服务端保留已接收的结果；没有回执才按未知处理。
-
-应用启动早期安装通知 delegate。旧版不含 ~notification_id~ 的通知 URL 仍可展示，但不发送回执。数据格式错误且仍可读取有效 ID 时回报失败；无法读取 ID 时只记录日志。首次授权等待期间不会阻塞原 HTTP 请求，超过 30 秒仍可继续等待用户决定。
-
-点击跳转与通知提交结果分别处理，当前回执不追踪业务激活或用户阅读状态。
+旧版不含 ~notification_id~ 的通知 URL 可以直接展示，点击跳转和用户阅读状态独立于提交回执。
 
 * macOS 服务管理
 

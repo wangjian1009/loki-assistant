@@ -14,7 +14,7 @@
 * 缓存设计
 
 #+BEGIN_EXAMPLE
-~/.cache/slack/{team_id}/
+~/.cache/assistant/slack/{team_id}/
 ├── users/
 │   ├── {user_id}.txt
 │   └── {user_id}.png
@@ -32,6 +32,7 @@
     └── {key}.preview.{ext}
 #+END_EXAMPLE
 
+- services 首次启动时将已有的 ~~/.cache/slack~ 整目录迁移到 ~~/.cache/assistant/slack~ ，保留会话已读位置、消息和附件。已有新目录时使用新目录。
 - 每个 ~.txt~ 文件保存一条 UTF-8 S 表达式。顶层消息平铺在 ~messages/~ 下，线程回复按根消息的 ~thread_ts~ 分目录，文件名保留 Slack 返回的原始 ~ts~ 。
 - services 启动时读取已授权工作区的缓存，收到 Slack 更新后更新对应文件。写入时先写同目录的临时文件，再原子替换。资料或消息缓存缺失或损坏时按需从 Slack 补取。
 - 附件跟随所属消息记录，记录原始文件名、MIME 类型和缓存引用。文件按需下载到工作区的 ~attachments/~ ，同一 Slack 文件可由多条消息共用。 ~{key}~ 优先取 Slack ~file_id~ 。缺少 ID 时使用 ~url-~ 加实际下载 URL 的 SHA-256 小写十六进制值，原件和预览各用自己的 URL 计算。
@@ -49,6 +50,7 @@
 | DELETE | ~/slack/session~                                              | [[file:slack-services.org::*工作区状态与会话][断开本机 Slack 会话]]  |
 | GET    | ~/slack/users~                                                | [[file:slack-services.org::*用户目录][一次读取用户目录]]，[[file:slack-services.org::*批量查询用户][按 ID 筛选]] |
 | GET    | ~/slack/users/{id}~                                           | [[file:slack-services.org::*用户目录][查询单个用户（计划）]] |
+| PUT    | ~/slack/users/{id}/nickname~                                  | [[file:slack-services.org::*设置本机昵称][设置或清除本机昵称]] |
 | GET    | ~/slack/users/{id}/avatar~                                    | [[file:slack-services.org::*用户目录][获取头像缓存路径]] |
 | POST   | ~/slack/users/{id}/dm~                                        | [[file:slack-services.org::*按用户打开私聊][按用户打开私聊]] |
 | GET    | ~/slack/conversations~                                        | [[file:slack-services.org::*会话目录][分页查询会话]]         |

@@ -1,7 +1,10 @@
+use std::sync::LazyLock;
+
 use axum::{
     http::{HeaderValue, StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -30,6 +33,7 @@ pub(super) enum Error {
     ReadPositionStorage,
     WatchUnsupported,
     WatchStorage,
+    NicknameStorage,
     UserToken,
     WebUserToken,
     WebCookie,
@@ -113,6 +117,11 @@ impl Error {
                 503,
                 "slack-watch-storage-error",
                 "无法读取或保存 Slack 关注配置。",
+            ),
+            Self::NicknameStorage => (
+                503,
+                "slack-nickname-storage-error",
+                "无法保存 Slack 用户昵称。",
             ),
             Self::UserToken => (
                 422,
@@ -424,6 +433,49 @@ fn table_rows(block: &Value) -> Option<Vec<Vec<String>>> {
     )
 }
 
+pub(super) fn user_reference(reference: &str) -> Option<(&str, Option<&str>)> {
+    let reference = reference.strip_prefix('@')?;
+    let (id, label) = reference
+        .split_once('|')
+        .map_or((reference, None), |(id, label)| (id, Some(label)));
+    (id.starts_with(['U', 'W']) && valid_id(id)).then_some((id, label))
+}
+
+static SLACK_MARKUP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)(?:\x60{3,}(?:.*?\x60{3,}|$)|'{3}(?:.*?'{3}|$))|(?:\x60{1,2}[^\x60\n]*\x60{1,2})|<([^<>\n]+)>").unwrap()
+});
+
+fn text_user_references(text: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+    SLACK_MARKUP
+        .captures_iter(text)
+        .filter_map(|capture| user_reference(capture.get(1)?.as_str()))
+}
+
+impl Message {
+    pub fn user_references(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        let sections = self
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                MessageBlock::Section { text, fields } => Some(text.iter().chain(fields)),
+                _ => None,
+            })
+            .flatten();
+        let sections = sections.filter_map(|part| match part {
+            BlockText::Mrkdwn { text } => Some(text.as_str()),
+            BlockText::PlainText { .. } => None,
+        });
+        let attachments = self
+            .attachments
+            .iter()
+            .filter_map(|attachment| attachment.text.as_deref());
+        std::iter::once(self.text.as_str())
+            .chain(sections)
+            .chain(attachments)
+            .flat_map(text_user_references)
+    }
+}
+
 impl Message {
     pub fn mentions(&self, user: &str) -> bool {
         self.text.match_indices("<@").any(|(start, _)| {
@@ -438,7 +490,7 @@ impl Message {
         })
     }
 
-    pub fn preview(&self) -> String {
+    pub fn preview(&self, mut nickname: impl FnMut(&str) -> Option<String>) -> String {
         let text = self.text.trim();
         if text.is_empty() {
             return self
@@ -447,7 +499,17 @@ impl Message {
                 .or_else(|| (!self.tables.is_empty()).then(|| "表格".into()))
                 .unwrap_or_default();
         }
-        text.chars().take(120).collect()
+        SLACK_MARKUP
+            .replace_all(text, |capture: &regex::Captures<'_>| {
+                capture
+                    .get(1)
+                    .and_then(|tag| user_reference(tag.as_str()))
+                    .and_then(|(id, _)| nickname(id))
+                    .map_or_else(|| capture[0].to_owned(), |nickname| format!("@{nickname}"))
+            })
+            .chars()
+            .take(120)
+            .collect()
     }
 
     pub fn from_slack(value: &Value, root: Option<&str>) -> Option<Self> {
@@ -520,11 +582,16 @@ impl Message {
             icon_emoji: value["icons"]["emoji"]
                 .as_str()
                 .filter(|emoji| {
-                    emoji.strip_prefix(':').and_then(|name| name.strip_suffix(':'))
+                    emoji
+                        .strip_prefix(':')
+                        .and_then(|name| name.strip_suffix(':'))
                         .is_some_and(|name| {
-                            !name.is_empty() && name.len() <= 64 && name.bytes().all(|byte| {
-                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+')
-                            })
+                            !name.is_empty()
+                                && name.len() <= 64
+                                && name.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric()
+                                        || matches!(byte, b'_' | b'-' | b'+')
+                                })
                         })
                 })
                 .map(str::to_owned),

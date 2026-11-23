@@ -7,6 +7,7 @@ use url::Url;
 
 use super::{
     mailbox::UserDirectory,
+    store::Account,
     protocol::{BlockText, Message, MessageBlock, valid_id},
 };
 
@@ -21,7 +22,16 @@ pub(super) fn callback(conversation_id: &str, message_ts: &str, thread_ts: Optio
     callback
 }
 
-pub(super) fn body(message: &Message, users: Option<&UserDirectory>) -> String {
+#[cfg(test)]
+fn body(message: &Message, users: Option<&UserDirectory>) -> String {
+    body_with_nicknames(message, users, None)
+}
+
+pub(super) fn body_with_nicknames(
+    message: &Message,
+    users: Option<&UserDirectory>,
+    account: Option<&Account>,
+) -> String {
     let mut parts = Vec::new();
     let mut has_prose = false;
     let mut has_table = false;
@@ -30,7 +40,7 @@ pub(super) fn body(message: &Message, users: Option<&UserDirectory>) -> String {
             MessageBlock::Section { text, fields } => {
                 let render = |part: &BlockText| match part {
                     BlockText::PlainText { text } => slack_entities(text),
-                    BlockText::Mrkdwn { text } => slack_text(text, users),
+                    BlockText::Mrkdwn { text } => slack_text(text, users, account),
                 };
                 let fields = fields.iter().map(|field| single_line(&render(field)));
                 for text in text.iter().map(render).chain(fields) {
@@ -65,7 +75,7 @@ pub(super) fn body(message: &Message, users: Option<&UserDirectory>) -> String {
         parts.extend(message.tables.iter().flat_map(|rows| table_text(rows)));
     }
     if !has_prose {
-        let text = slack_text(&message.text, users);
+        let text = slack_text(&message.text, users, account);
         if !text.trim().is_empty() {
             parts.insert(0, text);
         }
@@ -103,7 +113,8 @@ pub(super) fn body(message: &Message, users: Option<&UserDirectory>) -> String {
         } else {
             name
         };
-        format!("{name} · {summary}")
+        let nickname = account.and_then(|account| account.nickname(&author.id));
+        format!("{} · {summary}", nickname.as_deref().unwrap_or(name))
     } else {
         summary.to_owned()
     };
@@ -159,7 +170,7 @@ fn slack_entities(text: &str) -> String {
         .into_owned()
 }
 
-fn slack_text(text: &str, users: Option<&UserDirectory>) -> String {
+fn slack_text(text: &str, users: Option<&UserDirectory>, account: Option<&Account>) -> String {
     // 先识别 Slack 链接和提及，保护代码中的字面内容。
     static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?m)(?P<code>```(?s:.*?)```|``[^`\n]+``|`[^`\n]+`)|(?P<quote>^[ \t]*&gt;[ \t]?)|<(?P<reference>[^<>\n]+)>")
@@ -179,7 +190,9 @@ fn slack_text(text: &str, users: Option<&UserDirectory>) -> String {
         let label = label.filter(|label| !label.trim().is_empty());
         let visible = match target.as_bytes().first() {
             Some(b'@') if valid_id(&target[1..]) => {
-                format!("@{}", display_name(users, &target[1..]))
+                let id = &target[1..];
+                let nickname = account.and_then(|account| account.nickname(id));
+                format!("@{}", nickname.as_deref().unwrap_or_else(|| display_name(users, id)))
             }
             Some(b'#') if valid_id(&target[1..]) => {
                 let name = label.unwrap_or(&target[1..]);

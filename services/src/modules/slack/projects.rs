@@ -23,7 +23,7 @@ use crate::modules::{
 };
 
 use super::{
-    CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS, WATCHES,
+    CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS, NICKNAMES, WATCHES,
     disk::DiskCache,
     downloads::Downloads,
     mailbox::{next_cursor, read_cursor},
@@ -31,6 +31,7 @@ use super::{
     routes,
     service::SlackService,
     status::ProjectsStatus,
+    store::Nicknames,
 };
 
 pub(super) type BrowserFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -77,6 +78,31 @@ pub(super) async fn read_watches(config: &ConfigService) -> Result<Vec<SlackWatc
         .await
         .map_err(|_| Error::WatchStorage)?;
     serde_json::from_value(value.value).map_err(|_| Error::WatchStorage)
+}
+
+#[derive(Deserialize)]
+struct SlackNickname {
+    id: String,
+    nickname: String,
+}
+
+fn parse_nicknames(value: Value) -> Result<BTreeMap<String, String>, String> {
+    let entries: Vec<SlackNickname> = serde_json::from_value(value)
+        .map_err(|_| "Slack 昵称配置格式无效。".to_owned())?;
+    let mut nicknames = BTreeMap::new();
+    for entry in entries {
+        let (team, user) = entry.id.split_once('.').ok_or("Slack 用户 ID 无效。")?;
+        if !valid_team_id(team) || !valid_id(user) || !valid_nickname(&entry.nickname) {
+            return Err("Slack 用户 ID 或昵称无效。".into());
+        }
+        nicknames.insert(entry.id, entry.nickname);
+    }
+    Ok(nicknames)
+}
+
+fn valid_nickname(nickname: &str) -> bool {
+    !nickname.is_empty() && nickname == nickname.trim()
+        && nickname.chars().count() <= 80 && !nickname.chars().any(char::is_control)
 }
 
 impl SlackTeam {
@@ -133,6 +159,8 @@ pub struct Projects {
     projects: RwLock<BTreeMap<String, Project>>,
     reconcile: Mutex<()>,
     watch_changes: Arc<Mutex<()>>,
+    nicknames: Nicknames,
+    nickname_changes: Mutex<()>,
     port: std::sync::OnceLock<u16>,
     backend: Backend,
     shutdown: Notify,
@@ -167,7 +195,7 @@ impl Projects {
                 .await
                 .map_err(|_| Error::WatchStorage)?;
             if let Ok(service) = self.service(team).await {
-                service.forget_watch(conversation, &id).await;
+                service.forget_watch(&id).await;
             }
             return Ok(());
         }
@@ -207,7 +235,7 @@ impl Projects {
                 cache_root: std::env::var_os("HOME")
                     .map(PathBuf::from)
                     .filter(|path| path.is_absolute())
-                    .map(|path| path.join(".cache/slack")),
+                    .map(|path| path.join(".cache/assistant/slack")),
                 open_browser: Arc::new(|url| {
                     Box::pin(async move {
                         let mut opener = tokio::process::Command::new("/usr/bin/open");
@@ -243,6 +271,8 @@ impl Projects {
             projects: RwLock::default(),
             reconcile: Mutex::default(),
             watch_changes: Arc::default(),
+            nicknames: Arc::default(),
+            nickname_changes: Mutex::new(()),
             port: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
@@ -258,6 +288,11 @@ impl Projects {
     pub async fn run(self: Arc<Self>, port: u16) {
         self.prune_cache().await;
         let _ = self.port.set(port);
+        if let Ok(value) = self.config.value("slack", NICKNAMES).await
+            && let Err(error) = self.apply_nicknames(value.value).await
+        {
+            eprintln!("{error}");
+        }
         let _ = self.sync_projects(None).await;
         loop {
             tokio::select! {
@@ -386,6 +421,54 @@ impl Projects {
             }
         }
         Ok(json!({"api_version":"1","items":items,"issues":issues}))
+    }
+
+    pub(super) async fn set_nickname(
+        &self,
+        team: &str,
+        user: &str,
+        nickname: Option<&str>,
+        session: Uuid,
+    ) -> Result<Value, Error> {
+        let nickname = nickname.map(str::trim).filter(|name| !name.is_empty());
+        if nickname.is_some_and(|name| !valid_nickname(name)) {
+            return Err(Error::Invalid);
+        }
+        let service = self.service(team).await?;
+        let profile = service.lookup_user(session, user).await?;
+        let id = format!("{team}.{user}");
+        let _change = self.nickname_changes.lock().await;
+        if let Some(nickname) = nickname {
+            self.config.replace_record(
+                "slack".into(), NICKNAMES.into(), id.clone(),
+                json!({"id":id,"nickname":nickname}), false, false,
+            ).await.map_err(|_| Error::NicknameStorage)?;
+        } else {
+            self.config.remove_record("slack".into(), NICKNAMES.into(), id)
+                .await.map_err(|_| Error::NicknameStorage)?;
+        }
+        let saved = self.config.value("slack", NICKNAMES).await.map_err(|_| Error::NicknameStorage)?;
+        self.apply_nicknames(saved.value).await.map_err(|_| Error::NicknameStorage)?;
+        service.user_result(session, &profile).await
+    }
+
+    async fn apply_nicknames(&self, value: Value) -> Result<(), String> {
+        let next = parse_nicknames(value)?;
+        let changed: std::collections::BTreeSet<_> = {
+            let mut current = self.nicknames.write().unwrap();
+            let changed = current.keys().chain(next.keys())
+                .filter(|id| current.get(*id) != next.get(*id))
+                .map(|id| id.split_once('.').unwrap().0.to_owned())
+                .collect();
+            *current = next;
+            changed
+        };
+        for team in changed {
+            if let Ok(service) = self.service(&team).await {
+                service.nicknames_changed().await;
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn lookup_users(&self, ids: Vec<(String, String)>) -> Value {
@@ -626,6 +709,7 @@ impl Projects {
                 &self.backend,
                 Arc::clone(&self.config),
                 Arc::clone(&self.watch_changes),
+                Arc::clone(&self.nicknames),
             ));
             self.status
                 .register(&id, generation, service.public_status().await);
@@ -658,7 +742,7 @@ impl ConfigChangeHandler for Projects {
 
     fn committed(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
-            if change.key == WATCHES {
+            if change.key == WATCHES || change.key == NICKNAMES {
                 return Ok(());
             }
             if change.key == CACHE_RETENTION_DAYS {

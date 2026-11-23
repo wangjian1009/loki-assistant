@@ -93,6 +93,8 @@
 (defvar loki-assistant-slack--subscription-buffers (make-hash-table :test #'equal))
 (defvar loki-assistant-slack--refresh-timer nil)
 (defvar-local loki-assistant-slack--profiles nil)
+(defvar-local loki-assistant-slack--nicknames nil
+  "来自 services 的昵称快照，car 表示是否已收到快照。")
 (defvar-local loki-assistant-slack--attachment-downloads nil)
 (defvar loki-assistant-slack--selection nil)
 (defvar loki-assistant-slack--completion-choices nil)
@@ -121,6 +123,13 @@
   "生成 ROOM 的显示名称。"
   (concat (when (member (alist-get 'kind room) '("public_channel" "private_channel")) "#")
           (replace-regexp-in-string "[\n\r]+" " " (or (alist-get 'title room) (alist-get 'id room)))))
+
+(defun loki-assistant-slack--nickname (user)
+  "返回 USER 在当前会话中的昵称。"
+  (if (car loki-assistant-slack--nicknames)
+      (when-let ((id (alist-get 'id user)))
+        (cdr (assoc-string id (cdr loki-assistant-slack--nicknames))))
+    (loki-assistant-slack--non-null (alist-get 'nickname user))))
 
 (defun loki-assistant-slack--single-line (text)
   "返回压成一行的 TEXT。"
@@ -363,12 +372,14 @@
             (let* ((id (alist-get 'id user))
                    (team (or (loki-assistant-slack--single-line (alist-get 'team_name user))
                              (alist-get 'team_id user)))
-                   (name (or (loki-assistant-slack--single-line (alist-get 'name user)) id))
+                   (nickname (loki-assistant-slack--single-line (loki-assistant-slack--non-null (alist-get 'nickname user))))
+                   (original-name (loki-assistant-slack--single-line (alist-get 'name user)))
+                   (name (or nickname original-name id))
                    (username (or (loki-assistant-slack--single-line (alist-get 'username user)) id))
                    (display-name (loki-assistant-slack--single-line (alist-get 'display_name user)))
                    (title (concat team " · " name))
                    (label (loki-assistant-slack--fit-column title (- width 3)))
-                   (names (seq-uniq (delq nil (list name display-name username)))))
+                   (names (seq-uniq (delq nil (list name original-name display-name username)))))
               (cl-incf (gethash (cons label username) labels 0))
               (make-loki-assistant-slack--choice
                :room user :group loki-assistant-slack--user-group
@@ -415,12 +426,13 @@
            (message "%s" (or (plist-get response :error-message) "无法打开 Slack 私聊"))))))
    :room user))
 
-(defun loki-assistant-slack--choose (window selection rooms &optional status on-user)
+(defun loki-assistant-slack--choose (window selection rooms &optional status on-user user-prompt)
   "在 WINDOW 选择当前请求 SELECTION 得到的 ROOMS。
-ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调用它。"
+ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调用它。
+USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷键。"
   (when (and (eq selection loki-assistant-slack--selection) (window-live-p window))
     (if (active-minibuffer-window)
-        (message "请退出当前 minibuffer 后重新选择 Slack 聊天。")
+        (message "请退出当前 minibuffer 后再进行 Slack 选择。")
       (let* ((opened (unless on-user (loki-assistant-slack--open-rooms)))
              (listed (mapcar (lambda (room) (alist-get 'id room)) rooms))
              (sink (consult--async-sink))
@@ -428,7 +440,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
              (title-width (min 38 (max 14 (/ window-width 4))))
              (sender-width (min 18 (max 8 (/ window-width 8))))
              (choices-table (make-hash-table :test #'equal))
-             (keymap (when on-user (make-sparse-keymap)))
+             (keymap (when (and on-user (null user-prompt)) (make-sparse-keymap)))
              (loki-assistant-slack--completion-choices choices-table)
              (loki-assistant-slack--pick-users-only (and on-user t))
              (completion-styles-alist (cons '(loki-slack loki-assistant-slack--try-completion
@@ -497,8 +509,9 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
                       (with-selected-window window
                         (consult--read
                          #'source
-                         :prompt (if on-user "Slack 用户（Shift+Enter 打开私聊）："
-                                   "Slack 聊天：")
+                         :prompt (or user-prompt
+                                     (if on-user "Slack 用户（Shift+Enter 打开私聊）："
+                                       "Slack 聊天："))
                          :category 'loki-slack :keymap keymap
                          :async-wrap nil :sort nil :require-match t
                          :lookup (lambda (key &rest _) (gethash key choices-table))
@@ -563,6 +576,72 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
              (run-at-time 0 nil #'loki-assistant-slack--choose
                           window selection (append (alist-get 'items data) nil) status))))))))
 
+(defun loki-assistant-slack--nickname-target ()
+  "取得光标处的 Slack 用户，输入区中的单人私聊默认选对方。"
+  (or (get-text-property (point) 'loki-slack-user-id)
+      (get-text-property (point) 'loki-slack-author-id)
+      (when (and (equal (alist-get 'kind loki-assistant-slack--room) "im")
+                 (>= (point) (loki-assistant-slack--draft-start)))
+        (seq-find (lambda (id) (and (stringp id) (not (equal id loki-assistant-slack--self-id))))
+                  (alist-get 'participant_ids loki-assistant-slack--room)))))
+
+(defun loki-assistant-slack--edit-user-nickname (user)
+  "编辑 USER 的昵称并通过 services 保存。"
+  (let* ((id (alist-get 'id user))
+         (name (or (loki-assistant-slack--single-line (alist-get 'name user)) id))
+         (team (or (loki-assistant-slack--single-line (alist-get 'team_name user))
+                   (alist-get 'team_id user)))
+         (current (loki-assistant-slack--non-null (alist-get 'nickname user)))
+         (nickname (string-trim
+                    (read-string (format "为 %s（%s）设置昵称（留空清除） " name team)
+                                 current))))
+    (loki-assistant-slack--request
+     "PUT" (concat "/slack/users/" (url-hexify-string id) "/nickname")
+     (lambda (response)
+       (if (plist-get response :ok)
+           (if-let ((saved (loki-assistant-slack--non-null
+                            (alist-get 'nickname (alist-get 'user (plist-get response :data))))))
+               (message "已将 %s 的昵称设为 %s" name saved)
+             (message "已清除 %s 的昵称" name))
+         (message "%s" (or (plist-get response :error-message) "无法保存 Slack 昵称"))))
+     :room user :body (list (cons 'nickname (if (string-empty-p nickname) :null nickname))))))
+
+(defun loki-assistant-slack-set-nickname ()
+  "设置当前 Slack 聊天中的用户昵称。"
+  (interactive)
+  (unless loki-assistant-slack--room (user-error "请在 Slack 聊天中设置昵称"))
+  (let ((id (loki-assistant-slack--nickname-target))
+        (window (selected-window))
+        (buffer (current-buffer))
+        (selection (setq loki-assistant-slack--selection (list nil))))
+    (if id
+        (loki-assistant-slack--request
+         "GET" "/slack/users"
+         (lambda (response)
+           (when (eq selection loki-assistant-slack--selection)
+             (let* ((data (plist-get response :data))
+                    (user (and (plist-get response :ok)
+                               (seq-find (lambda (item) (equal (alist-get 'id item) id))
+                                         (alist-get 'items data)))))
+               (if user
+                   (run-at-time
+                    0 nil
+                    (lambda ()
+                      (when (and (eq selection loki-assistant-slack--selection)
+                                 (eq window (selected-window))
+                                 (eq buffer (window-buffer window))
+                                 (not (active-minibuffer-window)))
+                        (loki-assistant-slack--edit-user-nickname user))))
+                 (message "%s" (or (plist-get response :error-message)
+                                   (alist-get 'message (alist-get 'error (seq-first (alist-get 'issues data))))
+                                   "无法读取 Slack 用户资料"))))))
+         :params (list (cons 'id id)))
+      (unless (require 'consult nil t) (user-error "Slack 用户选择需要 Consult"))
+      (loki-assistant-slack--choose
+       window selection nil nil
+       (lambda (user _open-dm) (loki-assistant-slack--edit-user-nickname user))
+       "为 Slack 用户设置昵称 "))))
+
 (defun loki-assistant-slack--chat-buffer-p (buffer)
   "判断 BUFFER 是否为仍存活的 Slack 主聊天。"
   (and (buffer-local-value 'loki-assistant-slack--room buffer)
@@ -608,7 +687,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
     (unless (equal name loki-assistant-slack--display-name)
       (unless (equal name (buffer-name)) (rename-buffer name t))
       (setq loki-assistant-slack--display-name name))
-    (setq header-line-format (concat " " escaped))
+    (setq header-line-format (concat " " escaped (propertize "    C-c n 设置昵称" 'face 'shadow)))
     (setq-local frame-title-format escaped)))
 
 (defun loki-assistant-slack--request-watch (&optional watching on-read)
@@ -689,6 +768,17 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
                                (alist-get 'text (car (loki-assistant-slack--section-texts block))))
                              (alist-get 'blocks message))
                  body))
+         (body (if (and body (string-search "<@" body))
+                   (let ((profiles (or loki-assistant-slack--profiles
+                                       (make-hash-table :test #'equal)))
+                         (nicknames loki-assistant-slack--nicknames))
+                     (with-temp-buffer
+                       (let ((loki-assistant-slack--nicknames nicknames))
+                         (loki-assistant-slack--markdown
+                          body (alist-get 'team_id room) profiles nil nil
+                          (alist-get 'mentions message)))
+                       (buffer-substring-no-properties (point-min) (point-max))))
+                 body))
          (text (when body
                  (loki-assistant-slack--single-line
                   (replace-regexp-in-string "<[^<>|]+|\\([^<>]+\\)>" "\\1" body)))))
@@ -726,7 +816,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
         (setq loki-assistant-slack--timeline (make-loki-assistant-slack--page)
               loki-assistant-slack--profiles (make-hash-table :test #'equal)))
       (if loki-assistant-slack--room
-          (dolist (key '(team_id team_name title kind))
+          (dolist (key '(team_id team_name title kind participant_ids))
             (when-let ((value (loki-assistant-slack--non-null (alist-get key room))))
               (setf (alist-get key loki-assistant-slack--room) value)))
         (setq loki-assistant-slack--room (copy-tree room))))
@@ -1236,6 +1326,14 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
                                                     `((items . ,replies)) root))))
              items)))
 
+(defun loki-assistant-slack--apply-nicknames (data room)
+  "将 DATA 提供的昵称和标题应用于 ROOM。"
+  (when (assq 'nicknames data)
+    (setq loki-assistant-slack--nicknames (cons t (alist-get 'nicknames data))))
+  (if-let ((title (alist-get 'title data)))
+      (cons (cons 'title title) (assq-delete-all 'title (copy-sequence room)))
+    room))
+
 (defun loki-assistant-slack--apply-snapshot (subscription snapshot)
   "将 SUBSCRIPTION 的 SNAPSHOT 安装到当前 buffer。"
   (let ((previous loki-assistant-slack--subscription)
@@ -1245,7 +1343,8 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
                    (alist-get 'session_id loki-assistant-slack--room))
       (setq loki-assistant-slack--profiles (make-hash-table :test #'equal)
             loki-assistant-slack--read-positions nil
-            loki-assistant-slack--send-request nil))
+            loki-assistant-slack--send-request nil
+            loki-assistant-slack--nicknames nil))
     (when (and loki-assistant-slack--threads (assq 'thread_items snapshot))
       (maphash (lambda (root page)
                  (unless (equal root (alist-get 'ts loki-assistant-slack--notification-root))
@@ -1262,7 +1361,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
            :loaded t)
           loki-assistant-slack--page-changes nil
           loki-assistant-slack--notification-root nil
-          loki-assistant-slack--room room
+          loki-assistant-slack--room (loki-assistant-slack--apply-nicknames snapshot room)
           loki-assistant-slack--self-id (loki-assistant-slack--subscription-self-id subscription))
     (when (eq subscription loki-assistant-slack--pending-subscription)
       (when-let ((timer (loki-assistant-slack--subscription-timeout subscription)))
@@ -1315,6 +1414,8 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
                (loki-assistant-slack--apply-snapshot subscription (alist-get 'snapshot data)))
               ("changes"
                (unless (eq subscription active) (error "Slack 订阅缺少快照"))
+               (setq loki-assistant-slack--room
+                     (loki-assistant-slack--apply-nicknames data loki-assistant-slack--room))
                (let* ((page loki-assistant-slack--timeline)
                       (items (loki-assistant-slack--page-items page))
                       (lower (and (loki-assistant-slack--page-cursor page)
@@ -1586,12 +1687,13 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
         (insert fence)
         (unless (eolp) (insert "\n"))))))
 
-(defun loki-assistant-slack--markdown (text team profiles tables &optional mrkdwn)
+(defun loki-assistant-slack--markdown (text team profiles tables &optional mrkdwn mentions)
   "渲染 TEXT 和 TABLES。MRKDWN 启用 Slack 区块文本的强调语法。"
   (let* ((markup (if mrkdwn
                      (concat loki-assistant-slack--markup-regexp "\\|\\\\[*~]\\|\\([*]+\\|~+\\)")
                    loki-assistant-slack--markup-regexp))
          (renderer (require 'agent-shell-markdown nil t))
+         (nicknames loki-assistant-slack--nicknames)
          openers
          (content
          (with-temp-buffer
@@ -1621,10 +1723,19 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
                        (cond
                         ((string-match-p "\\`[A-Za-z][A-Za-z0-9+.-]*:" target)
                          (propertize (or label target) 'agent-shell-markdown-url target))
-                        ((string-prefix-p "@" target)
-                         (let ((profile (gethash (concat team "." (substring target 1)) profiles)))
-                           (concat "@" (or (and (listp profile) (alist-get 'name profile))
-                                           label (substring target 1)))))
+                        ((and (stringp team) (string-match-p "\\`@[UW][A-Z0-9]+\\'" target))
+                         (let* ((user (substring target 1))
+                                (id (concat team "." user))
+                                (mention (seq-find (lambda (item) (equal (alist-get 'id item) id))
+                                                   mentions))
+                                (provided (alist-get 'name mention))
+                                (profile (gethash id profiles))
+                                (loki-assistant-slack--nicknames nicknames)
+                                (name (or (loki-assistant-slack--nickname (cons (cons 'id id) mention))
+                                          (and (listp profile) (loki-assistant-slack--nickname profile))
+                                          (and (not (equal provided user)) provided)
+                                          (and (listp profile) (alist-get 'name profile)) label user)))
+                           (propertize target 'loki-slack-mention (list id name))))
                         ((string-prefix-p "#" target)
                          (concat "#" (or label (substring target 1)))))))
                  (when replacement (replace-match replacement t t))))
@@ -1644,6 +1755,19 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
              (let ((agent-shell-markdown-render-functions nil))
                (cl-letf (((symbol-function 'agent-shell-markdown--linkify-file-references) #'ignore))
                  (agent-shell-markdown-replace-markup :complete t :render-images nil :highlight-blocks nil))))
+           (goto-char (point-min))
+           (while-let ((match (text-property-search-forward 'loki-slack-mention)))
+             (pcase-let ((`(,id ,name) (prop-match-value match)))
+               (let* ((start (prop-match-beginning match))
+                      (properties (text-properties-at start)))
+                 (delete-region start (prop-match-end match))
+                 (goto-char start)
+                 (insert "@" (loki-assistant-slack--single-line name))
+                 (add-text-properties start (point) properties)
+                 (remove-text-properties start (point) '(loki-slack-mention nil))
+                 (add-text-properties start (point)
+                                      (list 'help-echo (format "%s (%s)" name id)
+                                            'loki-slack-user-id id 'loki-slack-user-name name)))))
            (let ((start (point-min)))
              (while (< start (point-max))
                (let ((end (next-single-property-change start 'agent-shell-markdown-url nil (point-max)))
@@ -1663,11 +1787,12 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
   "按顺序渲染 MESSAGE 的正文区块，使用 TEAM 和 PROFILES 解析提及。"
   (let* ((text (or (alist-get 'text message) ""))
          (blocks (alist-get 'blocks message))
+         (mentions (alist-get 'mentions message))
          (legacy-tables (unless (seq-some (lambda (block) (equal (alist-get 'type block) "table")) blocks)
                           (alist-get 'tables message))))
     (unless (seq-some #'loki-assistant-slack--section-texts blocks)
       (when (or (not (string-empty-p text)) (not (seq-empty-p legacy-tables)))
-        (loki-assistant-slack--markdown text team profiles legacy-tables)))
+        (loki-assistant-slack--markdown text team profiles legacy-tables nil mentions)))
     (seq-doseq (block blocks)
       (pcase (alist-get 'type block)
         ("section"
@@ -1676,11 +1801,11 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
              (if (equal (alist-get 'type part) "plain_text")
                  (insert (replace-regexp-in-string loki-assistant-slack--entity-regexp
                                                    #'loki-assistant-slack--decode-entity body t t) "\n")
-               (loki-assistant-slack--markdown body team profiles nil t)))))
+               (loki-assistant-slack--markdown body team profiles nil t mentions)))))
         ("table"
          (loki-assistant-slack--markdown "" team profiles (list (alist-get 'rows block))))))))
 
-(defun loki-assistant-slack--attachment (attachment index ts room)
+(defun loki-assistant-slack--attachment (attachment index ts room &optional profiles mentions)
   "插入 ROOM 中消息 TS 的第 INDEX 个 ATTACHMENT。"
   (let ((title (or (loki-assistant-slack--single-line (alist-get 'title attachment)) "附件"))
         (url (alist-get 'url attachment))
@@ -1699,7 +1824,8 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
     (insert "\n")
     (when (and (stringp text) (not (string-empty-p text)))
       (let ((start (point)))
-        (loki-assistant-slack--markdown text (alist-get 'team_id room) (make-hash-table :test #'equal) nil)
+        (loki-assistant-slack--markdown text (alist-get 'team_id room)
+                                       (or profiles (make-hash-table :test #'equal)) nil nil mentions)
         (add-text-properties start (point) '(face shadow))))
     (when-let ((image (loki-assistant-slack--file-image (alist-get 'preview_path attachment) 560 320)))
       (insert (propertize title 'display image) "\n"))))
@@ -1829,9 +1955,14 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
       (insert icon " "))
     (loki-assistant-slack--message-body message (alist-get 'team_id room) profiles)
     (cl-loop for attachment across (vconcat (alist-get 'attachments message)) for index from 0
-             do (loki-assistant-slack--attachment attachment index ts room))
+             do (loki-assistant-slack--attachment attachment index ts room profiles
+                                                     (alist-get 'mentions message)))
     (loki-assistant-slack--insert-message-time start time)
-    (add-text-properties start (point) (list 'line-prefix "  " 'wrap-prefix "  " 'loki-slack-message ts))
+    (add-text-properties start (point)
+                         (list 'line-prefix "  " 'wrap-prefix "  "
+                               'loki-slack-message ts
+                               'loki-slack-author-id
+                               (alist-get 'id (loki-assistant-slack--non-null (alist-get 'author message)))))
     (let ((position start))
       (while (< position (point))
         (let ((end (next-single-property-change position 'help-echo nil (point))))
@@ -1853,10 +1984,12 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
   (let* ((id (alist-get 'id author))
          (entry (gethash id profiles))
          (profile (and (listp entry) entry))
-         (name (or (alist-get 'name profile) (alist-get 'name author)))
+         (nickname (or (loki-assistant-slack--nickname author)
+                       (loki-assistant-slack--nickname profile)))
+         (name (or nickname (alist-get 'name profile) (alist-get 'name author)))
          (self (and id (equal id loki-assistant-slack--self-id))))
     (loki-assistant-slack--insert-label
-     (if self "我" (or (loki-assistant-slack--single-line name) "Slack"))
+     (if (and self (null nickname)) "我" (or (loki-assistant-slack--single-line name) "Slack"))
      (if self 'loki-assistant-slack-self-label 'loki-assistant-slack-sender-label)
      (if (alist-get 'avatar_path author) author profile))))
 
@@ -1995,6 +2128,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
   (let* ((room loki-assistant-slack--room)
          (self-id loki-assistant-slack--self-id)
          (profiles loki-assistant-slack--profiles)
+         (nicknames loki-assistant-slack--nicknames)
          (threads loki-assistant-slack--threads)
          (root (loki-assistant-slack--root-message
                 (buffer-local-value 'loki-assistant-slack--thread-root buffer))))
@@ -2002,6 +2136,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
       (setq loki-assistant-slack--room room
             loki-assistant-slack--self-id self-id
             loki-assistant-slack--profiles profiles
+            loki-assistant-slack--nicknames nicknames
             loki-assistant-slack--threads threads
             loki-assistant-slack--thread-message (or root loki-assistant-slack--thread-message))
       (loki-assistant-slack--render-buffer))))
@@ -2024,8 +2159,10 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
          (thread-message loki-assistant-slack--thread-message)
          (threads loki-assistant-slack--threads)
          (profiles loki-assistant-slack--profiles)
+         (nicknames loki-assistant-slack--nicknames)
          (history (with-temp-buffer
                     (let ((loki-assistant-slack--self-id self-id)
+                          (loki-assistant-slack--nicknames nicknames)
                           (loki-assistant-slack--reply reply)
                           (loki-assistant-slack--threads threads))
                       (loki-assistant-slack--history timeline room profiles thread thread-message))
@@ -2161,6 +2298,7 @@ ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调
     (define-key map (kbd "q") #'loki-assistant-slack-quit-thread)
     (define-key map (kbd "C-c C-q") #'loki-assistant-slack-quit-thread)
     (define-key map (kbd "C-c C-r") #'loki-assistant-slack-refresh)
+    (define-key map (kbd "C-c n") #'loki-assistant-slack-set-nickname)
     (define-key map (kbd "C-c C-w")
       '(menu-item "" loki-assistant-slack-toggle-watch
                   :filter (lambda (command)

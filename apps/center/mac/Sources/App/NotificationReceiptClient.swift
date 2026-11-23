@@ -181,22 +181,49 @@ struct NotificationReceiptClient: Sendable {
     }
 }
 
-/// 展示仅执行一次；网络重试完全由回执客户端负责。
+/// services 可以重试同一条通知。提交成功后优先补发回执。
 @MainActor
-struct NotificationDelivery {
-    let present: (SystemNotification) async throws -> Void
-    let report: (String, NotificationReceipt) async throws -> Void
+final class NotificationDelivery {
+    private let present: (SystemNotification) async throws -> Void
+    private let report: (String, NotificationReceipt) async throws -> Void
+    private var inFlight: Set<String> = []
+    private var awaitingConfirmation: Set<String> = []
+
+    init(
+        present: @escaping (SystemNotification) async throws -> Void,
+        report: @escaping (String, NotificationReceipt) async throws -> Void
+    ) {
+        self.present = present
+        self.report = report
+    }
 
     func handle(_ url: URL) async throws {
-        let id = try SystemNotification.receiptID(url: url)
-        let receipt: NotificationReceipt
-        do {
+        guard let id = try SystemNotification.receiptID(url: url) else {
             try await present(SystemNotification(url: url))
-            receipt = .submitted
-        } catch {
-            guard id != nil else { throw error }
-            receipt = .failed(error)
+            return
         }
-        if let id { try await report(id, receipt) }
+        guard inFlight.insert(id).inserted else { return }
+        defer { inFlight.remove(id) }
+
+        if !awaitingConfirmation.contains(id) {
+            do {
+                try await present(SystemNotification(url: url))
+                awaitingConfirmation.insert(id)
+            } catch {
+                try await report(id, .failed(error))
+                return
+            }
+        }
+
+        do {
+            try await report(id, .submitted)
+            awaitingConfirmation.remove(id)
+        } catch {
+            if case NotificationReceiptError.rejected(let status) = error,
+               (400..<500).contains(status) {
+                awaitingConfirmation.remove(id)
+            }
+            throw error
+        }
     }
 }

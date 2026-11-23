@@ -15,7 +15,7 @@ use super::{
     notification,
     protocol::{Author, Error, Message, Page, timestamp, valid_id},
     service::SlackService,
-    store::{Conversation, NotificationTarget, PendingNotification, SendState},
+    store::{Conversation, PendingNotification, SendState},
 };
 
 impl SlackService {
@@ -384,18 +384,7 @@ impl SlackService {
                         + usize::from(!conversation.messages.contains_key(&message.ts));
                     conversation.update_reply_count(root, count as u64);
                 }
-                if let Some(order) = notification_order {
-                    conversation.notification_targets.insert(
-                        order,
-                        NotificationTarget {
-                            ts: message.ts.clone(),
-                            thread_ts: message.thread_ts.clone(),
-                            watch_only: !ordinary,
-                        },
-                    );
-                    if conversation.notification_targets.len() > 1_000 {
-                        conversation.notification_targets.pop_first();
-                    }
+                if notification_order.is_some() {
                     let callback = notification::callback(
                         &conversation_id,
                         &message.ts,
@@ -404,7 +393,7 @@ impl SlackService {
                     cache.notifications.insert(
                         event_id,
                         PendingNotification {
-                            body: notification::body(&message, users.as_ref()),
+                            body: notification::body_with_nicknames(&message, users.as_ref(), Some(account)),
                             callback,
                             watch: (!ordinary).then_some(conversation_id),
                         },

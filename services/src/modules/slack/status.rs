@@ -14,7 +14,9 @@ use crate::modules::status::{
 };
 
 use super::{
+    mailbox::UserDirectory,
     notification,
+    protocol::timestamp,
     store::{Account, Cache},
 };
 
@@ -23,7 +25,7 @@ fn slack_status_metadata() -> StatusModuleMetadata {
     StatusModuleMetadata {
         id: "slack".into(),
         name: "Slack".into(),
-        description: "Slack 授权、连接和新消息会话状态。".into(),
+        description: "Slack 授权、连接和未读会话状态。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         items: vec![
             StatusItemMetadata {
@@ -87,8 +89,8 @@ fn slack_status_metadata() -> StatusModuleMetadata {
             },
             StatusItemMetadata {
                 key: "new_conversations".into(),
-                name: "Slack 新消息会话".into(),
-                description: "含有符合通知规则的未读消息的会话，按最新匹配消息排序。".into(),
+                name: "Slack 未读会话".into(),
+                description: "包含未读消息的会话，按最新未读消息排序。".into(),
                 remote_access: false,
                 schema: StatusSchema::Array {
                     items: Box::new(StatusSchema::Object {
@@ -118,9 +120,15 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                                 StatusSchema::string(),
                             ),
                             Field::new(
+                                "unread_count",
+                                "未读数",
+                                "本机已同步的未读消息数。",
+                                StatusSchema::Integer,
+                            ),
+                            Field::new(
                                 "callback",
                                 "打开路径",
-                                "定位最新匹配消息的本机 POST 路径。",
+                                "定位最新未读消息的本机 POST 路径。",
                                 StatusSchema::string(),
                             ),
                         ],
@@ -138,6 +146,7 @@ struct NewConversation {
     team_name: String,
     session_id: Uuid,
     callback: String,
+    unread_count: usize,
     #[serde(skip)]
     order: (u64, u32),
 }
@@ -194,24 +203,25 @@ impl ProjectsStatus {
         &self,
         id: &str,
         generation: Uuid,
-        authorized: Option<(&Cache, &Account)>,
+        authorized: Option<(&Cache, &Account, Option<&UserDirectory>)>,
     ) {
-        let new_conversations = authorized.map_or_else(Vec::new, |(cache, account)| {
+        let new_conversations = authorized.map_or_else(Vec::new, |(cache, account, users)| {
             cache
                 .conversations
                 .values()
                 .filter_map(|room| {
-                    let (&order, target) =
-                        room.notification_targets
-                            .iter()
-                            .rev()
-                            .find(|(order, target)| {
-                                room.read_positions.after_cursor(
-                                    **order,
-                                    target.thread_ts.as_deref(),
-                                    account,
-                                )
-                            })?;
+                    let mut unread = room.unread_messages(account);
+                    let first = unread.next()?;
+                    let (unread_count, target) =
+                        unread.fold((1, first), |(count, latest), message| {
+                            let latest = if timestamp(&message.ts) > timestamp(&latest.ts) {
+                                message
+                            } else {
+                                latest
+                            };
+                            (count + 1, latest)
+                        });
+                    let order = timestamp(&target.ts)?;
                     let id = format!("{id}.{}", room.id);
                     Some(NewConversation {
                         callback: notification::callback(
@@ -220,9 +230,10 @@ impl ProjectsStatus {
                             target.thread_ts.as_deref(),
                         ),
                         id,
-                        title: room.title.clone(),
+                        title: room.display_title(account, users),
                         team_name: account.identity.team_name.clone(),
                         session_id: account.identity.session_id,
+                        unread_count,
                         order,
                     })
                 })

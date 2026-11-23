@@ -1,10 +1,10 @@
 use std::{fmt::Debug, future::Future, pin::Pin};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 菜单栏应用承接的通用通知数据，不解释业务回调路径。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NotificationContent {
     pub notification_id: String,
     pub title: String,

@@ -29,10 +29,8 @@ pub enum NotificationReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationStatus {
-    Forwarded,
-    Submitted,
-    Failed,
     Unconfirmed,
+    Confirmed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

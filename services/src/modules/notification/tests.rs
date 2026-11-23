@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -45,7 +47,7 @@ async fn code_interface_sends_without_emacs_or_callback_and_validates_navigation
         })
         .await
         .unwrap();
-    assert_eq!(result.status, NotificationStatus::Forwarded);
+    assert_eq!(result.status, NotificationStatus::Unconfirmed);
     assert_eq!(launcher.0.lock().unwrap()[0].navigation_url, None);
     for callback in [
         "https://example.com/path",
@@ -189,7 +191,7 @@ async fn emacs_uses_injected_module_and_both_routes_share_receipts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(state["status"], "forwarded");
+    assert_eq!(state["status"], "unconfirmed");
     let (status, _) = request(
         app.clone(),
         "POST",
@@ -205,13 +207,92 @@ async fn emacs_uses_injected_module_and_both_routes_share_receipts() {
         Value::Null,
     )
     .await;
-    assert_eq!(state["status"], "submitted");
+    assert_eq!(state["status"], "confirmed");
     assert_eq!(
         notification.status(id).await.unwrap().status,
-        NotificationStatus::Submitted
+        NotificationStatus::Confirmed
     );
     notification
         .receive_receipt(id, NotificationReceipt::Submitted {})
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn pending_content_survives_restart_and_is_removed_only_on_confirmation() {
+    let directory =
+        std::env::temp_dir().join(format!("loki-notification-{}", uuid::Uuid::new_v4()));
+    let launcher = Arc::new(Launcher::default());
+    let load = || {
+        NotificationService::load_with_launcher(
+            directory.clone(),
+            launcher.clone(),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+    };
+    let service = load();
+    let notification = service
+        .send(NotificationRequest {
+            title: "待确认".into(),
+            body: Some("正文".into()),
+            app: Some("slack".into()),
+            callback_url: Some("/slack/conversations/TTEAM.CWORK/open".into()),
+        })
+        .await
+        .unwrap();
+    let id = &notification.notification_id;
+    let path = directory.join(format!("{id}.json"));
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let state = service
+        .receive_receipt(
+            id,
+            NotificationReceipt::Failed {
+                code: "permission-denied".into(),
+                message: "未授权".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.status, NotificationStatus::Unconfirmed);
+    assert!(path.is_file());
+    drop(service);
+
+    let service = load();
+    assert_eq!(
+        service.status(id).await.unwrap().status,
+        NotificationStatus::Unconfirmed
+    );
+    let worker = service.retry_pending();
+    tokio::pin!(worker);
+    tokio::select! {
+        _ = &mut worker => unreachable!(),
+        _ = async {
+            while launcher.0.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    {
+        let sent = launcher.0.lock().unwrap();
+        assert_eq!(sent[0].notification_id, sent[1].notification_id);
+        assert_eq!(sent[0].body, sent[1].body);
+        assert_eq!(sent[0].navigation_url, sent[1].navigation_url);
+    }
+    for _ in 0..2 {
+        let state = service
+            .receive_receipt(id, NotificationReceipt::Submitted {})
+            .await
+            .unwrap();
+        assert_eq!(state.status, NotificationStatus::Confirmed);
+        assert!(!path.exists());
+    }
+    assert!(matches!(
+        load().status(id).await,
+        Err(NotificationError::NotFound)
+    ));
+    fs::remove_dir_all(directory).unwrap();
 }

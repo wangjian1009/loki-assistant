@@ -363,10 +363,10 @@ impl NetworkService {
             .await
         {
             Ok(receipt) => eprintln!(
-                "{title}：通知已转交，notification_id={}",
+                "{title}：通知已登记，notification_id={}",
                 receipt.notification_id
             ),
-            Err(error) => eprintln!("{title}，通知转交失败：{error}"),
+            Err(error) => eprintln!("{title}，通知登记失败：{error}"),
         }
     }
 

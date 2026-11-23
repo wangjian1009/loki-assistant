@@ -173,7 +173,7 @@ async fn notification(
     path = "/emacs/receiver/notification/{id}",
     access = "paired",
     summary = "查询系统通知处理状态",
-    description = "协议版本 1：查询 forwarded、submitted、failed 或 unconfirmed；记录保留 15 分钟，services 重启后失效。"
+    description = "查询 unconfirmed 或 confirmed；未确认记录跨重启保留。"
 )]
 async fn notification_status(
     State(service): State<Arc<EmacsService>>,
@@ -192,9 +192,8 @@ async fn notification_status(
     id = "notification-receipt",
     method = "POST",
     path = "/emacs/receiver/notification/{id}/receipt",
-    access = "paired",
     summary = "接收菜单栏应用的通知回执",
-    description = "协议版本 1：接收 submitted 或带 code、message 的 failed；相同回执幂等，冲突回执返回 409。"
+    description = "接收本机托盘回执。submitted 确认通知，failed 保留待确认记录。"
 )]
 async fn notification_receipt(
     State(service): State<Arc<EmacsService>>,

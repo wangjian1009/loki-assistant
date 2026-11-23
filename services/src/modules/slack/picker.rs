@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{disk::DiskCache, mailbox::UserProfile, service::SlackService};
+use super::{disk::DiskCache, mailbox::UserProfile, service::SlackService, store::Account};
 
 #[derive(Serialize)]
 pub(super) struct PickerItem {
@@ -20,12 +20,18 @@ struct Participant {
     id: String,
     name: String,
     username: Option<String>,
+    nickname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     avatar_path: Option<PathBuf>,
 }
 
 impl PickerItem {
-    fn from_summary(mut summary: Value, users: &[UserProfile], disk: Option<&DiskCache>) -> Self {
+    fn from_summary(
+        mut summary: Value,
+        users: &[UserProfile],
+        disk: Option<&DiskCache>,
+        account: &Account,
+    ) -> Self {
         let find_user = |id: &str| {
             users
                 .binary_search_by(|user| user.id.as_str().cmp(id))
@@ -40,10 +46,15 @@ impl PickerItem {
             .filter_map(Value::as_str)
             .map(|id| {
                 let user = find_user(id);
+                let raw_id = id.split_once('.').map_or(id, |(_, raw)| raw);
+                let nickname = account.nickname(raw_id);
                 let name = user
                     .map(|user| user.name.as_str())
                     .unwrap_or_else(|| id.split_once('.').map_or(id, |(_, id)| id));
                 add_terms(&mut search_terms, name);
+                if let Some(nickname) = &nickname {
+                    add_terms(&mut search_terms, nickname);
+                }
                 if let Some(user) = user {
                     for alias in [user.display_name.as_deref(), user.username.as_deref()]
                         .into_iter()
@@ -54,7 +65,8 @@ impl PickerItem {
                 }
                 Participant {
                     id: id.to_owned(),
-                    name: name.to_owned(),
+                    name: nickname.clone().unwrap_or_else(|| name.to_owned()),
+                    nickname,
                     username: user.and_then(|user| user.username.clone()),
                     avatar_path: user.and_then(|user| disk?.cached_avatar(user.slack_id())),
                 }
@@ -62,7 +74,7 @@ impl PickerItem {
             .collect();
         if summary["kind"] == "im"
             && let Some(user) = participants.first()
-            && find_user(&user.id).is_some()
+            && (user.nickname.is_some() || find_user(&user.id).is_some())
         {
             summary["title"] = json!(user.name);
         }
@@ -76,7 +88,9 @@ impl PickerItem {
                 .and_then(find_user)
                 .map(|user| user.name.as_str())
                 .or_else(|| author["name"].as_str());
-            last.insert("author_name".into(), json!(name));
+            let nickname = author["nickname"].as_str();
+            last.insert("author_name".into(), json!(nickname.or(name)));
+            last.insert("author_nickname".into(), json!(nickname));
         }
         Self {
             summary,
@@ -150,9 +164,11 @@ impl SlackService {
                 .values()
                 .map(|room| {
                     PickerItem::from_summary(
-                        self.conversation_summary(account, room).2,
+                        self.conversation_summary(account, room, state.user_directory.as_ref())
+                            .2,
                         users,
                         state.cache.disk.as_ref(),
+                        account,
                     )
                 })
                 .collect();

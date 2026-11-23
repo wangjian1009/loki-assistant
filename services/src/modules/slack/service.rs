@@ -20,7 +20,7 @@ use super::{
     projects::{Backend, SlackTeam, read_watches},
     protocol::{Error, Identity, valid_id},
     status::ProjectsStatus,
-    store::{Account, Cache, Secrets},
+    store::{Account, Cache, Nicknames, Secrets},
 };
 
 #[derive(Default)]
@@ -70,6 +70,7 @@ pub struct SlackService {
     project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     config: Arc<ConfigService>,
     imported_token_lock: Mutex<()>,
+    nicknames: Nicknames,
 }
 
 impl fmt::Debug for SlackService {
@@ -90,6 +91,7 @@ impl SlackService {
         backend: &Backend,
         config: Arc<ConfigService>,
         watch_changes: Arc<Mutex<()>>,
+        nicknames: Nicknames,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -113,6 +115,7 @@ impl SlackService {
             project: (id, settings, generation, reporter),
             config,
             imported_token_lock: Mutex::new(()),
+            nicknames,
         }
     }
 
@@ -152,22 +155,35 @@ impl SlackService {
         self.signal_change();
     }
 
-    pub(super) async fn forget_watch(&self, conversation: &str, watch: &str) {
+    pub(super) async fn nicknames_changed(&self) {
         let mut state = self.state.lock().await;
-        state
-            .cache
-            .notifications
-            .retain(|_, alert| alert.watch.as_deref() != Some(watch));
-        if let Some(room) = state.cache.conversations.get_mut(conversation) {
-            room.notification_targets.retain(|_, target| !target.watch_only);
-        }
         let (id, _, generation, reporter) = &self.project;
-        let authorized = state
+        if let Some(account) = state
             .cache
             .session_id
             .and_then(|session| state.account(session).ok())
-            .map(|account| (&state.cache, account));
-        reporter.update_new_conversations(id, *generation, authorized);
+        {
+            reporter.update_new_conversations(
+                id,
+                *generation,
+                Some((&state.cache, account, state.user_directory.as_ref())),
+            );
+            for room in state.cache.conversations.values_mut() {
+                if let Some(journal) = &mut room.journal {
+                    journal.nicknames_changed();
+                }
+            }
+        }
+        self.picker_changed.notify_one();
+    }
+
+    pub(super) async fn forget_watch(&self, watch: &str) {
+        self.state
+            .lock()
+            .await
+            .cache
+            .notifications
+            .retain(|_, alert| alert.watch.as_deref() != Some(watch));
     }
 
     pub(super) async fn update_cache<T: Send + 'static>(
@@ -180,14 +196,19 @@ impl SlackService {
         let (_, _, generation, reporter) = &self.project;
         let (generation, reporter) = (*generation, Arc::clone(reporter));
         let result = tokio::task::spawn_blocking(move || {
-            let State { cache, secrets, .. } = &mut *state;
+            let State {
+                cache,
+                secrets,
+                user_directory,
+                ..
+            } = &mut *state;
             let account = secrets.account.as_ref().expect("已验证的 Slack 会话");
             let result = operation(cache, account);
             if result.is_ok() {
                 reporter.update_new_conversations(
                     &account.identity.team_id,
                     generation,
-                    Some((cache, account)),
+                    Some((cache, account, user_directory.as_ref())),
                 );
             }
             result
@@ -226,6 +247,8 @@ impl SlackService {
             state.picker_failed = false;
             state.cache.reset(session);
             if let (Some(root), Some(identity)) = (self.cache_root.clone(), identity) {
+                let (_, _, generation, reporter) = &self.project;
+                let (generation, reporter) = (*generation, Arc::clone(reporter));
                 tokio::task::spawn_blocking(move || {
                     if let Ok(disk) = DiskCache::open(&root, &identity.team_id, &identity.user_id) {
                         let account = state.secrets.account.as_mut().expect("已验证的 Slack 会话");
@@ -246,6 +269,13 @@ impl SlackService {
                         ));
                         state.cache.conversations = rooms;
                         state.cache.disk = Some(disk);
+                        if let Ok(account) = state.account(identity.session_id) {
+                            reporter.update_new_conversations(
+                                &identity.team_id,
+                                generation,
+                                Some((&state.cache, account, state.user_directory.as_ref())),
+                            );
+                        }
                     }
                 })
                 .await
@@ -253,9 +283,6 @@ impl SlackService {
             }
         } else if authorization_lost {
             state.cache.clear_subscriptions();
-            for room in state.cache.conversations.values_mut() {
-                room.notification_targets.clear();
-            }
         }
         self.picker_changed.notify_one();
         Ok(result)
@@ -417,6 +444,7 @@ impl SlackService {
         web_session: bool,
     ) -> Result<(), Error> {
         let mut account = Account {
+            nicknames: Arc::clone(&self.nicknames),
             identity,
             access: token,
             web_session,

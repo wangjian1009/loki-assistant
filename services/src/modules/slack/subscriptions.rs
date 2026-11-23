@@ -42,6 +42,8 @@ pub(super) fn thread_roots(page: &Value) -> Vec<String> {
 pub(super) struct MessageJournal {
     changed: watch::Sender<u64>,
     entries: VecDeque<MessageChange>,
+    nickname_revision: Option<u64>,
+    dropped_through: u64,
 }
 
 struct MessageChange {
@@ -73,9 +75,13 @@ impl MessageJournal {
     }
 
     fn overflowed(&self, revision: u64) -> bool {
-        self.entries
-            .front()
-            .is_some_and(|first| first.revision > revision + 1)
+        self.dropped_through > revision
+    }
+
+    pub fn nicknames_changed(&mut self) {
+        let revision = *self.changed.borrow() + 1;
+        self.nickname_revision = Some(revision);
+        self.changed.send_replace(revision);
     }
 
     pub fn push(&mut self, ts: String, thread_ts: Option<String>, message: Option<Message>) {
@@ -86,8 +92,10 @@ impl MessageJournal {
             thread_ts,
             message,
         });
-        if self.entries.len() > JOURNAL_LIMIT {
-            self.entries.pop_front();
+        if self.entries.len() > JOURNAL_LIMIT
+            && let Some(oldest) = self.entries.pop_front()
+        {
+            self.dropped_through = oldest.revision;
         }
         self.changed.send_replace(revision);
     }
@@ -389,11 +397,13 @@ impl SlackService {
                 .map(|first| next_cursor(session, format!("messages:{id}:"), first.ts.clone()));
             let range = items.first().zip(items.last()).filter(|_| live)
                 .map(|(first, last)| json!({"from_ts":first.ts,"through_ts":last.ts}));
-            let replies = room.cached_replies(items, true);
+            let replies = room.cached_replies(items, true, account, state.user_directory.as_ref());
             let snapshot = json!({
                 "api_version":"1", "conversation_id":id,
-                "items": items.iter().map(|message| room.message_result(message)).collect::<Vec<_>>(),
+                "items": items.iter().map(|message| room.message_result(message, account, state.user_directory.as_ref())).collect::<Vec<_>>(),
                 "thread_items": replies,
+                "nicknames": account.team_nicknames(),
+                "title": room.display_title(account, state.user_directory.as_ref()),
                 "next_cursor":cursor, "sync_state":if live { "live" } else { "cached" },
                 "covered_range":range, "read_through_ts":room.read_positions.get(None),
                 "first_unread_ts":room.messages.values()
@@ -414,7 +424,7 @@ impl SlackService {
         previous: u64,
     ) -> Result<Option<(u64, Value)>, Error> {
         let state = self.state.lock().await;
-        state.account(session)?;
+        let account = state.account(session)?;
         let room = state
             .cache
             .conversations
@@ -440,16 +450,20 @@ impl SlackService {
         let (mut thread_items, mut deleted_thread_messages) = (Vec::new(), Vec::new());
         for (ts, entry) in effective {
             match (&entry.thread_ts, &entry.message) {
-                (None, Some(message)) => items.push(room.message_result(message)),
+                (None, Some(message)) => items.push(room.message_result(message, account, state.user_directory.as_ref())),
                 (None, None) => deleted_ts.push(ts),
-                (Some(_), Some(message)) => thread_items.push(room.message_result(message)),
+                (Some(_), Some(message)) => thread_items.push(room.message_result(message, account, state.user_directory.as_ref())),
                 (Some(root), None) => {
                     deleted_thread_messages.push(json!({"thread_ts":root, "ts":ts}))
                 }
             }
         }
-        let update = json!({"kind":"changes", "items":items, "deleted_ts":deleted_ts,
+        let mut update = json!({"kind":"changes", "items":items, "deleted_ts":deleted_ts,
                             "thread_items":thread_items, "deleted_thread_messages":deleted_thread_messages});
+        if journal.nickname_revision.is_some_and(|revision| revision > previous) {
+            update["nicknames"] = json!(account.team_nicknames());
+            update["title"] = json!(room.display_title(account, state.user_directory.as_ref()));
+        }
         Ok(Some((
             revision,
             super::routes::messages_result(update, team),
