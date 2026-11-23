@@ -232,8 +232,11 @@ impl SlackService {
     }
 
     pub(super) async fn retire(&self) {
+        let downloads = self.downloads.clone();
+        let team = self.project.0.clone();
         self.state
-            .call(|state| {
+            .call(move |state| {
+                downloads.request_cancel_team(&team);
                 state.retired = true;
                 if let Some(restore) = state.cache_restore.take() {
                     restore.store(true, Ordering::Release);

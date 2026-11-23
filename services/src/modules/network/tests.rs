@@ -122,15 +122,22 @@ impl Fixture {
             &pass,
             r#"#!/bin/sh
 set -eu
+agent_only=
 for argument do
     case "$argument" in
+        --show-only-session-key) agent_only=1 ;;
         --decrypt) operation=decrypt ;;
         --encrypt) operation=encrypt ;;
     esac
     last="$argument"
 done
 case "$operation" in
-    decrypt) cat "$last" ;;
+    decrypt)
+        if [ -n "$agent_only" ]; then
+            printf '[GNUPG:] SESSION_KEY 9:1111\n'
+        else
+            cat "$last"
+        fi ;;
     encrypt) cat ;;
     *) exit 1 ;;
 esac
@@ -146,13 +153,19 @@ esac
         }
     }
     pub(super) fn stored_config(&self) -> ConfigService {
-        use crate::modules::password::service::{PasswordEnvironment, PasswordService};
+        use crate::modules::password::service::{
+            PasswordEnvironment, PasswordService, ProcessCommandRunner,
+        };
         let mut environment = PasswordEnvironment::new(
             self.root.join("gpg").to_str().unwrap().to_owned(),
             self.root.join("pass-store"),
         );
         environment.recipients = vec!["test-recipient".into()];
-        let passwords = Arc::new(PasswordService::new(Some(environment)));
+        let passwords = Arc::new(PasswordService::with_fixture_runner(
+            Some(environment),
+            Arc::new(ProcessCommandRunner),
+            Duration::from_secs(30),
+        ));
         ConfigService::load(self.root.join("config.yml"))
             .unwrap()
             .with_password_service(passwords)

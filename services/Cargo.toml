@@ -38,8 +38,10 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
 url = "2"
 tower = { version = "0.5", features = ["util"] }
+pgp = { version = "0.21.1", default-features = false }
 
 [dev-dependencies]
 loki-mobile-network = { path = "../apps/harmony/entry/src/main/rust" }

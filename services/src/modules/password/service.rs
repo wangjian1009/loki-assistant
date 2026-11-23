@@ -1,19 +1,24 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fmt::Debug,
     fs::{self, DirBuilder, OpenOptions},
     future::Future,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use super::payload;
+use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use zeroize::Zeroizing;
+
+use crate::process::{Process, WeakProcess};
 
 use crate::modules::config::{
     executable, model::ExecutableMetadata, service::SYSTEM_PASSWORD_PREFIX,
@@ -174,13 +179,117 @@ pub enum PasswordError {
 
 #[derive(Debug)]
 pub struct PasswordService {
-    process: crate::process::Process<Store>,
+    store: Arc<Store>,
+    agent: Process<SessionKeys>,
+    writers: Process<HashMap<String, WeakProcess<()>>>,
 }
 
+#[derive(Debug)]
 struct Store {
     environment: Option<PasswordEnvironment>,
     runner: Arc<dyn CommandRunner>,
     timeout: Duration,
+    #[cfg(test)]
+    fixture_payload: bool,
+}
+
+struct SessionKey {
+    algorithm: u8,
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct SessionKeys {
+    keys: VecDeque<([u8; 32], Instant, Arc<SessionKey>)>,
+}
+
+impl SessionKeys {
+    async fn key(
+        &mut self,
+        store: &Store,
+        snapshot: &CiphertextSnapshot,
+    ) -> Result<Arc<SessionKey>, PasswordError> {
+        self.keys.retain(|(_, expiry, _)| *expiry > Instant::now());
+        if let Some(index) = self
+            .keys
+            .iter()
+            .position(|(hash, _, _)| *hash == snapshot.digest)
+        {
+            let entry = self.keys.remove(index).expect("已找到会话密钥");
+            let key = entry.2.clone();
+            self.keys.push_back(entry);
+            return Ok(key);
+        }
+
+        let key = Arc::new(store.session_key(snapshot).await?);
+        if self.keys.len() == 64 {
+            self.keys.pop_front();
+        }
+        self.keys.push_back((
+            snapshot.digest,
+            Instant::now() + Duration::from_secs(300),
+            key.clone(),
+        ));
+        Ok(key)
+    }
+}
+
+// gpg-agent 和 Rust 解密任务读取同一份密文。
+struct CiphertextSnapshot {
+    directory: PathBuf,
+    digest: [u8; 32],
+}
+
+impl CiphertextSnapshot {
+    fn create(source: &Path) -> Result<Self, PasswordError> {
+        let directory = std::env::temp_dir().join(format!("loki-gpg-{}", uuid::Uuid::new_v4()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|_| PasswordError::StoreUnavailable)?;
+        let mut snapshot = Self {
+            directory,
+            digest: [0; 32],
+        };
+        let mut ciphertext = fs::File::open(source).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                PasswordError::EntryNotFound
+            } else {
+                PasswordError::StoreUnavailable
+            }
+        })?;
+        let mut copy = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(snapshot.file())
+            .map_err(|_| PasswordError::StoreUnavailable)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 16384];
+        loop {
+            let size = ciphertext
+                .read(&mut buffer)
+                .map_err(|_| PasswordError::StoreUnavailable)?;
+            if size == 0 {
+                break;
+            }
+            digest.update(&buffer[..size]);
+            copy.write_all(&buffer[..size])
+                .map_err(|_| PasswordError::StoreUnavailable)?;
+        }
+        snapshot.digest = digest.finalize().into();
+        Ok(snapshot)
+    }
+
+    fn file(&self) -> PathBuf {
+        self.directory.join("entry.gpg")
+    }
+}
+
+impl Drop for CiphertextSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
 }
 
 impl PasswordService {
@@ -198,18 +307,59 @@ impl PasswordService {
         timeout: Duration,
     ) -> Self {
         Self {
-            process: crate::process::Process::start(Store {
+            store: Arc::new(Store {
                 environment,
                 runner,
                 timeout,
+                #[cfg(test)]
+                fixture_payload: false,
             }),
+            agent: Process::start(SessionKeys::default()),
+            writers: Process::start(HashMap::new()),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_fixture_runner(
+        environment: Option<PasswordEnvironment>,
+        runner: Arc<dyn CommandRunner>,
+        timeout: Duration,
+    ) -> Self {
+        let mut service = Self::with_runner(environment, runner, timeout);
+        Arc::get_mut(&mut service.store)
+            .expect("独立的密码库")
+            .fixture_payload = true;
+        service
+    }
+
+    async fn writer(&self, file: &str) -> Result<Process<()>, PasswordError> {
+        validate_file(file)?;
+        // 普通文件路径以写入规则校验，拒绝目录别名和符号链接。
+        let file = file.to_owned();
+        Ok(self
+            .writers
+            .call(move |writers| {
+                writers.retain(|_, writer| writer.upgrade().is_some());
+                if let Some(writer) = writers.get(&file).and_then(WeakProcess::upgrade) {
+                    return writer;
+                }
+                let writer = Process::start(());
+                writers.insert(file, writer.downgrade());
+                writer
+            })
+            .await)
+    }
+
     pub(crate) async fn save(&self, file: &str, secret: &str) -> Result<(), PasswordError> {
+        let writer = self.writer(file).await?;
+        let store = self.store.clone();
         let (file, secret) = (file.to_owned(), secret.to_owned());
-        self.process
-            .with(move |store| Box::pin(async move { store.save(&file, &secret).await }))
+        let keep_alive = writer.clone();
+        writer
+            .run(async move {
+                let _writer = keep_alive;
+                store.save(&file, &secret).await
+            })
             .await
     }
 
@@ -218,26 +368,33 @@ impl PasswordService {
         file: &str,
         contents: &str,
     ) -> Result<(), PasswordError> {
+        let writer = self.writer(file).await?;
+        let store = self.store.clone();
         let (file, contents) = (file.to_owned(), contents.to_owned());
-        self.process
-            .with(move |store| {
-                Box::pin(async move { store.save_multiline(&file, &contents).await })
+        let keep_alive = writer.clone();
+        writer
+            .run(async move {
+                let _writer = keep_alive;
+                store.save_multiline(&file, &contents).await
             })
             .await
     }
 
     pub(crate) async fn remove(&self, file: &str) -> Result<(), PasswordError> {
+        let writer = self.writer(file).await?;
+        let store = self.store.clone();
         let file = file.to_owned();
-        self.process
-            .with(move |store| Box::pin(async move { store.remove(&file).await }))
+        let keep_alive = writer.clone();
+        writer
+            .run(async move {
+                let _writer = keep_alive;
+                store.remove(&file).await
+            })
             .await
     }
 
     pub async fn entries(&self, query: &str) -> Result<Vec<String>, PasswordError> {
-        let query = query.to_owned();
-        self.process
-            .with(move |store| Box::pin(async move { store.entries(&query).await }))
-            .await
+        self.store.entries(query).await
     }
 
     pub async fn fetch(&self, file: &str) -> Result<String, PasswordError> {
@@ -249,19 +406,30 @@ impl PasswordService {
     }
 
     async fn fetch_entry(&self, file: &str, public: bool) -> Result<String, PasswordError> {
-        let file = file.to_owned();
-        self.process
-            .with(move |store| Box::pin(async move { store.fetch_entry(&file, public).await }))
-            .await
+        let snapshot = Arc::new(self.store.snapshot(file, public).await?);
+        let store = self.store.clone();
+        let agent_snapshot = snapshot.clone();
+        let key = self
+            .agent
+            .with(move |keys| Box::pin(async move { keys.key(&store, &agent_snapshot).await }))
+            .await?;
+        #[cfg(test)]
+        if self.store.fixture_payload {
+            return self.store.decrypt_fixture(&snapshot).await;
+        }
+        tokio::task::spawn_blocking(move || {
+            payload::decrypt(&snapshot.file(), key.algorithm, key.bytes.as_slice())
+                .map_err(|_| PasswordError::InvalidOutput)
+        })
+        .await
+        .map_err(|_| PasswordError::InvalidOutput)?
     }
 
     pub(crate) async fn missing_entries(
         &self,
         paths: HashSet<String>,
     ) -> Result<HashSet<String>, PasswordError> {
-        self.process
-            .with(move |store| Box::pin(async move { store.missing_entries(paths).await }))
-            .await
+        self.store.missing_entries(paths).await
     }
 }
 
@@ -427,12 +595,18 @@ impl Store {
         let mut args = environment.options.clone();
         args.extend(["--batch".into(), "--no-tty".into(), "--quiet".into()]);
         args.extend(operation);
-        let output = timeout(
-            self.timeout,
-            self.runner.run(&environment.program, &args, input),
-        )
-        .await
-        .map_err(|_| PasswordError::Timeout)??;
+        self.run_gpg(&environment.program, &args, input).await
+    }
+
+    async fn run_gpg(
+        &self,
+        program: &str,
+        args: &[String],
+        input: Option<&[u8]>,
+    ) -> Result<Vec<u8>, PasswordError> {
+        let output = timeout(self.timeout, self.runner.run(program, args, input))
+            .await
+            .map_err(|_| PasswordError::Timeout)??;
         if output.status != Some(0) {
             return Err(PasswordError::CommandFailed {
                 status: output.status,
@@ -452,22 +626,89 @@ impl Store {
             .map_err(|_| PasswordError::StoreUnavailable)?
     }
 
-    async fn fetch_entry(&self, file: &str, public: bool) -> Result<String, PasswordError> {
+    async fn snapshot(
+        &self,
+        file: &str,
+        public: bool,
+    ) -> Result<CiphertextSnapshot, PasswordError> {
         validate_file(file)?;
         if public && file.starts_with(SYSTEM_PASSWORD_PREFIX) {
             return Err(PasswordError::EntryNotFound);
         }
         let store = self.store().await?;
         let file = file.to_owned();
-        let path = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let path = checked_file(&store, &file)?;
             if public && internal_path(&store, &path) {
                 return Err(PasswordError::EntryNotFound);
             }
-            gpg_path(&path)
+            CiphertextSnapshot::create(&path)
         })
         .await
-        .map_err(|_| PasswordError::StoreUnavailable)??;
+        .map_err(|_| PasswordError::StoreUnavailable)?
+    }
+
+    async fn session_key(
+        &self,
+        snapshot: &CiphertextSnapshot,
+    ) -> Result<SessionKey, PasswordError> {
+        let status = Zeroizing::new(
+            self.run(
+                vec![
+                    "--status-fd".into(),
+                    "1".into(),
+                    "--show-only-session-key".into(),
+                    "--decrypt".into(),
+                    "--".into(),
+                    gpg_path(&snapshot.file())?,
+                ],
+                None,
+            )
+            .await?,
+        );
+        let key = status
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"[GNUPG:] SESSION_KEY "))
+            .ok_or(PasswordError::InvalidOutput)?;
+        let Some(colon) = key.iter().position(|byte| *byte == b':') else {
+            return Err(PasswordError::InvalidOutput);
+        };
+        if colon == 0
+            || key.len() <= colon + 1
+            || !key[colon + 1..].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(PasswordError::InvalidOutput);
+        }
+        // GnuPG 在 AEAD 状态中以「对称算法.AEAD 算法」表示算法编号。
+        let algorithms =
+            std::str::from_utf8(&key[..colon]).map_err(|_| PasswordError::InvalidOutput)?;
+        let algorithm = if let Some((cipher, aead)) = algorithms.split_once('.') {
+            aead.parse::<u8>()
+                .map_err(|_| PasswordError::InvalidOutput)?;
+            cipher
+        } else {
+            algorithms
+        };
+        let algorithm = algorithm
+            .parse::<u8>()
+            .map_err(|_| PasswordError::InvalidOutput)?;
+        let mut bytes = Zeroizing::new(Vec::new());
+        let mut characters = key[colon + 1..].chunks_exact(2);
+        if !characters.remainder().is_empty() {
+            return Err(PasswordError::InvalidOutput);
+        }
+        for pair in &mut characters {
+            let hex = std::str::from_utf8(pair).map_err(|_| PasswordError::InvalidOutput)?;
+            bytes.push(u8::from_str_radix(hex, 16).map_err(|_| PasswordError::InvalidOutput)?);
+        }
+        Ok(SessionKey { algorithm, bytes })
+    }
+
+    #[cfg(test)]
+    async fn decrypt_fixture(
+        &self,
+        snapshot: &CiphertextSnapshot,
+    ) -> Result<String, PasswordError> {
         let output = self
             .run(
                 vec![
@@ -475,7 +716,7 @@ impl Store {
                     "-".into(),
                     "--decrypt".into(),
                     "--".into(),
-                    path,
+                    gpg_path(&snapshot.file())?,
                 ],
                 None,
             )

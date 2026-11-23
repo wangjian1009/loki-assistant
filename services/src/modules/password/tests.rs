@@ -84,6 +84,12 @@ impl CommandRunner for FakeRunner {
             if self.pending {
                 return std::future::pending().await;
             }
+            if args.iter().any(|arg| arg == "--show-only-session-key") {
+                return Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: b"[GNUPG:] SESSION_KEY 9:1111\n".to_vec(),
+                });
+            }
             let (status, stdout) = self
                 .outputs
                 .lock()
@@ -96,7 +102,7 @@ impl CommandRunner for FakeRunner {
 }
 
 fn configured(fixture: &Fixture, runner: Arc<FakeRunner>) -> Arc<PasswordService> {
-    Arc::new(PasswordService::with_runner(
+    Arc::new(PasswordService::with_fixture_runner(
         Some(PasswordEnvironment::new(
             "/bin/echo".into(),
             fixture.0.clone(),
@@ -183,8 +189,22 @@ async fn fetches_raw_contents_and_passes_a_checked_absolute_path_to_gpg() {
         json!({"api_version":"1", "file":"-c.gpg", "contents":CONTENTS})
     );
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(&calls[0][3..7], ["--output", "-", "--decrypt", "--"]);
-    assert_eq!(Path::new(&calls[0][7]), fixture.0.join("-c.gpg"));
+    assert_eq!(
+        &calls[0][3..8],
+        [
+            "--status-fd",
+            "1",
+            "--show-only-session-key",
+            "--decrypt",
+            "--"
+        ]
+    );
+    assert_eq!(calls[0].last(), calls[1].last());
+    let snapshot = Path::new(calls[1].last().unwrap());
+    assert!(snapshot.is_absolute());
+    assert_eq!(snapshot.file_name().unwrap(), "entry.gpg");
+    assert!(calls[1].iter().any(|arg| arg == "--decrypt"));
+    assert!(!snapshot.exists());
 }
 
 #[tokio::test]
@@ -192,6 +212,7 @@ async fn reads_nested_and_percent_encoded_resource_paths_without_a_request_body(
     let fixture = Fixture::new();
     fixture.entry("example.com/alice.gpg");
     fixture.entry("中文 网站/a#?%.gpg");
+    std::fs::write(fixture.0.join("中文 网站/a#?%.gpg"), "另一份密文").unwrap();
     let runner = Arc::new(FakeRunner::default());
     runner.output(Some(0), CONTENTS);
     runner.output(Some(0), CONTENTS);
@@ -209,14 +230,64 @@ async fn reads_nested_and_percent_encoded_resource_paths_without_a_request_body(
         assert_eq!(body["contents"], CONTENTS);
     }
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(
-        Path::new(calls[0].last().unwrap()),
-        fixture.0.join("example.com/alice.gpg")
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[0].last(), calls[1].last());
+    assert_eq!(calls[2].last(), calls[3].last());
+    assert_ne!(calls[0].last(), calls[2].last());
+}
+
+#[tokio::test]
+async fn decrypts_openpgp_in_rust_and_reuses_the_cached_session_key() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Agent(AtomicUsize);
+
+    impl CommandRunner for Agent {
+        fn run<'a>(
+            &'a self,
+            _: &'a str,
+            args: &'a [String],
+            _: Option<&'a [u8]>,
+        ) -> CommandFuture<'a> {
+            Box::pin(async move {
+                assert!(args.iter().any(|arg| arg == "--show-only-session-key"));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: b"[GNUPG:] SESSION_KEY 9.2:B9B7DE7BD4ADCA47DF9E7C7BF37829E910AFB6F14E799B67D0C268D1331C9464\n".to_vec(),
+                })
+            })
+        }
+    }
+
+    // 用一次性密钥生成的压缩 OpenPGP 密文。
+    let ciphertext = STANDARD.decode("hQEMA469UUVI/69EAQf/fu7nwhRSpK6ZyHn12o9cnAmgKQzC/9C1jtFU372yu6j1Tx2hafqRtMDMh0EVKc2C9L1lG7E18kTYoWIWjKHyek+dR/BF26bKPGS2G9VmmtyO8DPolFq12WS/erLMgJmjHczXhjeU5B5+33JLFm/4ZdXXZOivNHCgU/4Xo1MzxFTuIk/XhKw6B1e6pQcjnlxtbV0tdlz/+stJm5jiRdVhJ1vAFGl7r8P5jCAqiyW6XNWGtclAiMv7PXtFRIM0zs+lgdEjrpwhL7sUrWt+3wHyJehbWZ69X5jnx5KjdIPp1wkWVeMVYOzqURSXDraPko2AygfcjXsmrw/U0Q6wjxgm4NRNAQkCEGqpWLdOQ/n3UAFrjhxGMO3C+iaUAMo/h8wdSgX4ZozcS4zBMK2t59gidSMn4ctpNlT4wbIS+MNpEznFfnr9KsHuzjFYVsna5T8=").unwrap();
+    let fixture = Fixture::new();
+    std::fs::write(fixture.0.join("entry.gpg"), &ciphertext).unwrap();
+    let agent = Arc::new(Agent::default());
+    let service = PasswordService::with_runner(
+        Some(PasswordEnvironment::new(
+            "/bin/echo".into(),
+            fixture.0.clone(),
+        )),
+        agent.clone(),
+        Duration::from_secs(1),
     );
-    assert_eq!(
-        Path::new(calls[1].last().unwrap()),
-        fixture.0.join("中文 网站/a#?%.gpg")
-    );
+    let (left, right) = tokio::join!(service.fetch("entry.gpg"), service.fetch("entry.gpg"));
+    assert_eq!(left.unwrap(), "fixture\n");
+    assert_eq!(right.unwrap(), "fixture\n");
+    assert_eq!(agent.0.load(Ordering::SeqCst), 1);
+
+    let mut corrupt = ciphertext;
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(fixture.0.join("entry.gpg"), corrupt).unwrap();
+    assert!(matches!(
+        service.fetch("entry.gpg").await,
+        Err(PasswordError::InvalidOutput)
+    ));
+    assert_eq!(agent.0.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -360,7 +431,7 @@ async fn hides_internal_credentials_and_their_aliases_from_http() {
 #[tokio::test]
 async fn reports_missing_configuration_and_unavailable_store_without_running_gpg() {
     let runner = Arc::new(FakeRunner::default());
-    let service = Arc::new(PasswordService::with_runner(
+    let service = Arc::new(PasswordService::with_fixture_runner(
         None,
         runner.clone(),
         Duration::from_secs(1),

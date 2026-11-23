@@ -513,13 +513,10 @@ impl DiskCache {
         write_atomically(path, bytes, None, Some(&self.1))
     }
 
-    pub fn commit_original(
-        &self,
-        partial: &PartialAttachment,
-        destination: PathBuf,
-    ) -> io::Result<PathBuf> {
-        let _write = self.1.lock().expect("缓存写入许可有效");
-        partial.commit(destination)
+    pub fn remove_expired_original(path: &Path, retention: Duration) {
+        if expired_file(path, SystemTime::now(), retention) {
+            let _ = fs::remove_file(path);
+        }
     }
 
     pub fn cached_teams(root: &Path) -> Vec<String> {
@@ -542,6 +539,7 @@ impl DiskCache {
             &CacheWrites::default(),
             || false,
             || {},
+            |path| Self::remove_expired_original(&path, retention),
         );
     }
 
@@ -553,6 +551,7 @@ impl DiskCache {
         writes: &CacheWrites,
         cancelled: impl Fn() -> bool,
         partial_done: impl FnOnce(),
+        mut original_expired: impl FnMut(PathBuf),
     ) {
         if !super::projects::valid_team_id(id) {
             return;
@@ -564,13 +563,7 @@ impl DiskCache {
             return;
         }
         let now = SystemTime::now();
-        let expired = |path: &Path| {
-            fs::symlink_metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age > retention)
-        };
+        let expired = |path: &Path| expired_file(path, now, retention);
         let remove_if = |path: &Path, condition: &dyn Fn() -> bool| {
             let _write = writes.lock().expect("缓存写入许可有效");
             if !cancelled() && condition() {
@@ -600,7 +593,18 @@ impl DiskCache {
             if cancelled() {
                 return;
             }
-            remove_if(&path, &|| expired(&path));
+            if path.parent() == Some(team.join("attachments").as_path())
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(".original"))
+            {
+                if expired(&path) {
+                    original_expired(path);
+                }
+            } else {
+                remove_if(&path, &|| expired(&path));
+            }
         }
         for room in entries(&team.join("conversations"), true) {
             if cancelled() {
@@ -664,6 +668,15 @@ impl DiskCache {
             }
         }
     }
+}
+
+fn expired_file(path: &Path, now: SystemTime, retention: Duration) -> bool {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > retention)
 }
 
 pub(super) fn avatar_png(bytes: &[u8]) -> Option<Vec<u8>> {

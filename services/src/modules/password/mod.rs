@@ -1,3 +1,4 @@
+mod payload;
 pub mod protocol;
 mod routes;
 pub mod service;
@@ -17,7 +18,7 @@ use self::service::{PasswordEnvironment, PasswordService};
 static PASSWORD_MODULE: ModuleRegistration = ModuleRegistration {
     id: "password",
     name: "密码管理",
-    description: "查询本地密码库的条目，并通过 GPG 解密原文。",
+    description: "查询本地密码库条目，通过 GnuPG 获取会话密钥并在后台解密文件。",
     version: env!("CARGO_PKG_VERSION"),
 };
 

@@ -1990,18 +1990,24 @@ impl crate::modules::password::service::CommandRunner for FakeGpg {
         input: Option<&'a [u8]>,
     ) -> crate::modules::password::service::CommandFuture<'a> {
         Box::pin(async move {
+            let agent_only = args.iter().any(|arg| arg == "--show-only-session-key");
             let stdout = if args.iter().any(|arg| arg == "--encrypt") {
                 input.unwrap().to_vec()
             } else {
                 assert!(args.iter().any(|arg| arg == "--decrypt"));
                 fs::read(args.last().unwrap()).unwrap()
             };
-            if input.is_none() && stdout.starts_with("模拟解密失败".as_bytes()) {
+            if agent_only && stdout.starts_with("模拟解密失败".as_bytes()) {
                 return Ok(crate::modules::password::service::CommandOutput {
                     status: Some(1),
                     stdout: Vec::new(),
                 });
             }
+            let stdout = if agent_only {
+                b"[GNUPG:] SESSION_KEY 9:1111\n".to_vec()
+            } else {
+                stdout
+            };
             Ok(crate::modules::password::service::CommandOutput {
                 status: Some(0),
                 stdout,
@@ -2308,7 +2314,7 @@ fn password_config(
     let config = ConfigService::load(config_path).unwrap();
     let mut environment = PasswordEnvironment::new("/bin/echo".into(), store.to_owned());
     environment.recipients = vec!["test-recipient".into()];
-    let passwords = Arc::new(PasswordService::with_runner(
+    let passwords = Arc::new(PasswordService::with_fixture_runner(
         Some(environment),
         Arc::new(FakeGpg),
         Duration::from_secs(2),

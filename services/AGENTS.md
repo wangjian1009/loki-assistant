@@ -22,7 +22,7 @@
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
-`modules/password/` 提供只读查询协议。服务在加载用户配置前定位 `gpg`，并从进程环境的 `PASSWORD_STORE_DIR` 或 `$HOME/.password-store` 确定密码库。业务 HTTP 提供 `GET /password/entries` 和 `GET /password/entries/{*file}`。文件系统负责条目枚举、路径边界检查和密文的原子更新，GPG 命令经可注入的 `CommandRunner` 执行。HTTP 不提供密码写入操作。明文与 GPG 原始错误不得进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身。
+`modules/password/` 提供只读查询协议。服务在加载用户配置前定位 `gpg`，并从进程环境的 `PASSWORD_STORE_DIR` 或 `$HOME/.password-store` 确定密码库。业务 HTTP 提供 `GET /password/entries` 和 `GET /password/entries/{*file}`。文件系统负责条目枚举、路径边界检查和密文的原子更新，GnuPG 命令经可注入的 `CommandRunner` 执行。密码主控通过 `gpg --show-only-session-key` 与 `gpg-agent` 交互，按密文摘要缓存会话密钥，rPGP 解密任务并行读取同一份密文快照。单项写入按路径排队。HTTP 不提供密码写入操作。明文与 GPG 原始错误不得进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身。
 
 HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/code/message`；`source` 仅使用 `services`、`emacs`、`business`，`code`、`message` 必须为非空字符串，客户端按 `code` 判断并显示 `message`，不得新增模块专用错误外壳。
 
@@ -36,7 +36,7 @@ HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/c
 
 有状态的模块将可变数据定义在模块内部，由 Tokio 任务独占。HTTP handler 和其他模块通过服务句柄向 `mpsc` channel 发送请求，用 `oneshot` 接收响应，使用 `watch` 或 `broadcast` 订阅变化。跨模块调用传递命令和结果，禁止传递可变状态、状态锁或锁守卫。`src/process.rs` 提供进程内请求循环。需要发送响应的请求在入队后由内部服务完成，持久化成功后再更新内存和发布变化。
 
-Slack 为每个已配置的 team 启动独立的请求处理任务。 关注操作按复合会话 ID 路由到对应 team。每个 team 另有独立用户资料任务，有限并发拉取目录与补查，按资料版本合并结果。相同私聊的创建请求合并，目录结果保留拉取期间创建的私聊。共享缓存任务登记、查询和取消下载，文件探测、缓存恢复和扫盘交给后台。恢复结果按会话校验。昵称以配置为准，消息接口和订阅在生成响应时合并昵称。该任务接收会话查询、发送、订阅等操作，执行 Slack API 请求、接收 WebSocket 事件，并通过通知、告警和 Emacs 的服务句柄发送通知或回传订阅更新。team 内部状态顺序更新，等待外部 I/O 时可继续分发其他请求。移除 team 时退出请求处理并取消相关订阅。
+Slack 为每个已配置的 team 启动独立的请求处理任务。 关注操作按复合会话 ID 路由到对应 team。每个 team 另有独立用户资料任务，有限并发拉取目录与补查，按资料版本合并结果。相同私聊的创建请求合并，目录结果保留拉取期间创建的私聊。共享缓存任务登记、查询和取消下载，文件探测、缓存恢复和扫盘交给后台。下载任务写入半成品，由共享缓存任务按接收顺序处理原件提交和取消。恢复结果按会话校验。昵称以配置为准，消息接口和订阅在生成响应时合并昵称。该任务接收会话查询、发送、订阅等操作，执行 Slack API 请求、接收 WebSocket 事件，并通过通知、告警和 Emacs 的服务句柄发送通知或回传订阅更新。team 内部状态顺序更新，等待外部 I/O 时可继续分发其他请求。移除 team 时退出请求处理并取消相关订阅。
 
 当前已经建立的目录和职责：
 
