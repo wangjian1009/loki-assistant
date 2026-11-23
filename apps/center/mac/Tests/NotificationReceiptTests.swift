@@ -127,6 +127,23 @@ final class NotificationReceiptTests: XCTestCase {
         XCTAssertEqual(stub.requests.count, 2)
     }
 
+    func testSlackStatusClickOpensTargetInSnapshotSession() async throws {
+        let session = try XCTUnwrap(UUID(uuidString: "550e8400-e29b-41d4-a716-446655440000"))
+        let conversation = SlackNewConversation(
+            id: "TTEAM.CWORK", title: "产品讨论", teamName: "工作区",
+            sessionID: session, callback: "/slack/conversations/TTEAM.CWORK/open?message_ts=200.2&thread_ts=200.1"
+        )
+        let stub = ReceiptStub(statuses: [200])
+        let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })
+        try await client.openSlackConversation(conversation)
+        let request = try XCTUnwrap(stub.requests.last)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/slack/conversations/TTEAM.CWORK/open")
+        XCTAssertEqual(request.url?.query, "message_ts=200.2&thread_ts=200.1")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Loki-Slack-Session"), session.uuidString)
+        XCTAssertEqual(stub.requests.count, 2)
+    }
+
     func testClickSurfacesMissingBufferAndRejectsExternalCallback() async throws {
         let stub = ReceiptStub(statuses: [404])
         let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) }, retryDelay: { _ in XCTFail("点击操作不自动重试") })

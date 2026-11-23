@@ -66,6 +66,7 @@ pub struct SlackService {
     pub(super) avatars_changed: Notify,
     pub(super) preview_downloads: Semaphore,
     pub(super) subscriptions_changed: Notify,
+    pub(super) watch_changes: Arc<Mutex<()>>,
     project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     config: Arc<ConfigService>,
     imported_token_lock: Mutex<()>,
@@ -88,6 +89,7 @@ impl SlackService {
         reporter: Arc<ProjectsStatus>,
         backend: &Backend,
         config: Arc<ConfigService>,
+        watch_changes: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
@@ -107,6 +109,7 @@ impl SlackService {
             avatars_changed: Notify::new(),
             preview_downloads: Semaphore::new(4),
             subscriptions_changed: Notify::new(),
+            watch_changes,
             project: (id, settings, generation, reporter),
             config,
             imported_token_lock: Mutex::new(()),
@@ -149,6 +152,24 @@ impl SlackService {
         self.signal_change();
     }
 
+    pub(super) async fn forget_watch(&self, conversation: &str, watch: &str) {
+        let mut state = self.state.lock().await;
+        state
+            .cache
+            .notifications
+            .retain(|_, alert| alert.watch.as_deref() != Some(watch));
+        if let Some(room) = state.cache.conversations.get_mut(conversation) {
+            room.notification_targets.retain(|_, target| !target.watch_only);
+        }
+        let (id, _, generation, reporter) = &self.project;
+        let authorized = state
+            .cache
+            .session_id
+            .and_then(|session| state.account(session).ok())
+            .map(|account| (&state.cache, account));
+        reporter.update_new_conversations(id, *generation, authorized);
+    }
+
     pub(super) async fn update_cache<T: Send + 'static>(
         &self,
         session: Uuid,
@@ -156,12 +177,20 @@ impl SlackService {
     ) -> Result<T, Error> {
         let mut state = self.state.clone().lock_owned().await;
         state.account(session)?;
+        let (_, _, generation, reporter) = &self.project;
+        let (generation, reporter) = (*generation, Arc::clone(reporter));
         let result = tokio::task::spawn_blocking(move || {
             let State { cache, secrets, .. } = &mut *state;
-            operation(
-                cache,
-                secrets.account.as_ref().expect("已验证的 Slack 会话"),
-            )
+            let account = secrets.account.as_ref().expect("已验证的 Slack 会话");
+            let result = operation(cache, account);
+            if result.is_ok() {
+                reporter.update_new_conversations(
+                    &account.identity.team_id,
+                    generation,
+                    Some((cache, account)),
+                );
+            }
+            result
         })
         .await
         .map_err(|_| Error::Unavailable)?;
@@ -186,6 +215,11 @@ impl SlackService {
             .as_ref()
             .map(|account| account.identity.clone());
         let session = identity.as_ref().map(|identity| identity.session_id);
+        let authorization_lost = session.is_some_and(|session| state.account(session).is_err());
+        if state.cache.session_id != session || authorization_lost {
+            let (id, _, generation, reporter) = &self.project;
+            reporter.update_new_conversations(id, *generation, None);
+        }
         if state.cache.session_id != session {
             state.user_directory = None;
             state.picker_items = Arc::default();
@@ -217,9 +251,11 @@ impl SlackService {
                 .await
                 .map_err(|_| Error::Unavailable)?;
             }
-        }
-        else if session.is_some_and(|session| state.account(session).is_err()) {
+        } else if authorization_lost {
             state.cache.clear_subscriptions();
+            for room in state.cache.conversations.values_mut() {
+                room.notification_targets.clear();
+            }
         }
         self.picker_changed.notify_one();
         Ok(result)

@@ -55,6 +55,17 @@ struct DashboardView: View {
             .disabled(openingSlack)
             .buttonStyle(.borderless)
             .frame(maxWidth: .infinity, alignment: .leading)
+            if !status.slackNewConversations.isEmpty {
+                Section("Slack 新消息") {
+                    ForEach(status.slackNewConversations) { conversation in
+                        Button {
+                            openSlackConversation(conversation)
+                        } label: {
+                            Text("\(conversation.title) · \(conversation.teamName)")
+                        }
+                    }
+                }
+            }
             Button {
                 openingSettings = true
                 Task { @MainActor in
@@ -106,8 +117,6 @@ struct DashboardView: View {
         .padding(8)
         .frame(width: 300, alignment: .leading)
         .labelStyle(.titleAndIcon)
-        .onAppear { status.menuDidOpen() }
-        .onDisappear { status.menuDidClose() }
         .alert(appOpenErrorTitle, isPresented: Binding(
             get: { appOpenError != nil },
             set: { if !$0 { appOpenError = nil } }
@@ -115,6 +124,25 @@ struct DashboardView: View {
             Button("好") { appOpenError = nil }
         } message: {
             Text(appOpenError ?? "")
+        }
+    }
+
+    private func openSlackConversation(_ conversation: SlackNewConversation) {
+        Task { @MainActor in
+            let operation = CenterLog.shared.start("打开 Slack 新消息")
+            do {
+                try await NotificationReceiptClient().openSlackConversation(conversation)
+                CenterLog.shared.finish(operation, result: "success")
+            } catch {
+                CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
+                let alert = NSAlert()
+                alert.messageText = "无法打开 Slack 新消息"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "好")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
         }
     }
 

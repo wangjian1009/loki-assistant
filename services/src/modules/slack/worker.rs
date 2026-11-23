@@ -15,7 +15,7 @@ use super::{
     notification,
     protocol::{Author, Error, Message, Page, timestamp, valid_id},
     service::SlackService,
-    store::{Conversation, PendingNotification, SendState},
+    store::{Conversation, NotificationTarget, PendingNotification, SendState},
 };
 
 impl SlackService {
@@ -298,7 +298,6 @@ impl SlackService {
                 .cloned();
             (format!("{}.{id}", account.identity.team_id), users)
         };
-        let watched = new && self.watching(&conversation_id).await;
         if let Some(message) = &message {
             self.warm_message_media(session, std::slice::from_ref(message)).await;
         }
@@ -306,6 +305,12 @@ impl SlackService {
             .as_ref()
             .and_then(|message| message.author.as_ref())
             .is_some_and(|author| author.id.starts_with('B'));
+        let _watch_change = if new {
+            Some(self.watch_changes.lock().await)
+        } else {
+            None
+        };
+        let watched = new && self.watching(&conversation_id).await;
         let result = self
             .update_cache(session, move |cache, account| {
                 if team
@@ -360,16 +365,16 @@ impl SlackService {
                     }
                 }
                 let ordinary = direct_message || message.mentions(&account.identity.user_id);
-                let first_seen = new
-                    && timestamp(&message.ts)
-                        .is_some_and(|ts| cache.new_messages.insert((ts, id.clone())));
+                let first_seen = timestamp(&message.ts)
+                    .filter(|ts| new && cache.new_messages.insert((*ts, id.clone())));
                 if cache.new_messages.len() > 10_000 {
                     cache.new_messages.pop_first();
                 }
-                let notify = first_seen
-                    && (ordinary || (watched && !direct_message))
-                    && conversation.read_positions.unread(&message, account)
-                    && !conversation.deleted.contains(&message.ts);
+                let notification_order = first_seen.filter(|_| {
+                    (ordinary || (watched && !direct_message))
+                        && conversation.read_positions.unread(&message, account)
+                        && !conversation.deleted.contains(&message.ts)
+                });
                 if let Some(root) = &message.thread_ts {
                     let count = conversation
                         .messages
@@ -379,15 +384,23 @@ impl SlackService {
                         + usize::from(!conversation.messages.contains_key(&message.ts));
                     conversation.update_reply_count(root, count as u64);
                 }
-                if notify {
-                    let mut callback = format!(
-                        "/slack/conversations/{conversation_id}/open?message_ts={}",
-                        message.ts
+                if let Some(order) = notification_order {
+                    conversation.notification_targets.insert(
+                        order,
+                        NotificationTarget {
+                            ts: message.ts.clone(),
+                            thread_ts: message.thread_ts.clone(),
+                            watch_only: !ordinary,
+                        },
                     );
-                    if let Some(thread) = &message.thread_ts {
-                        callback.push_str("&thread_ts=");
-                        callback.push_str(thread);
+                    if conversation.notification_targets.len() > 1_000 {
+                        conversation.notification_targets.pop_first();
                     }
+                    let callback = notification::callback(
+                        &conversation_id,
+                        &message.ts,
+                        message.thread_ts.as_deref(),
+                    );
                     cache.notifications.insert(
                         event_id,
                         PendingNotification {
@@ -401,7 +414,7 @@ impl SlackService {
                     }
                 }
                 conversation.ingest(message);
-                Ok(notify)
+                Ok(notification_order.is_some())
             })
             .await;
         if bot && result.is_ok() {

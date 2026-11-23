@@ -725,6 +725,17 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(data["value"][0]["authorization_state"], "authorized");
     assert_eq!(data["value"][0]["socket_state"], "connected");
     let session = Some(Uuid::parse_str(data["value"][0]["session_id"].as_str().unwrap()).unwrap());
+    let read_status = || async {
+        invoke(&app, "GET", "/status", None, None, None).await.2["status"]["slack"]
+            ["new_conversations"]
+            .clone()
+    };
+    let conversations = read_status().await;
+    assert_eq!(conversations.as_array().unwrap().len(), 1);
+    assert_eq!(conversations[0]["id"], "TTEAM.DDIRECT");
+    assert_eq!(conversations[0]["callback"], callback.as_ref());
+    assert_eq!(conversations[0]["team_name"], "工作区");
+    assert_eq!(conversations[0]["session_id"], json!(session));
 
     let timeline = "/slack/conversations/TTEAM.DDIRECT/messages";
     let thread = format!(
@@ -1026,6 +1037,12 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             mock.reply, mock.root
         )
     );
+    let conversations = read_status().await;
+    assert_eq!(conversations.as_array().unwrap().len(), 2);
+    assert_eq!(conversations[0]["id"], "TTEAM.CWORK");
+    assert_eq!(conversations[0]["title"], "产品讨论");
+    assert_eq!(conversations[0]["callback"], callback.as_ref());
+    assert_eq!(conversations[1]["id"], "TTEAM.DDIRECT");
 
     // 已翻阅的旧线程根消息可能已经被逐出缓存，发送前向 Slack 核对。
     let root = mock.root.clone();
@@ -1230,6 +1247,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         invoke(&app, "GET", list_path, None, None, None).await.2["items"],
         json!([])
     );
+    assert_eq!(read_status().await[0]["callback"], callbacks[2]);
     for event in [
         json!({"type":"message","channel":"CWORK","ts":format!("{now}.300001"),
                "user":"UYOU","text":"取消关注后的普通消息"}),
@@ -1305,6 +1323,34 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         assert_eq!(attempts[6].body, attempts[7].body);
         assert_eq!(attempts[6].navigation_url, attempts[7].navigation_url);
     }
+    assert_eq!(
+        read_status().await[0]["callback"],
+        format!("/slack/conversations/TTEAM.CWORK/open?message_ts={retry_ts}")
+    );
+    let (code, _, _) = invoke(
+        &app,
+        "PUT",
+        "/slack/conversations/TTEAM.CWORK/read-position",
+        session,
+        None,
+        Some(json!({"through_ts":retry_ts})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    // 顶层已读位置不影响先前的线程提及，取消关注只移除依赖关注的消息。
+    assert_eq!(read_status().await[0]["callback"], callback.as_ref());
+    let (code, _, _) = invoke(
+        &app,
+        "PUT",
+        &format!("/slack/conversations/TTEAM.CWORK/threads/{}/read-position", mock.root),
+        session,
+        None,
+        Some(json!({"through_ts":mock.reply})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(read_status().await.as_array().unwrap().len(), 1);
+    assert_eq!(read_status().await[0]["id"], "TTEAM.DDIRECT");
     projects.stop().await;
     worker.await.unwrap();
 

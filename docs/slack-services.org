@@ -378,6 +378,12 @@ Emacs gateway 使用 ~loki-assistant-dispatch-slack-notification~ 转发通知�
 
 成功返回 HTTP 200，包含 ~api_version~ 、 ~conversation_id~ 和 ~target~ 。 ~target~ 为 ~conversation~ 、 ~thread~ 或 ~message~ ，表示实际定位到的层级。消息不可用时回退到线程或会话，失败沿用通用 JSON 错误。 [[file:control-center-services.org::*平台转交与点击跳转][通用通知回调]]
 
+** 托盘新消息会话
+
+本机 ~GET /status~ 的 ~status.slack.new_conversations~ 包含命中通知规则且仍未读的实时消息所在会话。Slack 模块在通知入队时同时记录匹配，私信、提及和关注频道沿用同一判断。每个会话显示一次，按最新匹配消息从新到旧排列。推进对应会话或线程的本机已读位置、删除消息或取消关注时，服务会更新列表。取消关注会保留仍符合提及规则的消息。
+
+每项包含 ~id~ 、 ~title~ 、 ~team_name~ 、 ~session_id~ 和 ~callback~ 。托盘从同一次状态请求读取列表，点击后携带 ~X-Loki-Slack-Session~ 向 ~callback~ 发送 POST，沿用通知跳转接口定位最新匹配消息及其线程。列表为空时菜单省略「Slack 新消息」区块。列表在 services 运行期间保存在内存中，重启后由新的实时事件填充。
+
 * 数据准备
 
 services 启动并恢复工作区授权后，在后台预热用户目录、会话目录和最近一页消息。参照 emacs-slack，缺失的私聊用户资料按需补查，用户变更与加入事件更新内存中的用户目录。查看更早消息和线程时按需分页。

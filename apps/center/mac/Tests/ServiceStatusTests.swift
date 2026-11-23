@@ -7,7 +7,7 @@ private actor MenuStatusTransport {
     func send(_ request: URLRequest) throws -> (Data, URLResponse) {
         let url = try XCTUnwrap(request.url)
         paths.append(url.path)
-        let data = Data(#"{"api_version":"1","status":{"service":{"start_at":200}}}"#.utf8)
+        let data = Data(#"{"api_version":"1","status":{"service":{"start_at":200},"slack":{"new_conversations":[{"id":"TTEAM.CWORK","title":"产品讨论","team_name":"工作区","session_id":"550e8400-e29b-41d4-a716-446655440000","callback":"/slack/conversations/TTEAM.CWORK/open?message_ts=200.1"}]}}}"#.utf8)
         return (data, try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)))
     }
 }
@@ -89,14 +89,17 @@ final class ServiceStatusTests: XCTestCase {
         defer { model.menuDidClose() }
 
         for count in 1...2 {
+            let before = model.lastUpdated
             model.menuDidOpen()
             model.menuDidOpen()
             let deadline = Date().addingTimeInterval(3)
-            while await transport.paths.count < count, Date() < deadline {
-                await Task.yield()
+            while model.lastUpdated == before, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
             }
             let paths = await transport.paths
             XCTAssertEqual(paths, Array(repeating: "/status", count: count))
+            XCTAssertEqual(model.slackNewConversations.map(\.title), ["产品讨论"])
+            XCTAssertNotEqual(model.lastUpdated, before)
             model.menuDidClose()
         }
     }

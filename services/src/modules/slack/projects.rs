@@ -132,7 +132,7 @@ pub struct Projects {
     pub(super) status: Arc<ProjectsStatus>,
     projects: RwLock<BTreeMap<String, Project>>,
     reconcile: Mutex<()>,
-    watch_changes: Mutex<()>,
+    watch_changes: Arc<Mutex<()>>,
     port: std::sync::OnceLock<u16>,
     backend: Backend,
     shutdown: Notify,
@@ -167,11 +167,7 @@ impl Projects {
                 .await
                 .map_err(|_| Error::WatchStorage)?;
             if let Ok(service) = self.service(team).await {
-                let mut state = service.state.lock().await;
-                state
-                    .cache
-                    .notifications
-                    .retain(|_, alert| alert.watch.as_deref() != Some(&id));
+                service.forget_watch(conversation, &id).await;
             }
             return Ok(());
         }
@@ -246,7 +242,7 @@ impl Projects {
             status: Arc::new(ProjectsStatus::new(status)),
             projects: RwLock::default(),
             reconcile: Mutex::default(),
-            watch_changes: Mutex::default(),
+            watch_changes: Arc::default(),
             port: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
@@ -629,6 +625,7 @@ impl Projects {
                 Arc::clone(&self.status),
                 &self.backend,
                 Arc::clone(&self.config),
+                Arc::clone(&self.watch_changes),
             ));
             self.status
                 .register(&id, generation, service.public_status().await);

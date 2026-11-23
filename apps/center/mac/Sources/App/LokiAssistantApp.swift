@@ -35,14 +35,14 @@ private final class MenuTrackingObserver {
             object: nil,
             queue: .main
         ) { [weak status] _ in
-            Task { @MainActor in status?.menuDidOpen() }
+            MainActor.assumeIsolated { status?.menuDidOpen() }
         })
         tokens.append(center.addObserver(
             forName: NSMenu.didEndTrackingNotification,
             object: nil,
             queue: .main
         ) { [weak status] _ in
-            Task { @MainActor in status?.menuDidClose() }
+            MainActor.assumeIsolated { status?.menuDidClose() }
         })
     }
 

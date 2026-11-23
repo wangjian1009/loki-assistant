@@ -44,9 +44,32 @@ struct NetworkStatusModule: Decodable, Equatable, Sendable {
     let my: NetworkStatusValue?
 }
 
+struct SlackNewConversation: Decodable, Equatable, Identifiable, Sendable {
+    let id: String
+    let title: String
+    let teamName: String
+    let sessionID: UUID
+    let callback: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, callback
+        case teamName = "team_name"
+        case sessionID = "session_id"
+    }
+}
+
+struct SlackStatusModule: Decodable, Equatable, Sendable {
+    let newConversations: [SlackNewConversation]?
+
+    enum CodingKeys: String, CodingKey {
+        case newConversations = "new_conversations"
+    }
+}
+
 struct ServiceStatusModules: Decodable, Equatable, Sendable {
     let service: SelfServiceStatusModule?
     let network: NetworkStatusModule?
+    let slack: SlackStatusModule?
 }
 
 struct ServiceStatusSnapshot: Decodable, Equatable, Sendable {
@@ -84,6 +107,10 @@ final class ServiceStatusModel {
     private(set) var networkStatus: String?
     private(set) var snapshot: ServiceStatusSnapshot?
 
+    var slackNewConversations: [SlackNewConversation] {
+        snapshot?.status.slack?.newConversations ?? []
+    }
+
     var indicator: ServiceIndicator {
         switch status {
         case .stopped, .unavailable: .red
@@ -98,8 +125,7 @@ final class ServiceStatusModel {
     @ObservationIgnored private let discover: Discover
     @ObservationIgnored private let transport: Transport
     @ObservationIgnored private let logger: CenterLog?
-    @ObservationIgnored private var menuOpen = false
-    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var menuRefresh: (id: UUID, task: Task<Void, Never>)?
 
     init(
         discover: @escaping Discover = { try NotificationReceiptClient.discoverEndpoint() },
@@ -112,31 +138,49 @@ final class ServiceStatusModel {
     }
 
     func menuDidOpen() {
-        guard !menuOpen else { return }
-        menuOpen = true
+        guard menuRefresh == nil else { return }
+        let id = UUID()
         let operation = logger?.start("打开托盘菜单")
-        refreshTask = Task { [weak self, logger] in
-            await self?.refresh(operation: operation)
-            guard let operation else { return }
-            if Task.isCancelled || self == nil {
-                logger?.finish(operation, result: "cancelled")
-            } else if case .healthy = self?.status {
-                logger?.finish(operation, result: "success")
-            } else if case let .unavailable(message) = self?.status {
-                logger?.finish(operation, result: "failure", details: ["error": message])
-            } else {
-                logger?.finish(operation, result: "failure")
+        let task = Task.detached { [weak self, discover, transport, logger] in
+            let result = await Self.fetch(discover: discover, transport: transport, operation: operation)
+            // 原生菜单追踪期间，主线程通过 eventTracking 模式处理菜单更新。
+            RunLoop.main.perform(inModes: [.default, .eventTracking]) { [weak self] in
+                MainActor.assumeIsolated {
+                    let current = self?.menuRefresh?.id == id
+                    if current { self?.apply(result) }
+                    guard let operation else { return }
+                    if !current {
+                        logger?.finish(operation, result: "cancelled")
+                    } else if case .healthy = self?.status {
+                        logger?.finish(operation, result: "success")
+                    } else if case let .unavailable(message) = self?.status {
+                        logger?.finish(operation, result: "failure", details: ["error": message])
+                    } else {
+                        logger?.finish(operation, result: "failure")
+                    }
+                }
             }
         }
+        menuRefresh = (id, task)
     }
 
     func menuDidClose() {
-        menuOpen = false
-        refreshTask?.cancel()
-        refreshTask = nil
+        menuRefresh?.task.cancel()
+        menuRefresh = nil
     }
 
-    func refresh(operation: CenterLogOperation? = nil) async {
+    func refresh() async {
+        let result = await Self.fetch(discover: discover, transport: transport, operation: nil)
+        if !Task.isCancelled { apply(result) }
+    }
+
+    private typealias FetchResult = Result<(version: String, snapshot: ServiceStatusSnapshot), Error>
+
+    nonisolated private static func fetch(
+        discover: Discover,
+        transport: Transport,
+        operation: CenterLogOperation?
+    ) async -> FetchResult {
         do {
             try Task.checkCancellation()
             // 与通知回执共用文件锁和 pfile 发现，不依赖任何服务管理器的任务名。
@@ -160,29 +204,34 @@ final class ServiceStatusModel {
                let message = (try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data))?.error.message {
                 throw NSError(domain: "LokiAssistant.Status", code: statusCode, userInfo: [NSLocalizedDescriptionKey: message])
             }
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            guard statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }
             let snapshot = try JSONDecoder().decode(ServiceStatusSnapshot.self, from: data)
             guard snapshot.apiVersion == "1" else {
                 throw URLError(.cannotParseResponse)
             }
-            status = .healthy(endpoint.version)
-            self.snapshot = snapshot
-            startedAt = snapshot.status.service.map {
-                Date(timeIntervalSince1970: TimeInterval($0.startedAt))
-            }
-            networkStatus = snapshot.status.network?.my?.status
-        } catch is CancellationError {
-            return
-        } catch NotificationReceiptError.serviceUnavailable {
-            status = .stopped
-            startedAt = nil
-            networkStatus = nil
-            snapshot = nil
+            return .success((endpoint.version, snapshot))
         } catch {
-            guard !Task.isCancelled else { return }
-            status = .unavailable(error.localizedDescription)
+            return .failure(error)
+        }
+    }
+
+    private func apply(_ result: FetchResult) {
+        switch result {
+        case let .success((version, snapshot)):
+            status = .healthy(version)
+            self.snapshot = snapshot
+            startedAt = snapshot.status.service.map { Date(timeIntervalSince1970: TimeInterval($0.startedAt)) }
+            networkStatus = snapshot.status.network?.my?.status
+        case .failure(is CancellationError):
+            return
+        case let .failure(error):
+            if case NotificationReceiptError.serviceUnavailable = error {
+                status = .stopped
+            } else {
+                status = .unavailable(error.localizedDescription)
+            }
             startedAt = nil
             networkStatus = nil
             snapshot = nil

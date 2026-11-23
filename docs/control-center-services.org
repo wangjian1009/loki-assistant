@@ -427,7 +427,7 @@ GET /password/entries/example.com/alice.gpg
 {"api_version":"1","module_id":"service","value":{"start_at":1795074000,"name":"工作电脑","device_type":"computer"},"updated_at":1795074000}
 #+end_src
 
-启动时间是响应字段，不把 ~start_at~ 附加在服务详情查询路径中。网络模块允许多个节点，保留 ~network/{节点}/status~ 层级，当前本机节点为 ~my~。两者的数据均由统一 ~GET /status~ 快照提供，托盘每次打开菜单时只读取一次该快照，不为启动时间另发字段请求。
+启动时间是响应字段，不把 ~start_at~ 附加在服务详情查询路径中。网络模块允许多个节点，保留 ~network/{节点}/status~ 层级，当前本机节点为 ~my~ 。托盘每次打开菜单时只请求一次 ~GET /status~ ，使用同一快照刷新启动时间、网络状态和 Slack 新消息会话。 [[file:slack-services.org::*托盘新消息会话][Slack 新消息会话]]
 
 ** 状态结构声明
 

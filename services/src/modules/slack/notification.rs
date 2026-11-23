@@ -12,6 +12,15 @@ use super::{
 
 const MAX_BODY_CHARS: usize = 240;
 
+pub(super) fn callback(conversation_id: &str, message_ts: &str, thread_ts: Option<&str>) -> String {
+    let mut callback = format!("/slack/conversations/{conversation_id}/open?message_ts={message_ts}");
+    if let Some(thread) = thread_ts {
+        callback.push_str("&thread_ts=");
+        callback.push_str(thread);
+    }
+    callback
+}
+
 pub(super) fn body(message: &Message, users: Option<&UserDirectory>) -> String {
     let mut parts = Vec::new();
     let mut has_prose = false;

@@ -42,6 +42,12 @@ pub(super) struct PendingNotification {
     pub watch: Option<String>,
 }
 
+pub(super) struct NotificationTarget {
+    pub ts: String,
+    pub thread_ts: Option<String>,
+    pub watch_only: bool,
+}
+
 impl Cache {
     pub fn reset(&mut self, session_id: Option<Uuid>) {
         if self.session_id != session_id {
@@ -61,6 +67,7 @@ pub(super) struct Conversation {
     pub participants: Vec<String>,
     pub read_positions: ReadPositions,
     pub messages: BTreeMap<String, Message>,
+    pub notification_targets: BTreeMap<(u64, u32), NotificationTarget>,
     pub deleted: BTreeSet<String>,
     pub loaded: BTreeMap<String, bool>,
     pub journal: Option<MessageJournal>,
@@ -95,6 +102,7 @@ impl Conversation {
             participants: Vec::new(),
             read_positions: ReadPositions::default(),
             messages: BTreeMap::new(),
+            notification_targets: BTreeMap::new(),
             deleted: BTreeSet::new(),
             loaded: BTreeMap::new(),
             journal: None,
@@ -205,6 +213,9 @@ impl Conversation {
             return;
         }
         let removed = self.messages.remove(ts);
+        if let Some(order) = timestamp(ts) {
+            self.notification_targets.remove(&order);
+        }
         let thread = removed
             .and_then(|message| message.thread_ts)
             .or_else(|| thread.map(str::to_owned))
@@ -244,11 +255,16 @@ impl ReadPositions {
         {
             return false;
         }
+        timestamp(&message.ts)
+            .is_some_and(|ts| self.after_cursor(ts, message.thread_ts.as_deref(), account))
+    }
+
+    pub fn after_cursor(&self, ts: (u64, u32), thread: Option<&str>, account: &Account) -> bool {
         let position = self
-            .get(message.thread_ts.as_deref())
+            .get(thread)
             .and_then(timestamp)
             .unwrap_or((self.baseline.unwrap_or(account.baseline), 0));
-        timestamp(&message.ts).is_some_and(|value| value > position)
+        ts > position
     }
 }
 

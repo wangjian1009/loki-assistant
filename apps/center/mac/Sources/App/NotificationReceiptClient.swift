@@ -100,15 +100,28 @@ struct NotificationReceiptClient: Sendable {
     static func callbackPath(_ navigation: URL) throws -> String {
         guard let components = URLComponents(url: navigation, resolvingAgainstBaseURL: false),
               components.scheme == "loki-assistant", components.host == "notification", components.path == "/activate",
-              let callback = components.queryItems?.first(where: { $0.name == "callback" })?.value,
-              callback.hasPrefix("/"), !callback.hasPrefix("//"), !callback.contains("\\"), !callback.contains("#"),
-              let target = URLComponents(string: callback), target.scheme == nil, target.host == nil,
-              !target.path.hasPrefix("//") else { throw SystemNotificationError.invalidPayload }
+              let callback = components.queryItems?.first(where: { $0.name == "callback" })?.value
+        else { throw SystemNotificationError.invalidPayload }
+        try validate(callback: callback)
         return callback
     }
 
+    private static func validate(callback: String) throws {
+        guard callback.hasPrefix("/"), !callback.hasPrefix("//"), !callback.contains("\\"), !callback.contains("#"),
+              let target = URLComponents(string: callback), target.scheme == nil, target.host == nil,
+              !target.path.hasPrefix("//") else { throw SystemNotificationError.invalidPayload }
+    }
+
     func activate(_ navigation: URL) async throws {
-        let callback = try Self.callbackPath(navigation)
+        try await activate(callback: Self.callbackPath(navigation))
+    }
+
+    func openSlackConversation(_ conversation: SlackNewConversation) async throws {
+        try await activate(callback: conversation.callback, slackSessionID: conversation.sessionID)
+    }
+
+    private func activate(callback: String, slackSessionID: UUID? = nil) async throws {
+        try Self.validate(callback: callback)
         let endpoint = try await healthyEndpoint()
         let base = try Self.url(endpoint: endpoint, path: "/")
         guard let target = URL(string: callback, relativeTo: base)?.absoluteURL,
@@ -117,6 +130,9 @@ struct NotificationReceiptClient: Sendable {
         }
         var request = URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.httpMethod = "POST"
+        if let slackSessionID {
+            request.setValue(slackSessionID.uuidString, forHTTPHeaderField: "X-Loki-Slack-Session")
+        }
         let (data, response) = try await transport(request)
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard response.statusCode == 200 else {
