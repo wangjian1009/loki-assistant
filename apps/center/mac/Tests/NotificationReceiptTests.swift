@@ -6,6 +6,27 @@ import XCTest
 private let receiptTestID = "550e8400-e29b-41d4-a716-446655440000"
 
 final class NotificationReceiptTests: XCTestCase {
+    func testStartupRequestsPendingRetryAfterHealthCheck() async throws {
+        let stub = ReceiptStub(statuses: [202])
+        let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })
+        try await client.requestPendingRetry()
+        let requests = stub.requests
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/healthz", "/notification/retry-pending"])
+        XCTAssertEqual(requests.map { $0.url?.port }, [47321, 47321])
+        XCTAssertEqual(requests.last?.httpMethod, "POST")
+        XCTAssertNil(requests.last?.httpBody)
+    }
+
+    func testStartupSkipsPendingRetryWhenServiceIsUnavailable() async throws {
+        let stub = ReceiptStub(statuses: [], healthBody: "{}")
+        let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })
+        do {
+            try await client.requestPendingRetry()
+            XCTFail("健康检查失败时应跳过补发请求")
+        } catch NotificationReceiptError.serviceUnavailable {}
+        XCTAssertEqual(stub.requests.map { $0.url?.path }, ["/healthz"])
+    }
+
     func testRetriesReceiptWithSameIDAndRediscoversEndpoint() async throws {
         let stub = ReceiptStub(statuses: [500, 200])
         let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) }, retryDelay: { _ in })

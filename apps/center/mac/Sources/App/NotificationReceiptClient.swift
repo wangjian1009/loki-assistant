@@ -23,12 +23,14 @@ enum NotificationReceiptError: Error, LocalizedError {
     case serviceUnavailable
     case invalidEndpoint
     case rejected(Int)
+    case retryRejected(Int)
 
     var errorDescription: String? {
         switch self {
         case .serviceUnavailable: "services 未运行或健康检查失败"
         case .invalidEndpoint: "services 回执地址无效"
         case let .rejected(status): "通知回执被 services 拒绝（HTTP \(status)）"
+        case let .retryRejected(status): "通知补发请求被 services 拒绝（HTTP \(status)）"
         }
     }
 }
@@ -58,6 +60,16 @@ struct NotificationReceiptClient: Sendable {
         self.discover = discover
         self.transport = transport
         self.retryDelay = retryDelay
+    }
+
+    func requestPendingRetry() async throws {
+        let endpoint = try await healthyEndpoint()
+        let url = try Self.url(endpoint: endpoint, path: "/notification/retry-pending")
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        let (_, response) = try await transport(request)
+        guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard response.statusCode == 202 else { throw NotificationReceiptError.retryRejected(response.statusCode) }
     }
 
     func send(_ receipt: NotificationReceipt, notificationID: String) async throws {

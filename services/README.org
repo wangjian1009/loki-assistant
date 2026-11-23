@@ -186,7 +186,9 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 使用前执行 ~make restart-center~ 加载菜单栏应用并注册通知 URL scheme。首次提交时 macOS 会请求 Loki Assistant 的通知权限。
 
-默认系统通知先写入 ~~/.cache/assistant/notification~ ，状态为 ~unconfirmed~ 。可用响应中的 ~result.notification_id~ 查询 ~GET /notification/{id}~ 。菜单栏应用成功提交给 macOS 后回报 ~submitted~ ，services 将状态更新为 ~confirmed~ 并移除对应缓存。提交失败或重启后，未确认通知会以原 ID 重试。 [[file:../docs/control-center-services.org::*系统通知模块][通知状态和回执协议]]
+本机客户端也可以通过 ~POST /notification~ 直接发送通用系统通知。发送 JSON 时须提供 ~title~ ，可选 ~body~ 、 ~app~ 和 ~callback_url~ 。成功响应的顶层 ~notification_id~ 可用于查询状态。 [[file:../docs/control-center-services.org::*HTTP 发送接口][通用通知发送协议]]
+
+默认系统通知先写入 ~~/.cache/assistant/notification~ ，状态为 ~unconfirmed~ 。可用响应中的 ~result.notification_id~ 查询 ~GET /notification/{id}~ 。菜单栏应用成功提交给 macOS 后回报 ~submitted~ ，services 将状态更新为 ~confirmed~ 并移除对应缓存。未确认通知会以原 ID 重试，菜单栏应用启动时会主动请求补发。 [[file:../docs/control-center-services.org::*系统通知模块][通知状态和回执协议]]
 
 
 使用回执能力需同时加载新版 services 和菜单栏应用；操作入口见下方服务管理以及 [[file:../apps/center/README.org][菜单栏应用说明]]。

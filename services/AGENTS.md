@@ -167,9 +167,9 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 `Services` 创建并持有 `Arc<notification::NotificationService>`，创建 `emacs::Module` 时通过 `Arc::clone` 注入通知和状态实例。通知模块直接导出 `NotificationService`，发送、状态查询、回执和路由均通过该实例调用，不另设 `Module` 包装或 `service()` 取用入口。`EmacsService` 保存该 `Arc<NotificationService>` 引用，不得自行创建通知服务或平台发送器。Emacs 通知上报入口保留 `POST /emacs/receiver/notification`：本模块负责把可选 buffer 转成 `/emacs/activate` 回调路径，未收到 `app` 或收到 `null` 时补为 `emacs`（图标由 center 按应用标识从内置资源读取），再调用通知服务发送；不在发送期间连接 Emacs。
 
-`modules/notification` 拥有通用 `NotificationRequest`、代码发送接口、应用内跳转封装、回执与状态。它通过可注入的 `NotificationLauncher` 调用 `/usr/bin/open -g`，使用 `loki-assistant://notification/show` 转交 App；将业务提供的本机服务路径包装成 `loki-assistant://notification/activate` 导航 URL，不解释 buffer。通用路由为 `GET /notification/{id}` 和 `POST /notification/{id}/receipt`；旧 Emacs 路由只代理同一份状态。单元测试注入 fake，不发送真实通知。
+`modules/notification` 拥有通用 `NotificationRequest`、代码发送接口、应用内跳转封装、回执与状态。它通过可注入的 `NotificationLauncher` 调用 `/usr/bin/open -g`，使用 `loki-assistant://notification/show` 转交 App；将业务提供的本机服务路径包装成 `loki-assistant://notification/activate` 导航 URL，不解释 buffer。通用路由为 `POST /notification`、`GET /notification/{id}`、`POST /notification/{id}/receipt` 和 `POST /notification/retry-pending`；旧 Emacs 路由只代理同一份状态。单元测试注入 fake，不发送真实通知。
 
-系统通知先以随机 `notification_id` 写入 `~/.cache/assistant/notification` ，再转交托盘；成功回执移除缓存并确认，失败回执保留未确认记录。由 `main.rs` 显式调度待确认通知恢复和重试。自定义 Emacs 模块通知处理器沿用各自的返回值。
+系统通知先以随机 `notification_id` 写入 `~/.cache/assistant/notification` ，再转交托盘；成功回执移除缓存并确认，失败回执保留未确认记录。由 `main.rs` 显式调度待确认通知恢复和重试，托盘就绪时通过本机补发路由唤醒同一任务。自定义 Emacs 模块通知处理器沿用各自的返回值。
 
 `POST /emacs/activate` 执行点击后的业务跳转：无 buffer 时通过独立参数打开 Emacs；有 buffer 时通过现有 gateway 定位存活目标并聚焦图形 frame，不自动启动新 daemon，不创建同名空 buffer。App 只解包通用导航 URL 并回调 services，不直接执行 Emacs 激活。
 

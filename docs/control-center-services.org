@@ -93,8 +93,10 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/network/peers~ | 查询已绑定设备 |
 | GET | ~/network/session~ | 查询已认证手机对应的电脑在线状态与绑定时间 |
 | DELETE | ~/network/peers/{endpoint_id}~ | 解除设备绑定 |
+| POST | ~/notification~ | 发送通用系统通知并返回当前确认状态 |
 | GET | ~/notification/{id}~ | 查询系统通知处理状态 |
 | POST | ~/notification/{id}/receipt~ | 接收菜单栏应用处理回执 |
+| POST | ~/notification/retry-pending~ | 托盘就绪后调度未确认通知补发 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
 | POST | ~/emacs/apps/open~ | 按 app 查询参数打开 Emacs 应用 |
 | POST | ~/emacs/capture/full~ | 接收浏览器生成的 Org 全文并进入 Loki Assistant 捕获 |
@@ -686,7 +688,17 @@ Emacs 包提供异步通知函数，内部读取 services pfile 并复用通用 
 
 * 系统通知模块
 
-~modules/notification~ 提供通用的 Rust 代码接口、平台转交、应用内跳转封装及回执状态。业务模块负责选择默认应用标识、生成本机服务回调路径并执行具体业务；通知模块不解释 buffer 或调用 Emacs。发送由代码接口触发，当前没有独立的通知发送 HTTP 接口。
+~modules/notification~ 提供通用的发送接口、平台转交、应用内跳转封装及回执状态。业务模块负责选择默认应用标识、生成本机服务回调路径并执行具体业务。
+
+** HTTP 发送接口
+
+本机调用方可以向 ~POST /notification~ 发送 JSON。 ~title~ 为必填非空字符串。 ~body~ 、 ~app~ 和 ~callback_url~ 为可选字符串，可以省略或传 ~null~ 。 ~app~ 使用下文约定的应用标识。 ~callback_url~ 指定点击通知后调用的本机 services 绝对路径，可以带查询参数。未提供回调时点击不执行额外操作。无效的请求返回 HTTP 400 ~invalid-request~ 。
+
+#+begin_src json
+{"title":"任务完成","body":"处理结果已就绪"}
+#+end_src
+
+成功返回 HTTP 200 和下文状态查询使用的 JSON 对象，包含 ~api_version~ 、 ~notification_id~ 和当前 ~status~ 。托盘转交失败时返回 ~unconfirmed~ ，可用原 ID 查询后续状态。
 
 ** 代码接口与依赖注入
 
@@ -715,9 +727,11 @@ services 通过独立参数调用 ~/usr/bin/open -g~ ，将通知 JSON 编码到
 
 使用前通过已有的 ~make restart-service~ 和 ~make restart-center~ 加载新版服务与 App。首次由 App 请求系统通知权限；拒绝后需要在系统设置中开启。旧版 ~loki-assistant://emacs/notification~ URL 及已发出通知的 Emacs 元数据仍可识别，点击统一回到 services，不在 App 中执行 Emacs 激活。
 
-** 通知回执与状态查询
+** 通知补发、回执与状态查询
 
 通知模块生成随机 UUID ~notification_id~ ，在 ~~/.cache/assistant/notification/<id>.json~ 原子写入未确认记录，再将同一 ID 和展示内容交给菜单栏应用。services 启动时恢复未确认记录，转交失败或等待回执时以同一 ID 重试。
+
+托盘启动完成后，通过文件锁、pfile 和健康检查发现 services，并向本机发送一次无请求体的 ~POST /notification/retry-pending~ 。services 将尚未确认且未在转交中的通知安排为立即重试，唤醒现有重试任务，以原 ID 和内容转交。接口返回 HTTP 202 和 ~{"api_version":"1","status":"accepted"}~ ，表示已调度补发。托盘启动时若 services 不可用，后续由 services 的启动恢复与定时重试继续处理。
 
 ~GET /notification/{id}~ 返回带协议版本的当前状态。
 

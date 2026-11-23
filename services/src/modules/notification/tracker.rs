@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -26,6 +27,39 @@ struct Pending {
     content: NotificationContent,
     retry_at: Instant,
     failure: Option<(String, String)>,
+    in_flight: Weak<()>,
+}
+
+#[derive(Debug)]
+pub(super) struct DeliveryAttempt {
+    pub content: NotificationContent,
+    _in_flight: Arc<()>,
+}
+
+impl Pending {
+    fn new(content: NotificationContent) -> Self {
+        Self {
+            content,
+            retry_at: Instant::now(),
+            failure: None,
+            in_flight: Weak::new(),
+        }
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.in_flight.strong_count() != 0
+    }
+
+    fn begin_attempt(&mut self, now: Instant) -> DeliveryAttempt {
+        // 转交完成、超时或取消时，DeliveryAttempt 释放占用。
+        let in_flight = Arc::new(());
+        self.in_flight = Arc::downgrade(&in_flight);
+        self.retry_at = now + RETRY_INTERVAL;
+        DeliveryAttempt {
+            content: self.content.clone(),
+            _in_flight: in_flight,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -65,14 +99,7 @@ impl NotificationTracker {
                 .and_then(|bytes| serde_json::from_slice::<NotificationContent>(&bytes).ok())
                 .filter(|content| content.notification_id == id.to_string());
             if let Some(content) = content {
-                records.pending.insert(
-                    id,
-                    Pending {
-                        content,
-                        retry_at: Instant::now(),
-                        failure: None,
-                    },
-                );
+                records.pending.insert(id, Pending::new(content));
             } else {
                 eprintln!("无法恢复待确认通知 {id}");
             }
@@ -87,7 +114,7 @@ impl NotificationTracker {
         &self,
         content: NotificationContent,
         id: Uuid,
-    ) -> Result<(), NotificationError> {
+    ) -> Result<DeliveryAttempt, NotificationError> {
         let mut records = self.records.lock().await;
         if records.pending.len() >= MAX_PENDING {
             return Err(NotificationError::Capacity);
@@ -95,15 +122,20 @@ impl NotificationTracker {
         if let Some(directory) = &self.directory {
             write_pending(directory, id, &content)?;
         }
-        records.pending.insert(
-            id,
-            Pending {
-                content,
-                retry_at: Instant::now() + RETRY_INTERVAL,
-                failure: None,
-            },
-        );
-        Ok(())
+        let mut pending = Pending::new(content);
+        let attempt = pending.begin_attempt(Instant::now());
+        records.pending.insert(id, pending);
+        Ok(attempt)
+    }
+
+    pub async fn schedule_retry(&self) {
+        let mut records = self.records.lock().await;
+        let now = Instant::now();
+        for pending in records.pending.values_mut() {
+            if !pending.is_in_flight() {
+                pending.retry_at = pending.retry_at.min(now);
+            }
+        }
     }
 
     pub async fn due(&self) -> Vec<Uuid> {
@@ -112,18 +144,18 @@ impl NotificationTracker {
         let mut due: Vec<_> = records
             .pending
             .iter()
-            .filter(|(_, pending)| pending.retry_at <= now)
+            .filter(|(_, pending)| pending.retry_at <= now && !pending.is_in_flight())
             .map(|(id, pending)| (pending.retry_at, *id))
             .collect();
         due.sort_unstable();
         due.into_iter().map(|(_, id)| id).collect()
     }
 
-    pub async fn retry(&self, id: Uuid) -> Option<NotificationContent> {
+    pub async fn retry(&self, id: Uuid) -> Option<DeliveryAttempt> {
         let mut records = self.records.lock().await;
         let pending = records.pending.get_mut(&id)?;
-        pending.retry_at = Instant::now() + RETRY_INTERVAL;
-        Some(pending.content.clone())
+        let now = Instant::now();
+        (pending.retry_at <= now && !pending.is_in_flight()).then(|| pending.begin_attempt(now))
     }
 
     pub async fn get(&self, id: &str) -> Result<NotificationStatusResponse, NotificationError> {

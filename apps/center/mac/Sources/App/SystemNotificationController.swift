@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import OSLog
 import UserNotifications
@@ -102,10 +103,33 @@ enum SystemNotificationError: LocalizedError {
     }
 }
 
+private final class CenterInstanceLock {
+    private let descriptor: Int32
+
+    init?() {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".assistant")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appending(path: "center.lock").path
+        let descriptor = open(path, O_CREAT | O_RDWR, 0o600)
+        guard descriptor >= 0, flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            if descriptor >= 0 { close(descriptor) }
+            return nil
+        }
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+}
+
 @MainActor
 final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private let logger = Logger(subsystem: "cc.loki-assistant.center", category: "notification")
     private let receiptClient = NotificationReceiptClient()
+    private var instanceLock: CenterInstanceLock?
     private lazy var delivery = NotificationDelivery(
         present: { [unowned self] in try await self.present($0) },
         report: { [receiptClient] in try await receiptClient.send($1, notificationID: $0) }
@@ -113,6 +137,32 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
+        // XCTest 的宿主进程使用独立标识，跳过正式实例锁和启动补发。
+        let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+        guard !isTesting else { return }
+
+        instanceLock = CenterInstanceLock()
+        if instanceLock == nil {
+            let existing = NSRunningApplication.runningApplications(
+                withBundleIdentifier: Bundle.main.bundleIdentifier ?? "cc.loki-assistant.center"
+            ).first { $0.processIdentifier != getpid() }
+            existing?.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            DispatchQueue.main.async {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard instanceLock != nil else { return }
+        Task {
+            do {
+                try await receiptClient.requestPendingRetry()
+            } catch {
+                logger.debug("启动时请求补发通知失败：\(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {

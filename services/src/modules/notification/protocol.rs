@@ -2,8 +2,15 @@ use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: &str = "1";
 
-/// 业务模块提供通知内容和本机服务回调路径；平台跳转 URL 由通知模块生成。
-#[derive(Clone, Debug)]
+#[derive(Debug, Serialize)]
+pub(super) struct NotificationRetryResponse {
+    pub api_version: &'static str,
+    pub status: &'static str,
+}
+
+/// 调用方提供通知内容和本机服务回调路径；平台跳转 URL 由通知模块生成。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotificationRequest {
     pub title: String,
     pub body: Option<String>,

@@ -2,14 +2,17 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::http::Uri;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use tokio::time::{interval, timeout};
+use tokio::{
+    sync::Notify,
+    time::{interval, timeout},
+};
 use uuid::Uuid;
 
 use super::{
     protocol::{
         NotificationReceipt, NotificationRequest, NotificationStatusResponse, is_valid_app,
     },
-    tracker::NotificationTracker,
+    tracker::{DeliveryAttempt, NotificationTracker},
 };
 use crate::platform::macos::notification::{
     MacNotificationLauncher, NotificationContent, NotificationLauncher,
@@ -40,6 +43,7 @@ pub struct NotificationService {
     launcher: Arc<dyn NotificationLauncher>,
     timeout: Duration,
     tracker: NotificationTracker,
+    retry_requested: Notify,
 }
 
 impl Default for NotificationService {
@@ -70,6 +74,7 @@ impl NotificationService {
             launcher,
             timeout,
             tracker: NotificationTracker::load(directory)?,
+            retry_requested: Notify::new(),
         })
     }
 
@@ -78,6 +83,7 @@ impl NotificationService {
             launcher,
             timeout,
             tracker: NotificationTracker::default(),
+            retry_requested: Notify::new(),
         }
     }
 
@@ -108,27 +114,35 @@ impl NotificationService {
             app: request.app,
             navigation_url,
         };
-        self.tracker.register(content.clone(), id).await?;
-        self.forward(content).await;
+        let attempt = self.tracker.register(content, id).await?;
+        self.forward(attempt).await;
         self.tracker.get(&id.to_string()).await
+    }
+
+    pub(super) async fn request_pending_retry(&self) {
+        self.tracker.schedule_retry().await;
+        self.retry_requested.notify_one();
     }
 
     pub async fn retry_pending(&self) {
         let mut ticks = interval(Duration::from_secs(15));
         loop {
-            ticks.tick().await;
+            tokio::select! {
+                _ = self.retry_requested.notified() => {}
+                _ = ticks.tick() => {}
+            }
             for id in self.tracker.due().await {
-                if let Some(content) = self.tracker.retry(id).await {
-                    self.forward(content).await;
+                if let Some(attempt) = self.tracker.retry(id).await {
+                    self.forward(attempt).await;
                 }
             }
         }
     }
 
-    async fn forward(&self, content: NotificationContent) {
-        let id = content.notification_id.clone();
+    async fn forward(&self, attempt: DeliveryAttempt) {
+        let id = attempt.content.notification_id.clone();
         if !matches!(
-            timeout(self.timeout, self.launcher.launch(content)).await,
+            timeout(self.timeout, self.launcher.launch(attempt.content)).await,
             Ok(Ok(()))
         ) {
             eprintln!("通知 {id} 暂未转交给菜单栏应用，稍后重试");

@@ -16,6 +16,7 @@ use tower::ServiceExt;
 use super::{
     NotificationError, NotificationService,
     protocol::{NotificationReceipt, NotificationRequest, NotificationStatus},
+    tracker::NotificationTracker,
 };
 use crate::{
     modules::{config::service::ConfigService, emacs},
@@ -106,6 +107,60 @@ async fn request(app: Router, method: &str, path: &str, body: Value) -> (StatusC
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn http_send_validates_input_and_forwards_through_the_shared_tracker() {
+    let launcher = Arc::new(Launcher::default());
+    let service = Arc::new(NotificationService::with_launcher(
+        launcher.clone(),
+        Duration::from_secs(1),
+    ));
+    let app = service.router();
+    for body in [
+        json!({"body":"缺少标题"}),
+        json!({"title":" "}),
+        json!({"title":"错误类型","body":42}),
+        json!({"title":"无效应用","app":"../emacs"}),
+        json!({"title":"外部回调","callback_url":"https://example.org/"}),
+        json!({"title":"额外字段","notification_id":"自定义 ID"}),
+    ] {
+        let (status, result) = request(app.clone(), "POST", "/notification", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(result["error"]["code"], "invalid-request");
+    }
+    assert!(launcher.0.lock().unwrap().is_empty());
+
+    let (status, sent) = request(
+        app.clone(),
+        "POST",
+        "/notification",
+        json!({"title":"接口通知","body":"正文","app":"emacs","callback_url":"/emacs/activate"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sent["api_version"], "1");
+    assert_eq!(sent["status"], "unconfirmed");
+    let id = sent["notification_id"].as_str().unwrap();
+    {
+        let calls = launcher.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let content = &calls[0];
+        assert_eq!(content.notification_id, id);
+        assert_eq!(content.title, "接口通知");
+        assert_eq!(content.body.as_deref(), Some("正文"));
+        assert_eq!(content.app.as_deref(), Some("emacs"));
+        assert!(content.navigation_url.is_some());
+    }
+    let (status, received) = request(
+        app,
+        "POST",
+        &format!("/notification/{id}/receipt"),
+        json!({"status":"submitted"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(received["status"], "confirmed");
 }
 
 #[tokio::test]
@@ -295,4 +350,90 @@ async fn pending_content_survives_restart_and_is_removed_only_on_confirmation() 
         Err(NotificationError::NotFound)
     ));
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn tray_startup_wakes_worker_and_retries_only_unconfirmed_notifications() {
+    let launcher = Arc::new(Launcher::default());
+    let service = Arc::new(NotificationService::with_launcher(
+        launcher.clone(),
+        Duration::from_secs(1),
+    ));
+    let send = |title: &str| {
+        service.send(NotificationRequest {
+            title: title.into(),
+            body: None,
+            app: None,
+            callback_url: None,
+        })
+    };
+    let pending = send("待确认").await.unwrap();
+    let confirmed = send("已确认").await.unwrap();
+    service
+        .receive_receipt(
+            &confirmed.notification_id,
+            NotificationReceipt::Submitted {},
+        )
+        .await
+        .unwrap();
+
+    let worker_service = service.clone();
+    let worker = tokio::spawn(async move { worker_service.retry_pending().await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(launcher.0.lock().unwrap().len(), 2);
+
+    let response = service
+        .router()
+        .oneshot(
+            Request::post("/notification/retry-pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"api_version": "1", "status": "accepted"})
+    );
+
+    // 一秒内没有定时扫描，只有托盘就绪请求能触发转交。
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    {
+        let sent = launcher.0.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2].notification_id, pending.notification_id);
+    }
+    assert_eq!(
+        service
+            .status(&pending.notification_id)
+            .await
+            .unwrap()
+            .status,
+        NotificationStatus::Unconfirmed
+    );
+    worker.abort();
+}
+
+#[tokio::test]
+async fn startup_retry_leaves_in_flight_delivery_to_its_current_attempt() {
+    let tracker = NotificationTracker::default();
+    let id = uuid::Uuid::new_v4();
+    let content = NotificationContent {
+        notification_id: id.to_string(),
+        title: "正在转交".into(),
+        app: None,
+        body: None,
+        navigation_url: None,
+    };
+    let attempt = tracker.register(content, id).await.unwrap();
+    tracker.schedule_retry().await;
+    assert!(tracker.due().await.is_empty());
+
+    drop(attempt);
+    tracker.schedule_retry().await;
+    assert_eq!(tracker.due().await, [id]);
+    assert!(tracker.retry(id).await.is_some());
+    assert!(tracker.retry(id).await.is_none());
 }

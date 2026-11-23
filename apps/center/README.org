@@ -16,7 +16,7 @@
 
 通过 ~loki-assistant~ URL scheme 后台接收通知；运行新版应用后由 LaunchServices 注册该 scheme。macOS 禁止通知或启用勿扰模式时可能不显示横幅，权限与处理错误记录在系统日志中。
 
-菜单栏应用成功向 macOS 提交通知后，通过 ~/notification/{id}/receipt~ 确认。提交失败时回报错误，services 保留未确认记录并重试。重复转交同一个 ID 时，应用检查已有提交记录并补发回执。点击时通过本机 services 调用业务回调，失败时显示具体原因。 [[file:../../docs/control-center-services.org::*系统通知模块][通知状态和回执协议]]
+菜单栏应用启动后会主动请求 services 补发未确认通知。成功向 macOS 提交通知后，通过 ~/notification/{id}/receipt~ 确认。提交失败时回报错误，services 保留未确认记录并重试。重复转交同一个 ID 时，应用检查已有提交记录并补发回执。点击时通过本机 services 调用业务回调，失败时显示具体原因。 [[file:../../docs/control-center-services.org::*系统通知模块][通知状态和回执协议]]
 
 「设置」通过 ~POST /emacs/apps/open?app=config~ 打开 Emacs 配置界面。托盘操作记录在 ~~/.assistant/loki-assistant.log.org~ ，最多保留最近 500 条一级操作。 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]
 
