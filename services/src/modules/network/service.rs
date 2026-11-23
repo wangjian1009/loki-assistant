@@ -310,7 +310,7 @@ impl NetworkService {
             .ok_or(NetworkError::PeerNotBound)?;
         let name = self
             .status
-            .value("service", "name")
+            .value_for("service", "name", true)
             .ok()
             .and_then(|v| v.value.as_str().map(str::to_owned))
             .unwrap_or_else(|| "Loki 电脑".into());

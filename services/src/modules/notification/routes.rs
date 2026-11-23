@@ -24,7 +24,6 @@ pub fn router(service: Arc<NotificationService>) -> Router {
     id = "status",
     method = "GET",
     path = "/notification/{id}",
-    access = "paired",
     summary = "查询系统通知处理状态",
     description = "查询 unconfirmed 或 confirmed；未确认记录跨重启保留。"
 )]

@@ -31,7 +31,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 
 没有用户设置和静态 ~default~ 时，配置模块按 services 启动时的 ~PATH~ 顺序搜索，再按 ~search_paths~ 的顺序补充查找。只接受实际可执行的普通文件（允许符号链接），返回绝对路径；不通过 shell，不执行待查找的程序，也不展开 ~ 和环境变量。每次读取重新查找，因此安装或移除程序后，下次读取即可反映变化。找不到程序时不生成默认值，Emacs 配置界面显示“未设置”并提供文件选择入口。
 
-配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取，~read_write~ 另开放替换、部分更新和预检。配置中心依据 network 注入的 ~x-loki-remote-devices~ 判断请求来源。远端元数据和模块值只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 为只读，~control-center/center_auto_start~ 可读写，其余配置项仅限本机。
+配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取。写入须同时得到 API 的 ~paired~ 声明与配置项的 ~read_write~ 声明授权，预检同样需要写权限。配置中心依据 network 注入的 Axum 请求扩展判断请求来源。远端元数据、模块值和待确认记录只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 和 ~control-center/center_auto_start~ 对绑定设备只读，其余配置项仅限本机。
 
 * 生效值与来源
 

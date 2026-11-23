@@ -46,12 +46,11 @@ fn network_status_metadata() -> StatusModuleMetadata {
         name: "网络".to_owned(),
         description: "本机网络连接状态。".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        items: vec![StatusItemMetadata {
-            remote_access: true,
-            key: "my".to_owned(),
-            name: "本机节点".to_owned(),
-            description: "由网络模块发布的本机连接状态。".to_owned(),
-            schema: StatusSchema::Object {
+        items: vec![StatusItemMetadata::new(
+            "my",
+            "本机节点",
+            "由网络模块发布的本机连接状态。",
+            StatusSchema::Object {
                 fields: vec![StatusFieldMetadata::new(
                     "status",
                     "连接状态",
@@ -59,6 +58,6 @@ fn network_status_metadata() -> StatusModuleMetadata {
                     StatusSchema::String { choices },
                 )],
             },
-        }],
+        )],
     }
 }

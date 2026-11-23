@@ -28,12 +28,11 @@ fn slack_status_metadata() -> StatusModuleMetadata {
         description: "Slack 授权、连接和未读会话状态。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         items: vec![
-            StatusItemMetadata {
-                key: "connections".into(),
-                name: "Slack 连接".into(),
-                description: "各工作区的授权和连接状态。".into(),
-                remote_access: false,
-                schema: StatusSchema::Array {
+            StatusItemMetadata::new(
+                "connections",
+                "Slack 连接",
+                "各工作区的授权和连接状态。",
+                StatusSchema::Array {
                     items: Box::new(StatusSchema::Object {
                         fields: vec![
                             Field::new(
@@ -86,13 +85,13 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         ],
                     }),
                 },
-            },
-            StatusItemMetadata {
-                key: "new_conversations".into(),
-                name: "Slack 未读会话".into(),
-                description: "包含未读消息的会话，按最新未读消息排序。".into(),
-                remote_access: false,
-                schema: StatusSchema::Array {
+            )
+            .local_only(),
+            StatusItemMetadata::new(
+                "new_conversations",
+                "Slack 未读会话",
+                "包含未读消息的会话，按最新未读消息排序。",
+                StatusSchema::Array {
                     items: Box::new(StatusSchema::Object {
                         fields: vec![
                             Field::new(
@@ -134,7 +133,8 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                         ],
                     }),
                 },
-            },
+            )
+            .local_only(),
         ],
     }
 }

@@ -8,12 +8,12 @@ use super::{
 };
 use crate::{
     http::error::{ErrorSource, response},
-    modules::network::remote::is_remote,
+    modules::network::remote::AuthenticatedPeer,
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::Response,
 };
 use loki_services_macros::loki_api;
@@ -35,18 +35,11 @@ pub fn router(service: Arc<StatusService>) -> Router {
 )]
 async fn metadata(
     State(service): State<Arc<StatusService>>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Json<StatusMetaResponse> {
-    let mut modules = service.metadata();
-    if is_remote(&headers) {
-        for module in &mut modules {
-            module.items.retain(|item| item.remote_access);
-        }
-        modules.retain(|module| !module.items.is_empty());
-    }
     Json(StatusMetaResponse {
         api_version: API_VERSION.to_owned(),
-        modules,
+        modules: service.metadata_for(peer.is_some()),
     })
 }
 
@@ -62,9 +55,9 @@ async fn metadata(
 )]
 async fn snapshot(
     State(service): State<Arc<StatusService>>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Json<StatusResponse> {
-    Json(service.snapshot_for(is_remote(&headers)))
+    Json(service.snapshot_for(peer.is_some()))
 }
 
 #[loki_api(
@@ -80,10 +73,10 @@ async fn snapshot(
 async fn module_value(
     State(service): State<Arc<StatusService>>,
     Path(module): Path<String>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Result<Json<StatusModuleResponse>, Response> {
     service
-        .module_value_for(&module, is_remote(&headers))
+        .module_value_for(&module, peer.is_some())
         .map(Json)
         .map_err(error_response)
 }
@@ -101,15 +94,10 @@ async fn module_value(
 async fn value(
     State(service): State<Arc<StatusService>>,
     Path((module, key)): Path<(String, String)>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Result<Json<StatusValueResponse>, Response> {
-    if is_remote(&headers) {
-        service
-            .require_remote_access(&module, &key)
-            .map_err(error_response)?;
-    }
     service
-        .value(&module, &key)
+        .value_for(&module, &key, peer.is_some())
         .map(Json)
         .map_err(error_response)
 }
@@ -127,15 +115,10 @@ async fn value(
 async fn path_value(
     State(service): State<Arc<StatusService>>,
     Path((module, key, path)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Result<Json<StatusPathResponse>, Response> {
-    if is_remote(&headers) {
-        service
-            .require_remote_access(&module, &key)
-            .map_err(error_response)?;
-    }
     service
-        .path_value(&module, &key, &path)
+        .path_value_for(&module, &key, &path, peer.is_some())
         .map(Json)
         .map_err(error_response)
 }

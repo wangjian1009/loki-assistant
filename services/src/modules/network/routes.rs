@@ -91,7 +91,6 @@ fn pairing_id(path: Result<Path<String>, PathRejection>) -> Result<String, Respo
     id = "create-pairing",
     method = "POST",
     path = "/network/pairings",
-    access = "paired",
     summary = "创建绑定邀请",
     description = "协议版本 1，创建五分钟有效的单次邀请，返回二维码 PNG 的 Base64 与 payload，成功后取消原有未完成邀请。"
 )]
@@ -119,7 +118,6 @@ async fn create(
     id = "pairing",
     method = "GET",
     path = "/network/pairings/{id}",
-    access = "paired",
     summary = "查询绑定进度",
     description = "协议版本 1：读取邀请状态、有效期与绑定设备，不返回令牌。"
 )]
@@ -140,7 +138,6 @@ async fn query(
     id = "cancel-pairing",
     method = "DELETE",
     path = "/network/pairings/{id}",
-    access = "paired",
     summary = "取消绑定邀请",
     description = "协议版本 1：取消未完成邀请；重复取消幂等，已完成绑定返回冲突。"
 )]
@@ -161,7 +158,6 @@ async fn cancel(
     id = "peers",
     method = "GET",
     path = "/network/peers",
-    access = "paired",
     summary = "查询绑定设备",
     description = "协议版本 1：返回持久化的设备身份、名称和绑定时间，不表示设备在线。"
 )]
@@ -178,7 +174,6 @@ async fn peers(State(service): State<Arc<NetworkService>>) -> Response {
     id = "remove-peer",
     method = "DELETE",
     path = "/network/peers/{endpoint_id}",
-    access = "paired",
     summary = "解除设备绑定",
     description = "协议版本 1：删除持久化绑定并关闭该设备的当前连接；不存在时返回 404。"
 )]

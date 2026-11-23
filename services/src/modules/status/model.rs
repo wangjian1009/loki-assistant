@@ -19,6 +19,23 @@ pub struct StatusItemMetadata {
     pub schema: StatusSchema,
 }
 
+impl StatusItemMetadata {
+    pub fn new(key: &str, name: &str, description: &str, schema: StatusSchema) -> Self {
+        Self {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            remote_access: true,
+            schema,
+        }
+    }
+
+    pub fn local_only(mut self) -> Self {
+        self.remote_access = false;
+        self
+    }
+}
+
 /// 独立描述状态值的结构，不依赖配置值类型或当前是否已经发布数据。
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "data_type", rename_all = "snake_case")]

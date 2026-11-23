@@ -176,6 +176,8 @@ Emacs 的 ~loki-assistant-devices~ 管理界面通过现有异步 HTTP 客户端
 
 *** 创建和查询邀请
 
+邀请创建、查询、取消、已绑定设备列表和解绑接口仅供电脑本机 HTTP 使用。
+
 ~POST /network/pairings~ 不需要参数，接受空请求体或空 JSON object，其他请求体及超过 1024 字节的请求体返回 400 ~invalid-request~ 。仅当前已提交的中继配置处于连接状态且无配置提交进行时允许创建；否则返回 503 ~network-not-ready~ 。成功返回 HTTP 201：
 
 #+begin_src json
@@ -300,9 +302,9 @@ query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体
 
 电脑 network 模块统一完成通用请求到 HTTP request 的转换，通过进程内 Axum Router 调用现有 handler；业务模块不另写远程分发逻辑。Services 组合根调用 ~attach_remote~ 注入共享业务路由工厂，仅持有 Weak 引用。每次请求都校验当前会话、已认证手机的绑定记录以及 ~binding_token~ ，凭据使用常量时间比较，解绑关闭被跟踪连接及其 stream。
 
-~#[loki_api]~ 的 ~access~ 默认 ~local~ ，显式声明 ~paired~ 后允许绑定设备调用。discover 返回同一份声明，network 检查请求方法与实际匹配的 Axum 路由模板。现有 ~password~ API 仅限本机，其余现有 API 开放给绑定设备。配置项与状态项继续按各自的 ~remote_access~ 检查。
+~#[loki_api]~ 的 ~access~ 默认 ~local~ ，显式声明 ~paired~ 后允许绑定设备调用。discover 返回同一份声明，network 检查请求方法与实际匹配的 Axum 路由模板。绑定管理、Emacs、密码、Slack 和通知接口仅供本机调用。绑定设备可查询会话、健康、发现目录、配置和状态。配置项与状态项的读取按各自的 ~remote_access~ 检查，配置写入默认仅限本机。[[file:config-module.org][配置中心协议]]
 
-network 将 iroh 已认证的 Endpoint ID 写入 ~x-loki-device~ 和 ~x-loki-remote-devices~ 。配置中心和状态中心通过后者判断请求来源。通用协议没有客户端请求头字段，loopback HTTP 入口移除这两个请求头。~GET /network/session~ 返回当前电脑的身份、在线状态、名称、设备类型和请求方的绑定时间。本机调用该接口返回 401 ~peer-authentication-required~ 。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
+network 将 iroh 已认证的 Endpoint ID 注入 Axum 请求扩展，配置中心和状态中心通过该扩展判断请求来源。转发请求也携带 ~x-loki-device~ 和 ~x-loki-remote-devices~ ，loopback HTTP 入口移除这两个请求头。~GET /network/session~ 返回当前电脑的身份、在线状态、名称、设备类型和请求方的绑定时间。本机调用该接口返回 401 ~peer-authentication-required~ 。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
 
 请求最大 1 MiB，响应最大 4 MiB；每个手机最多 8 个正在执行请求，服务总上限 64，超限返回 429。服务端 stream 处理上限 30 秒；手机请求默认 10 秒，允许 1 至 30 秒，覆盖连接、发送与读取。手机显式取消 reset 当前 stream，超时和取消不保证已经执行的写操作回滚。网络层不自动重发请求。
 
@@ -435,7 +437,7 @@ GET /password/entries/example.com/alice.gpg
 
 ~GET /stats/meta~ 返回 ~api_version~ 和 ~modules~ 列表。模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 、 ~remote_access~ 和递归 ~schema~ 。数据路径为 ~/status/{模块 id}/{状态项 key}~ ，嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~ 。本次 services 启动时间可通过 ~GET /status/service~ 查询。
 
-状态项以 ~remote_access: true~ 开放远端访问。目前开放 ~service~ 的所有状态项和 ~network/my~ ，Emacs 状态与未声明状态项仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。远端上报包含受限项时拒绝整个批次，成功返回的快照同样按权限过滤。
+通过 ~StatusItemMetadata::new~ 声明的状态项默认可由绑定设备读取，调用 ~local_only()~ 可将 ~remote_access~ 设为 ~false~ 。目前开放 ~service~ 的所有状态项和 ~network/my~ ，Emacs、Slack 与未声明状态项仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。状态上报接口仅供本机调用。
 
 ~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未配置、未连接、连接成功、连接失败和连接中的五个值及说明。
 

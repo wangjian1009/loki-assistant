@@ -387,7 +387,12 @@ async fn services_mounts_network_apis_and_access_without_exposing_credentials() 
         serde_json::from_slice(&to_bytes(response.into_body(), 65_536).await.unwrap()).unwrap();
     assert_eq!(metadata["apis"].as_array().unwrap().len(), 6);
     for api in metadata["apis"].as_array().unwrap() {
-        assert_eq!(api["access"], "paired");
+        let expected = if api["id"] == "session" {
+            "paired"
+        } else {
+            "local"
+        };
+        assert_eq!(api["access"], expected);
     }
     assert!(!metadata.to_string().contains("relay_token"));
     assert_eq!(http(app, "POST", "/network/pairings").await.0, 503);
@@ -744,9 +749,8 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         ]
     );
     let (status, body) = mobile_http(debug_address, "/service/network/peers").await;
-    assert_eq!(status, 200);
-    assert_eq!(body["peers"][0]["endpoint_id"], mobile_id);
-    assert!(!body.to_string().contains(&token));
+    assert_eq!(status, 403);
+    assert_eq!(body["code"], "remote-api-forbidden");
     let (status, body) = mobile_http(debug_address, "/service/missing").await;
     assert_eq!(status, 404);
     assert_eq!(body["status"], 404);
@@ -815,16 +819,21 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         assert_eq!(response.data["status"], "online");
         assert!(ids.insert(response.request_id));
     }
-    for path in [
-        "/password/entries",
-        "/password/entries/test/item.gpg",
-        "/network-test/echo/local",
+    for (method, path) in [
+        ("GET", "/password/entries"),
+        ("GET", "/password/entries/test/item.gpg"),
+        ("GET", "/network-test/echo/local"),
+        ("POST", "/network/pairings"),
+        ("DELETE", "/network/peers/test"),
+        ("GET", "/emacs/buffers"),
+        ("POST", "/emacs/eval"),
     ] {
-        let forbidden = channel_request(network.clone(), ServiceRequest::get(path))
-            .await
-            .unwrap_err();
+        let mut request = ServiceRequest::get(path);
+        request.method = method.parse().unwrap();
+        let forbidden = channel_request(network.clone(), request).await.unwrap_err();
         assert!(
-            matches!(forbidden, ResponsError::Services(error) if error.code == "remote-api-forbidden")
+            matches!(forbidden, ResponsError::Services(error) if error.status == 403 && error.code == "remote-api-forbidden"),
+            "{method} {path}"
         );
     }
     check_remote_config_and_status(network.clone(), &fixture, &remote_config_service).await;
@@ -902,6 +911,10 @@ async fn check_remote_config_and_status(
         .unwrap();
     fixture
         .status
+        .publish("slack", "connections", json!([{"session_id":"本机会话"}]))
+        .unwrap();
+    fixture
+        .status
         .publish("service", "name", json!("测试电脑"))
         .unwrap();
     let get = |path: &'static str| channel_request(network.clone(), ServiceRequest::get(path));
@@ -914,18 +927,30 @@ async fn check_remote_config_and_status(
     assert_eq!(metadata["items"][0]["key"], "relay_url");
     assert_eq!(metadata["items"][0]["remote_access"], "read");
     assert_eq!(
+        get("/data/control-center/center_auto_start")
+            .await
+            .unwrap()
+            .data["value"],
+        false
+    );
+    assert_eq!(
+        get("/status/service/name").await.unwrap().data["value"],
+        "测试电脑"
+    );
+    assert_eq!(
         get("/status/network/my/status").await.unwrap().data["value"],
         "connected"
     );
     let snapshot = get("/status").await.unwrap().data;
     assert!(snapshot["status"].get("emacs").is_none());
     assert!(snapshot["status"].get("custom").is_none());
+    assert!(snapshot["status"].get("slack").is_none());
     assert!(
         get("/stats/meta").await.unwrap().data["modules"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|module| module["id"] != "emacs")
+            .all(|module| !matches!(module["id"].as_str(), Some("emacs" | "slack")))
     );
 
     for (method, path, body, code) in [
@@ -945,6 +970,18 @@ async fn check_remote_config_and_status(
             "POST",
             "/data/network/relay_token",
             Some(json!("其他令牌")),
+            "remote-config-forbidden",
+        ),
+        (
+            "PUT",
+            "/data/control-center/center_auto_start",
+            Some(json!(true)),
+            "remote-config-forbidden",
+        ),
+        (
+            "PATCH",
+            "/data/control-center/center_auto_start",
+            Some(json!(true)),
             "remote-config-forbidden",
         ),
         (
@@ -972,10 +1009,16 @@ async fn check_remote_config_and_status(
             "remote-status-forbidden",
         ),
         (
+            "GET",
+            "/status/slack/connections/0/session_id",
+            None,
+            "remote-status-forbidden",
+        ),
+        (
             "POST",
             "/emacs/receiver/status",
-            Some(json!({"emacs":{"runtime":{}},"service":{"name":"禁止提交的名称"}})),
-            "remote-status-forbidden",
+            Some(json!({"service":{"name":"禁止提交的名称"}})),
+            "remote-api-forbidden",
         ),
     ] {
         let mut request = ServiceRequest::get(path);
@@ -983,7 +1026,8 @@ async fn check_remote_config_and_status(
         request.body = body;
         let error = channel_request(network.clone(), request).await.unwrap_err();
         assert!(
-            matches!(error, ResponsError::Services(error) if error.status == 403 && error.code == code)
+            matches!(error, ResponsError::Services(error) if error.status == 403 && error.code == code),
+            "{method} {path}"
         );
     }
     assert_eq!(
@@ -991,20 +1035,13 @@ async fn check_remote_config_and_status(
         "测试电脑"
     );
 
-    let mut report = ServiceRequest::get("/emacs/receiver/status");
-    report.method = axum::http::Method::POST;
-    report.body = Some(json!({"service":{"name":"更新后的名称"}}));
-    let reported = channel_request(network.clone(), report).await.unwrap().data;
-    assert_eq!(reported["status"]["service"]["name"], "更新后的名称");
-    assert!(reported["status"].get("emacs").is_none());
-    assert!(reported["status"].get("custom").is_none());
-
-    let mut request = ServiceRequest::get("/data/control-center/center_auto_start");
-    request.method = axum::http::Method::PUT;
-    request.body = Some(json!(true));
     assert_eq!(
-        channel_request(network, request).await.unwrap().data["value"],
-        true
+        config
+            .value("control-center", "center_auto_start")
+            .await
+            .unwrap()
+            .value,
+        false
     );
     assert_eq!(
         config.value("network", "relay_token").await.unwrap().value,

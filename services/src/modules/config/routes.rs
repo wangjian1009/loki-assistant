@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use crate::{
     http::error::{ApiError, ErrorSource, response as api_error_response},
-    modules::network::remote::is_remote,
+    modules::network::remote::AuthenticatedPeer,
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{Path, State},
     http::{
@@ -19,7 +19,7 @@ use loki_services_macros::loki_api;
 use serde_json::Value;
 
 use super::{
-    model::{ConfigModuleMetadata, ConfigValue, ConfigValueSource},
+    model::{ConfigValue, ConfigValueSource},
     protocol::{
         MetaResponse, ModuleDataResponse, ModuleMetaResponse, RecordResponse, ValidateRequest,
         ValidateResponse, ValueResponse,
@@ -43,10 +43,11 @@ pub fn router(service: Arc<ConfigService>) -> Router {
 )]
 async fn validate(
     State(service): State<Arc<ConfigService>>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
     Json(request): Json<ValidateRequest>,
 ) -> Result<Json<ValidateResponse>, Response> {
-    check_access(&service, &headers, &request.module_id, &request.key, true).await?;
+    check_write_access(&service, peer.is_some(), &request.module_id, &request.key).await?;
     service
         .authorize_secret_request(&request.module_id, &request.key, bearer(&headers))
         .await
@@ -85,9 +86,13 @@ async fn validate(
     summary = "获取完整配置模型",
     description = "返回所有配置模块及配置项类型、默认值和检查器描述。"
 )]
-async fn meta(State(service): State<Arc<ConfigService>>, headers: HeaderMap) -> Json<MetaResponse> {
+async fn meta(
+    State(service): State<Arc<ConfigService>>,
+    peer: Option<Extension<AuthenticatedPeer>>,
+) -> Json<MetaResponse> {
     Json(MetaResponse {
-        modules: visible_metadata(&service, &headers)
+        modules: service
+            .metadata_for(peer.is_some())
             .await
             .into_iter()
             .map(Into::into)
@@ -108,9 +113,10 @@ async fn meta(State(service): State<Arc<ConfigService>>, headers: HeaderMap) -> 
 async fn module_meta(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Result<Json<ModuleMetaResponse>, Response> {
-    visible_metadata(&service, &headers)
+    service
+        .metadata_for(peer.is_some())
         .await
         .into_iter()
         .find(|metadata| metadata.id == module_id)
@@ -131,21 +137,18 @@ async fn module_meta(
 async fn module_data(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Result<Json<ModuleDataResponse>, Response> {
-    let remote = is_remote(&headers);
+    let remote = peer.is_some();
     let mut values = service
         .module_values_for(&module_id, remote)
         .await
         .map_err(error_response)?;
     let mut pending = service.module_pending_notifications(&module_id).await;
     if remote {
-        let metadata = visible_metadata(&service, &headers).await;
-        pending.retain(|key, _| {
-            metadata
-                .iter()
-                .any(|module| module.id == module_id && module.item(key).is_some())
-        });
+        let metadata = service.metadata_for(true).await;
+        let module = metadata.iter().find(|module| module.id == module_id);
+        pending.retain(|key, _| module.is_some_and(|module| module.item(key).is_some()));
     }
     for (key, value) in &mut values {
         service
@@ -187,11 +190,16 @@ async fn module_data(
 async fn get_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
-    headers: HeaderMap,
+    peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Result<Json<ValueResponse>, Response> {
-    check_access(&service, &headers, &module_id, &key, false).await?;
+    let value = match service.value_for(&module_id, &key, peer.is_some()).await {
+        Err(error) if !matches!(error, ConfigServiceError::ValueNotSet { .. }) => {
+            return Err(error_response(error));
+        }
+        value => value,
+    };
     let mut pending = service.pending_notifications(&module_id, &key).await;
-    let mut data = match service.value(&module_id, &key).await {
+    let mut data = match value {
         Ok(data) => data,
         Err(ConfigServiceError::ValueNotSet { .. }) if !pending.is_empty() => ConfigValue {
             value: Value::Null,
@@ -223,10 +231,11 @@ async fn get_value(
 async fn put_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
@@ -281,10 +290,11 @@ async fn put_value(
 async fn post_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Result<Json<ValueResponse>, Response> {
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
@@ -311,34 +321,19 @@ async fn post_value(
         .map_err(error_response)
 }
 
-async fn visible_metadata(
+async fn check_write_access(
     service: &ConfigService,
-    headers: &HeaderMap,
-) -> Vec<ConfigModuleMetadata> {
-    let mut modules = service.metadata().await;
-    if is_remote(headers) {
-        for module in &mut modules {
-            module.items.retain(|item| item.remote_access.allows_read());
-        }
-        modules.retain(|module| !module.items.is_empty());
-    }
-    modules
-}
-
-async fn check_access(
-    service: &ConfigService,
-    headers: &HeaderMap,
+    remote: bool,
     module_id: &str,
     key: &str,
-    write: bool,
 ) -> Result<(), Response> {
-    if is_remote(headers) {
+    if remote {
         service
-            .require_remote_access(module_id, key, write)
+            .require_remote_access(module_id, key, true)
             .await
             .map_err(error_response)?;
     }
-    if write && super::registry::item_options(module_id, key).read_only {
+    if super::registry::item_options(module_id, key).read_only {
         return Err(error_response(ConfigServiceError::ReadOnly {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
@@ -368,9 +363,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 async fn delete_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, Response> {
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     if !service.has_notification(&module_id, &key) {
         return Err(error_response(ConfigServiceError::ActionNotFound));
     }
@@ -401,6 +397,7 @@ async fn delete_value(
 async fn put_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
@@ -413,7 +410,7 @@ async fn put_record(
             )));
         }
     };
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
@@ -492,9 +489,10 @@ async fn put_record(
 async fn delete_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, Response> {
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
@@ -573,10 +571,11 @@ async fn retry_config(
 async fn patch_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
@@ -619,10 +618,11 @@ async fn patch_value(
 async fn patch_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
+    peer: Option<Extension<AuthenticatedPeer>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    check_access(&service, &headers, &module_id, &key, true).await?;
+    check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
@@ -739,7 +739,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::*;
-    use crate::modules::config::model::{ConfigDataType, ConfigItemMetadata};
+    use crate::modules::config::model::{ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata};
 
     fn service() -> Arc<ConfigService> {
         Arc::new(ConfigService::new(ConfigModuleMetadata {

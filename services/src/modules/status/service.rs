@@ -49,6 +49,17 @@ impl StatusService {
         super::registry::metadata()
     }
 
+    pub(super) fn metadata_for(&self, remote: bool) -> Vec<StatusModuleMetadata> {
+        let mut modules = self.metadata();
+        if remote {
+            for module in &mut modules {
+                module.items.retain(|item| item.remote_access);
+            }
+            modules.retain(|module| !module.items.is_empty());
+        }
+        modules
+    }
+
     fn valid_name(name: &str) -> Result<(), StatusError> {
         if name.trim().is_empty() || name.contains('/') || matches!(name, "." | "..") {
             Err(StatusError::InvalidName)
@@ -124,26 +135,29 @@ impl StatusService {
             .is_some_and(|item| item.remote_access)
     }
 
-    pub(super) fn require_remote_access(
-        &self,
-        module_id: &str,
-        key: &str,
-    ) -> Result<(), StatusError> {
+    fn check_access(&self, module_id: &str, key: &str, remote: bool) -> Result<(), StatusError> {
         Self::valid_name(module_id)?;
         Self::valid_name(key)?;
-        if Self::allows_remote(&self.metadata(), module_id, key) {
-            Ok(())
-        } else {
-            Err(StatusError::RemoteAccessForbidden(
+        if remote && !Self::allows_remote(&self.metadata(), module_id, key) {
+            return Err(StatusError::RemoteAccessForbidden(
                 module_id.to_owned(),
                 key.to_owned(),
-            ))
+            ));
         }
+        Ok(())
     }
 
     pub fn value(&self, module_id: &str, key: &str) -> Result<StatusValueResponse, StatusError> {
-        Self::valid_name(module_id)?;
-        Self::valid_name(key)?;
+        self.value_for(module_id, key, false)
+    }
+
+    pub(crate) fn value_for(
+        &self,
+        module_id: &str,
+        key: &str,
+        remote: bool,
+    ) -> Result<StatusValueResponse, StatusError> {
+        self.check_access(module_id, key, remote)?;
         let state = self.snapshot.read().expect("状态锁不应中毒");
         let value = state
             .values
@@ -193,8 +207,17 @@ impl StatusService {
         key: &str,
         path: &str,
     ) -> Result<StatusPathResponse, StatusError> {
-        Self::valid_name(module_id)?;
-        Self::valid_name(key)?;
+        self.path_value_for(module_id, key, path, false)
+    }
+
+    pub(super) fn path_value_for(
+        &self,
+        module_id: &str,
+        key: &str,
+        path: &str,
+        remote: bool,
+    ) -> Result<StatusPathResponse, StatusError> {
+        self.check_access(module_id, key, remote)?;
         let segments: Vec<_> = path.split('/').collect();
         if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
             return Err(StatusError::InvalidName);
@@ -257,14 +280,10 @@ impl StatusService {
 
     pub fn publish_many(&self, values: StatusValues) -> Result<StatusResponse, StatusError> {
         Self::validate_names(&values)?;
-        Ok(self.publish_batch(values, None))
+        Ok(self.publish_batch(values))
     }
 
-    fn publish_batch(
-        &self,
-        values: StatusValues,
-        metadata: Option<&[StatusModuleMetadata]>,
-    ) -> StatusResponse {
+    fn publish_batch(&self, values: StatusValues) -> StatusResponse {
         let mut state = self.snapshot.write().expect("状态锁不应中毒");
         let now = Self::now();
         for (module, items) in values {
@@ -272,21 +291,13 @@ impl StatusService {
                 Self::put(&mut state, module.clone(), key, value, now);
             }
         }
-        Self::snapshot_from(&state, metadata)
+        Self::snapshot_from(&state, None)
     }
 
     /// 外部上报使用声明结构严格校验，整批通过后才更新共享状态。
     pub fn publish_many_validated(
         &self,
         values: StatusValues,
-    ) -> Result<StatusResponse, StatusError> {
-        self.publish_many_validated_for(values, false)
-    }
-
-    pub(crate) fn publish_many_validated_for(
-        &self,
-        values: StatusValues,
-        remote: bool,
     ) -> Result<StatusResponse, StatusError> {
         Self::validate_names(&values)?;
         let metadata = self.metadata();
@@ -299,16 +310,10 @@ impl StatusService {
                         module_id: module_id.clone(),
                         key: key.clone(),
                     })?;
-                if remote && !item.remote_access {
-                    return Err(StatusError::RemoteAccessForbidden(
-                        module_id.clone(),
-                        key.clone(),
-                    ));
-                }
                 super::validation::validate(&item.schema, value, &format!("{module_id}/{key}"))?;
             }
         }
-        Ok(self.publish_batch(values, remote.then_some(metadata.as_slice())))
+        Ok(self.publish_batch(values))
     }
 
     fn validate_names(values: &StatusValues) -> Result<(), StatusError> {

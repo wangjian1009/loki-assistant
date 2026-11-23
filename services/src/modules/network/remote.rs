@@ -10,7 +10,7 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     extract::MatchedPath,
-    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
+    http::{HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
@@ -67,14 +67,10 @@ impl DispatchResponse {
 }
 
 #[derive(Clone)]
-pub(super) struct AuthenticatedPeer(pub EndpointId);
+pub(crate) struct AuthenticatedPeer(pub(super) EndpointId);
 
 const DEVICE_HEADER: HeaderName = HeaderName::from_static("x-loki-device");
 const REMOTE_DEVICES_HEADER: HeaderName = HeaderName::from_static("x-loki-remote-devices");
-
-pub(crate) fn is_remote(headers: &HeaderMap) -> bool {
-    headers.contains_key(REMOTE_DEVICES_HEADER)
-}
 
 pub(crate) async fn strip_device_headers(mut request: Request<Body>, next: Next) -> Response {
     request.headers_mut().remove(DEVICE_HEADER);

@@ -347,7 +347,18 @@ impl ConfigService {
     }
 
     pub async fn metadata(&self) -> Vec<ConfigModuleMetadata> {
-        self.metadata.read().await.values().cloned().collect()
+        self.metadata_for(false).await
+    }
+
+    pub(super) async fn metadata_for(&self, remote: bool) -> Vec<ConfigModuleMetadata> {
+        let mut modules: Vec<_> = self.metadata.read().await.values().cloned().collect();
+        if remote {
+            for module in &mut modules {
+                module.items.retain(|item| item.remote_access.allows_read());
+            }
+            modules.retain(|module| !module.items.is_empty());
+        }
+        modules
     }
 
     pub async fn module_values(
@@ -460,10 +471,18 @@ impl ConfigService {
                 module_id: module_id.to_owned(),
                 key: key.to_owned(),
             })?;
+        Self::check_remote_access(module_id, item, write)
+    }
+
+    fn check_remote_access(
+        module_id: &str,
+        item: &ConfigItemMetadata,
+        write: bool,
+    ) -> Result<(), ConfigServiceError> {
         if !item.remote_access.allows_read() || (write && !item.remote_access.allows_write()) {
             return Err(ConfigServiceError::RemoteAccessForbidden {
                 module_id: module_id.to_owned(),
-                key: key.to_owned(),
+                key: item.key.clone(),
             });
         }
         Ok(())
@@ -474,6 +493,15 @@ impl ConfigService {
         module_id: &str,
         key: &str,
     ) -> Result<ConfigValue, ConfigServiceError> {
+        self.value_for(module_id, key, false).await
+    }
+
+    pub(super) async fn value_for(
+        &self,
+        module_id: &str,
+        key: &str,
+        remote: bool,
+    ) -> Result<ConfigValue, ConfigServiceError> {
         let metadata = self.module_metadata(module_id).await?;
         let item = metadata
             .item(key)
@@ -481,6 +509,9 @@ impl ConfigService {
                 module_id: module_id.to_owned(),
                 key: key.to_owned(),
             })?;
+        if remote {
+            Self::check_remote_access(module_id, item, false)?;
+        }
         if item.data_type.is_password() {
             return Ok(self.secret_value(module_id, key).await);
         }
