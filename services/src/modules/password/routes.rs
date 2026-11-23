@@ -13,7 +13,6 @@ use axum::{
 use loki_services_macros::loki_api;
 
 use crate::http::error::{ErrorSource, response as api_error};
-use crate::modules::config::service::SYSTEM_PASSWORD_PREFIX;
 
 use super::{
     protocol::{API_VERSION, EntriesResponse, EntryResponse, ListRequest},
@@ -50,18 +49,17 @@ async fn no_store(mut response: Response) -> Response {
     method = "GET",
     path = "/password/entries",
     summary = "查询密码条目",
-    description = "协议版本 1：通过 pass ls 列出相对 .gpg 路径；可选 query 按路径进行不区分大小写的子串过滤，不解密条目。"
+    description = "协议版本 1：列出相对 .gpg 路径；可选 query 按路径进行不区分大小写的子串过滤，不解密条目。"
 )]
 async fn entries(
     State(service): State<Arc<PasswordService>>,
     request: Result<Query<ListRequest>, QueryRejection>,
 ) -> Result<Json<EntriesResponse>, Response> {
     let Query(request) = request.map_err(|_| error_response(PasswordError::InvalidRequest))?;
-    let mut files = service
+    let files = service
         .entries(&request.query)
         .await
         .map_err(error_response)?;
-    files.retain(|file| !file.starts_with(SYSTEM_PASSWORD_PREFIX));
     Ok(Json(EntriesResponse {
         api_version: API_VERSION.to_owned(),
         files,
@@ -75,17 +73,14 @@ async fn entries(
     method = "GET",
     path = "/password/entries/{*file}",
     summary = "读取单条密码原文",
-    description = "协议版本 1：file 为路径中的相对 .gpg 文件名，支持多级目录；通过 pass show 返回完整 contents，不解析字段、不写入密码库。"
+    description = "协议版本 1：file 为路径中的相对 .gpg 文件名，支持多级目录；通过 GPG 解密并返回完整 contents，不解析字段、不写入密码库。"
 )]
 async fn entry(
     State(service): State<Arc<PasswordService>>,
     file: Result<Path<String>, PathRejection>,
 ) -> Result<Json<EntryResponse>, Response> {
     let Path(file) = file.map_err(|_| error_response(PasswordError::InvalidPath))?;
-    if file.starts_with(SYSTEM_PASSWORD_PREFIX) {
-        return Err(error_response(PasswordError::EntryNotFound));
-    }
-    let contents = service.fetch(&file).await.map_err(error_response)?;
+    let contents = service.fetch_public(&file).await.map_err(error_response)?;
     Ok(Json(EntryResponse {
         api_version: API_VERSION.to_owned(),
         file,
@@ -105,7 +100,7 @@ fn error_response(error: PasswordError) -> Response {
             ErrorSource::Business,
             "password-not-configured",
         ),
-        PasswordError::StoreUnavailable => (
+        PasswordError::StoreUnavailable | PasswordError::Recipients => (
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorSource::Business,
             "password-store-unavailable",

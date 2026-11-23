@@ -14,14 +14,13 @@ use axum::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::{Services, modules::config::service::ConfigService, runtime::RuntimeState};
+use crate::{Services, runtime::RuntimeState};
 
 use super::{
-    config::PasswordConfig,
     routes,
     service::{
-        CommandFuture, CommandOutput, CommandRunner, PasswordError, PasswordService,
-        ProcessCommandRunner,
+        CommandFuture, CommandOutput, CommandRunner, PasswordEnvironment, PasswordError,
+        PasswordService, ProcessCommandRunner, store_path,
     },
 };
 
@@ -44,7 +43,7 @@ impl Fixture {
     }
 
     fn executable(&self, script: &str) -> String {
-        let path = self.0.join("fake-pass");
+        let path = self.0.join("fake-gpg");
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path.to_str().unwrap().to_owned()
@@ -59,7 +58,7 @@ impl Drop for Fixture {
 
 #[derive(Debug, Default)]
 struct FakeRunner {
-    calls: Mutex<Vec<(String, PathBuf, Vec<String>)>>,
+    calls: Mutex<Vec<Vec<String>>>,
     outputs: Mutex<VecDeque<(Option<i32>, Vec<u8>)>>,
     pending: bool,
 }
@@ -76,15 +75,12 @@ impl FakeRunner {
 impl CommandRunner for FakeRunner {
     fn run<'a>(
         &'a self,
-        program: &'a str,
-        store: &'a Path,
+        _program: &'a str,
         args: &'a [String],
+        _input: Option<&'a [u8]>,
     ) -> CommandFuture<'a> {
         Box::pin(async move {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((program.to_owned(), store.to_owned(), args.to_vec()));
+            self.calls.lock().unwrap().push(args.to_vec());
             if self.pending {
                 return std::future::pending().await;
             }
@@ -99,26 +95,15 @@ impl CommandRunner for FakeRunner {
     }
 }
 
-async fn configured(
-    fixture: &Fixture,
-    runner: Arc<FakeRunner>,
-) -> (Arc<ConfigService>, Arc<PasswordService>) {
-    let config = Arc::new(ConfigService::new(PasswordConfig::metadata()));
-    config
-        .replace("password", "store_dir", json!(fixture.0.to_str().unwrap()))
-        .await
-        .unwrap();
-    // 替身仅记录参数，配置校验不会执行该程序。
-    config
-        .replace("password", "pass_path", json!("/bin/echo"))
-        .await
-        .unwrap();
-    let service = Arc::new(PasswordService::with_runner(
-        PasswordConfig::new(Arc::clone(&config)),
+fn configured(fixture: &Fixture, runner: Arc<FakeRunner>) -> Arc<PasswordService> {
+    Arc::new(PasswordService::with_runner(
+        Some(PasswordEnvironment::new(
+            "/bin/echo".into(),
+            fixture.0.clone(),
+        )),
         runner,
         Duration::from_secs(30),
-    ));
-    (config, service)
+    ))
 }
 
 async fn request(app: Router, method: &str, uri: &str) -> (StatusCode, Value) {
@@ -156,11 +141,9 @@ async fn lists_nested_entries_without_decrypting_and_filters_paths() {
     fixture.entry("name -> text.gpg");
     std::fs::create_dir(fixture.0.join("empty")).unwrap();
     std::fs::write(fixture.0.join("notes.txt"), "不是密码条目").unwrap();
-    let listing = "Password Store\n|-- \u{1b}[01;34mExample.COM\u{1b}[0m\n|   `-- \u{1b}[00malice\u{1b}[0m\n|-- directory\n|   `-- first\n|-- directory\n|   `-- nested\n|-- double.gpg\n|-- empty\n|-- name -> text\n|-- notes.txt\n`-- 中文 网站\n    `-- 账号\n";
+    fixture.entry(".hidden/secret.gpg");
     let runner = Arc::new(FakeRunner::default());
-    runner.output(Some(0), listing);
-    runner.output(Some(0), listing);
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     assert_eq!(
         service.entries("").await.unwrap(),
         vec![
@@ -183,29 +166,25 @@ async fn lists_nested_entries_without_decrypting_and_filters_paths() {
         body,
         json!({"api_version":"1", "files":["Example.COM/alice.gpg"]})
     );
-    let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert!(
-        calls
-            .iter()
-            .all(|(_, store, args)| store == &fixture.0 && args == &["ls"])
-    );
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn fetches_raw_contents_and_uses_fixed_show_with_option_separator() {
+async fn fetches_raw_contents_and_passes_a_checked_absolute_path_to_gpg() {
     let fixture = Fixture::new();
     fixture.entry("-c.gpg");
     let runner = Arc::new(FakeRunner::default());
     runner.output(Some(0), CONTENTS);
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     let (status, body) = request(routes::router(service), "GET", "/password/entries/-c.gpg").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
         json!({"api_version":"1", "file":"-c.gpg", "contents":CONTENTS})
     );
-    assert_eq!(runner.calls.lock().unwrap()[0].2, vec!["show", "--", "-c"]);
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(&calls[0][3..7], ["--output", "-", "--decrypt", "--"]);
+    assert_eq!(Path::new(&calls[0][7]), fixture.0.join("-c.gpg"));
 }
 
 #[tokio::test]
@@ -216,7 +195,7 @@ async fn reads_nested_and_percent_encoded_resource_paths_without_a_request_body(
     let runner = Arc::new(FakeRunner::default());
     runner.output(Some(0), CONTENTS);
     runner.output(Some(0), CONTENTS);
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     for (file, uri) in [
         (
             "example.com/alice.gpg",
@@ -230,15 +209,21 @@ async fn reads_nested_and_percent_encoded_resource_paths_without_a_request_body(
         assert_eq!(body["contents"], CONTENTS);
     }
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls[0].2, vec!["show", "--", "example.com/alice"]);
-    assert_eq!(calls[1].2, vec!["show", "--", "中文 网站/a#?%"]);
+    assert_eq!(
+        Path::new(calls[0].last().unwrap()),
+        fixture.0.join("example.com/alice.gpg")
+    );
+    assert_eq!(
+        Path::new(calls[1].last().unwrap()),
+        fixture.0.join("中文 网站/a#?%.gpg")
+    );
 }
 
 #[tokio::test]
-async fn rejects_traversal_options_hidden_paths_and_missing_files_before_running_pass() {
+async fn rejects_traversal_options_hidden_paths_and_missing_files_before_running_gpg() {
     let fixture = Fixture::new();
     let runner = Arc::new(FakeRunner::default());
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     assert!(matches!(
         service.fetch("").await,
         Err(PasswordError::InvalidPath)
@@ -284,8 +269,7 @@ async fn excludes_and_rejects_symlinks_outside_the_configured_store() {
     symlink(outside.0.join("secret.gpg"), fixture.0.join("linked.gpg")).unwrap();
     symlink(&outside.0, fixture.0.join("external")).unwrap();
     let runner = Arc::new(FakeRunner::default());
-    runner.output(Some(0), "Password Store\n|-- external -> /outside\n|   `-- secret\n`-- linked -> /outside/secret.gpg\n");
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     assert!(service.entries("").await.unwrap().is_empty());
     for file in ["linked.gpg", "external/secret.gpg"] {
         assert!(matches!(
@@ -293,36 +277,91 @@ async fn excludes_and_rejects_symlinks_outside_the_configured_store() {
             Err(PasswordError::InvalidPath)
         ));
     }
-    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    assert!(runner.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn configuration_changes_take_effect_on_the_next_query() {
+#[test]
+fn uses_the_password_store_environment() {
     let fixture = Fixture::new();
-    fixture.entry("old.gpg");
-    let next = Fixture::new();
-    next.entry("new.gpg");
-    let runner = Arc::new(FakeRunner::default());
-    runner.output(Some(0), "old\n");
-    runner.output(Some(0), "new\n");
-    let (config, service) = configured(&fixture, Arc::clone(&runner)).await;
-    assert_eq!(service.fetch("old.gpg").await.unwrap(), "old\n");
-    config
-        .replace("password", "store_dir", json!(next.0.to_str().unwrap()))
-        .await
-        .unwrap();
-    assert_eq!(service.fetch("new.gpg").await.unwrap(), "new\n");
-    let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls[0].1, fixture.0);
-    assert_eq!(calls[1].1, next.0);
+    let home = fixture.0.as_os_str().to_owned();
+    let custom = fixture.0.join("custom-store");
+    let store = store_path(Some(custom.clone().into_os_string()), Some(home.clone())).unwrap();
+    assert_eq!(store, custom);
+    for unset in [None, Some(std::ffi::OsString::new())] {
+        assert_eq!(
+            store_path(unset, Some(home.clone())).unwrap(),
+            fixture.0.join(".password-store")
+        );
+    }
 }
 
 #[tokio::test]
-async fn reports_missing_configuration_and_unavailable_store_without_running_pass() {
-    let config = Arc::new(ConfigService::new(PasswordConfig::metadata()));
+async fn stores_gpg_output_using_the_nearest_recipients_and_keeps_old_ciphertext_on_failure() {
+    let fixture = Fixture::new();
+    fixture.entry("team/nested/entry.gpg");
+    std::fs::write(fixture.0.join(".gpg-id"), "root@example.org\n").unwrap();
+    std::fs::write(
+        fixture.0.join("team/.gpg-id"),
+        "# 团队收件人\nteam@example.org # 注释\n",
+    )
+    .unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    runner.output(Some(0), b"test-ciphertext");
+    runner.output(Some(1), b"partial-ciphertext");
+    let service = configured(&fixture, Arc::clone(&runner));
+    let file = "team/nested/entry.gpg";
+    service.save(file, "测试密码").await.unwrap();
+    assert!(matches!(
+        service.save(file, "测试新密码").await,
+        Err(PasswordError::CommandFailed { .. })
+    ));
+    assert_eq!(
+        std::fs::read(fixture.0.join(file)).unwrap(),
+        b"test-ciphertext"
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.0.join(file))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let calls = runner.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .all(|args| args.ends_with(&["--recipient".into(), "team@example.org".into()]))
+    );
+}
+
+#[tokio::test]
+async fn hides_internal_credentials_and_their_aliases_from_http() {
+    let fixture = Fixture::new();
+    let entry = "loki-assistant/network/identity.gpg";
+    fixture.entry(entry);
+    symlink(fixture.0.join(entry), fixture.0.join("alias.gpg")).unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    let service = configured(&fixture, Arc::clone(&runner));
+    let app = routes::router(service);
+    assert_eq!(
+        request(app.clone(), "GET", "/password/entries").await.1["files"],
+        json!([])
+    );
+    for file in [entry, "alias.gpg"] {
+        assert_eq!(
+            request(app.clone(), "GET", &entry_uri(file)).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reports_missing_configuration_and_unavailable_store_without_running_gpg() {
     let runner = Arc::new(FakeRunner::default());
     let service = Arc::new(PasswordService::with_runner(
-        PasswordConfig::new(Arc::clone(&config)),
+        None,
         runner.clone(),
         Duration::from_secs(1),
     ));
@@ -330,7 +369,7 @@ async fn reports_missing_configuration_and_unavailable_store_without_running_pas
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["code"], "password-not-configured");
     let fixture = Fixture::new();
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     std::fs::remove_dir_all(&fixture.0).unwrap();
     assert!(matches!(
         service.entries("").await,
@@ -346,9 +385,7 @@ async fn converts_exit_status_and_invalid_outputs_without_echoing_secrets() {
     let runner = Arc::new(FakeRunner::default());
     runner.output(Some(2), CONTENTS);
     runner.output(Some(0), [0xff]);
-    runner.output(Some(0), "Password Store\nnot-a-tree\n");
-    runner.output(Some(0), "Password Store\n");
-    let (_, service) = configured(&fixture, runner).await;
+    let service = configured(&fixture, runner);
     let (status, body) = request(
         routes::router(Arc::clone(&service)),
         "GET",
@@ -365,31 +402,32 @@ async fn converts_exit_status_and_invalid_outputs_without_echoing_secrets() {
         service.fetch("entry.gpg").await,
         Err(PasswordError::InvalidOutput)
     ));
-    assert!(matches!(
-        service.entries("").await,
-        Err(PasswordError::InvalidOutput)
-    ));
-    assert!(service.entries("").await.unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
-async fn times_out_pass_queries() {
+async fn times_out_gpg_decryption() {
     let fixture = Fixture::new();
+    fixture.entry("entry.gpg");
     let runner = Arc::new(FakeRunner {
         pending: true,
         ..Default::default()
     });
-    let (_, service) = configured(&fixture, runner).await;
-    let (status, body) = request(routes::router(service), "GET", "/password/entries").await;
+    let service = configured(&fixture, runner);
+    let (status, body) = request(
+        routes::router(service),
+        "GET",
+        "/password/entries/entry.gpg",
+    )
+    .await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(body["error"]["code"], "pass-timeout");
 }
 
 #[tokio::test]
-async fn rejects_invalid_requests_and_write_routes_without_invoking_pass() {
+async fn rejects_invalid_requests_and_write_routes_without_invoking_gpg() {
     let fixture = Fixture::new();
     let runner = Arc::new(FakeRunner::default());
-    let (_, service) = configured(&fixture, Arc::clone(&runner)).await;
+    let service = configured(&fixture, Arc::clone(&runner));
     for uri in [
         "/password/entries?query=%00",
         "/password/entries?store_dir=/tmp",
@@ -422,22 +460,18 @@ async fn rejects_invalid_requests_and_write_routes_without_invoking_pass() {
 }
 
 #[tokio::test]
-async fn process_runner_passes_store_and_keeps_stdout_exact_and_stderr_private() {
+async fn process_runner_preserves_stdout_and_pipes_input() {
     let fixture = Fixture::new();
-    fixture.entry("entry.gpg");
-    let program = fixture.executable("#!/bin/sh\n[ \"$PASSWORD_STORE_ENABLE_EXTENSIONS\" = false ] || exit 10\n[ \"$LC_ALL\" = C ] || exit 11\n[ -f \"$PASSWORD_STORE_DIR/entry.gpg\" ] || exit 12\n[ \"$1\" = show ] && [ \"$2\" = -- ] && [ \"$3\" = entry ] || exit 13\nprintf 'secret\\r\\nlogin: user\\n\\n'\nprintf '敏感诊断内容' >&2\n");
+    let program = fixture
+        .executable("#!/bin/sh\n[ \"$LC_ALL\" = C ] || exit 1\ncat\nprintf '敏感诊断内容' >&2\n");
     let output = ProcessCommandRunner
-        .run(
-            &program,
-            &fixture.0,
-            &["show".to_owned(), "--".to_owned(), "entry".to_owned()],
-        )
+        .run(&program, &[], Some(b"secret\r\nlogin: user\n\n"))
         .await
         .unwrap();
     assert_eq!(output.status, Some(0));
     assert_eq!(output.stdout, b"secret\r\nlogin: user\n\n");
     let error = ProcessCommandRunner
-        .run("/不存在的程序", &fixture.0, &[])
+        .run("/不存在的程序", &[], None)
         .await
         .err()
         .unwrap();
@@ -445,7 +479,7 @@ async fn process_runner_passes_store_and_keeps_stdout_exact_and_stderr_private()
 }
 
 #[tokio::test]
-async fn registers_config_discovery_and_routes_in_the_composition_root() {
+async fn registers_discovery_and_routes_without_password_configuration() {
     let services = Arc::new(Services::build());
     let app = services.router(Arc::new(RuntimeState::new(Arc::clone(&services))));
     for path in ["/meta/password", "/discover/modules/password"] {
@@ -454,33 +488,31 @@ async fn registers_config_discovery_and_routes_in_the_composition_root() {
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
+        if path.starts_with("/meta") {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            continue;
+        }
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        if path.starts_with("/meta") {
-            let metadata = body.to_string();
-            assert!(metadata.contains("store_dir"));
-            assert!(metadata.contains("pass_path"));
-        } else {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 2);
-            assert!(
-                body["apis"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|api| api["method"] == "GET")
-            );
-            let entry = body["apis"]
+        assert_eq!(body["apis"].as_array().unwrap().len(), 2);
+        assert!(
+            body["apis"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|api| api["path"] == "/password/entries/{*file}")
-                .unwrap();
-            assert_eq!(entry["parameters"][0]["name"], "file");
-            assert_eq!(entry["parameters"][0]["location"], "path");
-            assert_eq!(entry["parameters"][0]["required"], true);
-        }
+                .all(|api| api["method"] == "GET")
+        );
+        let entry = body["apis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|api| api["path"] == "/password/entries/{*file}")
+            .unwrap();
+        assert_eq!(entry["parameters"][0]["name"], "file");
+        assert_eq!(entry["parameters"][0]["location"], "path");
+        assert_eq!(entry["parameters"][0]["required"], true);
     }
     let (status, body) = request(app, "GET", "/password/entries").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

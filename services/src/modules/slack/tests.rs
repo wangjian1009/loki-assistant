@@ -608,7 +608,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         alerts.clone(),
         Duration::from_secs(1),
     ));
-    let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0).await;
+    let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0);
     let credentials = "loki-assistant/slack/TTEAM.gpg";
     passwords
         .save_multiline(credentials, "xoxc-test-user\nd_cookie: first")
@@ -1560,27 +1560,23 @@ async fn socket_notifications_threads_and_idempotent_sends() {
 }
 
 #[derive(Debug)]
-struct FakePass;
+struct FakeGpg;
 
-impl crate::modules::password::service::CommandRunner for FakePass {
+impl crate::modules::password::service::CommandRunner for FakeGpg {
     fn run<'a>(
         &'a self,
         _program: &'a str,
-        store: &'a std::path::Path,
         args: &'a [String],
+        input: Option<&'a [u8]>,
     ) -> crate::modules::password::service::CommandFuture<'a> {
         Box::pin(async move {
-            if args[0] == "rm" {
-                assert_eq!(&args[..3], ["rm", "--force", "--"]);
-                fs::remove_file(store.join(format!("{}.gpg", args[3]))).unwrap();
-                return Ok(crate::modules::password::service::CommandOutput {
-                    status: Some(0),
-                    stdout: Vec::new(),
-                });
-            }
-            assert_eq!(&args[..2], ["show", "--"]);
-            let stdout = fs::read(store.join(format!("{}.gpg", args[2]))).unwrap();
-            if stdout.starts_with("模拟解密失败".as_bytes()) {
+            let stdout = if args.iter().any(|arg| arg == "--encrypt") {
+                input.unwrap().to_vec()
+            } else {
+                assert!(args.iter().any(|arg| arg == "--decrypt"));
+                fs::read(args.last().unwrap()).unwrap()
+            };
+            if input.is_none() && stdout.starts_with("模拟解密失败".as_bytes()) {
                 return Ok(crate::modules::password::service::CommandOutput {
                     status: Some(1),
                     stdout: Vec::new(),
@@ -1597,7 +1593,7 @@ impl crate::modules::password::service::CommandRunner for FakePass {
 #[tokio::test]
 async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_recovery() {
     let directory = Directory::new();
-    let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0).await;
+    let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0);
     let invalid_path = "loki-assistant/slack/TINVALID.gpg";
     let missing_path = "loki-assistant/slack/TMISSING.gpg";
     let unreadable_path = "loki-assistant/slack/TUNREADABLE.gpg";
@@ -1620,7 +1616,7 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
             .unwrap();
     }
     // 启动后从持久化配置加载仍存在的凭据引用。
-    let (config, _) = password_config(&directory.0.join("config.yml"), &directory.0).await;
+    let (config, _) = password_config(&directory.0.join("config.yml"), &directory.0);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
     let expired_auth_checks = Arc::new(AtomicUsize::new(0));
@@ -1880,51 +1876,24 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
     upstream.abort();
 }
 
-fn fake_pass_write<'a>(
-    _program: &'a str,
-    store: &'a std::path::Path,
-    args: &'a [String],
-    input: &'a str,
-) -> crate::modules::password::service::CommandFuture<'a> {
-    Box::pin(async move {
-        assert_eq!(&args[..4], ["insert", "--force", "--multiline", "--"]);
-        let path = store.join(format!("{}.gpg", args[4]));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, input).unwrap();
-        Ok(crate::modules::password::service::CommandOutput {
-            status: Some(0),
-            stdout: Vec::new(),
-        })
-    })
-}
-
-async fn password_config(
+fn password_config(
     config_path: &std::path::Path,
     store: &std::path::Path,
 ) -> (
     Arc<ConfigService>,
     Arc<crate::modules::password::service::PasswordService>,
 ) {
-    use crate::modules::password::{config::PasswordConfig, service::PasswordService};
+    use crate::modules::password::service::{PasswordEnvironment, PasswordService};
 
-    let config = Arc::new(ConfigService::load(config_path).unwrap());
-    config
-        .replace("password", "store_dir", json!(store.to_str().unwrap()))
-        .await
-        .unwrap();
-    config
-        .replace("password", "pass_path", json!("/bin/echo"))
-        .await
-        .unwrap();
-    let passwords = Arc::new(
-        PasswordService::with_runner(
-            PasswordConfig::new(config.clone()),
-            Arc::new(FakePass),
-            Duration::from_secs(2),
-        )
-        .with_writer(fake_pass_write),
-    );
-    let config = Arc::new((*config).clone().with_password_service(passwords.clone()));
+    let config = ConfigService::load(config_path).unwrap();
+    let mut environment = PasswordEnvironment::new("/bin/echo".into(), store.to_owned());
+    environment.recipients = vec!["test-recipient".into()];
+    let passwords = Arc::new(PasswordService::with_runner(
+        Some(environment),
+        Arc::new(FakeGpg),
+        Duration::from_secs(2),
+    ));
+    let config = Arc::new(config.with_password_service(passwords.clone()));
     (config, passwords)
 }
 
@@ -1932,7 +1901,8 @@ async fn password_config(
 async fn pending_team_passwords_migrate_to_team_id_filename() {
     let directory = Directory::new();
     let config_path = directory.0.join("config.yml");
-    let (_, passwords) = password_config(&config_path, &directory.0).await;
+    fs::write(&config_path, "{}\n").unwrap();
+    let (_, passwords) = password_config(&config_path, &directory.0);
     let id = uuid::Uuid::new_v4();
     let path = "loki-assistant/slack/TLEGACY.gpg";
     let legacy = format!("loki-assistant/slack/TLEGACY-{id}.gpg");
@@ -1950,7 +1920,7 @@ async fn pending_team_passwords_migrate_to_team_id_filename() {
     });
     fs::write(&config_path, serde_yaml_ng::to_string(&values).unwrap()).unwrap();
 
-    let (config, _) = password_config(&config_path, &directory.0).await;
+    let (config, _) = password_config(&config_path, &directory.0);
     config.migrate_pending_password_paths().await.unwrap();
     config.migrate_pending_password_paths().await.unwrap();
 
@@ -1983,7 +1953,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
         .unwrap();
     let config_path = directory.0.join("config.yml");
-    let (base, passwords) = password_config(&config_path, &directory.0).await;
+    let (base, passwords) = password_config(&config_path, &directory.0);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
     let user_directory_requests = Arc::new(Mutex::new(std::collections::BTreeSet::new()));

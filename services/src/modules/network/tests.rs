@@ -117,33 +117,27 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("loki-network-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("pass-store")).unwrap();
-        let pass = root.join("test-pass");
+        let pass = root.join("gpg");
         fs::write(
             &pass,
             r#"#!/bin/sh
 set -eu
-case "$1" in
-    show) cat "$PASSWORD_STORE_DIR/$3.gpg" ;;
-    insert)
-        entry="$PASSWORD_STORE_DIR/$5.gpg"
-        mkdir -p "$(dirname "$entry")"
-        cat > "$entry"
-        ;;
-    rm) rm -f "$PASSWORD_STORE_DIR/$4.gpg" ;;
+for argument do
+    case "$argument" in
+        --decrypt) operation=decrypt ;;
+        --encrypt) operation=encrypt ;;
+    esac
+    last="$argument"
+done
+case "$operation" in
+    decrypt) cat "$last" ;;
+    encrypt) cat ;;
     *) exit 1 ;;
 esac
 "#,
         )
         .unwrap();
         fs::set_permissions(&pass, fs::Permissions::from_mode(0o700)).unwrap();
-        let settings = json!({"password":{
-            "store_dir":root.join("pass-store"), "pass_path":pass
-        }});
-        fs::write(
-            root.join("pass-config.yml"),
-            serde_yaml_ng::to_string(&settings).unwrap(),
-        )
-        .unwrap();
         Self {
             root,
             registrar: Arc::default(),
@@ -152,9 +146,13 @@ esac
         }
     }
     pub(super) fn stored_config(&self) -> ConfigService {
-        use crate::modules::password::{config::PasswordConfig, service::PasswordService};
-        let settings = Arc::new(ConfigService::load(self.root.join("pass-config.yml")).unwrap());
-        let passwords = Arc::new(PasswordService::new(PasswordConfig::new(settings)));
+        use crate::modules::password::service::{PasswordEnvironment, PasswordService};
+        let mut environment = PasswordEnvironment::new(
+            self.root.join("gpg").to_str().unwrap().to_owned(),
+            self.root.join("pass-store"),
+        );
+        environment.recipients = vec!["test-recipient".into()];
+        let passwords = Arc::new(PasswordService::new(Some(environment)));
         ConfigService::load(self.root.join("config.yml"))
             .unwrap()
             .with_password_service(passwords)

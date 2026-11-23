@@ -524,7 +524,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     let routes = remote_config
         .router()
         .merge(fixture.status.router())
-        .merge(crate::modules::password::Module::new(remote_config_service.clone()).router())
+        .merge(crate::modules::password::Module::new(None).router())
         .merge(
             crate::modules::emacs::Module::new(
                 remote_config_service.clone(),

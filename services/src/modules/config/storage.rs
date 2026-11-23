@@ -57,7 +57,7 @@ impl FileStorage {
             .map_err(storage_error)?
     }
 
-    fn write_atomic(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
+    pub(super) fn write_atomic(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let parent = self.path.parent().expect("绝对配置路径应包含父目录");
         fs::DirBuilder::new()

@@ -1,4 +1,3 @@
-pub mod config;
 pub mod protocol;
 mod routes;
 pub mod service;
@@ -10,15 +9,15 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::modules::{config::service::ConfigService, discover::registry::ModuleRegistration};
+use crate::modules::discover::registry::ModuleRegistration;
 
-use self::{config::PasswordConfig, service::PasswordService};
+use self::service::{PasswordEnvironment, PasswordService};
 
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static PASSWORD_MODULE: ModuleRegistration = ModuleRegistration {
     id: "password",
     name: "密码管理",
-    description: "通过 pass 查询本地密码库的条目和解密原文，仅提供读取能力。",
+    description: "查询本地密码库的条目，并通过 GPG 解密原文。",
     version: env!("CARGO_PKG_VERSION"),
 };
 
@@ -28,9 +27,9 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new(config: Arc<ConfigService>) -> Self {
+    pub(crate) fn new(environment: Option<PasswordEnvironment>) -> Self {
         Self {
-            service: Arc::new(PasswordService::new(PasswordConfig::new(config))),
+            service: Arc::new(PasswordService::new(environment)),
         }
     }
 

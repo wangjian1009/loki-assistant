@@ -21,7 +21,7 @@
 | ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
-| ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
+| ~modules/password~ | 枚举本地密码库条目并通过 GPG 解密 | 已实现，只读 |
 | [[file:slack.org][modules/slack]] | 工作区注册、实时消息接收、提及和私信通知、消息查询和发送 | 已实现首期与网页会话接入 |
 | ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
 | ~modules/health~ | 服务健康检查 | 已实现 |
@@ -55,7 +55,7 @@ services/
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
     │   ├── network/        本地身份、中转注册、配置处理与状态发布
-    │   ├── password/       pass 目录配置、条目查询与只读解密
+    │   ├── password/       密码库条目查询与 GPG 解密
     │   ├── status/         状态结构元数据、编译期目录、Rust 发布与 HTTP 查询
 │   ├── notification/   系统通知发送、跳转封装和回执状态
     │   └── health/         健康状态路由
@@ -144,17 +144,17 @@ Slack 模块通过只读配置 ~slack/watches~ 持久化全局主题聊天关注
 
 * 网络模块
 
-~network.relay_url~ 为配置文件中的中转地址。 ~network.relay_token~ 为 ~Password~ 类型，对应 pass 条目 ~loki-assistant/network/relay.gpg~ ，使用首行的共享访问令牌。配置 API 中令牌项为只读，只返回凭据是否可用。通过已配置的 pass 密码库保存或更新令牌后重启 services。地址和令牌都非空时注册中转。
+~network.relay_url~ 为配置文件中的中转地址。 ~network.relay_token~ 为 ~Password~ 类型，对应密码库条目 ~loki-assistant/network/relay.gpg~ ，使用首行的共享访问令牌。配置 API 中令牌项为只读，只返回凭据是否可用。通过已配置的 GPG 密码库保存或更新令牌后重启 services。地址和令牌都非空时注册中转。
 
 ** 本地身份
 
-本地身份通过 ~~/.assistant/config.yml~ 的 ~_system.network_identity~ 记录 Endpoint ID 和 ~Password~ 引用。私钥以 Base64 编码后由 pass 加密，条目路径为 ~loki-assistant/network/identity.gpg~ 。服务启动及接收网络配置提交时读取私钥，并核对公私钥是否匹配。首次使用时生成随机身份，已有身份缺失私钥或校验失败时会通知初始化失败。
+本地身份通过 ~~/.assistant/config.yml~ 的 ~_system.network_identity~ 记录 Endpoint ID 和 ~Password~ 引用。私钥以 Base64 编码后由 GPG 加密，条目路径为 ~loki-assistant/network/identity.gpg~ 。服务启动及接收网络配置提交时读取私钥，并核对公私钥是否匹配。首次使用时生成随机身份，已有身份缺失私钥或校验失败时会通知初始化失败。
 
-升级时，服务将配置文件中的旧中转令牌、身份私钥和设备绑定令牌迁入已配置的 pass 密码库。旧版 ~~/.assistant/identity.json~ 和 ~~/.assistant/peers.json~ 仍可直接迁移。服务在凭据保存成功后原子更新配置文件，再移除已导入的旧文件。已有 Endpoint ID 和绑定凭据会一并保留。密码库不可用时保留待迁移的数据，可在恢复密码库后重试。内部凭据条目不通过密码查询 API 提供。
+升级时，服务将配置文件中的旧中转令牌、身份私钥和设备绑定令牌迁入已配置的 GPG 密码库。旧版 ~~/.assistant/identity.json~ 和 ~~/.assistant/peers.json~ 仍可直接迁移。服务在凭据保存成功后原子更新配置文件，再移除已导入的旧文件。已有 Endpoint ID 和绑定凭据会一并保留。密码库不可用时保留待迁移的数据，可在恢复密码库后重试。内部凭据条目不通过密码查询 API 提供。
 
 ** 注册和生命周期
 
-地址和令牌均非空白时开始注册。未配齐时状态为未配置。修改中转地址时，配置处理器用候选地址和 pass 中的令牌尝试注册。地址须为 HTTP(S) URL，且仅包含主机、端口和路径。连接启用 TLS 验证。
+地址和令牌均非空白时开始注册。未配齐时状态为未配置。修改中转地址时，配置处理器用候选地址和密码库中的令牌尝试注册。地址须为 HTTP(S) URL，且仅包含主机、端口和路径。连接启用 TLS 验证。
 
 “注册”表示使用本地持久化身份与指定 iroh-relay 建立中转连接，确认 relay 已接受节点。端点同时声明绑定协议 ~loki-assistant/pair/1~ 、兼容设备状态协议 ~loki-assistant/device-status/1~ 和通用请求协议 ~loki-assistant/services/1~ ，由进程入口显式调度接收任务；当前接收绑定与已绑定设备的通用 HTTP 请求。HTTP listener 只监听 loopback。注册最多等待 10 秒，认证拒绝提前失败。地址或令牌变化均重新注册，成功后才允许落盘，并在 ~committed~ 中替换旧连接、作废未完成邀请并发送成功通知；失败发送失败通知，返回 ~config-change-rejected~ ，保留原配置、连接和邀请。相同配置已连接时不重复注册，失败后重新提交可以重试。
 
@@ -262,7 +262,7 @@ Emacs 打开管理页面仅调用 ~GET /network/peers~ ，不创建邀请。点�
 
 ~DELETE /network/peers/{endpoint_id}~ 先持久化删除，再关闭该设备当前被跟踪的连接，并取消该设备已经消费的邀请，防止旧请求恢复绑定。成功返回 ~{"api_version":"1","endpoint_id":"...","removed":true}~ ；设备不存在返回 404 ~peer-not-found~ 。解除绑定不撤销共享中继令牌，持有新邀请的设备可以再次绑定。设备状态 ALPN 查询同一份绑定关系并纳入连接撤销；后续业务协议同样必须遵守此边界。
 
-设备记录保存在 ~~/.assistant/config.yml~ 的 ~_system.network_peers~ 中，最多 256 个设备。每个 ~binding_token~ 字段为 ~Password~ 引用，凭据由 pass 加密。重新绑定时先保存新凭据并提交配置，再清理旧条目。解绑先撤销设备授权，再清理对应的 pass 条目。导入和读取时均校验结构与身份唯一性。损坏记录须人工修复，服务会返回设备记录错误。邀请仅在内存中保留。设备列表和邀请查询只返回设备元数据。旧授权记录缺少绑定凭据时须重新扫码。
+设备记录保存在 ~~/.assistant/config.yml~ 的 ~_system.network_peers~ 中，最多 256 个设备。每个 ~binding_token~ 字段为 ~Password~ 引用，凭据由 GPG 加密。重新绑定时先保存新凭据并提交配置，再清理旧条目。解绑先撤销设备授权，再清理对应的密码库条目。导入和读取时均校验结构与身份唯一性。损坏记录须人工修复，服务会返回设备记录错误。邀请仅在内存中保留。设备列表和邀请查询只返回设备元数据。旧授权记录缺少绑定凭据时须重新扫码。
 
 *** 电脑状态查询与手机持久化
 
@@ -350,8 +350,8 @@ network 将 iroh 已认证的 Endpoint ID 注入 Axum 请求扩展，配置中�
 | 上游 action | native 的职责 | 本服务的对应能力 |
 |-------------+---------------+------------------|
 | ~configure~ | 检查密码库、返回版本、默认库路径和各库的 .browserpass.json 原文 | 通过现有配置中心管理单一本地库，通过 /healthz 和 /discover 查询服务及能力；不读取 .browserpass.json |
-| ~list~ | 列出每个库的相对 .gpg 文件路径，不解密 | GET /password/entries，通过 pass ls 获取列表 |
-| ~fetch~ | 按 storeId 与相对文件路径调用 GPG，返回完整 contents | GET /password/entries/{*file}，通过 pass show 获取完整 contents |
+| ~list~ | 列出每个库的相对 .gpg 文件路径，不解密 | GET /password/entries，枚举密码库中的文件 |
+| ~fetch~ | 按 storeId 与相对文件路径调用 GPG，返回完整 contents | GET /password/entries/{*file}，通过 GPG 获取完整 contents |
 | ~tree~ | 列出目录，供新增或编辑条目选择保存位置 | 查询流程不需要，未实现 |
 | ~save~ 、 ~delete~ | 加密写入、删除文件及清理空目录 | 未实现 |
 | ~echo~ | 原样返回请求中的 echoResponse，供通信诊断 | 使用现有健康接口，未实现此 action |
@@ -364,27 +364,18 @@ OTP 参数解析和 TOTP 计算、剪贴板、最近使用记录、页面填充�
 
 ** 配置与执行
 
-模块标识为 ~password~ ，~GET /meta/password~ 返回以下配置元数据，用户值由通用配置接口保存到 ~~/.assistant/config.yml~ ：
+服务在加载 ~~/.assistant/config.yml~ 前查找 ~gpg~ 。先使用进程的 ~PATH~ ，再搜索 ~/opt/homebrew/bin~ 和 ~/usr/local/bin~ 。密码库使用启动环境中的 ~PASSWORD_STORE_DIR~ 。该变量未设置或为空时，使用 ~$HOME/.password-store~ 。环境变更在重启后生效。旧版配置中的 ~password.pass_path~ 和 ~password.store_dir~ 会在升级时移除。
 
-| 键 | 类型 | 默认行为 |
-|----+------+----------|
-| ~store_dir~ | ~file_path~ ，目录 | 无默认值，必须显式指定绝对路径；不展开 ~ 和环境变量 |
-| ~pass_path~ | ~executable~ | 默认查找 pass，先搜索服务 PATH，再搜索 /opt/homebrew/bin 和 /usr/local/bin；允许显式覆盖 |
+- 查询条目时遍历密码库中的 ~.gpg~ 文件。目录遍历跳过隐藏目录和目录符号链接。文件符号链接的实际目标须位于密码库内。内部网络凭据及指向它们的别名不通过查询接口提供。
+- 读取条目时通过 GPG 解密，保留原文的换行和字段。GPG 沿用启动环境中的 ~GNUPGHOME~ 和 GPG agent。
+- 新建和更新条目时使用 ~PASSWORD_STORE_KEY~ 指定的收件人。该变量为空时向上查找最近的 ~.gpg-id~ 。设置 ~PASSWORD_STORE_SIGNING_KEY~ 时会验证 ~.gpg-id~ 的签名。GPG 生成密文后，服务通过同目录临时文件原子替换目标。
+- GPG 调用限时 30 秒。密码库的 Git 工作区记录密文变更，提交由用户管理。
 
-配置通过 ~PasswordConfig~ 在每次查询时读取，下次调用即生效。目录在查询时规范化并检查存在性和目录类型；不创建密码库，不执行 ~pass init~ ，不回退到进程环境中的 ~PASSWORD_STORE_DIR~ 或默认用户密码库。
-
-所有数据查询由 ~pass~ 命令完成，服务不直接读取密文内容或调用 ~gpg~ ：
-
-- 列表固定执行 ~pass ls~ ，以 ~LC_ALL=C~ 固定 ASCII 树枝，去除 ANSI 颜色后恢复相对路径。兼容标准 ~pass 1.7.x~ 的 tree 输出；不支持的输出返回 ~invalid-pass-response~ 。仅以文件元数据确认 .gpg 普通文件及库内路径，列表不解密。
-- 单条固定执行 ~pass show -- <去掉末尾 .gpg 的相对路径>~ ，不添加 clip、qrcode 或扩展命令，不改变原文中的换行和字段。
-- 子进程显式设置 ~PASSWORD_STORE_DIR~ ，禁用用户 pass 扩展，关闭标准输入；参数独立传递，不经过 shell。服务 PATH 额外补入 pass 所在目录，供 pass 查找 GPG、tree 等依赖。
-- pass 调用限时 30 秒，取消等待时终止直接子进程。解密依赖本机已配置的 GPG agent 和 pinentry；服务不接收 GPG 口令、不管理私钥。
-
-密码和解密结果不持久化、不进入日志、通知、状态中心或发现元数据；pass/GPG 的原始标准错误和失败时的标准输出不回显到 HTTP，失败只提供稳定错误码、中文说明和退出码。密码接口的成功和错误响应均带 ~Cache-Control: no-store~ ，不启用 CORS，沿用服务的 loopback 监听边界。
+密码和解密结果不持久化、不进入日志、通知、状态中心或发现元数据；GPG 的原始标准错误和失败时的标准输出不回显到 HTTP，失败只提供稳定错误码、中文说明和退出码。密码接口的成功和错误响应均带 ~Cache-Control: no-store~ ，不启用 CORS，沿用服务的 loopback 监听边界。
 
 ** 查询接口
 
-~GET /password/entries~ 返回排序、去重后的相对 ~.gpg~ 路径。可选 ~query~ 按完整路径进行不区分大小写的字面子串过滤，不作为 shell、正则或 pass 参数执行；省略或空字符串表示列出全部。空库、没有匹配项均返回空数组，不读取任何条目明文。
+~GET /password/entries~ 返回排序、去重后的相对 ~.gpg~ 路径。可选 ~query~ 按完整路径进行不区分大小写的字面子串过滤，不作为命令或正则执行；省略或空字符串表示列出全部。空库、没有匹配项均返回空数组，不读取任何条目明文。
 
 #+begin_src json
 {"api_version":"1","files":["example.com/alice.gpg","work/example.org.gpg"]}
@@ -402,7 +393,7 @@ GET /password/entries/example.com/alice.gpg
 
 ~file~ 是列表返回的相对路径，保留 ~.gpg~ 后缀。调用方按 URL 路径规则编码中文、空格、~#~、~?~ 和 ~%~ 等字符，目录分隔符可保留；服务端解码后检查路径。拒绝绝对路径、空路径分量、~.~ / ~..~ / 隐藏路径、反斜杠、控制字符，以及实际目标在库外的符号链接。列表同样排除这些条目。不存在或并非普通文件的目标返回 404；名称以 ~-~ 开头的普通条目仍可查询，由固定 ~show --~ 防止选项注入。
 
-当前密码业务接口只提供 GET 查询；POST、PUT、PATCH 和 DELETE 请求返回 405 ~method-not-allowed~ ，沿用统一 JSON 错误外壳及禁止缓存响应头。请求不能指定其他库目录、程序、命令或新增内容；模块不提供密码新增、修改、删除、剪贴板或 OTP 接口。模块配置仍由现有通用配置中心维护。
+当前密码业务接口只提供 GET 查询；POST、PUT、PATCH 和 DELETE 请求返回 405 ~method-not-allowed~ ，沿用统一 JSON 错误外壳及禁止缓存响应头。请求不能指定其他库目录、程序、命令或新增内容；模块不提供密码新增、修改、删除、剪贴板或 OTP 接口。密码库位置取自服务的启动环境。
 
 错误采用统一的 ~api_version/status/error{source,code,message}~ 外壳：
 
@@ -412,12 +403,12 @@ GET /password/entries/example.com/alice.gpg
 | 400 | ~invalid-password-path~ | ~business~ | 条目路径不符合约定或实际目标越出密码库 |
 | 404 | ~password-entry-not-found~ | ~business~ | 条目不存在或不是普通文件 |
 | 405 | ~method-not-allowed~ | ~services~ | 密码业务接口不接受该 HTTP 方法 |
-| 503 | ~password-not-configured~ | ~business~ | 未配置密码库，或未找到 pass 程序 |
+| 503 | ~password-not-configured~ | ~business~ | 服务启动环境未提供可解析的密码库路径 |
 | 503 | ~password-store-unavailable~ | ~business~ | 密码库不可访问 |
-| 502 | ~pass-unavailable~ | ~services~ | 无法启动 pass |
-| 502 | ~pass-command-failed~ | ~services~ | pass 非零退出或被信号终止，包括 GPG 解密失败 |
-| 502 | ~invalid-pass-response~ | ~services~ | pass 列表格式不受支持或内容不是 UTF-8 |
-| 504 | ~pass-timeout~ | ~services~ | pass 查询超过 30 秒 |
+| 502 | ~pass-unavailable~ | ~services~ | 无法启动 GPG |
+| 502 | ~pass-command-failed~ | ~services~ | GPG 非零退出或被信号终止，包括 GPG 解密失败 |
+| 502 | ~invalid-pass-response~ | ~services~ | 解密结果不是 UTF-8 |
+| 504 | ~pass-timeout~ | ~services~ | GPG 操作超过 30 秒 |
 
 * 状态中心
 

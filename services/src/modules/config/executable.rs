@@ -6,7 +6,7 @@ use std::{
 
 use super::model::ExecutableMetadata;
 
-pub(super) fn find(metadata: &ExecutableMetadata, search_path: &[PathBuf]) -> Option<String> {
+pub(crate) fn find(metadata: &ExecutableMetadata, search_path: &[PathBuf]) -> Option<String> {
     validate(
         &metadata.default_program,
         search_path,

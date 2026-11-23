@@ -362,7 +362,7 @@ impl NetworkService {
                     self.notify(
                         "已生成本地身份",
                         format!(
-                            "身份私钥已保存到 pass 密码库。\nEndpoint ID：{}",
+                            "身份私钥已保存到 GPG 密码库。\nEndpoint ID：{}",
                             identity.public()
                         ),
                     )

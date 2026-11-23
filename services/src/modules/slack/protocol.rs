@@ -161,7 +161,7 @@ impl Error {
             Self::PasswordRead => (
                 503,
                 "slack-password-unavailable",
-                "无法读取项目的 pass 条目，请检查密码库设置。",
+                "无法读取项目的 密码库条目，请检查密码库设置。",
             ),
             Self::DeliveryUnknown => (
                 503,

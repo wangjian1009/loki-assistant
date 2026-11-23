@@ -22,7 +22,7 @@
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
-`modules/password/` 维护本地 `store_dir`、`pass_path` 配置和只读查询协议。业务 HTTP 仅提供 `GET /password/entries` 和 `GET /password/entries/{*file}`，单条文件标识由路径传递，不接受 JSON 查询请求体。条目列表通过 `pass ls` 获取，解密通过固定的 `pass show --` 获取，不直接读取条目内容或调用 GPG；文件系统只用于目录、普通文件和路径边界检查。命令执行经本模块可注入的 `CommandRunner`，不复用 Emacs gateway。HTTP 不接收程序、库目录或任意命令参数，不提供密码写入操作；明文与 pass/GPG 原始错误不进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身，不读取真实密码库。
+`modules/password/` 提供只读查询协议。服务在加载用户配置前定位 `gpg`，并从进程环境的 `PASSWORD_STORE_DIR` 或 `$HOME/.password-store` 确定密码库。业务 HTTP 提供 `GET /password/entries` 和 `GET /password/entries/{*file}`。文件系统负责条目枚举、路径边界检查和密文的原子更新，GPG 命令经可注入的 `CommandRunner` 执行。HTTP 不提供密码写入操作。明文与 GPG 原始错误不得进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身。
 
 HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/code/message`；`source` 仅使用 `services`、`emacs`、`business`，`code`、`message` 必须为非空字符串，客户端按 `code` 判断并显示 `message`，不得新增模块专用错误外壳。
 
@@ -155,7 +155,7 @@ modules/<module>
 
 `http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 通过 `#[loki_api(...)]` 统一声明方法、路径、访问范围和必填的挂载状态 `mount`。无状态接口声明 `mount = "()"`。模块 Router 通过 `mount_routes` 安装整组 handler 并应用中间件。`Services::build()` 负责模块组装、配置处理器注入和路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
 
-配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。网络身份和设备绑定写入同一文件的 `_system`，使用配置模块内部的 `Password` 引用。中转令牌、身份私钥和设备绑定凭据由 pass 加密存储。网络专用条目仅供服务内部调用。配置元数据和 HTTP 接口只提供已登记的用户设置。
+配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。网络身份和设备绑定写入同一文件的 `_system`，使用配置模块内部的 `Password` 引用。中转令牌、身份私钥和设备绑定凭据由 GPG 加密存储。网络专用条目仅供服务内部调用。配置元数据和 HTTP 接口只提供已登记的用户设置。
 
 Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `Arc<ConfigService>`，每个配置项对应独立异步方法，例如 `emacsclient_path()`。方法每次调用配置中心并返回带 `value`、`source` 的 `ConfigValue`，不缓存属性值；`EmacsService` 持有 `EmacsConfig` 并通过这些方法读取。配置项键、默认值和搜索目录均由该文件维护。`EmacsConfig::metadata()` 是不依赖实例的静态函数，经 `#[loki_config]` 注册，配置中心与 API 发现一样通过编译期目录获取元数据。配置项声明 `remote_access`，配置中心对远端请求按项限制读取、写入和预检，列表过滤本机专用项。
 

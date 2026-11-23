@@ -1,7 +1,11 @@
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fmt::Debug,
+    fs::{self, DirBuilder, OpenOptions},
     future::Future,
+    io::{ErrorKind, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -11,61 +15,131 @@ use std::{
 
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
-use super::config::PasswordConfig;
+use crate::modules::config::{
+    executable, model::ExecutableMetadata, service::SYSTEM_PASSWORD_PREFIX,
+};
 
-type PassWriter = for<'a> fn(&'a str, &'a Path, &'a [String], &'a str) -> CommandFuture<'a>;
+#[derive(Debug)]
+pub(crate) struct PasswordEnvironment {
+    pub(crate) program: String,
+    pub(crate) store: PathBuf,
+    pub(crate) recipients: Vec<String>,
+    pub(crate) signing_keys: Vec<String>,
+    options: Vec<String>,
+}
 
-pub type CommandFuture<'a> =
+impl PasswordEnvironment {
+    pub(crate) fn from_env() -> Result<Self, PasswordError> {
+        let paths = std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let program = executable::find(
+            &ExecutableMetadata {
+                default_program: "gpg".into(),
+                search_paths: vec!["/opt/homebrew/bin".into(), "/usr/local/bin".into()],
+            },
+            &paths,
+        )
+        .ok_or(PasswordError::Process)?;
+        let store = store_path(
+            std::env::var_os("PASSWORD_STORE_DIR"),
+            std::env::var_os("HOME"),
+        )?;
+        let mut environment = Self::new(program, store);
+        environment.recipients = env_words("PASSWORD_STORE_KEY");
+        environment.signing_keys = env_words("PASSWORD_STORE_SIGNING_KEY");
+        environment.options = env_words("PASSWORD_STORE_GPG_OPTS");
+        Ok(environment)
+    }
+
+    pub(crate) fn new(program: String, store: PathBuf) -> Self {
+        Self {
+            program,
+            store,
+            recipients: Vec::new(),
+            signing_keys: Vec::new(),
+            options: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn store_path(
+    store: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, PasswordError> {
+    let store = store
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".password-store"))
+        })
+        .ok_or(PasswordError::NotConfigured)?;
+    std::path::absolute(store).map_err(|_| PasswordError::StoreUnavailable)
+}
+
+fn env_words(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) type CommandFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CommandOutput, PasswordError>> + Send + 'a>>;
 
-/// 只允许模块业务入口构造 ls 和 show 参数；测试替身不访问真实密码库。
-pub trait CommandRunner: Debug + Send + Sync {
+pub(crate) trait CommandRunner: Debug + Send + Sync {
     fn run<'a>(
         &'a self,
         program: &'a str,
-        store: &'a Path,
         args: &'a [String],
+        input: Option<&'a [u8]>,
     ) -> CommandFuture<'a>;
 }
 
-// 不派生 Debug，避免诊断输出包含明文或 GPG 的原始标准错误。
-pub struct CommandOutput {
+// 不派生 Debug，避免诊断输出包含解密结果。
+pub(crate) struct CommandOutput {
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub struct ProcessCommandRunner;
+pub(crate) struct ProcessCommandRunner;
 
 impl CommandRunner for ProcessCommandRunner {
     fn run<'a>(
         &'a self,
         program: &'a str,
-        store: &'a Path,
         args: &'a [String],
+        input: Option<&'a [u8]>,
     ) -> CommandFuture<'a> {
         Box::pin(async move {
-            let mut command = Command::new(program);
-            // pass 会继续调用 gpg、tree 等程序；补入已解析 pass 所在目录，兼容 Homebrew 服务的 PATH。
-            let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
-                .map(|value| std::env::split_paths(&value).collect())
-                .unwrap_or_default();
-            if let Some(parent) = Path::new(program).parent() {
-                paths.push(parent.to_owned());
-            }
-            command
+            let mut child = Command::new(program)
                 .args(args)
-                .env(
-                    "PATH",
-                    std::env::join_paths(paths).map_err(|_| PasswordError::Process)?,
-                )
-                .env("PASSWORD_STORE_DIR", store)
-                .env("PASSWORD_STORE_ENABLE_EXTENSIONS", "false")
                 .env("LC_ALL", "C")
-                .stdin(Stdio::null())
-                .kill_on_drop(true);
-            let output = command.output().await.map_err(|_| PasswordError::Process)?;
-            // pass/GPG 标准错误可能含敏感内容，只用退出码生成稳定的中文错误。
+                .stdin(if input.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| PasswordError::Process)?;
+            let stdin = child.stdin.take();
+            let write = async move {
+                if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                    stdin.write_all(input).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            let (output, written) = tokio::join!(child.wait_with_output(), write);
+            let output = output.map_err(|_| PasswordError::Process)?;
+            if output.status.success() {
+                written.map_err(|_| PasswordError::Process)?;
+            }
             Ok(CommandOutput {
                 status: output.status.code(),
                 stdout: output.stdout,
@@ -78,107 +152,54 @@ impl CommandRunner for ProcessCommandRunner {
 pub enum PasswordError {
     #[error("请求格式无效，请按接口约定提供查询参数。")]
     InvalidRequest,
-    #[error("请先配置密码管理模块的本地 pass 目录和可执行程序。")]
+    #[error("无法从服务启动环境确定密码库。")]
     NotConfigured,
-    #[error("本地 pass 目录不可用，请检查目录配置和访问权限。")]
+    #[error("本地密码库不可用，请检查目录和访问权限。")]
     StoreUnavailable,
     #[error("密码条目不存在。")]
     EntryNotFound,
     #[error("file 必须是密码库内的相对 .gpg 文件路径，不允许路径穿越、隐藏路径或库外符号链接。")]
     InvalidPath,
-    #[error("无法运行 pass，请检查可执行程序及其依赖。")]
+    #[error("无法运行 GPG，请检查可执行程序及其依赖。")]
     Process,
-    #[error("pass 执行失败（退出码 {status:?}），请检查 pass、GPG agent 和解密权限。")]
+    #[error("GPG 执行失败（退出码 {status:?}），请检查 GPG agent 和密钥权限。")]
     CommandFailed { status: Option<i32> },
-    #[error("pass 查询超时，请检查 GPG agent 或 pinentry。")]
+    #[error("GPG 操作超时，请检查 GPG agent 或 pinentry。")]
     Timeout,
-    #[error("pass 返回了无法识别的列表或非 UTF-8 内容。")]
+    #[error("密码条目解密后不是有效的 UTF-8 内容。")]
     InvalidOutput,
+    #[error("无法确定或验证密码条目的 GPG 收件人。")]
+    Recipients,
 }
 
 #[derive(Debug)]
 pub struct PasswordService {
-    config: PasswordConfig,
+    environment: Option<PasswordEnvironment>,
     runner: Arc<dyn CommandRunner>,
-    writer: PassWriter,
     timeout: Duration,
 }
 
 impl PasswordService {
-    pub fn new(config: PasswordConfig) -> Self {
+    pub(crate) fn new(environment: Option<PasswordEnvironment>) -> Self {
         Self::with_runner(
-            config,
+            environment,
             Arc::new(ProcessCommandRunner),
             Duration::from_secs(30),
         )
     }
 
-    pub fn with_runner(
-        config: PasswordConfig,
+    pub(crate) fn with_runner(
+        environment: Option<PasswordEnvironment>,
         runner: Arc<dyn CommandRunner>,
         timeout: Duration,
     ) -> Self {
         Self {
-            config,
+            environment,
             runner,
-            writer: |program, store, args, input| {
-                Box::pin(Self::write_pass(program, store, args, input))
-            },
             timeout,
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_writer(mut self, writer: PassWriter) -> Self {
-        self.writer = writer;
-        self
-    }
-
-    async fn write_pass(
-        program: &str,
-        store: &Path,
-        args: &[String],
-        input: &str,
-    ) -> Result<CommandOutput, PasswordError> {
-        let mut command = Command::new(program);
-        // pass 会继续调用 gpg、tree 等程序；补入已解析 pass 所在目录，兼容 Homebrew 服务的 PATH。
-        let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|value| std::env::split_paths(&value).collect())
-            .unwrap_or_default();
-        if let Some(parent) = Path::new(program).parent() {
-            paths.push(parent.to_owned());
-        }
-        command
-            .args(args)
-            .env(
-                "PATH",
-                std::env::join_paths(paths).map_err(|_| PasswordError::Process)?,
-            )
-            .env("PASSWORD_STORE_DIR", store)
-            .env("PASSWORD_STORE_ENABLE_EXTENSIONS", "false")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|_| PasswordError::Process)?;
-        {
-            let mut stdin = child.stdin.take().ok_or(PasswordError::Process)?;
-            stdin
-                .write_all(input.as_bytes())
-                .await
-                .map_err(|_| PasswordError::Process)?;
-        }
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|_| PasswordError::Process)?;
-        // pass/GPG 标准错误可能含敏感内容，只用退出码生成稳定的中文错误。
-        Ok(CommandOutput {
-            status: output.status.code(),
-            stdout: output.stdout,
-        })
-    }
     pub(crate) async fn save(&self, file: &str, secret: &str) -> Result<(), PasswordError> {
         if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control) {
             return Err(PasswordError::InvalidRequest);
@@ -202,158 +223,225 @@ impl PasswordService {
 
     async fn write_entry(&self, file: &str, contents: &str) -> Result<(), PasswordError> {
         validate_file(file)?;
-        let (program, store) = self.settings().await?;
-        let (checked_store, checked_file) = (store.clone(), file.to_owned());
-        tokio::task::spawn_blocking(move || check_write_path(&checked_store, &checked_file))
-            .await
-            .map_err(|_| PasswordError::StoreUnavailable)??;
-        let entry = file
-            .strip_suffix(".gpg")
-            .ok_or(PasswordError::InvalidPath)?;
-        let args = [
-            "insert".into(),
-            "--force".into(),
-            "--multiline".into(),
-            "--".into(),
-            entry.into(),
+        let store = self.store().await?;
+        let file = file.to_owned();
+        let lookup_store = store.clone();
+        let lookup_file = file.clone();
+        let recipients_file = tokio::task::spawn_blocking(move || {
+            check_write_path(&lookup_store, &lookup_file)?;
+            recipient_file(&lookup_store, &lookup_file)
+        })
+        .await
+        .map_err(|_| PasswordError::StoreUnavailable)??;
+        let recipients = self.recipients(&store, recipients_file).await?;
+        let mut args = vec![
+            "--output".into(),
+            "-".into(),
+            "--compress-algo".into(),
+            "none".into(),
+            "--no-encrypt-to".into(),
+            "--encrypt".into(),
         ];
-        let input = format!("{contents}\n");
-        let output = timeout(self.timeout, (self.writer)(&program, &store, &args, &input))
-            .await
-            .map_err(|_| PasswordError::Timeout)??;
-        if output.status != Some(0) {
-            return Err(PasswordError::CommandFailed {
-                status: output.status,
-            });
+        for recipient in recipients {
+            args.extend(["--recipient".into(), recipient]);
         }
-        Ok(())
+        let input = format!("{contents}\n");
+        let ciphertext = self.run(args, Some(input.as_bytes())).await?;
+        if ciphertext.is_empty() {
+            return Err(PasswordError::InvalidOutput);
+        }
+        tokio::task::spawn_blocking(move || write_ciphertext(&store, &file, &ciphertext))
+            .await
+            .map_err(|_| PasswordError::StoreUnavailable)?
+    }
+
+    async fn recipients(
+        &self,
+        store: &Path,
+        recipient_file: Option<PathBuf>,
+    ) -> Result<Vec<String>, PasswordError> {
+        let environment = self.environment()?;
+        if !environment.recipients.is_empty() {
+            return Ok(environment.recipients.clone());
+        }
+        let path = recipient_file.ok_or(PasswordError::Recipients)?;
+        let path = fs::canonicalize(path).map_err(|_| PasswordError::Recipients)?;
+        if !path.starts_with(store) || !path.is_file() {
+            return Err(PasswordError::Recipients);
+        }
+        if !environment.signing_keys.is_empty() {
+            let mut signature = path.as_os_str().to_owned();
+            signature.push(".sig");
+            let signature = fs::canonicalize(signature).map_err(|_| PasswordError::Recipients)?;
+            if !signature.starts_with(store) || !signature.is_file() {
+                return Err(PasswordError::Recipients);
+            }
+            let output = self
+                .run(
+                    vec![
+                        "--status-fd".into(),
+                        "1".into(),
+                        "--verify".into(),
+                        "--".into(),
+                        gpg_path(&signature)?,
+                        gpg_path(&path)?,
+                    ],
+                    None,
+                )
+                .await?;
+            let status = String::from_utf8(output).map_err(|_| PasswordError::Recipients)?;
+            if !status
+                .lines()
+                .filter_map(|line| line.strip_prefix("[GNUPG:] VALIDSIG "))
+                .any(|signature| {
+                    let mut fields = signature.split_whitespace();
+                    let signer = fields.next();
+                    let primary = fields.last();
+                    environment
+                        .signing_keys
+                        .iter()
+                        .any(|key| signer == Some(key.as_str()) || primary == Some(key.as_str()))
+                })
+            {
+                return Err(PasswordError::Recipients);
+            }
+        }
+        let contents = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|_| PasswordError::Recipients)?;
+        let recipients: Vec<_> = contents
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or_default().trim())
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if recipients.is_empty() {
+            return Err(PasswordError::Recipients);
+        }
+        Ok(recipients)
     }
 
     pub(crate) async fn remove(&self, file: &str) -> Result<(), PasswordError> {
         validate_file(file)?;
-        let (program, store) = self.settings().await?;
-        let (checked_store, checked_file) = (store.clone(), file.to_owned());
-        let exists = tokio::task::spawn_blocking(move || {
-            check_write_path(&checked_store, &checked_file)?;
-            match check_file(&checked_store, &checked_file) {
-                Ok(()) => Ok(true),
-                Err(PasswordError::EntryNotFound) => Ok(false),
-                Err(error) => Err(error),
+        let store = self.store().await?;
+        let file = file.to_owned();
+        tokio::task::spawn_blocking(move || {
+            check_write_path(&store, &file)?;
+            match fs::remove_file(store.join(file)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(PasswordError::StoreUnavailable),
             }
         })
         .await
-        .map_err(|_| PasswordError::StoreUnavailable)??;
-        if !exists {
-            return Ok(());
-        }
-        let entry = file
-            .strip_suffix(".gpg")
-            .ok_or(PasswordError::InvalidPath)?;
-        self.run(
-            &program,
-            &store,
-            &["rm".into(), "--force".into(), "--".into(), entry.into()],
-        )
-        .await?;
-        Ok(())
+        .map_err(|_| PasswordError::StoreUnavailable)?
     }
 
-    async fn settings(&self) -> Result<(String, PathBuf), PasswordError> {
-        let store = self
-            .config
-            .store_dir()
-            .await
-            .map_err(|_| PasswordError::NotConfigured)?;
-        let store = store
-            .value
-            .as_str()
-            .filter(|value| Path::new(value).is_absolute() && !value.contains('\0'))
-            .ok_or(PasswordError::StoreUnavailable)?
-            .to_owned();
-        let program = self
-            .config
-            .pass_path()
-            .await
-            .map_err(|_| PasswordError::NotConfigured)?;
-        let program = program
-            .value
-            .as_str()
-            .filter(|value| !value.is_empty() && !value.contains('\0'))
-            .ok_or(PasswordError::NotConfigured)?
-            .to_owned();
-        let store = tokio::task::spawn_blocking(move || {
-            let store =
-                std::fs::canonicalize(store).map_err(|_| PasswordError::StoreUnavailable)?;
+    fn environment(&self) -> Result<&PasswordEnvironment, PasswordError> {
+        self.environment
+            .as_ref()
+            .ok_or(PasswordError::NotConfigured)
+    }
+
+    async fn store(&self) -> Result<PathBuf, PasswordError> {
+        let store = self.environment()?.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = fs::canonicalize(store).map_err(|_| PasswordError::StoreUnavailable)?;
             if !store.is_dir() {
                 return Err(PasswordError::StoreUnavailable);
             }
             Ok(store)
         })
         .await
-        .map_err(|_| PasswordError::StoreUnavailable)??;
-        Ok((program, store))
+        .map_err(|_| PasswordError::StoreUnavailable)?
     }
 
     async fn run(
         &self,
-        program: &str,
-        store: &Path,
-        args: &[String],
-    ) -> Result<String, PasswordError> {
-        let output = timeout(self.timeout, self.runner.run(program, store, args))
-            .await
-            .map_err(|_| PasswordError::Timeout)??;
+        operation: Vec<String>,
+        input: Option<&[u8]>,
+    ) -> Result<Vec<u8>, PasswordError> {
+        let environment = self.environment()?;
+        let mut args = environment.options.clone();
+        args.extend(["--batch".into(), "--no-tty".into(), "--quiet".into()]);
+        args.extend(operation);
+        let output = timeout(
+            self.timeout,
+            self.runner.run(&environment.program, &args, input),
+        )
+        .await
+        .map_err(|_| PasswordError::Timeout)??;
         if output.status != Some(0) {
             return Err(PasswordError::CommandFailed {
                 status: output.status,
             });
         }
-        String::from_utf8(output.stdout).map_err(|_| PasswordError::InvalidOutput)
+        Ok(output.stdout)
     }
 
     pub async fn entries(&self, query: &str) -> Result<Vec<String>, PasswordError> {
         if query.chars().any(char::is_control) {
             return Err(PasswordError::InvalidRequest);
         }
-        let (program, store) = self.settings().await?;
-        let output = self.run(&program, &store, &["ls".to_owned()]).await?;
-        let mut files = tokio::task::spawn_blocking(move || list_files(&store, &output))
-            .await
-            .map_err(|_| PasswordError::InvalidOutput)??;
+        let store = self.store().await?;
         let query = query.to_lowercase();
-        files.retain(|file| file.to_lowercase().contains(&query));
-        Ok(files)
+        tokio::task::spawn_blocking(move || list_files(&store, &query))
+            .await
+            .map_err(|_| PasswordError::StoreUnavailable)?
     }
 
     pub async fn fetch(&self, file: &str) -> Result<String, PasswordError> {
+        self.fetch_entry(file, false).await
+    }
+
+    pub(super) async fn fetch_public(&self, file: &str) -> Result<String, PasswordError> {
+        self.fetch_entry(file, true).await
+    }
+
+    async fn fetch_entry(&self, file: &str, public: bool) -> Result<String, PasswordError> {
         validate_file(file)?;
-        let (program, store) = self.settings().await?;
-        let (checked_store, checked_file) = (store.clone(), file.to_owned());
-        tokio::task::spawn_blocking(move || check_file(&checked_store, &checked_file))
-            .await
-            .map_err(|_| PasswordError::StoreUnavailable)??;
-        // 固定子命令和 -- 防止条目名被识别成 pass 命令、选项或扩展。
-        let entry = file
-            .strip_suffix(".gpg")
-            .ok_or(PasswordError::InvalidPath)?;
-        self.run(
-            &program,
-            &store,
-            &["show".to_owned(), "--".to_owned(), entry.to_owned()],
-        )
+        if public && file.starts_with(SYSTEM_PASSWORD_PREFIX) {
+            return Err(PasswordError::EntryNotFound);
+        }
+        let store = self.store().await?;
+        let file = file.to_owned();
+        let path = tokio::task::spawn_blocking(move || {
+            let path = checked_file(&store, &file)?;
+            if public && internal_path(&store, &path) {
+                return Err(PasswordError::EntryNotFound);
+            }
+            gpg_path(&path)
+        })
         .await
+        .map_err(|_| PasswordError::StoreUnavailable)??;
+        let output = self
+            .run(
+                vec![
+                    "--output".into(),
+                    "-".into(),
+                    "--decrypt".into(),
+                    "--".into(),
+                    path,
+                ],
+                None,
+            )
+            .await?;
+        String::from_utf8(output).map_err(|_| PasswordError::InvalidOutput)
     }
 
     pub(crate) async fn missing_entries(
         &self,
         paths: HashSet<String>,
     ) -> Result<HashSet<String>, PasswordError> {
-        let (_, store) = self.settings().await?;
+        let store = self.store().await?;
         tokio::task::spawn_blocking(move || {
             paths
                 .into_iter()
                 .filter(|path| {
-                    matches!(check_file(&store, path), Err(PasswordError::EntryNotFound))
+                    matches!(
+                        checked_file(&store, path),
+                        Err(PasswordError::EntryNotFound)
+                    )
                 })
                 .collect()
         })
@@ -362,23 +450,72 @@ impl PasswordService {
     }
 }
 
+fn gpg_path(path: &Path) -> Result<String, PasswordError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or(PasswordError::InvalidPath)
+}
+
+fn recipient_file(store: &Path, file: &str) -> Result<Option<PathBuf>, PasswordError> {
+    let entry = store.join(file);
+    let parent = entry.parent().ok_or(PasswordError::InvalidPath)?;
+    for path in parent
+        .ancestors()
+        .take_while(|directory| directory.starts_with(store))
+        .map(|directory| directory.join(".gpg-id"))
+    {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(PasswordError::Recipients),
+        }
+    }
+    Ok(None)
+}
+
+fn write_ciphertext(store: &Path, file: &str, ciphertext: &[u8]) -> Result<(), PasswordError> {
+    check_write_path(store, file)?;
+    let destination = store.join(file);
+    let parent = destination.parent().ok_or(PasswordError::InvalidPath)?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|_| PasswordError::StoreUnavailable)?;
+    let temporary = parent.join(format!(".password-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        output.write_all(ciphertext)?;
+        output.sync_all()?;
+        fs::rename(&temporary, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(|_| PasswordError::StoreUnavailable)
+}
+
 fn check_write_path(store: &Path, file: &str) -> Result<(), PasswordError> {
-    let parts: Vec<_> = file.split('/').collect();
+    let mut parts = file.split('/').peekable();
     let mut path = store.to_owned();
-    for (index, part) in parts.iter().enumerate() {
+    while let Some(part) = parts.next() {
         path.push(part);
-        match std::fs::symlink_metadata(&path) {
+        match fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                let regular = if index + 1 == parts.len() {
+                let valid = if parts.peek().is_none() {
                     metadata.is_file()
                 } else {
                     metadata.is_dir()
                 };
-                if !regular || metadata.file_type().is_symlink() {
+                if !valid {
                     return Err(PasswordError::InvalidPath);
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
             Err(_) => return Err(PasswordError::StoreUnavailable),
         }
     }
@@ -399,11 +536,10 @@ pub(crate) fn validate_file(file: &str) -> Result<(), PasswordError> {
     Ok(())
 }
 
-/// 只检查文件元数据及边界；内容只能由 pass show 读取。
-fn check_file(store: &Path, file: &str) -> Result<(), PasswordError> {
+fn checked_file(store: &Path, file: &str) -> Result<PathBuf, PasswordError> {
     validate_file(file)?;
-    let path = std::fs::canonicalize(store.join(file)).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+    let path = fs::canonicalize(store.join(file)).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
             PasswordError::EntryNotFound
         } else {
             PasswordError::StoreUnavailable
@@ -415,74 +551,43 @@ fn check_file(store: &Path, file: &str) -> Result<(), PasswordError> {
     if !path.is_file() {
         return Err(PasswordError::EntryNotFound);
     }
-    Ok(())
+    Ok(path)
 }
 
-/// pass 1.7 的 ls 使用 tree 展示目录；LC_ALL=C 固定为 ASCII 树枝，去掉 ANSI 颜色后恢复相对路径。
-fn list_files(store: &Path, output: &str) -> Result<Vec<String>, PasswordError> {
-    let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").expect("固定的 ANSI 正则有效");
-    let output = ansi.replace_all(output, "");
-    let mut lines = output.lines();
-    if lines.next() != Some("Password Store") {
-        return Err(PasswordError::InvalidOutput);
-    }
-    let mut parents: Vec<String> = Vec::new();
-    let mut directories = HashSet::new();
+fn internal_path(store: &Path, path: &Path) -> bool {
+    path.starts_with(store.join(SYSTEM_PASSWORD_PREFIX))
+}
+
+fn list_files(store: &Path, query: &str) -> Result<Vec<String>, PasswordError> {
     let mut files = Vec::new();
-    for line in lines {
-        let mut branch = line;
-        let mut depth = 0;
-        while let Some(rest) = branch
-            .strip_prefix("|   ")
-            .or_else(|| branch.strip_prefix("    "))
-        {
-            branch = rest;
-            depth += 1;
+    let mut directories = vec![store.to_owned()];
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(directory).map_err(|_| PasswordError::StoreUnavailable)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| PasswordError::StoreUnavailable)?;
+            let path = entry.path();
+            let Some(relative) = path.strip_prefix(store).ok().and_then(Path::to_str) else {
+                continue;
+            };
+            if relative.split('/').any(|part| part.starts_with('.')) || internal_path(store, &path)
+            {
+                continue;
+            }
+            if entry
+                .file_type()
+                .map_err(|_| PasswordError::StoreUnavailable)?
+                .is_dir()
+            {
+                directories.push(path);
+            } else if relative.to_lowercase().contains(query) {
+                match checked_file(store, relative) {
+                    Ok(target) if !internal_path(store, &target) => files.push(relative.to_owned()),
+                    Ok(_) | Err(PasswordError::InvalidPath | PasswordError::EntryNotFound) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
-        let name = branch
-            .strip_prefix("|-- ")
-            .or_else(|| branch.strip_prefix("`-- "))
-            .ok_or(PasswordError::InvalidOutput)?;
-        if depth > parents.len() {
-            return Err(PasswordError::InvalidOutput);
-        }
-        parents.truncate(depth);
-        // tree 在符号链接后附加目标；仅把名称用于路径检查，不把目标暴露给客户端。
-        let prefix = if parents.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", parents.join("/"))
-        };
-        let name = if store.join(format!("{prefix}{name}")).exists()
-            || store.join(format!("{prefix}{name}.gpg")).exists()
-        {
-            name
-        } else {
-            name.split(" -> ")
-                .next()
-                .ok_or(PasswordError::InvalidOutput)?
-        };
-        if name.is_empty() || name.contains('/') || name.chars().any(char::is_control) {
-            return Err(PasswordError::InvalidOutput);
-        }
-        let relative = format!("{prefix}{name}");
-        let file = format!("{relative}.gpg");
-        match check_file(store, &file) {
-            Ok(()) => files.push(file),
-            Err(PasswordError::EntryNotFound | PasswordError::InvalidPath) => {}
-            Err(error) => return Err(error),
-        }
-        // pass 同样移除目录名结尾的 .gpg；同名显示的两个目录按 tree 的名称顺序恢复。
-        let directory = [name.to_owned(), format!("{name}.gpg")]
-            .into_iter()
-            .find(|candidate| {
-                let relative = format!("{prefix}{candidate}");
-                store.join(&relative).is_dir() && directories.insert(relative)
-            })
-            .unwrap_or_else(|| name.to_owned());
-        parents.push(directory);
     }
     files.sort();
-    files.dedup();
     Ok(files)
 }

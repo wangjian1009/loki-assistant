@@ -268,6 +268,17 @@ impl ConfigService {
     ) -> Result<Self, ConfigServiceError> {
         let storage = FileStorage::new(path)?;
         let mut values = storage.read()?;
+        let mut cleaned = None;
+        if let Some(password) = values.get_mut("password") {
+            let pass_path = password.remove("pass_path");
+            let store_dir = password.remove("store_dir");
+            if pass_path.is_some() || store_dir.is_some() {
+                if password.is_empty() {
+                    values.remove("password");
+                }
+                cleaned = Some(values.clone());
+            }
+        }
         let mut system_values = values.remove(system::SECTION).unwrap_or_default();
         if let Some(token) = values
             .get_mut("network")
@@ -309,6 +320,9 @@ impl ConfigService {
             }
         }
         notifications::clear_retired_pending_password_references(&mut values);
+        if let Some(cleaned) = cleaned {
+            storage.write_atomic(cleaned)?;
+        }
         let mut service = Self::with_metadata(metadata);
         service.values = Arc::new(RwLock::new(values));
         service.system_values = Arc::new(RwLock::new(system::SystemValues(system_values)));
@@ -2364,6 +2378,22 @@ mod tests {
         fs::write(&path, "module_a: [broken").unwrap();
         assert!(ConfigService::load_with_metadata(&path, vec![metadata()]).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "module_a: [broken");
+    }
+
+    #[test]
+    fn removes_retired_password_settings_from_the_file() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.yml");
+        fs::write(
+            &path,
+            "password:\n  store_dir: /old/store\n  pass_path: /old/pass\nother:\n  setting: true\n",
+        )
+        .unwrap();
+
+        ConfigService::load(&path).unwrap();
+
+        let saved: Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved, json!({"other": {"setting": true}}));
     }
 
     #[tokio::test]

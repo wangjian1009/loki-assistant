@@ -88,7 +88,7 @@ fn network_config_metadata() -> ConfigModuleMetadata {
             ConfigItemMetadata {
                 key: "relay_token".to_owned(),
                 name: "中转令牌".to_owned(),
-                description: "保存在本机 pass 密码库中的共享访问令牌，与中转地址一起生效。"
+                description: "保存在本机 GPG 密码库中的共享访问令牌，与中转地址一起生效。"
                     .to_owned(),
                 data_type: ConfigDataType::Password {
                     path: RELAY_PASSWORD_PATH.into(),

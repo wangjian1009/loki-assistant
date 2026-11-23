@@ -99,9 +99,9 @@ control-center:
 
 * 网络身份与中转注册
 
-在「网络」分组设置「中转地址」 ~relay_url~ 。通过 Loki 已配置的 pass 密码库将共享中转令牌保存到 ~loki-assistant/network/relay.gpg~ 的首行，再重启 services。只读的「中转令牌」配置项显示凭据是否可用。地址和令牌配齐后开始注册。
+在「网络」分组设置「中转地址」 ~relay_url~ 。通过 Loki 使用的密码库将共享中转令牌保存到 ~loki-assistant/network/relay.gpg~ 的首行，再重启 services。只读的「中转令牌」配置项显示凭据是否可用。地址和令牌配齐后开始注册。
 
-services 使用已配置的 pass 密码库保存本机身份私钥和设备绑定令牌，在 ~~/.assistant/config.yml~ 保留条目引用。升级时自动迁移旧中转令牌、原身份和设备绑定，手机可继续使用原绑定。
+services 使用 GPG 密码库保存本机身份私钥和设备绑定令牌，在 ~~/.assistant/config.yml~ 保留条目引用。升级时自动迁移旧中转令牌、原身份和设备绑定，手机可继续使用原绑定。
 
 完整配置变化时先注册新连接，成功且落盘后才替换旧连接并通知成功；注册失败或超时会通知并拒绝保存，保留原配置和连接。清空任意一项成功后关闭连接；首次只保存一项不连接、不发出注册失败通知。启动时配置完整才注册，失败不影响本机 HTTP 服务；可修复后重新提交。每次注册最多等待 10 秒。
 
@@ -127,23 +127,17 @@ Emacs 的设备管理界面默认只显示已绑定设备；点击“新增设�
 
 * 密码查询
 
-~password~ 模块通过 ~pass ls~ 查询条目，通过 ~pass show~ 读取单条密码原文，仅提供查询能力。先安装标准 ~pass 1.7.x~ 及其 GPG、tree 等依赖，并配置可用的 GPG agent 和 pinentry；模块不初始化密码库或管理私钥。
+~password~ 模块查找现有密码库的 ~.gpg~ 条目，并通过 GPG 解密。服务从 ~PATH~ 和 Homebrew 常用目录查找 ~gpg~ 。密码库目录使用服务环境中的 ~PASSWORD_STORE_DIR~ ，未设置或为空时使用 ~$HOME/.password-store~ 。环境变更在重启后生效。使用 Homebrew services 时，变量由用户的 LaunchAgent 环境提供。
 
-在现有 Emacs 服务配置界面的“密码管理”模块中设置“本地 pass 目录”，使用绝对路径，不展开 ~ 和环境变量。~pass_path~ 默认从服务 PATH 和 Homebrew 常用目录发现，也可指定可执行文件。没有显式设置目录时返回 ~password-not-configured~ ，不会自动访问用户的默认密码库。
-
-也可通过通用配置接口设置并查询，以下地址仅为默认监听地址示例，客户端仍应从 ~~/.assistant/service~ 获取实际地址：
+以下地址为默认监听地址示例，客户端从 ~~/.assistant/service~ 获取实际地址。
 
 #+begin_src sh
-curl -X PUT http://127.0.0.1:47321/data/password/store_dir \
-  -H 'Content-Type: application/json' \
-  -d '"/absolute/path/to/password-store"'
-
 curl 'http://127.0.0.1:47321/password/entries?query=example.com'
 
 curl http://127.0.0.1:47321/password/entries/example.com/alice.gpg
 #+end_src
 
-密码业务接口只提供 GET 查询。列表返回相对 ~.gpg~ 文件路径，不解密；单条读取使用 ~GET /password/entries/{*file}~ ，不需要请求体，返回完整 ~contents~ ，保留字段和换行，供调用方解析。文件名中的中文、空格及 URL 保留字符需按路径规则编码。POST、PUT、PATCH 和 DELETE 返回 405。配置变更从下一次查询生效。每次 pass 调用最多等待 30 秒，响应禁止缓存；失败不回显 GPG 原始输出。
+密码业务接口只提供 GET 查询。列表返回相对 ~.gpg~ 文件路径，不解密；单条读取使用 ~GET /password/entries/{*file}~ ，不需要请求体，返回完整 ~contents~ ，保留字段和换行，供调用方解析。文件名中的中文、空格及 URL 保留字符需按路径规则编码。POST、PUT、PATCH 和 DELETE 返回 405。每次 GPG 调用最多等待 30 秒，响应禁止缓存；失败不回显 GPG 原始输出。
 
 browserpass 源码分析、服务职责和完整接口见 [[file:../docs/control-center-services.org::*密码管理模块][密码管理模块协议]]。目前提供项目自身的 HTTP API，原版 browserpass 使用 Native Messaging，仍需另行适配才能接入。
 

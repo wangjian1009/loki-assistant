@@ -65,10 +65,12 @@ impl Services {
         Self::with_config(
             config::service::ConfigService::from_registry(),
             NotificationService::new(),
+            None,
         )
     }
 
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let password_environment = password::service::PasswordEnvironment::from_env()?;
         let config_path = config::service::ConfigService::storage_path()?;
         let home = config_path
             .parent()
@@ -79,12 +81,14 @@ impl Services {
         Ok(Self::with_config(
             config::service::ConfigService::load(config_path)?,
             notification,
+            Some(password_environment),
         ))
     }
 
     fn with_config(
         config: config::service::ConfigService,
         notification: NotificationService,
+        password_environment: Option<password::service::PasswordEnvironment>,
     ) -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
@@ -95,7 +99,7 @@ impl Services {
             Arc::clone(&notification),
         ));
         let service = service::Module::new(Arc::clone(&status));
-        let password = password::Module::new(Arc::new(config.clone()));
+        let password = password::Module::new(password_environment);
         let config = config.with_password_service(password.service());
         let network = Arc::new(network::NetworkService::new(
             config.clone(),

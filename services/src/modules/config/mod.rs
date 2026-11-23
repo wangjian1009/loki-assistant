@@ -1,7 +1,7 @@
 pub mod model;
 pub mod registry;
 
-mod executable;
+pub(crate) mod executable;
 mod protocol;
 mod routes;
 pub mod service;
