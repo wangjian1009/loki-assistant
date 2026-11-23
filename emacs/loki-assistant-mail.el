@@ -3,7 +3,7 @@
 (require 'json)
 (require 'seq)
 
-(declare-function mu4e--server-view "mu4e-server")
+(declare-function mu4e-search "mu4e-search")
 (declare-function mu4e--start "mu4e")
 (declare-function mu4e-compose-mail "mu4e-compose")
 (declare-function mu4e-running-p "mu4e-server")
@@ -13,6 +13,8 @@
 (defvar mu4e--started)
 (defvar mu4e--server-indexing)
 (defvar mu4e-mu-home)
+(defvar mu4e-search-include-related)
+(defvar mu4e-search-threads)
 
 (defun loki-assistant-mail--focus ()
   "选中可用于显示邮件的图形 frame。"
@@ -69,7 +71,11 @@
                      (when (frame-live-p frame)
                        (with-selected-frame frame
                          (if (equal action "view")
-                             (mu4e--server-view payload)
+                             (let ((mu4e-search-include-related nil)
+                                   (mu4e-search-threads nil))
+                               ;; 先建立邮件列表，再由 mu4e 打开匹配的邮件。
+                               (mu4e-search (concat "msgid:" (json-serialize payload))
+                                            nil nil t payload t))
                            (loki-assistant-mail--compose payload))))
                    (error (message "邮件操作失败：%s" (error-message-string err)))))))
     (if (and (mu4e-running-p) mu4e--started)
