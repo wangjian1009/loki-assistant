@@ -115,12 +115,21 @@ use super::{
 };
 
 #[derive(Debug, Default)]
-struct Alerts(Mutex<Vec<NotificationContent>>);
+struct Alerts {
+    attempts: Mutex<Vec<NotificationContent>>,
+    fail_next: AtomicBool,
+}
 
 impl NotificationLauncher for Alerts {
     fn launch(&self, content: NotificationContent) -> NotificationFuture<'_> {
-        self.0.lock().unwrap().push(content);
-        Box::pin(async { Ok(()) })
+        self.attempts.lock().unwrap().push(content);
+        let fail = self.fail_next.swap(false, Ordering::SeqCst);
+        Box::pin(async move {
+            if fail {
+                return Err("模拟通知转交失败".into());
+            }
+            Ok(())
+        })
     }
 }
 
@@ -668,15 +677,15 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .unwrap()
         .unwrap();
     timeout(Duration::from_secs(5), async {
-        while alerts.0.lock().unwrap().is_empty() {
+        while alerts.attempts.lock().unwrap().is_empty() {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(alerts.0.lock().unwrap().len(), 1);
-    assert_eq!(alerts.0.lock().unwrap()[0].app.as_deref(), Some("slack"));
-    let navigation = alerts.0.lock().unwrap()[0].navigation_url.clone().unwrap();
+    assert_eq!(alerts.attempts.lock().unwrap().len(), 1);
+    assert_eq!(alerts.attempts.lock().unwrap()[0].app.as_deref(), Some("slack"));
+    let navigation = alerts.attempts.lock().unwrap()[0].navigation_url.clone().unwrap();
     let navigation = url::Url::parse(&navigation).unwrap();
     let (_, callback) = navigation
         .query_pairs()
@@ -997,7 +1006,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(channel["last_message"]["preview"], "请 <@UME> 看一下");
     let navigation = timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(alert) = alerts.0.lock().unwrap().get(1) {
+            if let Some(alert) = alerts.attempts.lock().unwrap().get(1) {
                 break alert.navigation_url.clone().unwrap();
             }
             sleep(Duration::from_millis(10)).await;
@@ -1075,7 +1084,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         let message = &room.messages[&mock.sent];
         assert_eq!(message.author.as_ref().unwrap().id, "UME");
     }
-    assert_eq!(alerts.0.lock().unwrap().len(), 2);
+    assert_eq!(alerts.attempts.lock().unwrap().len(), 2);
     assert_eq!(
         invoke(
             &app,
@@ -1161,7 +1170,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     for event in [
         json!({"type":"message","channel":"CWORK","ts":top,"user":"UYOU","text":"普通消息"}),
         json!({"type":"message","channel":"CWORK","ts":reply,"thread_ts":"1.0",
-               "user":"UYOU","text":"未打开线索的普通回复"}),
+               "user":"UYOU","text":"未打开线索的普通回复",
+               "blocks":[alert_section("&gt;请 <@UYOU> 检查 *<https://example.com/alerts|告警明细>*")]}),
         json!({"type":"message","subtype":"thread_broadcast","channel":"CWORK","ts":reply,
                "event_ts":format!("{now}.200002"),"root":{"ts":"1.0"},"user":"UYOU","text":"同一条回复"}),
         json!({"type":"message","channel":"CWORK","ts":self_reply,"thread_ts":"1.0",
@@ -1171,14 +1181,18 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         watch_events.send(event).unwrap();
     }
     timeout(Duration::from_secs(3), async {
-        while alerts.0.lock().unwrap().len() < 5 {
+        while alerts.attempts.lock().unwrap().len() < 5 {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
+    assert_eq!(
+        alerts.attempts.lock().unwrap()[3].body.as_deref(),
+        Some("林舟 · 请 @林舟 检查 告警明细")
+    );
     let callbacks: Vec<_> = alerts
-        .0
+        .attempts
         .lock()
         .unwrap()
         .iter()
@@ -1226,7 +1240,7 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     }
     timeout(Duration::from_secs(3), async {
         loop {
-            let alerts = alerts.0.lock().unwrap();
+            let alerts = alerts.attempts.lock().unwrap();
             assert!(alerts.len() <= 6);
             if let Some(alert) = alerts.get(5) {
                 assert!(alert.navigation_url.as_ref().unwrap().contains("300002"));
@@ -1238,6 +1252,59 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     })
     .await
     .unwrap();
+    alerts.fail_next.store(true, Ordering::SeqCst);
+    let retry_ts = format!("{now}.300003");
+    watch_events
+        .send(json!({"type":"message","channel":"CWORK","ts":retry_ts,
+                     "user":"UYOU","text":"<@UME>",
+                     "blocks":[alert_section("*原始告警*")]}))
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while alerts.attempts.lock().unwrap().len() < 7 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    watch_events
+        .send(json!({"type":"message","subtype":"message_changed","channel":"CWORK",
+                     "message":{"ts":retry_ts,"user":"UYOU","text":"告警已更新"}}))
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if service
+                .state
+                .lock()
+                .await
+                .cache
+                .conversations
+                .get("CWORK")
+                .and_then(|room| room.messages.get(&retry_ts))
+                .is_some_and(|message| message.text == "告警已更新")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    timeout(Duration::from_secs(3), async {
+        while alerts.attempts.lock().unwrap().len() < 8 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let attempts = alerts.attempts.lock().unwrap();
+        assert_eq!(attempts[6].body.as_deref(), Some("林舟 · 原始告警"));
+        assert_eq!(attempts[6].body, attempts[7].body);
+        assert_eq!(attempts[6].navigation_url, attempts[7].navigation_url);
+    }
     projects.stop().await;
     worker.await.unwrap();
 

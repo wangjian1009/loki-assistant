@@ -37,6 +37,7 @@ pub(super) struct Cache {
 
 #[derive(Clone)]
 pub(super) struct PendingNotification {
+    pub body: String,
     pub callback: String,
     pub watch: Option<String>,
 }

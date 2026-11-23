@@ -6,11 +6,13 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use uuid::Uuid;
 
-use crate::modules::notification::protocol::NotificationRequest;
-use crate::modules::emacs::service::EmacsService;
+use crate::modules::{
+    emacs::service::EmacsService, notification::protocol::NotificationRequest,
+};
 
 use super::{
     client::Socket,
+    notification,
     protocol::{Author, Error, Message, Page, timestamp, valid_id},
     service::SlackService,
     store::{Conversation, PendingNotification, SendState},
@@ -111,7 +113,7 @@ impl SlackService {
                 .notification
                 .send(NotificationRequest {
                     title: "Slack 新消息".into(),
-                    body: None,
+                    body: Some(alert.body),
                     app: Some("slack".into()),
                     callback_url: Some(alert.callback),
                 })
@@ -281,7 +283,7 @@ impl SlackService {
             return Ok(false);
         };
         let event_id = format!("{id}.{subtype}.{event_ts}");
-        let conversation_id = {
+        let (conversation_id, users) = {
             let state = self.state.lock().await;
             let account = state.account(session)?;
             if team.as_deref().is_some_and(|team| team != account.identity.team_id)
@@ -289,7 +291,12 @@ impl SlackService {
             {
                 return Ok(false);
             }
-            format!("{}.{id}", account.identity.team_id)
+            let users = state
+                .user_directory
+                .as_ref()
+                .filter(|directory| directory.session == session)
+                .cloned();
+            (format!("{}.{id}", account.identity.team_id), users)
         };
         let watched = new && self.watching(&conversation_id).await;
         if let Some(message) = &message {
@@ -384,6 +391,7 @@ impl SlackService {
                     cache.notifications.insert(
                         event_id,
                         PendingNotification {
+                            body: notification::body(&message, users.as_ref()),
                             callback,
                             watch: (!ordinary).then_some(conversation_id),
                         },

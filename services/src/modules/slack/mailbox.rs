@@ -119,6 +119,7 @@ impl UserProfile {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct UserDirectory {
     pub session: Uuid,
     expires_at: Option<u64>,
@@ -137,7 +138,7 @@ impl UserDirectory {
         self.expires_at.is_some()
     }
 
-    fn find(&self, id: &str) -> Option<&UserProfile> {
+    pub(super) fn find(&self, id: &str) -> Option<&UserProfile> {
         self.users
             .binary_search_by(|user| user.slack_id().cmp(id))
             .ok()

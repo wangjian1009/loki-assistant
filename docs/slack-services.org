@@ -320,7 +320,7 @@ services 在本机持久化一份全局关注队列。配置项 ~slack/watches~ 
 - 当前的「提及和私信」规则继续适用。主题聊天开启关注后，services 将该主题下普通的未读新消息也纳入现有通知流程，沿用本人消息过滤。线索中的新回复按所属会话匹配关注，无论根消息何时发送、线索是否展开或进入过缓存。
 - Slack 实时消息归一化后，以复合会话 ID 匹配关注。~thread_ts~ 存在时用作线索根标识。编辑、删除和反应不触发关注通知。首次开启从落盘时开始生效，历史翻页和 buffer 快照只更新缓存。
 - 同一条新消息同时命中关注和直接提及时，只进入一次系统通知队列。按复合会话 ID 和消息 ~ts~ 去重，线索广播使用原回复的消息标识。关闭关注后，尚未转交的消息只按原有通知规则判断。
-- 通知使用共享 ~NotificationService~ 。回调复用 ~POST /slack/conversations/{id}/open~ ，以 ~message_ts~ 定位消息，线索回复同时携带 ~thread_ts~ 。回复不可用时定位到根消息，根消息不可用时打开对应会话。 [[file:slack-services.org::*通知点击跳转][通知点击协议]] · [[file:control-center-services.org::*系统通知模块][系统通知模块]]
+- 通知使用共享 ~NotificationService~ 。回调复用 ~POST /slack/conversations/{id}/open~ ，以 ~message_ts~ 定位消息，线索回复同时携带 ~thread_ts~ 。回复不可用时定位到根消息，根消息不可用时打开对应会话。 [[*正文摘要][通知正文]] · [[*通知点击跳转][通知点击协议]] · [[file:control-center-services.org::*系统通知模块][系统通知模块]]
 
 ** 验收场景
 
@@ -342,7 +342,35 @@ services 在本机持久化一份全局关注队列。配置项 ~slack/watches~ 
 
 ~PUT /slack/conversations/{id}/read-position~ 推进会话顶层已读位置。 ~PUT /slack/conversations/{id}/threads/{thread_ts}/read-position~ 推进线程已读位置。两个接口的 JSON 请求体均包含 ~through_ts~ 。响应包含 ~conversation_id~ 、 ~team_id~ 、 ~thread_ts~ 、 ~read_through_ts~ 和 ~unread_count~ 。
 
-* 通知点击跳转
+* Slack 新消息通知
+
+** 正文摘要
+
+Slack 模块在消息命中现有通知规则后，使用归一化的 ~Message~ 生成纯文本摘要。通知标题为「Slack 新消息」，有发送人时在正文开头加上「发送人 · 」。发送人和提及优先使用事件或当前工作区缓存中的显示名，缺少资料时回退到 Slack ID。摘要与点击回调一同写入内存通知队列，投递和重试直接把摘要用作 ~NotificationRequest.body~ 。 [[file:control-center-services.org::*系统通知模块][通用通知接口]]
+
+按 ~blocks~ 的顺序生成摘要。只要 ~section~ 或 ~markdown~ 能转换出正文，就使用区块内容。只有表格、代码块，或没有可用区块时，先取非空的顶层 ~text~ ，再追加已转换的区块。相邻区块用换行分隔。
+
+| 区块 | 通知正文中的表示 |
+|------+------------------|
+| ~section~ | 先取 ~text~ ，再按顺序展开 ~fields~ ，每项占一行。 ~plain_text~ 按字面显示， ~mrkdwn~ 按下文规则转换。 |
+| ~markdown~ | 保留标题、列表和段落中的文本。链接取可见标签，代码围栏内保留内容，省略围栏和语言标签。 |
+| ~rich_text_preformatted~ | 展示首个非空代码行，省略后续非空行时加上「…」。 |
+| ~table~ | 展示前两条非空行，每行最多取前三个单元格，以「 · 」分隔单元格。省略列或行时加上「…」。缺少可显示的表格区块时，同样处理旧字段 ~tables~ 。 |
+
+顶层 ~text~ 和 ~mrkdwn~ 文本将 Slack 链接转成标签，无标签的网页链接显示域名。用户提及显示为「@显示名」，频道引用使用 Slack 提供的标签或频道 ID。省略成对的强调标记、行内代码定界符和行首引用标记，代码按字面显示。Slack 字符实体在输出文本中解码一次。未知或空区块逐项略过。
+
+正文和区块都无可显示内容时，取首个附件的标题。旧消息可回退到 ~attachment~ ，再回退到「点击查看消息」。去掉首尾空白，合并多余空行，整条正文最多 240 个 Unicode 码点（含发送人前缀和省略号）。在完整字符簇边界截断，末尾加「…」。横幅能显示的行数由 macOS 决定，点击后在 Emacs 查看完整正文、表格和附件。
+
+上文 Block Kit 示例中的第一段正文可转换成以下文本，其中 ~U123~ 已有显示名「小林」。
+
+#+begin_example
+值班 @小林: IP绑定不通
+已持续0.4小时: 有3个绑定的IP无法连通
+#+end_example
+
+验收覆盖顶层 ~text~ 与区块正文重复、只有 ~blocks~ 、只有表格或代码块、旧 ~tables~ 、只有附件、提及资料缺失、带 emoji 的长消息，以及线程回复点击定位。另检查同一条消息的重试沿用入队时生成的正文。
+
+** 通知点击跳转
 
 ~POST /slack/conversations/{id}/open~ 打开或聚焦通知对应的 Emacs Slack 会话，请求体为空。可选查询参数 ~thread_ts~ 展开指定线程， ~message_ts~ 定位目标消息。两者同时提供时，目标消息是指定线程中的回复。
 

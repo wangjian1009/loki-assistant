@@ -2,6 +2,7 @@ mod client;
 mod disk;
 mod downloads;
 mod mailbox;
+mod notification;
 mod picker;
 mod projects;
 mod protocol;
