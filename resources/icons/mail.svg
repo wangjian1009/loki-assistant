@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>邮件通知图标</title>
+  <rect x="8" y="8" width="112" height="112" rx="25" fill="#154842"/>
+  <rect x="29" y="41" width="70" height="46" rx="7" fill="#B6F8DD"/>
+  <path d="M32 45 59 65Q64 69 69 65L96 45" fill="none"
+        stroke="#154842" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

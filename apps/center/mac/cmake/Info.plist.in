@@ -40,6 +40,7 @@
             <key>CFBundleURLSchemes</key>
             <array><string>@LOKI_APP_URL_SCHEME@</string></array>
         </dict>
+@LOKI_APP_MAILTO_URL_TYPE@
     </array>
 </dict>
 </plist>

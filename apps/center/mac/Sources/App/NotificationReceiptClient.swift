@@ -97,6 +97,26 @@ struct NotificationReceiptClient: Sendable {
         }
     }
 
+    func composeMail(_ url: URL) async throws {
+        guard url.scheme?.lowercased() == "mailto" else { throw URLError(.unsupportedURL) }
+        let endpoint = try await healthyEndpoint()
+        var request = URLRequest(url: try Self.url(endpoint: endpoint, path: "/mail/compose"),
+                                 cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 35)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["url": url.absoluteString])
+        let (data, response) = try await transport(request)
+        guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard response.statusCode == 200 else {
+            let message = (try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data))?.error.message
+            throw MailComposeError.failed(message ?? "打开邮件草稿失败（HTTP \(response.statusCode)）")
+        }
+        let result = try JSONDecoder().decode(MailComposeResponse.self, from: data)
+        guard result.api_version == "1", result.opened else {
+            throw MailComposeError.failed("Emacs 未确认已打开邮件草稿")
+        }
+    }
+
     private func healthyEndpoint() async throws -> ServiceEndpoint {
         let endpoint = try discover()
         let request = URLRequest(url: try Self.url(endpoint: endpoint, path: "/healthz"), cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
@@ -190,6 +210,21 @@ struct NotificationReceiptClient: Sendable {
         components.path = path
         guard let url = components.url else { throw NotificationReceiptError.invalidEndpoint }
         return url
+    }
+}
+
+private struct MailComposeResponse: Decodable {
+    let api_version: String
+    let opened: Bool
+}
+
+private enum MailComposeError: LocalizedError {
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .failed(message): message
+        }
     }
 }
 

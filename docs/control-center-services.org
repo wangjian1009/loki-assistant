@@ -19,6 +19,7 @@
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
+| ~modules/mail~ | 同步 Maildir、更新 mu 索引、通知新邮件及转交 Emacs 撰写草稿 | 已实现 |
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 枚举本地密码库条目并解密 OpenPGP 文件 | 已实现，只读 |
@@ -54,6 +55,7 @@ services/
     │   ├── control_center/ 控制中心配置和登录启动处理器
     │   ├── discover/       模块/API 静态描述和发现路由
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
+    │   ├── mail/           邮件同步、索引、通知与草稿
     │   ├── network/        本地身份、中转注册、配置处理与状态发布
     │   ├── password/       密码库条目查询与 GPG 解密
     │   ├── status/         状态结构元数据、编译期目录、Rust 发布与 HTTP 查询
@@ -494,6 +496,24 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 告警模块通过共享状态中心发布 ~alert/active~ 。~GET /status/alert/active~ 的 ~value~ 为上述 ~alert~ 对象组成的数组，按 ID 排序。启动时和清理最后一条后均返回空数组。活跃告警仅保存在内存中，重启后由调用方重新发布。告警的读写仅开放给本机。
 
 首次发布或实际变更时，状态更新后向通知模块提交 ~app~ 、 ~title~ 、 ~body~ 和 ~callback_url~ 。告警发布接口在状态更新后即可返回。通知模块负责后台发送与回执重试。相同内容重发和清理无需触发通知。
+
+* 邮件模块
+
+~mail/enabled~ 默认为 ~false~ 。开启后立即执行首次同步，每轮结束五分钟后再次执行。关闭后停止定时任务并清理同步告警。~mail/mbsync_config~ 默认为 ~~/.mbsyncrc~ ，其中的 ~loki-auto~ 组决定要同步的邮箱和文件夹。
+
+services 先运行 ~mbsync~ ，再运行 ~mu index~ 。如果正在运行的 mu4e 持有同一个数据库的写锁，services 通过 Emacs gateway 请求 mu4e 更新索引并等待完成。部分邮箱同步失败时，仍索引已下载的邮件。失败通过 ~mail-sync~ 告警发布，成功后清理告警。
+
+新邮件通过索引中收件箱的 Message-ID 差集识别。首次同步前已在索引中的邮件建立基线。每封后续新增邮件发一条包含主题的系统通知，点击后由 services 通过 Emacs gateway 打开指定 Message-ID。新邮件通知和同步告警使用应用标识 ~mail~ 。
+
+以下接口仅供本机调用，成功返回 ~200~ 和 ~{"api_version":"1","opened":true}~ 。
+
+| 方法 | 路径 | 用途 |
+|------+------|------|
+| POST | ~/mail/open?message_id=...~ | 在 mu4e 打开通知对应的邮件 |
+| POST | ~/mail/config/open~ | 在 Emacs 打开告警关联的 mbsync 配置 |
+| POST | ~/mail/compose~ | 开启 mu4e 草稿 |
+
+撰写请求体为 ~{"url":"mailto:example@example.org?subject=Hello"}~ 。支持 ~to~ 、 ~cc~ 、 ~bcc~ 、 ~subject~ 和 ~body~ ，Emacs 接受撰写请求后按 mu4e 配置选择发件账户，草稿由用户确认发送。
 
 * Emacs 模块
 

@@ -189,6 +189,19 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 完整请求、响应、错误码和 Rust 处理器接入方式见 [[file:../docs/control-center-services.org::*Emacs 模块][Emacs 模块协议]]。
 
+* 邮件自动同步
+
+安装 ~mbsync~ 与 ~mu~ ，准备好 Maildir 和 ~mu init~ 所用的索引。在 mbsync 配置中加入 ~loki-auto~ 组，例如：
+
+#+begin_src conf
+Group loki-auto
+Channels personal-inbox work-inbox
+#+end_src
+
+把示例中的 Channel 名替换为配置中要自动同步的 Channel。迁移现有定时任务时，停止旧的 ~brew services~ isync 任务，将 Emacs 的 ~mu4e-update-interval~ 设为 ~nil~ 并重启 mu4e 后，可继续使用 mu4e 的手动同步命令。
+
+在 Emacs 的 services 设置中打开“邮件 → 自动同步”。默认使用 ~~/.mbsyncrc~ ，也可在同一界面指定配置路径。点击失败告警会打开该配置，新邮件通知会打开 mu4e 中的邮件。 [[file:../docs/control-center-services.org::*邮件模块][邮件模块协议]]
+
 * 系统通知代码接口
 
 ~services.notification~ 直接持有 ~Arc<NotificationService>~ ，通过 ~services.notification.send(NotificationRequest)~ 发送标题、正文、应用标识与本机服务回调路径。业务模块保存创建时注入的共享引用并调用其实例方法。通知模块负责 URL scheme 转交、App 内跳转封装和提交回执；具体跳转操作由 services 中的业务模块执行。Emacs 模块的创建方式为 ~emacs::Module::new(config.service(), Arc::clone(&notification), Arc::clone(&status))~ 。通用接口、应用图标命名规则及跳转协议见 [[file:../docs/control-center-services.org::*系统通知模块][系统通知模块协议]]。

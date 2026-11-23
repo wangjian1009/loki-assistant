@@ -63,7 +63,10 @@ struct LokiAssistantApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            DashboardView(status: status, idleSleep: idleSleep, openAlert: appDelegate.openAlert)
+            DashboardView(
+                status: status, idleSleep: idleSleep, openAlert: appDelegate.openAlert,
+                setDefaultMailApplication: appDelegate.setDefaultMailApplication
+            )
         } label: {
             Image(nsImage: idleSleep.isEnabled ? Self.menuBarSleepIcon : Self.menuBarIcon)
             .accessibilityLabel(idleSleep.isEnabled ? "Loki的助理，已阻止空闲休眠" : "Loki的助理")

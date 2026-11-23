@@ -88,7 +88,8 @@ def main() -> None:
         export_chrome(sources / "loki-assistant-chrome-v1.svg", staging / chrome_icons)
         notifications = staging / mac_resources / "NotificationAppIcons"
         notifications.mkdir()
-        render(sources / "slack.svg", notifications / "slack.png", 128)
+        for app in ("mail", "slack"):
+            render(sources / f"{app}.svg", notifications / f"{app}.png", 128)
         for generated in staging.rglob("*"):
             if generated.is_file():
                 output = root / generated.relative_to(staging)

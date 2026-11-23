@@ -1,8 +1,13 @@
 use crate::process::Process;
 
 use std::{collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
-use std::{io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
+use std::{
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{process::Command, time::timeout};
@@ -321,6 +326,40 @@ impl EmacsService {
                 "打开 Emacs 应用未返回 t 或 nil".to_owned(),
             )),
         }
+    }
+
+    pub(crate) async fn mail_action(
+        &self,
+        action: &'static str,
+        payload: Value,
+    ) -> Result<(), EmacsError> {
+        match self.mail_dispatch(action, payload, true).await?.as_str() {
+            "t" => Ok(()),
+            "nil" => Err(EmacsError::AppNotFound("mail".into())),
+            _ => Err(EmacsError::InvalidResponse("邮件操作结果无效。".into())),
+        }
+    }
+
+    pub(crate) async fn mail_index(&self, home: &Path, phase: &str) -> Result<String, EmacsError> {
+        self.mail_dispatch(
+            "index",
+            serde_json::json!({"home": home, "phase": phase}),
+            false,
+        )
+        .await
+    }
+
+    async fn mail_dispatch(
+        &self,
+        action: &'static str,
+        payload: Value,
+        auto_start: bool,
+    ) -> Result<String, EmacsError> {
+        let argument = STANDARD.encode(payload.to_string());
+        let script = format!(
+            "(when (require 'loki-assistant-mail nil t) (loki-assistant-mail-dispatch \"{action}\" \"{argument}\"))"
+        );
+        self.eval_with_startup(&script, auto_start).await
     }
 
     pub(crate) async fn open_slack_conversation(

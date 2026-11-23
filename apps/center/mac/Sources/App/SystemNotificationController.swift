@@ -134,6 +134,7 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private let logger = Logger(subsystem: "cc.loki-assistant.center", category: "notification")
     private let receiptClient = NotificationReceiptClient()
     private var instanceLock: CenterInstanceLock?
+    private var settingDefaultMailApplication = false
     private lazy var delivery = NotificationDelivery(
         present: { [unowned self] in try await self.present($0) },
         report: { [receiptClient] in try await receiptClient.send($1, notificationID: $0) }
@@ -172,6 +173,14 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
             Task {
+                if url.scheme?.lowercased() == "mailto" {
+                    do {
+                        try await receiptClient.composeMail(url)
+                    } catch {
+                        showError("无法打开邮件草稿", error: error)
+                    }
+                    return
+                }
                 do {
                     if url.host == "notification", url.path == "/activate" {
                         await followNotificationNavigation(url, notificationID: "URL")
@@ -245,19 +254,40 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         }
     }
 
+    func setDefaultMailApplication() {
+        guard !settingDefaultMailApplication else { return }
+        settingDefaultMailApplication = true
+        Task {
+            defer { settingDefaultMailApplication = false }
+            let operation = CenterLog.shared.start("设为默认邮件应用")
+            do {
+                try await NSWorkspace.shared.setDefaultApplication(
+                    at: Bundle.main.bundleURL, toOpenURLsWithScheme: "mailto")
+                CenterLog.shared.finish(operation, result: "success")
+            } catch {
+                CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
+                showError("无法设为默认邮件应用", error: error)
+            }
+        }
+    }
+
     private func followNotificationNavigation(_ navigation: URL, notificationID: String) async {
         do {
             try await receiptClient.activate(navigation)
             logger.notice("通知点击已回调 services：\(notificationID, privacy: .public)")
         } catch {
             logger.error("通知点击跳转失败：\(error.localizedDescription, privacy: .public)")
-            let alert = NSAlert()
-            alert.messageText = "无法完成通知跳转"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "好")
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            showError("无法完成通知跳转", error: error)
         }
+    }
+
+    private func showError(_ title: String, error: Error) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 }

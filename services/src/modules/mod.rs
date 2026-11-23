@@ -6,6 +6,7 @@ pub mod control_center;
 pub mod discover;
 pub mod emacs;
 pub mod health;
+mod mail;
 pub mod network;
 pub mod notification;
 pub mod password;

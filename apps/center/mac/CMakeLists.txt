@@ -12,6 +12,21 @@ project(LokiAssistant VERSION 0.1.0 LANGUAGES Swift)
 
 set(LOKI_APP_BUNDLE_IDENTIFIER "cc.loki-assistant.center" CACHE STRING "App Bundle ID")
 set(LOKI_APP_URL_SCHEME "loki-assistant" CACHE STRING "App URL scheme")
+option(LOKI_APP_REGISTER_MAILTO "Register the system mailto URL scheme" ON)
+if(LOKI_APP_REGISTER_MAILTO)
+    set(LOKI_APP_MAILTO_URL_TYPE [=[
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>$(PRODUCT_BUNDLE_IDENTIFIER).mail</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>mailto</string></array>
+        </dict>
+    ]=])
+endif()
 
 set(LOKI_APP_SOURCES
     Sources/App/LokiAssistantApp.swift

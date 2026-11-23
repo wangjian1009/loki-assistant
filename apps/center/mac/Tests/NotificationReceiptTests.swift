@@ -17,6 +17,19 @@ final class NotificationReceiptTests: XCTestCase {
         XCTAssertNil(requests.last?.httpBody)
     }
 
+    func testMailtoForwardsOriginalURLAfterHealthCheck() async throws {
+        let stub = ReceiptStub(statuses: [200], errorBody: Data(#"{"api_version":"1","opened":true}"#.utf8))
+        let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })
+        let url = try XCTUnwrap(URL(string: "mailto:a+tag@example.org?subject=%E9%82%AE%E4%BB%B6&body=a%0D%0Ab"))
+        try await client.composeMail(url)
+        let requests = stub.requests
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/healthz", "/mail/compose"])
+        XCTAssertEqual(requests.last?.httpMethod, "POST")
+        XCTAssertEqual(requests.last?.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        let body = try XCTUnwrap(requests.last?.httpBody)
+        XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: body), ["url": url.absoluteString])
+    }
+
     func testStartupSkipsPendingRetryWhenServiceIsUnavailable() async throws {
         let stub = ReceiptStub(statuses: [], healthBody: "{}")
         let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })

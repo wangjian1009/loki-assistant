@@ -22,6 +22,8 @@
 
 「设置」通过 ~POST /emacs/apps/open?app=config~ 打开 Emacs 配置界面。托盘操作记录在 ~~/.assistant/loki-assistant.log.org~ ，最多保留最近 500 条一级操作。 [[file:../../docs/emacs.org::*服务配置管理][服务配置管理]]
 
+托盘菜单的「设为默认邮件应用」使用 macOS 的默认应用设置注册 ~mailto:~ 。也可在「邮件 → 设置 → 通用 → 默认电子邮件阅读器」中选择「Loki的助理」。系统邮件链接经 services 转为 Emacs mu4e 草稿。 [[file:../../docs/control-center-services.org::*邮件模块][邮件模块协议]]
+
 * 应用图标
 
 应用显示名称为“Loki的助理”，采用已确认的“对话中的 L”图标：深绿底板、薄荷色字母 L 与回应气泡。SVG 母版与设计预览统一放在仓库根目录 ~resources/icons/~ ，由根目录 ~scripts/export-icons.py~ 同时生成 macOS 与 HarmonyOS 图标。Mac 应用的完整 PNG iconset、ICNS、1024 像素 PNG 及菜单栏 20/40 像素透明图标位于 ~mac/Resources/AppIcon/~ 。顶部菜单栏保持单色 template 渲染并保留休眠月牙标记；红、黄、绿仅用于展开菜单后的第一项状态圆点；设计说明与导出文件见 [[file:../../docs/icon-design.org][图标设计]]。
@@ -40,6 +42,8 @@ make restart-center
 通知图标按 ~mac/Resources/NotificationAppIcons/<app>.png~ 命名并由 CMake 打包到应用内的 ~Contents/Resources/NotificationAppIcons/~ 。~app~ 是仅含小写字母、数字、~-~ 或 ~_~ 的非空标识；已内置 ~emacs.png~ ，对应 ~app: "emacs"~ 。该资源取自 GNU Emacs 随附的 ~share/icons/hicolor/128x128/apps/emacs.png~ 。新增应用时按同一规则加入 PNG 资源并重新构建，无需维护代码映射表。
 
 Slack 通知使用 ~app: "slack"~ 和内置的 ~slack.png~ 。使用 ~make export-icons~ 从公共 SVG 母版生成 Slack 通知图标。 [[https://commons.wikimedia.org/wiki/File:Slack_icon_2019.svg][Slack 图标来源]]
+
+新邮件通知和邮件同步告警使用 ~app: "mail"~ 。~make export-icons~ 从深绿底的信封 SVG 母版生成 ~mail.png~ 。 [[file:../../resources/icons/mail.svg][邮件图标母版]]
 
 未提供 ~app~ 或找不到对应资源时继续展示文字通知；图标附件不改变系统通知来源名称及来源应用图标。
 
