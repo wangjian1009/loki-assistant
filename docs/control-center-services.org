@@ -18,6 +18,7 @@
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
+| ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
 | ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
 | ~modules/service~ | 发布本机 services 名称、设备类型和进程启动时间 | 已实现 |
 | ~modules/password~ | 使用 pass 查询本地密码库条目和解密原文 | 已实现，只读 |
@@ -48,6 +49,7 @@ services/
 └── src/
     ├── http/               公共 HTTP server
     ├── modules/
+    │   ├── alert/          活跃告警、状态发布和通知触发
     │   ├── config/         配置模型、路由、提交处理、存储和订阅
     │   ├── control_center/ 控制中心配置和登录启动处理器
     │   ├── discover/       模块/API 静态描述和发现路由
@@ -93,6 +95,9 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/network/peers~ | 查询已绑定设备 |
 | GET | ~/network/session~ | 查询已认证手机对应的电脑在线状态与绑定时间 |
 | DELETE | ~/network/peers/{endpoint_id}~ | 解除设备绑定 |
+| PUT | ~/alert/{id}~ | 新增或完整替换活跃告警 |
+| DELETE | ~/alert/{id}~ | 按 ID 清理活跃告警 |
+| GET | ~/status/alert/active~ | 通过状态中心读取活跃告警 |
 | POST | ~/notification~ | 发送通用系统通知并返回当前确认状态 |
 | GET | ~/notification/{id}~ | 查询系统通知处理状态 |
 | POST | ~/notification/{id}/receipt~ | 接收菜单栏应用处理回执 |
@@ -465,6 +470,37 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 ~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回完整状态项；~GET /status/{module_id}/{key}/{*path}~ 返回 ~module_id~、层级 ~path~、字段 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ 。字段路径按 URL 层级编码，不使用点号；未发布或字段不存在时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
 
 模块名和键不能为空、不能包含 ~/~ 、不能为 ~.~ 或 ~..~ ；空批量发布或名称无效返回 ~StatusError~ ，整批不修改；HTTP 查询名称无效返回 400 ~invalid-request~ 。Rust 发布接口为 ~StatusService::publish~ 与 ~publish_many~ ，读取接口为 ~value~ 和 ~snapshot~ 。发布后的数据只保留在内存，重启后由各发布方重新设置，不写入 YAML。旧 Emacs 状态路由已迁移到本模块。
+
+* 告警模块
+
+~Services~ 持有共享 ~Arc<AlertService>~ 。Rust 调用方通过 ~services.alert.publish(id, input).await~ 发布并取得 ~Alert~ ，通过 ~services.alert.clear(id).await~ 清理。~clear~ 删除成功时返回 ~true~ ，ID 已不存在时返回 ~false~ 。~AlertInput~ 包含 ~app~ 、 ~title~ 、 ~body~ 、 ~level~ 和可选的 ~callback_url~ 。
+
+~PUT /alert/{id}~ 接收 JSON 请求体。~id~ 由调用方根据业务确定，在当前 services 实例内全局唯一。它包含 1–128 个 ASCII 字母、数字、点、下划线或连字符，以字母或数字开头，例如 ~backup.disk-space~ 。~title~ 必填且不能只有空白。~app~ 和 ~body~ 省略或传 ~null~ 均表示缺省。提供 ~app~ 时，使用仅含小写 ASCII 字母、数字、连字符或下划线的非空应用标识。~level~ 支持 ~info~ 、 ~warning~ 和 ~error~ ，省略时默认为 ~warning~ 。
+
+首次发布返回 HTTP 201。同 ID 再次提交按完整告警替换，返回 HTTP 200，省略的字段按默认值处理。内容有变更时保留 ~created_at~ 并刷新 ~updated_at~ ，两者单位为 Unix 秒。相同内容重发返回原记录。两种成功响应均包含 ~api_version~ 和 ~alert~ 。
+
+~callback_url~ 使用本机服务的绝对路径，可带查询参数。设置后，该字段随告警发布到状态中心，点击系统通知时调用对应路径。省略或传 ~null~ 时，告警记录省略该字段。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "alert": {
+    "id": "backup.disk-space",
+    "app": "backup",
+    "title": "备份磁盘空间不足",
+    "body": "剩余空间低于 10 GB",
+    "level": "warning",
+    "created_at": 1795074000,
+    "updated_at": 1795074000
+  }
+}
+#+end_src
+
+~DELETE /alert/{id}~ 使用空请求体。删除成功和 ID 已不存在均返回 HTTP 204。无效 ID 或请求体返回 HTTP 400 ~invalid-request~ 。
+
+告警模块通过共享状态中心发布 ~alert/active~ 。~GET /status/alert/active~ 的 ~value~ 为上述 ~alert~ 对象组成的数组，按 ID 排序。启动时和清理最后一条后均返回空数组。活跃告警仅保存在内存中，重启后由调用方重新发布。告警的读写仅开放给本机。
+
+首次发布或实际变更时，状态更新后向通知模块提交 ~app~ 、 ~title~ 、 ~body~ 和 ~callback_url~ 。告警发布接口在状态更新后即可返回。通知模块负责后台发送与回执重试。相同内容重发和清理无需触发通知。
 
 * Emacs 模块
 

@@ -314,6 +314,7 @@ static EXTENSION: crate::services::ExtensionRegistration = crate::services::Exte
     build: |context| {
         Arc::new(Module(Arc::new(Projects::new(
             Arc::clone(context.config),
+            Arc::clone(context.alert),
             Arc::clone(context.notification),
             Arc::clone(context.status),
             context.emacs.service(),

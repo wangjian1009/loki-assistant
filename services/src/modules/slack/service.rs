@@ -11,8 +11,9 @@ use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use uuid::Uuid;
 
 use crate::modules::{
+    alert::{AlertInput, AlertLevel, AlertService},
     config::service::ConfigService,
-    notification::{NotificationService, protocol::NotificationRequest},
+    notification::NotificationService,
 };
 
 use super::{
@@ -59,6 +60,7 @@ pub struct SlackService {
     pub(super) state: Arc<Mutex<State>>,
     cache_root: Option<PathBuf>,
     pub(super) client: SlackClient,
+    alert: Arc<AlertService>,
     pub(super) notification: Arc<NotificationService>,
     pub(super) change: watch::Sender<u64>,
     pub(super) outgoing: Notify,
@@ -87,6 +89,7 @@ impl fmt::Debug for SlackService {
 
 impl SlackService {
     pub(super) fn for_project(
+        alert: Arc<AlertService>,
         notification: Arc<NotificationService>,
         id: String,
         settings: SlackTeam,
@@ -104,6 +107,7 @@ impl SlackService {
             })),
             cache_root: backend.cache_root.clone(),
             client: SlackClient::new(&backend.api),
+            alert,
             notification,
             change: watch::channel(0).0,
             outgoing: Notify::new(),
@@ -334,17 +338,50 @@ impl SlackService {
         reporter.update(id, *generation, self.public_status().await);
     }
 
-    pub(super) async fn notify_reauthorization(&self) -> bool {
+    fn reauthorization_alert_id(&self) -> String {
+        format!("slack.{}.reauthorization", self.project.0)
+    }
+
+    pub(super) async fn sync_reauthorization_alert(&self) {
+        let state = self.state.lock().await;
+        if state.retired {
+            return;
+        }
         let (id, settings, _, _) = &self.project;
-        self.notification
-            .send(NotificationRequest {
-                title: "Slack 需要重新授权".into(),
-                body: Some(format!("点击为「{}」重新填写 Slack 凭据。", settings.name)),
-                app: Some("slack".into()),
-                callback_url: Some(super::routes::credential_reset_path(id)),
-            })
-            .await
-            .is_ok()
+        match Self::authorization_state(&state) {
+            "reauthorization_required" => {
+                let result = self
+                    .alert
+                    .publish(
+                        &self.reauthorization_alert_id(),
+                        AlertInput {
+                            title: "Slack 需要重新授权".into(),
+                            body: Some(format!("点击为「{}」重新填写 Slack 凭据。", settings.name)),
+                            app: Some("slack".into()),
+                            callback_url: Some(super::routes::credential_reset_path(id)),
+                            level: AlertLevel::Warning,
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("无法发布 Slack 工作区 {id} 的重新授权告警：{error}");
+                }
+            }
+            "authorized" => self.clear_reauthorization_alert().await,
+            _ if settings.token.is_none() && settings.d_cookie.is_none() => {
+                self.clear_reauthorization_alert().await;
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) async fn clear_reauthorization_alert(&self) {
+        if let Err(error) = self.alert.clear(&self.reauthorization_alert_id()).await {
+            eprintln!(
+                "无法清理 Slack 工作区 {} 的重新授权告警：{error}",
+                self.project.0
+            );
+        }
     }
 
     async fn verify_user_token(&self, token: &str) -> Result<Identity, Error> {
@@ -562,8 +599,9 @@ impl SlackService {
             })
             .await;
         if revoked == Ok(true) {
-            self.signal_change();
+            self.sync_reauthorization_alert().await;
             self.publish_status().await;
+            self.signal_change();
         }
     }
 

@@ -14,6 +14,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::modules::{
+    alert::AlertService,
     config::service::{
         ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService, ConfigServiceError,
     },
@@ -154,6 +155,7 @@ impl Drop for Project {
 pub struct Projects {
     pub(super) emacs: Arc<EmacsService>,
     config: Arc<ConfigService>,
+    alert: Arc<AlertService>,
     notification: Arc<NotificationService>,
     pub(super) status: Arc<ProjectsStatus>,
     projects: RwLock<BTreeMap<String, Project>>,
@@ -221,12 +223,14 @@ impl Projects {
 
     pub fn new(
         config: Arc<ConfigService>,
+        alert: Arc<AlertService>,
         notification: Arc<NotificationService>,
         status: Arc<StatusService>,
         emacs: Arc<EmacsService>,
     ) -> Self {
         Self::with_backend(
             config,
+            alert,
             notification,
             status,
             emacs,
@@ -258,6 +262,7 @@ impl Projects {
 
     pub(super) fn with_backend(
         config: Arc<ConfigService>,
+        alert: Arc<AlertService>,
         notification: Arc<NotificationService>,
         status: Arc<StatusService>,
         emacs: Arc<EmacsService>,
@@ -266,6 +271,7 @@ impl Projects {
         Self {
             emacs,
             config,
+            alert,
             notification,
             status: Arc::new(ProjectsStatus::new(status)),
             projects: RwLock::default(),
@@ -341,6 +347,7 @@ impl Projects {
         for (id, project) in projects.iter() {
             project.service.retire().await;
             project.worker.abort();
+            project.service.clear_reauthorization_alert().await;
             self.status.remove(id);
         }
         projects.clear();
@@ -716,6 +723,9 @@ impl Projects {
                 project.service.retire().await;
                 project.worker.abort();
                 let _ = (&mut project.worker).await;
+                if !settings.contains_key(&id) {
+                    project.service.clear_reauthorization_alert().await;
+                }
             }
             self.status.remove(&id);
         }
@@ -725,6 +735,7 @@ impl Projects {
             }
             let generation = Uuid::new_v4();
             let service = Arc::new(SlackService::for_project(
+                Arc::clone(&self.alert),
                 Arc::clone(&self.notification),
                 id.clone(),
                 settings.clone(),

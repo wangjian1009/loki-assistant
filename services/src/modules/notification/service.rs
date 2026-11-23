@@ -87,6 +87,16 @@ impl NotificationService {
         }
     }
 
+    /// 在后台提交通知，并沿用通用发送流程与回执重试。
+    pub(crate) fn trigger(self: &Arc<Self>, request: NotificationRequest) {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = service.send(request).await {
+                eprintln!("提交后台通知失败：{error}");
+            }
+        });
+    }
+
     pub async fn send(
         &self,
         request: NotificationRequest,
@@ -162,6 +172,14 @@ impl NotificationService {
     }
 
     fn navigation_url(callback: &str) -> Result<String, NotificationError> {
+        Self::validate_callback_url(callback)?;
+        Ok(format!(
+            "loki-assistant://notification/activate?callback={}",
+            utf8_percent_encode(callback, NON_ALPHANUMERIC)
+        ))
+    }
+
+    pub(crate) fn validate_callback_url(callback: &str) -> Result<(), NotificationError> {
         let uri = callback.parse::<Uri>().map_err(|_| {
             NotificationError::InvalidRequest("回调必须是本机服务的绝对路径".to_owned())
         })?;
@@ -175,9 +193,6 @@ impl NotificationService {
                 "回调必须是本机服务的绝对路径，不接受其他主机".to_owned(),
             ));
         }
-        Ok(format!(
-            "loki-assistant://notification/activate?callback={}",
-            utf8_percent_encode(callback, NON_ALPHANUMERIC)
-        ))
+        Ok(())
     }
 }

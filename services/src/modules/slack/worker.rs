@@ -20,11 +20,10 @@ use super::{
 
 impl SlackService {
     pub async fn run(self: Arc<Self>, emacs: Arc<EmacsService>) {
-        let mut reauthorization_notified = false;
-        self.restore_user_token(&mut reauthorization_notified).await;
+        self.restore_user_token().await;
         self.sync.notify_one();
         tokio::join!(
-            self.sockets(reauthorization_notified),
+            self.sockets(),
             self.sending(),
             self.synchronizing(),
             self.warming_users(),
@@ -35,15 +34,11 @@ impl SlackService {
         );
     }
 
-    async fn restore_user_token(&self, notified: &mut bool) {
+    async fn restore_user_token(&self) {
         let issue = self.restore_imported_token().await.err();
         self.state.lock().await.issue = issue;
         self.publish_status().await;
-        if self.session_id().await.is_some() {
-            *notified = false;
-        } else if !*notified && issue.is_some_and(Error::requires_reauthorization) {
-            *notified = self.notify_reauthorization().await;
-        }
+        self.sync_reauthorization_alert().await;
     }
 
     async fn warming_users(&self) {
@@ -138,7 +133,7 @@ impl SlackService {
         }
     }
 
-    async fn sockets(&self, mut reauthorization_notified: bool) {
+    async fn sockets(&self) {
         let mut changes = self.change.subscribe();
         let mut backoff = 1;
         loop {
@@ -148,7 +143,7 @@ impl SlackService {
                 tokio::select! {
                     _ = changes.changed() => { backoff = 1; }
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        self.restore_user_token(&mut reauthorization_notified).await;
+                        self.restore_user_token().await;
                     }
                 }
                 continue;
@@ -162,7 +157,11 @@ impl SlackService {
             let connection = async {
                 let web = self.web_session(session).await?;
                 let token = self.state.lock().await.account(session)?.access.clone();
-                let socket = self.client.connect(&token, web.as_ref()).await?;
+                let socket = self.client.connect(&token, web.as_ref()).await;
+                if matches!(socket, Err(Error::Authorization)) {
+                    self.revoke(session, &token).await;
+                }
+                let socket = socket?;
                 self.socket_loop(session, socket).await
             };
             let started = tokio::time::Instant::now();

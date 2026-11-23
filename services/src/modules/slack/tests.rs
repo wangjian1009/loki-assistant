@@ -33,7 +33,8 @@ use uuid::Uuid;
 
 use crate::{
     modules::{
-        config::service::ConfigService, notification::NotificationService, status::StatusService,
+        alert::AlertService, config::service::ConfigService, notification::NotificationService,
+        status::StatusService,
     },
     platform::macos::notification::{
         NotificationContent, NotificationFuture, NotificationLauncher,
@@ -630,9 +631,11 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         .await
         .unwrap();
     let emacs = Arc::new(OpenSlackRunner::default());
+    let alert_service = Arc::new(AlertService::new(status.clone(), notification.clone()));
     let start = || {
         let projects = Arc::new(Projects::with_backend(
             Arc::clone(&config),
+            Arc::clone(&alert_service),
             Arc::clone(&notification),
             Arc::clone(&status),
             Arc::new(crate::modules::emacs::service::EmacsService::with_runner(
@@ -1592,7 +1595,7 @@ impl crate::modules::password::service::CommandRunner for FakePass {
 }
 
 #[tokio::test]
-async fn startup_credential_notifications_use_config_reset_and_team_setup() {
+async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_recovery() {
     let directory = Directory::new();
     let (config, passwords) = password_config(&directory.0.join("config.yml"), &directory.0).await;
     let invalid_path = "loki-assistant/slack/TINVALID.gpg";
@@ -1622,6 +1625,8 @@ async fn startup_credential_notifications_use_config_reset_and_team_setup() {
     let api = format!("http://{}", listener.local_addr().unwrap());
     let expired_auth_checks = Arc::new(AtomicUsize::new(0));
     let upstream_checks = Arc::clone(&expired_auth_checks);
+    let rtm_revoked = Arc::new(AtomicBool::new(false));
+    let upstream_rtm_revoked = Arc::clone(&rtm_revoked);
     let upstream = tokio::spawn(async move {
         let app = Router::new().route(
             "/auth.test",
@@ -1640,7 +1645,14 @@ async fn startup_credential_notifications_use_config_reset_and_team_setup() {
                     })
                 }
             }),
-        );
+        )
+        .route("/rtm.connect", post(move || {
+            let revoked = upstream_rtm_revoked.load(Ordering::SeqCst);
+            async move {
+                let error = if revoked { "token_revoked" } else { "temporarily_unavailable" };
+                Json(json!({"ok":false,"error":error}))
+            }
+        }));
         axum::serve(listener, app).await.unwrap();
     });
     let alerts = Arc::new(Alerts::default());
@@ -1649,9 +1661,11 @@ async fn startup_credential_notifications_use_config_reset_and_team_setup() {
         Duration::from_secs(1),
     ));
     let status = Arc::new(StatusService::new());
+    let alert_service = Arc::new(AlertService::new(status.clone(), notification.clone()));
     let (browser, mut opened) = tokio::sync::mpsc::unbounded_channel();
     let projects = Arc::new(Projects::with_backend(
         config.clone(),
+        alert_service,
         notification.clone(),
         status.clone(),
         crate::modules::emacs::Module::new(config.clone(), notification, status.clone()).service(),
@@ -1712,6 +1726,26 @@ async fn startup_credential_notifications_use_config_reset_and_team_setup() {
     assert!(opened.try_recv().is_err());
     assert!(directory.0.join(invalid_path).is_file());
     assert!(directory.0.join(missing_path).is_file());
+
+    let (_, _, active) = invoke(&app, "GET", "/status/alert/active", None, None, None).await;
+    let active = active["value"].as_array().unwrap();
+    assert_eq!(active.len(), 2);
+    for (alert, team) in active.iter().zip(["TINVALID", "TMISSING"]) {
+        assert_eq!(alert["id"], format!("slack.{team}.reauthorization"));
+        assert_eq!(alert["app"], "slack");
+        assert_eq!(
+            alert["callback_url"],
+            format!("/slack/teams/{team}/reset-credentials")
+        );
+        projects
+            .service(team)
+            .await
+            .unwrap()
+            .sync_reauthorization_alert()
+            .await;
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(alerts.attempts.lock().unwrap().len(), 2);
 
     let mut callbacks: Vec<_> = alerts
         .attempts
@@ -1781,14 +1815,44 @@ async fn startup_credential_notifications_use_config_reset_and_team_setup() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, _, active) =
+                invoke(&app, "GET", "/status/alert/active", None, None, None).await;
+            if active["value"] == json!([]) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let (status, _, response) = invoke(&app, "POST", &callbacks[0], None, None, None).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(response["error"]["code"], "slack-credentials-current");
     assert!(directory.0.join(invalid_path).is_file());
     assert!(opened.try_recv().is_err());
 
+    rtm_revoked.store(true, Ordering::SeqCst);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, _, active) =
+                invoke(&app, "GET", "/status/alert/active", None, None, None).await;
+            if active["value"][0]["id"] == "slack.TINVALID.reauthorization"
+                && alerts.attempts.lock().unwrap().len() == 3
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
     projects.stop().await;
     worker.await.unwrap();
+    let (_, _, active) = invoke(&app, "GET", "/status/alert/active", None, None, None).await;
+    assert_eq!(active["value"], json!([]));
     upstream.abort();
 }
 
@@ -1997,17 +2061,14 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         axum::serve(listener, slack).await.unwrap();
     });
     let status = Arc::new(StatusService::new());
+    let notification = Arc::new(NotificationService::new());
     let (browser, mut opened) = tokio::sync::mpsc::unbounded_channel::<String>();
     let projects = Arc::new(Projects::with_backend(
         base.clone(),
-        Arc::new(NotificationService::new()),
+        Arc::new(AlertService::new(status.clone(), notification.clone())),
+        notification.clone(),
         status.clone(),
-        crate::modules::emacs::Module::new(
-            base.clone(),
-            Arc::new(NotificationService::new()),
-            status.clone(),
-        )
-        .service(),
+        crate::modules::emacs::Module::new(base.clone(), notification, status.clone()).service(),
         Backend {
             api,
             cache_root: Some(cache_root),

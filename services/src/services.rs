@@ -4,13 +4,14 @@ use axum::Router;
 
 use crate::{
     modules::{
-        config, control_center, discover, emacs, health, network,
+        alert::AlertService, config, control_center, discover, emacs, health, network,
         notification::NotificationService, password, service, status::StatusService,
     },
     runtime::RuntimeState,
 };
 
 pub struct ExtensionContext<'a> {
+    pub alert: &'a Arc<AlertService>,
     pub config: &'a Arc<config::service::ConfigService>,
     pub notification: &'a Arc<NotificationService>,
     pub status: &'a Arc<StatusService>,
@@ -48,6 +49,7 @@ pub struct Services {
     pub service: service::Module,
     pub notification: Arc<NotificationService>,
     pub status: Arc<StatusService>,
+    pub alert: Arc<AlertService>,
     pub emacs: emacs::Module,
     pub network: Arc<network::NetworkService>,
     pub password: password::Module,
@@ -88,6 +90,10 @@ impl Services {
         let discover = discover::Module::new();
         let notification = Arc::new(notification);
         let status = Arc::new(StatusService::new());
+        let alert = Arc::new(AlertService::new(
+            Arc::clone(&status),
+            Arc::clone(&notification),
+        ));
         let service = service::Module::new(Arc::clone(&status));
         let identity = config::service::ConfigService::storage_path()
             .map(|path| network::IdentityStore::new(path.with_file_name("identity.json")))
@@ -108,6 +114,7 @@ impl Services {
             Arc::clone(&status),
         );
         let context = ExtensionContext {
+            alert: &alert,
             config: &base_config,
             notification: &notification,
             status: &status,
@@ -142,6 +149,7 @@ impl Services {
             config,
             notification,
             status,
+            alert,
             emacs,
             network,
             password,
@@ -157,6 +165,7 @@ impl Services {
             .merge(self.config.router())
             .merge(self.notification.router())
             .merge(self.status.router())
+            .merge(self.alert.router())
             .merge(self.network.router())
             .merge(self.emacs.router())
             .merge(self.password.router());

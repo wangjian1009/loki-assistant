@@ -42,7 +42,9 @@ d_cookie: …
 
 ** 工作区重新授权
 
-services 启动后检查已配置的工作区。发现凭据缺失（例如 ~pass~ 条目缺失或缺少 Cookie d）或 Slack 明确拒绝当前凭据时，发布 ~reauthorization_required~ 并发送系统通知。凭据读取失败时发布 ~slack-password-unavailable~ ，保留凭据并重试读取。
+services 启动后检查已配置的工作区。发现凭据缺失（例如 ~pass~ 条目缺失或缺少 Cookie d）或 Slack 明确拒绝当前凭据时，连接状态进入 ~reauthorization_required~ ，并按工作区发布 ~slack.{team_id}.reauthorization~ 告警。告警模块负责触发系统通知，相同告警重发无需重复提醒。凭据读取失败时发布 ~slack-password-unavailable~ ，保留凭据并重试读取。 [[file:control-center-services.org::*告警模块][活跃告警接口]]
+
+认证恢复、已提交的凭据重置或工作区删除后，Slack 清理对应告警。
 
 点击系统通知发送本机 ~POST /slack/teams/{team_id}/reset-credentials~ ，请求体为空。接口依据 Slack 后台记录的凭据状态提交 ~token=null~ 配置变更。配置模块清理共用的 ~pass~ 条目及两个配置字段，并通知 Slack 配置变更处理器。提交成功后，处理器打开新建工作区时使用的 ~/slack/team-setup/{team_id}~ 授权网页。该网页通过原有配置接口提交并验证新凭据。
 
