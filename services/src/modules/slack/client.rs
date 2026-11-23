@@ -1,15 +1,13 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use crate::process::Process;
+
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 use reqwest::{
     Client, Method, RequestBuilder, StatusCode,
     header::{ACCEPT_ENCODING, IF_RANGE, RANGE, RETRY_AFTER},
 };
 use serde_json::Value;
-use tokio::{net::TcpStream, sync::Mutex, time::Instant};
+use tokio::{net::TcpStream, time::Instant};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::client::IntoClientRequest,
 };
@@ -109,7 +107,7 @@ pub(super) struct SlackClient {
     http: Client,
     attachments: Client,
     api: String,
-    limits: Arc<Mutex<HashMap<String, Instant>>>,
+    limits: Process<HashMap<String, Instant>>,
 }
 
 impl SlackClient {
@@ -270,7 +268,7 @@ impl SlackClient {
                 .build()
                 .expect("Slack 附件 HTTP 客户端配置有效"),
             api: api.trim_end_matches('/').to_owned(),
-            limits: Arc::new(Mutex::new(HashMap::new())),
+            limits: Process::start(HashMap::new()),
         }
     }
 
@@ -326,8 +324,15 @@ impl SlackClient {
         body: Option<&Value>,
         cookie: Option<&str>,
     ) -> Result<Value, Error> {
-        if let Some(until) = self.limits.lock().await.get(name)
-            && let Some(delay) = until.checked_duration_since(Instant::now())
+        let method_name = name.to_owned();
+        if let Some(delay) = self
+            .limits
+            .call(move |limits| {
+                limits
+                    .get(&method_name)?
+                    .checked_duration_since(Instant::now())
+            })
+            .await
         {
             return Err(Error::RateLimited(delay.as_secs().saturating_add(1)));
         }
@@ -356,10 +361,10 @@ impl SlackClient {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(30)
                 .clamp(1, 86_400);
-            self.limits
-                .lock()
-                .await
-                .insert(name.into(), Instant::now() + Duration::from_secs(seconds));
+            let name = name.to_owned();
+            self.limits.post(move |limits| {
+                limits.insert(name, Instant::now() + Duration::from_secs(seconds));
+            });
             return Err(Error::RateLimited(seconds));
         }
         if !response.status().is_success() {
@@ -378,7 +383,7 @@ impl SlackClient {
                 | "not_authed",
             ) => Error::Authorization,
             Some("channel_not_found") => Error::Conversation,
-            Some("user_not_found" | "users_not_found") => Error::UserNotFound,
+            Some("user_not_found" | "users_not_found" | "bot_not_found") => Error::UserNotFound,
             Some("thread_not_found") => Error::Thread,
             Some("invalid_arguments" | "msg_too_long" | "no_text") => Error::Invalid,
             _ => Error::Upstream,

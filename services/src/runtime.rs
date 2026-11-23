@@ -16,7 +16,7 @@ const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:47321";
 
 /// 随服务进程持有文件锁；进程退出或崩溃时由操作系统释放。
 pub struct ServiceInstanceLock {
-    _file: fs::File,
+    file: fs::File,
 }
 
 impl ServiceInstanceLock {
@@ -42,7 +42,7 @@ impl ServiceInstanceLock {
             Ok(file)
         };
         match lock_file() {
-            Ok(file) => Ok(Self { _file: file }),
+            Ok(file) => Ok(Self { file }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 Err(RuntimeConfigError::AlreadyRunning)
             }
@@ -51,6 +51,13 @@ impl ServiceInstanceLock {
                 source,
             }),
         }
+    }
+}
+
+impl Drop for ServiceInstanceLock {
+    fn drop(&mut self) {
+        // fork 到 exec 之间，子进程可能还持有同一文件描述。
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 

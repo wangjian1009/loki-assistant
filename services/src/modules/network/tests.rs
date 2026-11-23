@@ -172,8 +172,8 @@ esac
     pub(super) fn config(&self, service: Arc<NetworkService>) -> Arc<ConfigService> {
         Arc::new(service.config().with_change_handler("network", service))
     }
-    fn phase(&self) -> Value {
-        self.status.value("network", "my").unwrap().value["status"].clone()
+    async fn phase(&self) -> Value {
+        self.status.value("network", "my").await.unwrap().value["status"].clone()
     }
     fn titles(&self) -> Vec<String> {
         self.launcher
@@ -497,9 +497,7 @@ async fn real_iroh_registration_uses_only_the_configured_ephemeral_relay() {
         .await
         .unwrap();
     assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册成功"]);
-    assert_eq!(fixture.phase(), "connected");
-    let observer = service.clone();
-    let monitor = tokio::spawn(async move { observer.monitor().await });
+    assert_eq!(fixture.phase().await, "connected");
     let denied = IrohRelayRegistrar::new();
     let error = tokio::time::timeout(
         Duration::from_secs(5),
@@ -516,16 +514,14 @@ async fn real_iroh_registration_uses_only_the_configured_ephemeral_relay() {
     assert!(error.contains("令牌不匹配"));
     relay.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while fixture.phase() != "failed" {
+        while fixture.phase().await != "failed" {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
     service.shutdown().await;
-    assert_eq!(fixture.phase(), "disconnected");
-    monitor.abort();
-    let _ = monitor.await;
+    assert_eq!(fixture.phase().await, "disconnected");
 }
 
 #[tokio::test]
@@ -579,7 +575,7 @@ async fn incomplete_settings_are_saved_without_registration_on_startup_or_update
             .await
             .unwrap();
         assert!(fixture.registrar.calls.lock().unwrap().is_empty());
-        assert_eq!(fixture.phase(), "offline");
+        assert_eq!(fixture.phase().await, "offline");
         assert_eq!(fixture.titles(), ["已生成本地身份"]);
     }
 }
@@ -607,7 +603,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
                 if key == first { 0 } else { 1 }
             );
         }
-        assert_eq!(fixture.phase(), "connected");
+        assert_eq!(fixture.phase().await, "connected");
         assert_eq!(fixture.registrar.calls.lock().unwrap()[0].2, "first-token");
         config
             .replace("network", "relay_token", json!("rotated-token"))
@@ -632,7 +628,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
             .replace("network", "relay_token", json!(""))
             .await
             .unwrap();
-        assert_eq!(fixture.phase(), "offline");
+        assert_eq!(fixture.phase().await, "offline");
         assert_eq!(fixture.registrar.calls.lock().unwrap().len(), 2);
         assert!(
             fixture.registrar.sessions.lock().unwrap()[1]
@@ -665,6 +661,21 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
         .replace("network", "relay_token", json!("valid-token"))
         .await
         .unwrap();
+    let password_path = "loki-assistant/slack/TTEST.gpg";
+    let password_file = fixture.root.join("pass-store").join(password_path);
+    fs::create_dir_all(password_file.parent().unwrap()).unwrap();
+    fs::write(password_file, "xoxc-test\nd_cookie: test-cookie\n").unwrap();
+    config
+        .replace_record(
+            "slack".into(),
+            "teams".into(),
+            "TTEST".into(),
+            json!({"token":password_path,"d_cookie":password_path}),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
     fixture.registrar.hang.store(true, Ordering::SeqCst);
     let saving = config.clone();
     let task = tokio::spawn(async move {
@@ -679,6 +690,24 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     })
     .await
     .unwrap();
+    let invitation = tokio::time::timeout(Duration::from_millis(100), service.create_pairing())
+        .await
+        .expect("候选注册期间应及时响应绑定邀请请求");
+    assert!(matches!(
+        invitation,
+        Err(super::protocol::NetworkError::NotReady)
+    ));
+    let credentials = tokio::time::timeout(
+        Duration::from_millis(500),
+        config.read_record_passwords("slack", "teams", "TTEST", ["token", "d_cookie"]),
+    )
+    .await
+    .expect("Slack 凭据读取不应等待中转配置提交")
+    .unwrap();
+    assert_eq!(
+        credentials,
+        [Some("xoxc-test".into()), Some("test-cookie".into())]
+    );
     let peer = super::peers::StoredPeer {
         device_type: super::protocol::DeviceType::default(),
         endpoint_id: SecretKey::generate().public().to_string(),
@@ -713,7 +742,7 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
             .unwrap()
             .contains_key(&endpoint_id)
     );
-    assert_eq!(fixture.phase(), "connected");
+    assert_eq!(fixture.phase().await, "connected");
     fixture.registrar.fail.store(true, Ordering::SeqCst);
     *fixture.registrar.failure_message.lock().unwrap() = Some("拒绝 secret-token".to_owned());
     let error = config
@@ -725,7 +754,7 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
         super::config::relay_token(&config).await.unwrap(),
         "valid-token"
     );
-    assert_eq!(fixture.phase(), "connected");
+    assert_eq!(fixture.phase().await, "connected");
     assert!(
         fixture
             .launcher

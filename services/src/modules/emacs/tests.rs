@@ -1152,6 +1152,7 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
     let status = default_status();
     status
         .publish("network", "my", json!({"status":"disconnected"}))
+        .await
         .unwrap();
     let runner = Arc::new(FakeRunner::default());
     let service = Arc::new(EmacsService::with_runner(
@@ -1167,10 +1168,10 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
     assert_eq!(response, StatusCode::OK);
     assert_eq!(body["status"]["network"]["my"]["status"], "disconnected");
     assert_eq!(
-        status.value("emacs", "runtime").unwrap().value,
+        status.value("emacs", "runtime").await.unwrap().value,
         json!({"pid":42,"version":"31.1","started_at":1,"reported_at":2})
     );
-    let before = serde_json::to_value(status.snapshot()).unwrap();
+    let before = serde_json::to_value(status.snapshot().await).unwrap();
     for values in [
         json!([]),
         json!(null),
@@ -1182,7 +1183,10 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
         let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid-request");
-        assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(status.snapshot().await).unwrap(),
+            before
+        );
     }
     assert!(runner.calls.lock().unwrap().is_empty());
 }
@@ -1192,6 +1196,7 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
     let status = default_status();
     status
         .publish("network", "my", json!({"status":"disconnected"}))
+        .await
         .unwrap();
     let runner = Arc::new(FakeRunner::default());
     let service = Arc::new(EmacsService::with_runner(
@@ -1210,7 +1215,7 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    let before = serde_json::to_value(status.snapshot()).unwrap();
+    let before = serde_json::to_value(status.snapshot().await).unwrap();
     let mut extra_field = runtime.clone();
     extra_field["unexpected"] = json!("DO_NOT_ECHO_VALUE");
     let mut wrong_pid = runtime.clone();
@@ -1256,7 +1261,10 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
             "{body}"
         );
         assert!(!body.to_string().contains("DO_NOT_ECHO_VALUE"));
-        assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(status.snapshot().await).unwrap(),
+            before
+        );
     }
     for value in [
         json!("DO_NOT_ECHO_VALUE"),
@@ -1265,7 +1273,10 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
         let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", value).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(!body.to_string().contains("DO_NOT_ECHO_VALUE"));
-        assert_eq!(serde_json::to_value(status.snapshot()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(status.snapshot().await).unwrap(),
+            before
+        );
     }
     assert!(runner.calls.lock().unwrap().is_empty());
     let (code, _) = request(
@@ -1276,5 +1287,8 @@ async fn external_status_schema_errors_return_paths_and_preserve_the_entire_snap
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    assert_eq!(status.value("emacs", "runtime").unwrap().value["pid"], 43);
+    assert_eq!(
+        status.value("emacs", "runtime").await.unwrap().value["pid"],
+        43
+    );
 }

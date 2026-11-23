@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{ConfigService, ConfigServiceError, StoredValues};
+use super::{ConfigService, ConfigServiceError, StoredConfig, StoredValues};
 use crate::modules::{
     config::storage::open_private_file,
     password::service::{PasswordError, validate_file},
@@ -30,13 +30,50 @@ impl ConfigService {
         &self,
         values: StoredValues,
     ) -> Result<(), ConfigServiceError> {
-        let _persistence = self.persistence.lock().await;
-        self.write_snapshot(&values, &*self.system_values.read().await)
-            .await?;
-        *self.values.write().await = values;
-        Ok(())
+        let published = self.values.clone();
+        self.data
+            .call_async(move |mut data| async move {
+                let result = data.write_snapshot(&values, &data.system).await;
+                if result.is_ok() {
+                    data.values = std::sync::Arc::new(values);
+                    let next = data.values.clone();
+                    published.call(move |current| *current = next).await;
+                }
+                (data, result)
+            })
+            .await
     }
 
+    pub(crate) async fn system_value(&self, key: &str) -> Option<Value> {
+        let key = key.to_owned();
+        self.data
+            .call(move |data| data.system.0.get(&key).cloned())
+            .await
+    }
+
+    // 提交前处理器可以独立更新内部值。
+    pub(crate) async fn update_system_value<
+        R: Send + 'static,
+        F: std::future::Future<Output = Result<(Option<Value>, R), ConfigServiceError>>
+            + Send
+            + 'static,
+    >(
+        &self,
+        key: &str,
+        legacy: Option<LegacySystemFile>,
+        update: impl FnOnce(Option<Value>) -> F + Send + 'static,
+    ) -> Result<R, ConfigServiceError> {
+        let key = key.to_owned();
+        self.data
+            .call_async(move |mut data| async move {
+                let result = data.update_system_value(&key, legacy, update).await;
+                (data, result)
+            })
+            .await
+    }
+}
+
+impl StoredConfig {
     async fn write_snapshot(
         &self,
         values: &StoredValues,
@@ -52,26 +89,16 @@ impl ConfigService {
         Ok(())
     }
 
-    async fn write_system(&self, system: SystemValues) -> Result<(), ConfigServiceError> {
-        self.write_snapshot(&*self.values.read().await, &system)
-            .await?;
-        *self.system_values.write().await = system;
-        Ok(())
-    }
-
-    pub(crate) async fn system_value(&self, key: &str) -> Option<Value> {
-        self.system_values.read().await.0.get(key).cloned()
-    }
-
-    // 处理器可更新内部值，落盘锁独立于配置提交锁。
-    pub(crate) async fn update_system_value<R>(
-        &self,
+    async fn update_system_value<
+        R,
+        F: std::future::Future<Output = Result<(Option<Value>, R), ConfigServiceError>>,
+    >(
+        &mut self,
         key: &str,
         legacy: Option<LegacySystemFile>,
-        update: impl AsyncFnOnce(Option<Value>) -> Result<(Option<Value>, R), ConfigServiceError>,
+        update: impl FnOnce(Option<Value>) -> F,
     ) -> Result<R, ConfigServiceError> {
-        let _persistence = self.persistence.lock().await;
-        let mut system = self.system_values.read().await.clone();
+        let mut system = self.system.clone();
         let previous = system.0.get(key).cloned();
         let mut source = None;
         let mut value = previous.clone();
@@ -93,7 +120,8 @@ impl ConfigService {
                 Some(value) => system.0.insert(key.to_owned(), value),
                 None => system.0.remove(key),
             };
-            self.write_system(system).await?;
+            self.write_snapshot(&self.values, &system).await?;
+            self.system = system;
         }
         if let Some(path) = source
             && let Err(error) = tokio::task::spawn_blocking(move || {
@@ -107,7 +135,9 @@ impl ConfigService {
         }
         Ok(result)
     }
+}
 
+impl ConfigService {
     #[cfg(test)]
     pub(crate) async fn set_system_value(
         &self,
@@ -116,7 +146,7 @@ impl ConfigService {
     ) -> Result<(), ConfigServiceError> {
         let value = serde_json::to_value(value)
             .map_err(|_| ConfigServiceError::Storage("内部配置序列化失败。".into()))?;
-        self.update_system_value(key, None, async |_| Ok((Some(value), ())))
+        self.update_system_value(key, None, async move |_| Ok((Some(value), ())))
             .await
     }
 }

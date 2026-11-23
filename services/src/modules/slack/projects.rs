@@ -7,11 +7,10 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    sync::{Mutex, Notify, RwLock},
-    task::JoinHandle,
-};
+use tokio::{sync::Notify, task::JoinHandle};
 use uuid::Uuid;
+
+use crate::process::Process;
 
 use crate::modules::{
     alert::AlertService,
@@ -33,6 +32,7 @@ use super::{
     service::SlackService,
     status::ProjectsStatus,
     store::Nicknames,
+    team::Team,
 };
 
 pub(super) type BrowserFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -44,6 +44,7 @@ pub(super) enum RegistrationStatus {
     Invalid(Error),
 }
 
+#[derive(Clone)]
 pub(super) struct Backend {
     pub api: String,
     pub cache_root: Option<PathBuf>,
@@ -70,7 +71,7 @@ pub(super) struct SlackTeamIdentity {
 #[derive(Deserialize, Serialize)]
 pub(super) struct SlackWatch {
     pub id: String,
-    display_name: String,
+    pub(super) display_name: String,
 }
 
 pub(super) async fn read_watches(config: &ConfigService) -> Result<Vec<SlackWatch>, Error> {
@@ -87,9 +88,29 @@ struct SlackNickname {
     nickname: String,
 }
 
+async fn read_nicknames(config: &ConfigService) -> Result<BTreeMap<String, String>, Error> {
+    let data = config
+        .value("slack", NICKNAMES)
+        .await
+        .map_err(|_| Error::NicknameStorage)?;
+    parse_nicknames(data.value).map_err(|_| Error::NicknameStorage)
+}
+
+pub(super) async fn read_team_nicknames(
+    config: &ConfigService,
+    team: &str,
+) -> Result<BTreeMap<String, String>, Error> {
+    let prefix = format!("{team}.");
+    Ok(read_nicknames(config)
+        .await?
+        .into_iter()
+        .filter(|(id, _)| id.starts_with(&prefix))
+        .collect())
+}
+
 fn parse_nicknames(value: Value) -> Result<BTreeMap<String, String>, String> {
-    let entries: Vec<SlackNickname> = serde_json::from_value(value)
-        .map_err(|_| "Slack 昵称配置格式无效。".to_owned())?;
+    let entries: Vec<SlackNickname> =
+        serde_json::from_value(value).map_err(|_| "Slack 昵称配置格式无效。".to_owned())?;
     let mut nicknames = BTreeMap::new();
     for entry in entries {
         let (team, user) = entry.id.split_once('.').ok_or("Slack 用户 ID 无效。")?;
@@ -102,8 +123,10 @@ fn parse_nicknames(value: Value) -> Result<BTreeMap<String, String>, String> {
 }
 
 fn valid_nickname(nickname: &str) -> bool {
-    !nickname.is_empty() && nickname == nickname.trim()
-        && nickname.chars().count() <= 80 && !nickname.chars().any(char::is_control)
+    !nickname.is_empty()
+        && nickname == nickname.trim()
+        && nickname.chars().count() <= 80
+        && !nickname.chars().any(char::is_control)
 }
 
 impl SlackTeam {
@@ -142,7 +165,8 @@ fn parse_projects(value: &Value) -> Result<BTreeMap<String, SlackTeam>, String> 
 
 struct Project {
     settings: SlackTeam,
-    service: Arc<SlackService>,
+    service: Arc<Team>,
+    internal: Arc<SlackService>,
     worker: JoinHandle<()>,
 }
 
@@ -152,22 +176,24 @@ impl Drop for Project {
     }
 }
 
+#[derive(Default)]
+pub(super) struct Teams {
+    projects: BTreeMap<String, Project>,
+    nicknames: Nicknames,
+    pub(super) downloads: BTreeMap<String, Arc<Downloads>>,
+}
+
 pub struct Projects {
     pub(super) emacs: Arc<EmacsService>,
     config: Arc<ConfigService>,
     alert: Arc<AlertService>,
     notification: Arc<NotificationService>,
     pub(super) status: Arc<ProjectsStatus>,
-    projects: RwLock<BTreeMap<String, Project>>,
-    reconcile: Mutex<()>,
-    watch_changes: Arc<Mutex<()>>,
-    nicknames: Nicknames,
-    nickname_changes: Mutex<()>,
+    pub(super) teams: Process<Teams>,
     port: std::sync::OnceLock<u16>,
     backend: Backend,
     shutdown: Notify,
-    clean_cache: Notify,
-    pub(super) downloads: Arc<Downloads>,
+    clean_dormant_caches: Notify,
 }
 
 impl std::fmt::Debug for Projects {
@@ -190,35 +216,22 @@ impl Projects {
         conversation: &str,
         watching: bool,
     ) -> Result<(), Error> {
-        let _change = self.watch_changes.lock().await;
-        if !watching {
-            self.config
-                .remove_record("slack".into(), WATCHES.into(), id.clone())
-                .await
-                .map_err(|_| Error::WatchStorage)?;
-            if let Ok(service) = self.service(team).await {
-                service.forget_watch(&id).await;
+        let result = match self.service(team).await {
+            Ok(service) => {
+                service
+                    .set_watch(id.clone(), conversation.to_owned(), watching)
+                    .await
             }
-            return Ok(());
+            Err(error) => Err(error),
+        };
+        if matches!(result, Err(Error::Project)) && !watching {
+            return self
+                .config
+                .remove_record("slack".into(), WATCHES.into(), id)
+                .await
+                .map_err(|_| Error::WatchStorage);
         }
-        if self.watches().await?.iter().any(|watch| watch.id == id) {
-            return Ok(());
-        }
-        let service = self.service(team).await?;
-        let display_name = service.watch_conversation_name(conversation).await?;
-        let value = serde_json::to_value(SlackWatch {
-            id: id.clone(),
-            display_name,
-        })
-        .map_err(|_| Error::WatchStorage)?;
-        match self
-            .config
-            .replace_record("slack".into(), WATCHES.into(), id, value, true, false)
-            .await
-        {
-            Ok(_) | Err(ConfigServiceError::RecordExists) => Ok(()),
-            Err(_) => Err(Error::WatchStorage),
-        }
+        result
     }
 
     pub fn new(
@@ -274,16 +287,11 @@ impl Projects {
             alert,
             notification,
             status: Arc::new(ProjectsStatus::new(status)),
-            projects: RwLock::default(),
-            reconcile: Mutex::default(),
-            watch_changes: Arc::default(),
-            nicknames: Arc::default(),
-            nickname_changes: Mutex::new(()),
+            teams: Process::start(Teams::default()),
             port: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
-            clean_cache: Notify::new(),
-            downloads: Arc::default(),
+            clean_dormant_caches: Notify::new(),
         }
     }
 
@@ -292,25 +300,44 @@ impl Projects {
     }
 
     pub async fn run(self: Arc<Self>, port: u16) {
-        self.prune_cache().await;
         let _ = self.port.set(port);
-        if let Ok(value) = self.config.value("slack", NICKNAMES).await
-            && let Err(error) = self.apply_nicknames(value.value).await
-        {
-            eprintln!("{error}");
-        }
+        let mut changes = self.config.subscribe();
+        self.reload_nicknames().await;
         let _ = self.sync_projects(None).await;
+        self.prune_dormant_caches().await;
+        let mut cleanup = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(86_400),
+            Duration::from_secs(86_400),
+        );
         loop {
             tokio::select! {
                 _ = self.shutdown.notified() => break,
-                _ = self.clean_cache.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(86_400)) => {},
+                _ = self.clean_dormant_caches.notified() => self.prune_dormant_caches().await,
+                _ = cleanup.tick() => self.prune_dormant_caches().await,
+                change = changes.recv() => {
+                    match change {
+                        Ok(change) if change.module_id == "slack" && change.key == NICKNAMES => {
+                            self.reload_nicknames().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            self.reload_nicknames().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Ok(_) => {}
+                    }
+                }
             }
-            self.prune_cache().await;
         }
     }
 
-    async fn prune_cache(&self) {
+    async fn reload_nicknames(&self) {
+        match self.nicknames().await {
+            Ok(nicknames) => self.apply_nicknames(nicknames).await,
+            Err(error) => eprintln!("读取 Slack 昵称配置失败：{error:?}"),
+        }
+    }
+
+    async fn prune_dormant_caches(&self) {
         let Some(root) = self.backend.cache_root.clone() else {
             return;
         };
@@ -321,61 +348,67 @@ impl Projects {
             .ok()
             .and_then(|value| retention(&value.value))
             .unwrap_or(Duration::from_secs(DEFAULT_CACHE_RETENTION_DAYS * 86_400));
-        let _reconcile = self.reconcile.lock().await;
-        let states: Vec<_> = self
-            .projects
-            .read()
-            .await
-            .values()
-            .map(|project| Arc::clone(&project.service.state))
-            .collect();
-        let mut guards = Vec::with_capacity(states.len());
-        for state in states {
-            guards.push(state.lock_owned().await);
-        }
-        let active = self.downloads.active_paths().await;
-        let _ = tokio::task::spawn_blocking(move || {
-            DiskCache::clean_with_downloads(&root, retention, &active);
-            drop(guards);
-        })
-        .await;
+        let path = root.clone();
+        let Ok(cached) = tokio::task::spawn_blocking(move || DiskCache::cached_teams(&path)).await
+        else {
+            return;
+        };
+        self.teams.post(move |teams| {
+            for id in cached {
+                if !teams.projects.contains_key(&id) {
+                    let downloads = teams.downloads.entry(id.clone()).or_default();
+                    downloads.schedule_cache_cleanup(root.clone(), id, retention);
+                }
+            }
+        });
     }
 
     pub async fn stop(&self) {
-        let _sync = self.reconcile.lock().await;
-        let mut projects = self.projects.write().await;
-        for (id, project) in projects.iter() {
-            project.service.retire().await;
-            project.worker.abort();
-            project.service.clear_reauthorization_alert().await;
-            self.status.remove(id);
-        }
-        projects.clear();
+        let status = Arc::clone(&self.status);
+        self.teams
+            .call_async(move |mut teams| async move {
+                for (id, mut project) in std::mem::take(&mut teams.projects) {
+                    project.internal.retire().await;
+                    project.worker.abort();
+                    let _ = (&mut project.worker).await;
+                    project.internal.clear_reauthorization_alert().await;
+                    status.remove(&id).await;
+                }
+                (teams, ())
+            })
+            .await;
         self.shutdown.notify_one();
     }
 
-    pub(super) async fn service(&self, team_id: &str) -> Result<Arc<SlackService>, Error> {
-        self.projects
-            .read()
+    pub(super) async fn service(&self, team_id: &str) -> Result<Arc<Team>, Error> {
+        let team_id = team_id.to_owned();
+        self.teams
+            .call(move |teams| {
+                teams
+                    .projects
+                    .get(&team_id)
+                    .map(|project| Arc::clone(&project.service))
+                    .ok_or(Error::Project)
+            })
             .await
-            .get(team_id)
-            .map(|project| Arc::clone(&project.service))
-            .ok_or(Error::Project)
     }
 
     async fn active_sessions(
         &self,
         team_id: Option<&str>,
-    ) -> Result<Vec<(String, Arc<SlackService>, Uuid)>, Error> {
+    ) -> Result<Vec<(String, Arc<Team>, Uuid)>, Error> {
         let services: Vec<_> = if let Some(team_id) = team_id {
             vec![(team_id.to_owned(), self.service(team_id).await?)]
         } else {
-            self.projects
-                .read()
+            self.teams
+                .call(|teams| {
+                    teams
+                        .projects
+                        .iter()
+                        .map(|(id, project)| (id.clone(), Arc::clone(&project.service)))
+                        .collect()
+                })
                 .await
-                .iter()
-                .map(|(id, project)| (id.clone(), Arc::clone(&project.service)))
-                .collect()
         };
         let mut sessions = Vec::new();
         for (id, service) in services {
@@ -444,50 +477,75 @@ impl Projects {
         let service = self.service(team).await?;
         let profile = service.lookup_user(session, user).await?;
         let id = format!("{team}.{user}");
-        let _change = self.nickname_changes.lock().await;
         if let Some(nickname) = nickname {
-            self.config.replace_record(
-                "slack".into(), NICKNAMES.into(), id.clone(),
-                json!({"id":id,"nickname":nickname}), false, false,
-            ).await.map_err(|_| Error::NicknameStorage)?;
+            self.config
+                .replace_record(
+                    "slack".into(),
+                    NICKNAMES.into(),
+                    id.clone(),
+                    json!({"id":id,"nickname":nickname}),
+                    false,
+                    false,
+                )
+                .await
+                .map_err(|_| Error::NicknameStorage)?;
         } else {
-            self.config.remove_record("slack".into(), NICKNAMES.into(), id)
-                .await.map_err(|_| Error::NicknameStorage)?;
+            self.config
+                .remove_record("slack".into(), NICKNAMES.into(), id)
+                .await
+                .map_err(|_| Error::NicknameStorage)?;
         }
-        let saved = self.config.value("slack", NICKNAMES).await.map_err(|_| Error::NicknameStorage)?;
-        self.apply_nicknames(saved.value).await.map_err(|_| Error::NicknameStorage)?;
-        service.user_result(session, &profile).await
+        let mut profile = service.user_result(session, &profile).await?;
+        profile["nickname"] = json!(self.nicknames().await?.get(&format!("{team}.{user}")));
+        Ok(profile)
     }
 
-    async fn apply_nicknames(&self, value: Value) -> Result<(), String> {
-        let next = parse_nicknames(value)?;
-        let changed: std::collections::BTreeSet<_> = {
-            let mut current = self.nicknames.write().unwrap();
-            let changed = current.keys().chain(next.keys())
-                .filter(|id| current.get(*id) != next.get(*id))
-                .map(|id| id.split_once('.').unwrap().0.to_owned())
-                .collect();
-            *current = next;
-            changed
-        };
-        for team in changed {
-            if let Ok(service) = self.service(&team).await {
-                service.nicknames_changed().await;
-            }
-        }
-        Ok(())
+    pub(super) async fn nicknames(&self) -> Result<BTreeMap<String, String>, Error> {
+        read_nicknames(&self.config).await
+    }
+
+    pub(super) async fn team_nicknames(
+        &self,
+        team: &str,
+    ) -> Result<BTreeMap<String, String>, Error> {
+        read_team_nicknames(&self.config, team).await
+    }
+
+    async fn apply_nicknames(&self, next: BTreeMap<String, String>) {
+        self.teams
+            .call_async(move |mut teams| async move {
+                let changed: std::collections::BTreeSet<_> = teams
+                    .nicknames
+                    .keys()
+                    .chain(next.keys())
+                    .filter(|id| teams.nicknames.get(*id) != next.get(*id))
+                    .map(|id| id.split_once('.').unwrap().0.to_owned())
+                    .collect();
+                teams.nicknames = Arc::new(next);
+                for id in changed {
+                    if let Some(project) = teams.projects.get(&id) {
+                        project
+                            .internal
+                            .nicknames_changed(teams.nicknames.clone())
+                            .await;
+                    }
+                }
+                (teams, ())
+            })
+            .await;
+    }
+
+    pub(super) async fn lookup_user(&self, team: &str, id: &str) -> Result<Value, Error> {
+        let service = self.service(team).await?;
+        let session = service.session_id().await.ok_or(Error::Authorization)?;
+        let profile = service.lookup_user(session, id).await?;
+        service.user_result(session, &profile).await
     }
 
     pub(super) async fn lookup_users(&self, ids: Vec<(String, String)>) -> Value {
         let results = stream::iter(ids)
             .map(|(team, id)| async move {
-                let result = async {
-                    let service = self.service(&team).await?;
-                    let session = service.session_id().await.ok_or(Error::Authorization)?;
-                    let profile = service.lookup_user(session, &id).await?;
-                    service.user_result(session, &profile).await
-                }
-                .await;
+                let result = self.lookup_user(&team, &id).await;
                 (team, id, result)
             })
             .buffered(8)
@@ -508,24 +566,28 @@ impl Projects {
 
     pub(super) async fn picker(&self) -> Value {
         let projects: Vec<_> = self
-            .projects
-            .read()
-            .await
-            .iter()
-            .map(|(id, project)| {
-                (
-                    id.clone(),
-                    project.settings.name.clone(),
-                    Arc::clone(&project.service),
-                )
+            .teams
+            .call(|teams| {
+                teams
+                    .projects
+                    .iter()
+                    .map(|(id, project)| {
+                        (
+                            id.clone(),
+                            project.settings.name.clone(),
+                            Arc::clone(&project.service),
+                        )
+                    })
+                    .collect()
             })
-            .collect();
+            .await;
         let mut workspaces = Vec::with_capacity(projects.len());
         let mut snapshots = Vec::with_capacity(projects.len());
         for (id, name, service) in projects {
-            let (workspace, items) = service.picker_workspace(&id, &name).await;
-            workspaces.push(workspace);
-            snapshots.push(items);
+            if let Some((workspace, items)) = service.picker_workspace(&id, &name).await {
+                workspaces.push(workspace);
+                snapshots.push(items);
+            }
         }
         let items: Vec<_> = snapshots.iter().flat_map(|items| items.iter()).collect();
         json!({"api_version":"1", "workspaces":workspaces, "items":items})
@@ -700,65 +762,82 @@ impl Projects {
     }
 
     pub(super) async fn sync_projects(&self, reload_team: Option<&str>) -> Result<(), String> {
-        let _sync = self.reconcile.lock().await;
         if self.port.get().is_none() {
             return Ok(());
         }
-        let configured = self.config.value("slack", "teams").await.ok();
-        let settings = configured
-            .as_ref()
-            .map(|value| parse_projects(&value.value))
-            .transpose()?
-            .unwrap_or_default();
-        let mut projects = self.projects.write().await;
-        let removed: Vec<_> = projects
-            .iter()
-            .filter(|(id, project)| {
-                Some(id.as_str()) == reload_team || settings.get(*id) != Some(&project.settings)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in removed {
-            if let Some(mut project) = projects.remove(&id) {
-                project.service.retire().await;
-                project.worker.abort();
-                let _ = (&mut project.worker).await;
-                if !settings.contains_key(&id) {
-                    project.service.clear_reauthorization_alert().await;
+        let reload_team = reload_team.map(str::to_owned);
+        let config = Arc::clone(&self.config);
+        let alert = Arc::clone(&self.alert);
+        let notification = Arc::clone(&self.notification);
+        let status = Arc::clone(&self.status);
+        let backend = self.backend.clone();
+        let emacs = Arc::clone(&self.emacs);
+        self.teams
+            .call_async(move |mut teams| async move {
+                let result = async {
+                    let configured = config.value("slack", "teams").await.ok();
+                    let settings = configured
+                        .as_ref()
+                        .map(|value| parse_projects(&value.value))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let projects = &mut teams.projects;
+                    let removed: Vec<_> = projects
+                        .iter()
+                        .filter(|(id, project)| {
+                            Some(id.as_str()) == reload_team.as_deref()
+                                || settings.get(*id) != Some(&project.settings)
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in removed {
+                        if let Some(mut project) = projects.remove(&id) {
+                            project.internal.retire().await;
+                            project.worker.abort();
+                            let _ = (&mut project.worker).await;
+                            if !settings.contains_key(&id) {
+                                project.internal.clear_reauthorization_alert().await;
+                            }
+                        }
+                        status.remove(&id).await;
+                    }
+                    for (id, settings) in settings {
+                        if projects.contains_key(&id) {
+                            continue;
+                        }
+                        let generation = Uuid::new_v4();
+                        let service = Arc::new(SlackService::for_project(
+                            alert.clone(),
+                            notification.clone(),
+                            id.clone(),
+                            settings.clone(),
+                            generation,
+                            status.clone(),
+                            &backend,
+                            config.clone(),
+                            teams.downloads.entry(id.clone()).or_default().clone(),
+                            teams.nicknames.clone(),
+                        ));
+                        status
+                            .register(&id, generation, service.public_status().await)
+                            .await;
+                        let (team, worker) = Team::start(service.clone(), emacs.clone());
+                        projects.insert(
+                            id,
+                            Project {
+                                settings,
+                                service: team,
+                                internal: service,
+                                worker,
+                            },
+                        );
+                    }
+                    Ok(())
                 }
-            }
-            self.status.remove(&id);
-        }
-        for (id, settings) in settings {
-            if projects.contains_key(&id) {
-                continue;
-            }
-            let generation = Uuid::new_v4();
-            let service = Arc::new(SlackService::for_project(
-                Arc::clone(&self.alert),
-                Arc::clone(&self.notification),
-                id.clone(),
-                settings.clone(),
-                generation,
-                Arc::clone(&self.status),
-                &self.backend,
-                Arc::clone(&self.config),
-                Arc::clone(&self.watch_changes),
-                Arc::clone(&self.nicknames),
-            ));
-            self.status
-                .register(&id, generation, service.public_status().await);
-            let worker = tokio::spawn(Arc::clone(&service).run(Arc::clone(&self.emacs)));
-            projects.insert(
-                id,
-                Project {
-                    settings,
-                    service,
-                    worker,
-                },
-            );
-        }
-        Ok(())
+                .await;
+                (teams, result)
+            })
+            .await
     }
 }
 
@@ -767,6 +846,9 @@ impl ConfigChangeHandler for Projects {
         Box::pin(async move {
             if change.key == "teams" {
                 parse_projects(&change.value)?;
+            }
+            if change.key == NICKNAMES {
+                parse_nicknames(change.value.clone())?;
             }
             if change.key == CACHE_RETENTION_DAYS && retention(&change.value).is_none() {
                 return Err("缓存保留天数必须为可表示的正整数。".into());
@@ -781,7 +863,12 @@ impl ConfigChangeHandler for Projects {
                 return Ok(());
             }
             if change.key == CACHE_RETENTION_DAYS {
-                self.clean_cache.notify_one();
+                self.clean_dormant_caches.notify_one();
+                self.teams.post(|teams| {
+                    for project in teams.projects.values() {
+                        project.internal.clean_cache.notify_one();
+                    }
+                });
                 return Ok(());
             }
             self.sync_projects(None).await
@@ -789,7 +876,7 @@ impl ConfigChangeHandler for Projects {
     }
 }
 
-fn retention(value: &Value) -> Option<Duration> {
+pub(super) fn retention(value: &Value) -> Option<Duration> {
     let days = value.as_u64().filter(|days| *days > 0)?;
     days.checked_mul(86_400).map(Duration::from_secs)
 }

@@ -177,6 +177,7 @@ async fn from_passwords(
 pub(super) async fn load(
     config: &ConfigService,
 ) -> Result<BTreeMap<String, StoredPeer>, NetworkError> {
+    let storage = config.clone();
     let peers = config
         .update_system_value(
             KEY,
@@ -184,16 +185,16 @@ pub(super) async fn load(
                 name: "peers.json",
                 limit: 1_048_576,
             }),
-            async |previous| {
+            async move |previous| {
                 let Some(value) = previous else {
                     return Ok((None, Vec::new()));
                 };
                 if value["version"] == 2 {
-                    let peers = from_passwords(config, decode(value.clone(), 2)?).await?;
+                    let peers = from_passwords(&storage, decode(value.clone(), 2)?).await?;
                     return Ok((Some(value), peers));
                 }
                 let peers = decode(value, 1)?.peers;
-                let records = to_passwords(config, &peers, &HashSet::new()).await?;
+                let records = to_passwords(&storage, &peers, &HashSet::new()).await?;
                 Ok((
                     Some(serde_json::to_value(records).map_err(|_| invalid())?),
                     peers,
@@ -212,8 +213,9 @@ pub(super) async fn save(
     config: &ConfigService,
     peers: Vec<StoredPeer>,
 ) -> Result<(), NetworkError> {
+    let storage = config.clone();
     let retired = config
-        .update_system_value(KEY, None, async |previous| {
+        .update_system_value(KEY, None, async move |previous| {
             let existing = previous
                 .map(|value| decode::<Password>(value, 2))
                 .transpose()?
@@ -222,7 +224,7 @@ pub(super) async fn save(
                 .filter_map(|record| record.binding_token)
                 .map(|password| password.path().to_owned())
                 .collect();
-            let records = to_passwords(config, &peers, &existing).await?;
+            let records = to_passwords(&storage, &peers, &existing).await?;
             let retained: HashSet<_> = records
                 .peers
                 .iter()

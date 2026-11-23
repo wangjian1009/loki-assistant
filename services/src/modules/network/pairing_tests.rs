@@ -984,18 +984,22 @@ async fn check_remote_config_and_status(
     fixture
         .status
         .publish("emacs", "runtime", json!({"pid":123}))
+        .await
         .unwrap();
     fixture
         .status
         .publish("custom", "private", json!(true))
+        .await
         .unwrap();
     fixture
         .status
         .publish("slack", "connections", json!([{"session_id":"本机会话"}]))
+        .await
         .unwrap();
     fixture
         .status
         .publish("service", "name", json!("测试电脑"))
+        .await
         .unwrap();
     let get = |path: &'static str| channel_request(network.clone(), ServiceRequest::get(path));
     assert_eq!(
@@ -1111,7 +1115,7 @@ async fn check_remote_config_and_status(
         );
     }
     assert_eq!(
-        fixture.status.value("service", "name").unwrap().value,
+        fixture.status.value("service", "name").await.unwrap().value,
         "测试电脑"
     );
 
@@ -1128,7 +1132,12 @@ async fn check_remote_config_and_status(
         true
     );
     assert_eq!(
-        fixture.status.value("emacs", "runtime").unwrap().value["pid"],
+        fixture
+            .status
+            .value("emacs", "runtime")
+            .await
+            .unwrap()
+            .value["pid"],
         123
     );
 }

@@ -6,9 +6,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use uuid::Uuid;
 
-use crate::modules::{
-    emacs::service::EmacsService, notification::protocol::NotificationRequest,
-};
+use crate::modules::{emacs::service::EmacsService, notification::protocol::NotificationRequest};
 
 use super::{
     client::Socket,
@@ -20,6 +18,7 @@ use super::{
 
 impl SlackService {
     pub async fn run(self: Arc<Self>, emacs: Arc<EmacsService>) {
+        self.prune_cache().await;
         self.restore_user_token().await;
         self.sync.notify_one();
         tokio::join!(
@@ -30,13 +29,48 @@ impl SlackService {
             self.warming_avatars(),
             self.refreshing_picker(),
             self.notifications(),
-            self.subscription_workers(&emacs)
+            self.subscription_workers(&emacs),
+            self.cleaning_cache()
         );
+    }
+
+    async fn cleaning_cache(&self) {
+        loop {
+            tokio::select! {
+                _ = self.clean_cache.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(86_400)) => {},
+            }
+            self.prune_cache().await;
+        }
+    }
+
+    async fn prune_cache(&self) {
+        let Some(root) = self.cache_root.clone() else {
+            return;
+        };
+        let retention = self
+            .config
+            .value("slack", super::CACHE_RETENTION_DAYS)
+            .await
+            .ok()
+            .and_then(|value| super::projects::retention(&value.value))
+            .unwrap_or(Duration::from_secs(
+                super::DEFAULT_CACHE_RETENTION_DAYS * 86_400,
+            ));
+        let downloads = self.downloads.clone();
+        let team = self.project.0.clone();
+        self.state
+            .with(move |_| {
+                Box::pin(async move {
+                    downloads.clean_cache(root, team, retention).await;
+                })
+            })
+            .await;
     }
 
     async fn restore_user_token(&self) {
         let issue = self.restore_imported_token().await.err();
-        self.state.lock().await.issue = issue;
+        self.state.call(move |state| state.issue = issue).await;
         self.publish_status().await;
         self.sync_reauthorization_alert().await;
     }
@@ -80,32 +114,42 @@ impl SlackService {
 
     async fn notifications(&self) {
         loop {
-            let pending = {
-                let state = self.state.lock().await;
-                state
-                    .cache
-                    .session_id
-                    .filter(|session| state.account(*session).is_ok())
-                    .and_then(|session| {
-                        state
-                            .cache
-                            .notifications
-                            .first_key_value()
-                            .map(|(id, alert)| (session, id.clone(), alert.clone()))
-                    })
-            };
+            let pending = self
+                .state
+                .call(move |state| {
+                    state
+                        .cache
+                        .session_id
+                        .filter(|session| state.account(*session).is_ok())
+                        .and_then(|session| {
+                            state
+                                .cache
+                                .notifications
+                                .first_key_value()
+                                .map(|(id, alert)| (session, id.clone(), alert.clone()))
+                        })
+                })
+                .await;
             let Some((session, id, alert)) = pending else {
                 self.alerts.notified().await;
                 continue;
             };
             if let Some(watch) = &alert.watch {
                 let watched = self.watching(watch).await;
-                let mut state = self.state.lock().await;
-                if state.account(session).is_err() || !state.cache.notifications.contains_key(&id) {
-                    continue;
-                }
-                if !watched {
-                    state.cache.notifications.remove(&id);
+                let key = id.clone();
+                let deliver = self
+                    .state
+                    .call(move |state| {
+                        if state.account(session).is_err() {
+                            return false;
+                        }
+                        if !watched {
+                            state.cache.notifications.remove(&key);
+                        }
+                        watched && state.cache.notifications.contains_key(&key)
+                    })
+                    .await;
+                if !deliver {
                     continue;
                 }
             }
@@ -138,7 +182,9 @@ impl SlackService {
         let mut backoff = 1;
         loop {
             let Some(session) = self.session_id().await else {
-                self.state.lock().await.socket_state = "stopped";
+                self.state
+                    .call(|state| state.socket_state = "stopped")
+                    .await;
                 self.publish_status().await;
                 tokio::select! {
                     _ = changes.changed() => { backoff = 1; }
@@ -148,15 +194,19 @@ impl SlackService {
                 }
                 continue;
             };
-            self.state.lock().await.socket_state = if backoff == 1 {
-                "connecting"
-            } else {
-                "reconnecting"
-            };
+            self.state
+                .call(move |state| {
+                    state.socket_state = if backoff == 1 {
+                        "connecting"
+                    } else {
+                        "reconnecting"
+                    };
+                })
+                .await;
             self.publish_status().await;
             let connection = async {
                 let web = self.web_session(session).await?;
-                let token = self.state.lock().await.account(session)?.access.clone();
+                let token = self.session_token(session).await?;
                 let socket = self.client.connect(&token, web.as_ref()).await;
                 if matches!(socket, Err(Error::Authorization)) {
                     self.revoke(session, &token).await;
@@ -169,11 +219,14 @@ impl SlackService {
                 _ = changes.changed() => { backoff = 1; continue; }
                 result = connection => result,
             };
-            let mut state = self.state.lock().await;
-            state.socket_state = "reconnecting";
-            state.issue = outcome.err();
-            let retry = state.issue.and_then(Error::retry_after).unwrap_or(backoff);
-            drop(state);
+            let retry = self
+                .state
+                .call(move |state| {
+                    state.socket_state = "reconnecting";
+                    state.issue = outcome.err();
+                    state.issue.and_then(Error::retry_after).unwrap_or(backoff)
+                })
+                .await;
             self.publish_status().await;
             if outcome.is_ok() || started.elapsed() > Duration::from_secs(30) {
                 backoff = 1;
@@ -221,11 +274,14 @@ impl SlackService {
             let event: Value = serde_json::from_str(&content).map_err(|_| Error::Upstream)?;
             match event["type"].as_str() {
                 Some("hello") => {
-                    let mut state = self.state.lock().await;
-                    state.account(session)?;
-                    state.socket_state = "connected";
-                    state.issue = None;
-                    drop(state);
+                    self.state
+                        .call(move |state| {
+                            state.account(session)?;
+                            state.socket_state = "connected";
+                            state.issue = None;
+                            Ok(())
+                        })
+                        .await?;
                     self.publish_status().await;
                     self.sync.notify_one();
                     self.outgoing.notify_one();
@@ -286,30 +342,51 @@ impl SlackService {
             return Ok(false);
         };
         let event_id = format!("{id}.{subtype}.{event_ts}");
-        let (conversation_id, users) = {
-            let state = self.state.lock().await;
-            let account = state.account(session)?;
-            if team.as_deref().is_some_and(|team| team != account.identity.team_id)
-                || state.cache.events.contains(&event_id)
-            {
-                return Ok(false);
-            }
-            let users = state
-                .user_directory
-                .as_ref()
-                .filter(|directory| directory.session == session)
-                .cloned();
-            (format!("{}.{id}", account.identity.team_id), users)
+        let local_id = id.clone();
+        let event_key = event_id.clone();
+        let event_team = team.clone();
+        let candidate = self
+            .state
+            .call(move |state| {
+                let account = state.account(session)?;
+                if event_team
+                    .as_deref()
+                    .is_some_and(|team| team != account.identity.team_id)
+                    || state.cache.events.contains(&event_key)
+                {
+                    return Ok(None);
+                }
+                Ok(Some(format!("{}.{local_id}", account.identity.team_id)))
+            })
+            .await?;
+        let Some(conversation_id) = candidate else {
+            return Ok(false);
         };
         if let Some(message) = &message {
-            self.warm_message_media(session, std::slice::from_ref(message)).await;
+            self.warm_message_media(session, std::slice::from_ref(message))
+                .await;
         }
+        let users = self
+            .state
+            .call(move |state| {
+                state
+                    .user_directory
+                    .as_ref()
+                    .filter(|directory| directory.session == session)
+                    .cloned()
+            })
+            .await;
         let bot = message
             .as_ref()
             .and_then(|message| message.author.as_ref())
             .is_some_and(|author| author.id.starts_with('B'));
         let _watch_change = if new {
-            Some(self.watch_changes.lock().await)
+            Some(
+                self.watch_changes
+                    .acquire()
+                    .await
+                    .expect("Slack 操作许可不能关闭"),
+            )
         } else {
             None
         };
@@ -396,7 +473,11 @@ impl SlackService {
                     cache.notifications.insert(
                         event_id,
                         PendingNotification {
-                            body: notification::body_with_nicknames(&message, users.as_ref(), Some(account)),
+                            body: notification::body_with_nicknames(
+                                &message,
+                                users.as_ref(),
+                                Some(account),
+                            ),
                             callback,
                             watch: (!ordinary).then_some(conversation_id),
                         },
@@ -438,38 +519,40 @@ impl SlackService {
     }
 
     async fn refresh_recent_messages(&self, session: Uuid, reconnect: bool) {
-        let rooms: Vec<_> = {
-            let state = self.state.lock().await;
-            if state.account(session).is_err() {
-                return;
-            }
-            state
-                .cache
-                .conversations
-                .values()
-                .filter(|item| reconnect || !item.loaded.contains_key(""))
-                .map(|item| {
-                    let checkpoint = item
-                        .messages
-                        .values()
-                        .filter(|message| message.thread_ts.is_none())
-                        .max_by_key(|message| timestamp(&message.ts))
-                        .map(|message| message.ts.clone());
-                    let threads = if reconnect {
-                        item.loaded
-                            .keys()
-                            .rev()
-                            .filter(|ts| !ts.is_empty())
-                            .take(5)
-                            .cloned()
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    (item.id.clone(), checkpoint, threads)
-                })
-                .collect()
-        };
+        let rooms: Vec<_> = self
+            .state
+            .call(move |state| {
+                if state.account(session).is_err() {
+                    return Vec::new();
+                }
+                state
+                    .cache
+                    .conversations
+                    .values()
+                    .filter(|item| reconnect || !item.loaded.contains_key(""))
+                    .map(|item| {
+                        let checkpoint = item
+                            .messages
+                            .values()
+                            .filter(|message| message.thread_ts.is_none())
+                            .max_by_key(|message| timestamp(&message.ts))
+                            .map(|message| message.ts.clone());
+                        let threads = if reconnect {
+                            item.loaded
+                                .keys()
+                                .rev()
+                                .filter(|ts| !ts.is_empty())
+                                .take(5)
+                                .cloned()
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        (item.id.clone(), checkpoint, threads)
+                    })
+                    .collect()
+            })
+            .await;
         for (id, checkpoint, threads) in rooms {
             let result = if let Some(checkpoint) = checkpoint {
                 self.catch_up(session, &id, None, Some(&checkpoint)).await
@@ -535,19 +618,21 @@ impl SlackService {
     }
 
     async fn refresh_names(&self, session: Uuid) {
-        let ids = {
-            let state = self.state.lock().await;
-            if state.account(session).is_err() {
-                return;
-            }
-            state
-                .cache
-                .conversations
-                .values()
-                .filter(|item| matches!(item.kind.as_str(), "im" | "mpim"))
-                .flat_map(|item| item.participants.iter().cloned())
-                .collect::<std::collections::BTreeSet<_>>()
-        };
+        let ids = self
+            .state
+            .call(move |state| {
+                if state.account(session).is_err() {
+                    return std::collections::BTreeSet::new();
+                }
+                state
+                    .cache
+                    .conversations
+                    .values()
+                    .filter(|item| matches!(item.kind.as_str(), "im" | "mpim"))
+                    .flat_map(|item| item.participants.iter().cloned())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .await;
         if ids.is_empty() {
             return;
         }
@@ -606,13 +691,6 @@ impl SlackService {
                             let _ = disk.save_room(conversation);
                         }
                     }
-                    for message in conversation.messages.values_mut() {
-                        if let Some(author) = &mut message.author
-                            && let Some(name) = names.get(&author.id)
-                        {
-                            author.name.clone_from(name);
-                        }
-                    }
                 }
                 Ok(())
             })
@@ -622,22 +700,24 @@ impl SlackService {
     async fn sending(&self) {
         let mut changes = self.change.subscribe();
         loop {
-            let work = {
-                let state = self.state.lock().await;
-                state
-                    .secrets
-                    .account
-                    .as_ref()
-                    .filter(|account| state.account(account.identity.session_id).is_ok())
-                    .and_then(|account| {
-                        state
-                            .cache
-                            .sends
-                            .values()
-                            .find(|record| record.state == SendState::Pending)
-                            .map(|record| (account.identity.session_id, record.id))
-                    })
-            };
+            let work = self
+                .state
+                .call(move |state| {
+                    state
+                        .secrets
+                        .account
+                        .as_ref()
+                        .filter(|account| state.account(account.identity.session_id).is_ok())
+                        .and_then(|account| {
+                            state
+                                .cache
+                                .sends
+                                .values()
+                                .find(|record| record.state == SendState::Pending)
+                                .map(|record| (account.identity.session_id, record.id))
+                        })
+                })
+                .await;
             if let Some((session, id)) = work {
                 self.send_one(session, id, &mut changes).await;
             } else {
@@ -684,7 +764,8 @@ impl SlackService {
             }
         };
         if let Ok((_, Some(message))) = &outcome {
-            self.warm_message_media(session, std::slice::from_ref(message)).await;
+            self.warm_message_media(session, std::slice::from_ref(message))
+                .await;
         }
         let _ = self
             .update_cache(session, move |cache, account| {
@@ -699,13 +780,15 @@ impl SlackService {
                         {
                             message.author.get_or_insert_with(|| Author {
                                 id: account.identity.user_id.clone(),
-                                name: account.identity.user_id.clone(),
                             });
                             conversation.ingest(message);
                         }
                     }
                     Err(error) => {
-                        record.state = if matches!(error, Error::DeliveryUnknown | Error::DeliveryTargetMismatch) {
+                        record.state = if matches!(
+                            error,
+                            Error::DeliveryUnknown | Error::DeliveryTargetMismatch
+                        ) {
                             SendState::Unknown
                         } else {
                             SendState::Failed
@@ -730,12 +813,15 @@ impl SlackService {
             .as_str()
             .filter(|ts| timestamp(ts).is_some())
             .ok_or(Error::DeliveryUnknown)?;
-        let message = Message::from_slack(&response["message"], None)
-            .filter(|message| message.ts == ts);
+        let message =
+            Message::from_slack(&response["message"], None).filter(|message| message.ts == ts);
         let Some(thread) = thread else {
             return Ok((ts.to_owned(), message));
         };
-        if response["channel"].as_str().is_some_and(|channel| channel != conversation) {
+        if response["channel"]
+            .as_str()
+            .is_some_and(|channel| channel != conversation)
+        {
             return Err(Error::DeliveryTargetMismatch);
         }
         if let Some(root) = response["message"]["thread_ts"].as_str() {

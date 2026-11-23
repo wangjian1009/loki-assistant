@@ -229,7 +229,6 @@ pub(super) struct Identity {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct Author {
     pub id: String,
-    pub name: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -538,16 +537,8 @@ impl Message {
         let author = value["user"]
             .as_str()
             .or(value["bot_id"].as_str())
-            .map(|id| Author {
-                id: id.into(),
-                name: value["user_profile"]["display_name"]
-                    .as_str()
-                    .or(value["bot_profile"]["name"].as_str())
-                    .or(value["username"].as_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(id)
-                    .into(),
-            });
+            .filter(|id| valid_id(id))
+            .map(|id| Author { id: id.into() });
         let files = value["files"].as_array().into_iter().flatten();
         let unfurls = value["attachments"].as_array().into_iter().flatten();
         let attachments: Vec<_> = files

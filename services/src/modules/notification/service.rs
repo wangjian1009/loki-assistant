@@ -1,3 +1,5 @@
+use crate::process::Process;
+
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::http::Uri;
@@ -38,12 +40,16 @@ impl From<io::Error> for NotificationError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NotificationService {
+    process: Process<State>,
+    retry_requested: Arc<Notify>,
+}
+
+struct State {
     launcher: Arc<dyn NotificationLauncher>,
     timeout: Duration,
     tracker: NotificationTracker,
-    retry_requested: Notify,
 }
 
 impl Default for NotificationService {
@@ -70,26 +76,35 @@ impl NotificationService {
         launcher: Arc<dyn NotificationLauncher>,
         timeout: Duration,
     ) -> io::Result<Self> {
-        Ok(Self {
+        Ok(Self::with_tracker(
+            NotificationTracker::load(directory)?,
             launcher,
             timeout,
-            tracker: NotificationTracker::load(directory)?,
-            retry_requested: Notify::new(),
-        })
+        ))
     }
 
     pub fn with_launcher(launcher: Arc<dyn NotificationLauncher>, timeout: Duration) -> Self {
+        Self::with_tracker(NotificationTracker::default(), launcher, timeout)
+    }
+
+    fn with_tracker(
+        tracker: NotificationTracker,
+        launcher: Arc<dyn NotificationLauncher>,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            launcher,
-            timeout,
-            tracker: NotificationTracker::default(),
-            retry_requested: Notify::new(),
+            process: Process::start(State {
+                launcher,
+                timeout,
+                tracker,
+            }),
+            retry_requested: Arc::new(Notify::new()),
         }
     }
 
     /// 在后台提交通知，并沿用通用发送流程与回执重试。
-    pub(crate) fn trigger(self: &Arc<Self>, request: NotificationRequest) {
-        let service = Arc::clone(self);
+    pub(crate) fn trigger(&self, request: NotificationRequest) {
+        let service = self.clone();
         tokio::spawn(async move {
             if let Err(error) = service.send(request).await {
                 eprintln!("提交后台通知失败：{error}");
@@ -124,13 +139,21 @@ impl NotificationService {
             app: request.app,
             navigation_url,
         };
-        let attempt = self.tracker.register(content, id).await?;
-        self.forward(attempt).await;
-        self.tracker.get(&id.to_string()).await
+        let delivered = self
+            .process
+            .blocking(move |state| {
+                let attempt = state.tracker.register(content, id)?;
+                Ok::<_, NotificationError>(state.forward(attempt))
+            })
+            .await?;
+        let _ = delivered.await;
+        self.status(&id.to_string()).await
     }
 
     pub(super) async fn request_pending_retry(&self) {
-        self.tracker.schedule_retry().await;
+        self.process
+            .call(|state| state.tracker.schedule_retry())
+            .await;
         self.retry_requested.notify_one();
     }
 
@@ -141,26 +164,26 @@ impl NotificationService {
                 _ = self.retry_requested.notified() => {}
                 _ = ticks.tick() => {}
             }
-            for id in self.tracker.due().await {
-                if let Some(attempt) = self.tracker.retry(id).await {
-                    self.forward(attempt).await;
+            for id in self.process.call(|state| state.tracker.due()).await {
+                if let Some(delivered) = self
+                    .process
+                    .call(move |state| {
+                        state
+                            .tracker
+                            .retry(id)
+                            .map(|attempt| state.forward(attempt))
+                    })
+                    .await
+                {
+                    let _ = delivered.await;
                 }
             }
         }
     }
 
-    async fn forward(&self, attempt: DeliveryAttempt) {
-        let id = attempt.content.notification_id.clone();
-        if !matches!(
-            timeout(self.timeout, self.launcher.launch(attempt.content)).await,
-            Ok(Ok(()))
-        ) {
-            eprintln!("通知 {id} 暂未转交给菜单栏应用，稍后重试");
-        }
-    }
-
     pub async fn status(&self, id: &str) -> Result<NotificationStatusResponse, NotificationError> {
-        self.tracker.get(id).await
+        let id = id.to_owned();
+        self.process.call(move |state| state.tracker.get(&id)).await
     }
 
     pub async fn receive_receipt(
@@ -168,7 +191,10 @@ impl NotificationService {
         id: &str,
         receipt: NotificationReceipt,
     ) -> Result<NotificationStatusResponse, NotificationError> {
-        self.tracker.receive(id, receipt).await
+        let id = id.to_owned();
+        self.process
+            .blocking(move |state| state.tracker.receive(&id, receipt))
+            .await
     }
 
     fn navigation_url(callback: &str) -> Result<String, NotificationError> {
@@ -194,5 +220,21 @@ impl NotificationService {
             ));
         }
         Ok(())
+    }
+}
+
+impl State {
+    fn forward(&self, attempt: DeliveryAttempt) -> tokio::task::JoinHandle<()> {
+        let launcher = Arc::clone(&self.launcher);
+        let deadline = self.timeout;
+        tokio::spawn(async move {
+            let id = attempt.content.notification_id.clone();
+            if !matches!(
+                timeout(deadline, launcher.launch(attempt.content)).await,
+                Ok(Ok(()))
+            ) {
+                eprintln!("通知 {id} 暂未转交给菜单栏应用，稍后重试");
+            }
+        })
     }
 }

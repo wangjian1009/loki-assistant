@@ -43,6 +43,8 @@ pub(super) struct MessageJournal {
     changed: watch::Sender<u64>,
     entries: VecDeque<MessageChange>,
     nickname_revision: Option<u64>,
+    profiles: VecDeque<(u64, BTreeSet<String>)>,
+    profiles_dropped_through: u64,
     dropped_through: u64,
 }
 
@@ -81,6 +83,17 @@ impl MessageJournal {
     pub fn nicknames_changed(&mut self) {
         let revision = *self.changed.borrow() + 1;
         self.nickname_revision = Some(revision);
+        self.changed.send_replace(revision);
+    }
+
+    pub fn profiles_changed(&mut self, ids: &BTreeSet<String>) {
+        let revision = *self.changed.borrow() + 1;
+        self.profiles.push_back((revision, ids.clone()));
+        if self.profiles.len() > JOURNAL_LIMIT
+            && let Some((revision, _)) = self.profiles.pop_front()
+        {
+            self.profiles_dropped_through = revision;
+        }
         self.changed.send_replace(revision);
     }
 
@@ -138,13 +151,16 @@ impl Cache {
 
 impl SlackService {
     pub(super) async fn has_message_subscribers(&self, id: &str) -> bool {
+        let id = id.to_owned();
         self.state
-            .lock()
+            .call(move |state| {
+                state
+                    .cache
+                    .conversations
+                    .get(&id)
+                    .is_some_and(|room| room.journal.is_some())
+            })
             .await
-            .cache
-            .conversations
-            .get(id)
-            .is_some_and(|room| room.journal.is_some())
     }
 
     pub(super) async fn refresh_threads(&self, session: Uuid, id: &str, roots: Vec<String>) {
@@ -167,47 +183,62 @@ impl SlackService {
         id: String,
         uuid: Uuid,
     ) -> Result<bool, Error> {
-        let mut state = self.state.lock().await;
-        state.account(session)?;
-        if !state.cache.conversations.contains_key(&id) && !state.cache.directory_loaded {
-            drop(state);
+        let room_id = id.clone();
+        let refresh = self
+            .state
+            .call(move |state| {
+                state.account(session)?;
+                Ok(!state.cache.conversations.contains_key(&room_id)
+                    && !state.cache.directory_loaded)
+            })
+            .await?;
+        if refresh {
             self.refresh_directory(session).await?;
-            state = self.state.lock().await;
-            state.account(session)?;
         }
-        let cache = &mut state.cache;
-        let room = cache
-            .conversations
-            .get_mut(&id)
-            .ok_or(Error::Conversation)?;
-        let key = (id, uuid);
-        if cache.subscriptions.contains_key(&key) {
-            return Ok(false);
+        let created = self
+            .state
+            .call(move |state| {
+                state.account(session)?;
+                let cache = &mut state.cache;
+                let room = cache
+                    .conversations
+                    .get_mut(&id)
+                    .ok_or(Error::Conversation)?;
+                let key = (id, uuid);
+                if cache.subscriptions.contains_key(&key) {
+                    return Ok(false);
+                }
+                let changes = room
+                    .journal
+                    .get_or_insert_with(MessageJournal::default)
+                    .changed
+                    .subscribe();
+                let (stop, cancel) = oneshot::channel();
+                cache.subscriptions.insert(
+                    key,
+                    Subscription {
+                        registration: Uuid::new_v4(),
+                        pending: Some(Delivery {
+                            session,
+                            changes,
+                            cancel,
+                        }),
+                        _cancel: stop,
+                    },
+                );
+                Ok(true)
+            })
+            .await?;
+        if created {
+            self.subscriptions_changed.notify_one();
         }
-        let changes = room
-            .journal
-            .get_or_insert_with(MessageJournal::default)
-            .changed
-            .subscribe();
-        let (stop, cancel) = oneshot::channel();
-        cache.subscriptions.insert(
-            key,
-            Subscription {
-                registration: Uuid::new_v4(),
-                pending: Some(Delivery {
-                    session,
-                    changes,
-                    cancel,
-                }),
-                _cancel: stop,
-            },
-        );
-        self.subscriptions_changed.notify_one();
-        Ok(true)
+        Ok(created)
     }
 
     pub(super) async fn unsubscribe_messages(&self, id: String, uuid: Uuid) {
-        self.state.lock().await.cache.unsubscribe(&(id, uuid), None);
+        self.state
+            .call(move |state| state.cache.unsubscribe(&(id, uuid), None))
+            .await;
     }
 
     pub(super) async fn subscription_workers(self: &Arc<Self>, emacs: &Arc<EmacsService>) {
@@ -215,15 +246,17 @@ impl SlackService {
         loop {
             let pending: Vec<_> = self
                 .state
-                .lock()
-                .await
-                .cache
-                .subscriptions
-                .iter_mut()
-                .filter_map(|(key, entry)| {
-                    Some((key.clone(), entry.registration, entry.pending.take()?))
+                .call(|state| {
+                    state
+                        .cache
+                        .subscriptions
+                        .iter_mut()
+                        .filter_map(|(key, entry)| {
+                            Some((key.clone(), entry.registration, entry.pending.take()?))
+                        })
+                        .collect()
                 })
-                .collect();
+                .await;
             for (
                 key,
                 registration,
@@ -244,10 +277,8 @@ impl SlackService {
                     }
                     service
                         .state
-                        .lock()
-                        .await
-                        .cache
-                        .unsubscribe(&key, Some(registration));
+                        .call(move |state| state.cache.unsubscribe(&key, Some(registration)))
+                        .await;
                 });
             }
             tokio::select! {
@@ -264,12 +295,17 @@ impl SlackService {
         key: &SubscriptionKey,
         changes: &mut watch::Receiver<u64>,
     ) {
-        let team = {
-            let state = self.state.lock().await;
-            let Ok(account) = state.account(session) else {
-                return;
-            };
-            account.identity.team_id.clone()
+        let Some(team) = self
+            .state
+            .call(move |state| {
+                state
+                    .account(session)
+                    .ok()
+                    .map(|account| account.identity.team_id.clone())
+            })
+            .await
+        else {
+            return;
         };
         let mut sequence = 1;
         let mut revision = None;
@@ -369,9 +405,8 @@ impl SlackService {
             Err(Error::Unavailable | Error::Upstream | Error::RateLimited(_)) => false,
             Err(error) => return Err(error),
         };
-        let state = self.state.clone().lock_owned().await;
         let id = id.to_owned();
-        let (revision, snapshot) = tokio::task::spawn_blocking(move || {
+        let (revision, snapshot) = self.state.blocking(move |state| {
             let account = state.account(session)?;
             let room = state.cache.conversations.get(&id).ok_or(Error::Conversation)?;
             let journal = room.journal.as_ref().ok_or(Error::Conversation)?;
@@ -411,8 +446,9 @@ impl SlackService {
                     .min_by_key(|message| timestamp(&message.ts)).map(|message| &message.ts)
             });
             Ok((*journal.changed.borrow(), snapshot))
-        }).await.map_err(|_| Error::Unavailable)??;
-        let snapshot = super::routes::messages_result(snapshot, team);
+        }).await?;
+        let nicknames = self.team_nicknames(team).await;
+        let snapshot = super::routes::messages_result(snapshot, team, &nicknames);
         Ok((revision, json!({"kind":"snapshot", "snapshot":snapshot})))
     }
 
@@ -423,19 +459,21 @@ impl SlackService {
         id: &str,
         previous: u64,
     ) -> Result<Option<(u64, Value)>, Error> {
-        let state = self.state.lock().await;
+        let (id, team) = (id.to_owned(), team.to_owned());
+        let names = self.team_nicknames(&team).await;
+        self.state.call(move |state| {
         let account = state.account(session)?;
         let room = state
             .cache
             .conversations
-            .get(id)
+            .get(&id)
             .ok_or(Error::Conversation)?;
         let journal = room.journal.as_ref().ok_or(Error::Conversation)?;
         let revision = *journal.changed.borrow();
         if revision == previous {
             return Ok(None);
         }
-        if journal.overflowed(previous) {
+        if journal.overflowed(previous) || journal.profiles_dropped_through > previous {
             return Err(Error::Cursor);
         }
         let mut effective = BTreeMap::new();
@@ -448,7 +486,7 @@ impl SlackService {
         }
         let (mut items, mut deleted_ts) = (Vec::new(), Vec::new());
         let (mut thread_items, mut deleted_thread_messages) = (Vec::new(), Vec::new());
-        for (ts, entry) in effective {
+        for (&ts, entry) in &effective {
             match (&entry.thread_ts, &entry.message) {
                 (None, Some(message)) => items.push(room.message_result(message, account, state.user_directory.as_ref())),
                 (None, None) => deleted_ts.push(ts),
@@ -458,15 +496,37 @@ impl SlackService {
                 }
             }
         }
+        let changed_profiles: BTreeSet<_> = journal.profiles.iter()
+            .filter(|(revision, _)| *revision > previous)
+            .flat_map(|(_, ids)| ids.iter().map(String::as_str))
+            .collect();
+        if !changed_profiles.is_empty() {
+            for message in room.messages.values().filter(|message| {
+                !effective.contains_key(&message.ts) && (
+                    message.author.as_ref().is_some_and(|author| changed_profiles.contains(author.id.as_str()))
+                    || message.user_references().any(|(id, _)| changed_profiles.contains(id))
+                )
+            }) {
+                let value = room.message_result(message, account, state.user_directory.as_ref());
+                if message.thread_ts.is_some() {
+                    thread_items.push(value);
+                } else {
+                    items.push(value);
+                }
+            }
+        }
         let mut update = json!({"kind":"changes", "items":items, "deleted_ts":deleted_ts,
                             "thread_items":thread_items, "deleted_thread_messages":deleted_thread_messages});
         if journal.nickname_revision.is_some_and(|revision| revision > previous) {
             update["nicknames"] = json!(account.team_nicknames());
+        }
+        if !changed_profiles.is_empty() || journal.nickname_revision.is_some_and(|revision| revision > previous) {
             update["title"] = json!(room.display_title(account, state.user_directory.as_ref()));
         }
         Ok(Some((
             revision,
-            super::routes::messages_result(update, team),
+            super::routes::messages_result(update, &team, &names),
         )))
+        }).await
     }
 }

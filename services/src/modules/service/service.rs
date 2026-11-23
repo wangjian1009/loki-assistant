@@ -44,18 +44,13 @@ impl SelfService {
         } else {
             name
         };
+        service.status.post("service", "name", json!(name));
         service
             .status
-            .publish("service", "name", json!(name))
-            .expect("服务名称状态有效");
+            .post("service", "device_type", json!("computer"));
         service
             .status
-            .publish("service", "device_type", json!("computer"))
-            .expect("设备类型状态有效");
-        service
-            .status
-            .publish("service", "start_at", json!(service.started_at))
-            .expect("服务状态路径固定且有效");
+            .post("service", "start_at", json!(service.started_at));
         service
     }
 

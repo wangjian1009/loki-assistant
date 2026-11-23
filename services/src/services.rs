@@ -218,13 +218,14 @@ mod tests {
         let services = Arc::new(Services::build());
         // 网络构造和 Emacs 业务发布必须写到组合根持有的同一个实例。
         assert_eq!(
-            services.status.value("network", "my").unwrap().value["status"],
+            services.status.value("network", "my").await.unwrap().value["status"],
             "offline"
         );
         assert!(
             services
                 .status
                 .value("service", "start_at")
+                .await
                 .unwrap()
                 .value
                 .as_u64()
@@ -241,9 +242,15 @@ mod tests {
                 }))
                 .unwrap(),
             )
+            .await
             .unwrap();
         assert_eq!(
-            services.status.value("emacs", "runtime").unwrap().value,
+            services
+                .status
+                .value("emacs", "runtime")
+                .await
+                .unwrap()
+                .value,
             runtime
         );
 
@@ -262,6 +269,12 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["value"], runtime);
-        assert!(Services::build().status.value("emacs", "runtime").is_err());
+        assert!(
+            Services::build()
+                .status
+                .value("emacs", "runtime")
+                .await
+                .is_err()
+        );
     }
 }

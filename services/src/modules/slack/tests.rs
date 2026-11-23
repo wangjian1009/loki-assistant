@@ -41,8 +41,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct OpenSlackRunner {
     deliveries: Mutex<Vec<Value>>,
     emacs_exited: AtomicBool,
@@ -68,18 +67,26 @@ impl crate::modules::emacs::service::CommandRunner for OpenSlackRunner {
             };
             let script = decode_string(args[3].split_once("((source ").unwrap().1);
             assert!(script.contains("loki-assistant-dispatch"));
-            if let Some((_, argument)) = script.split_once("(loki-assistant-dispatch-slack-messages ") {
+            if let Some((_, argument)) =
+                script.split_once("(loki-assistant-dispatch-slack-messages ")
+            {
                 use std::os::unix::fs::PermissionsExt;
                 let file = decode_string(argument);
-                assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(
+                    fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
                 let payload = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
                 self.deliveries.lock().unwrap().push(payload);
                 let exited = self.emacs_exited.load(Ordering::SeqCst);
                 return Ok(crate::modules::emacs::service::CommandOutput {
                     success: !exited,
                     status: Some(if exited { 1 } else { 0 }),
-                    stdout: if exited { String::new() }
-                        else { json!(json!({"result":"applied"}).to_string()).to_string() },
+                    stdout: if exited {
+                        String::new()
+                    } else {
+                        json!(json!({"result":"applied"}).to_string()).to_string()
+                    },
                     stderr: String::new(),
                 });
             }
@@ -210,6 +217,7 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
     let root = Message::from_slack(
         &json!({
             "ts":"10.000001", "text":"UTF-8 文本\n引号\"与反斜杠\\",
+            "user":"UYOU", "user_profile":{"display_name":"消息里的旧名字"},
             "blocks":[
                 alert_section("&gt;组一 *IP绑定不通*\n&gt;已持续0.4小时"),
                 {"type":"unsupported"},
@@ -280,6 +288,28 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
     let root_path = room_path.join("messages/10.000001.txt");
     let reply_path = room_path.join("threads/10.000001/11.000002.txt");
     let stale_path = room_path.join("messages/1.000003.txt");
+    assert_eq!(
+        serde_json::to_value(saved).unwrap()["author"],
+        json!({"id":"UYOU"})
+    );
+    let stored = fs::read_to_string(&root_path).unwrap();
+    assert!(stored.contains("(id . \"UYOU\")"));
+    assert!(!stored.contains("消息里的旧名字"));
+    let legacy = stored.replace(
+        "(id . \"UYOU\")",
+        "(id . \"UYOU\") (name . \"消息里的旧名字\")",
+    );
+    fs::write(&root_path, legacy).unwrap();
+    let modified = fs::metadata(&root_path).unwrap().modified().unwrap();
+    assert_eq!(
+        serde_json::to_value(cache.message("CROOM", None, &root.ts).unwrap()).unwrap()["author"],
+        json!({"id":"UYOU"})
+    );
+    assert_eq!(fs::read_to_string(&root_path).unwrap(), stored);
+    assert_eq!(
+        fs::metadata(&root_path).unwrap().modified().unwrap(),
+        modified
+    );
     let expire = |path: &std::path::Path| {
         fs::File::options()
             .write(true)
@@ -288,15 +318,32 @@ fn disk_cache_retains_active_threads_and_restores_message_records() {
             .set_modified(SystemTime::now() - Duration::from_secs(2 * 86_400))
             .unwrap();
     };
+    let other_team = DiskCache::open(&directory.0, "TOTHER", "UME").unwrap();
+    other_team.save_message("CROOM", &stale);
+    let other_path = directory
+        .0
+        .join("TOTHER/conversations/CROOM/messages/1.000003.txt");
+    expire(&other_path);
     expire(&root_path);
     expire(&stale_path);
     expire(&path);
-    DiskCache::clean(&directory.0, Duration::from_secs(86_400));
+    DiskCache::clean_team(
+        &directory.0,
+        "TTEAM",
+        Duration::from_secs(86_400),
+        &Default::default(),
+    );
     assert!(root_path.is_file() && reply_path.is_file());
     assert!(!stale_path.exists() && !path.exists());
+    assert!(other_path.is_file());
 
     expire(&reply_path);
-    DiskCache::clean(&directory.0, Duration::from_secs(86_400));
+    DiskCache::clean_team(
+        &directory.0,
+        "TTEAM",
+        Duration::from_secs(86_400),
+        &Default::default(),
+    );
     assert!(!root_path.exists() && !reply_path.exists());
     assert!(cache.room_path("CROOM").is_file());
     let rooms = cache.rooms();
@@ -347,7 +394,7 @@ async fn invoke(
     (parts.status, parts.headers, value)
 }
 
-async fn ready_service(projects: &Projects, team: &str) -> Arc<super::service::SlackService> {
+async fn ready_service(projects: &Projects, team: &str) -> Arc<super::team::Team> {
     timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(service) = projects.service(team).await
@@ -395,7 +442,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         misplaced_reply: AtomicBool::default(),
         history_unavailable: AtomicBool::default(),
     });
-    let media = get(|axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap| async move {
+    let media = get(
+        |axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap| async move {
             if name == "preview.png" {
                 assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
             } else {
@@ -406,7 +454,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 .write_to(&mut png, image::ImageFormat::Png)
                 .unwrap();
             ([("content-type", "image/png")], png.into_inner())
-        });
+        },
+    );
     let interrupt_download = Arc::new(tokio::sync::Notify::new());
     let server_interrupt = interrupt_download.clone();
     let replace_original = Arc::new(AtomicBool::default());
@@ -707,8 +756,14 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await
     .unwrap();
     assert_eq!(alerts.attempts.lock().unwrap().len(), 1);
-    assert_eq!(alerts.attempts.lock().unwrap()[0].app.as_deref(), Some("slack"));
-    let navigation = alerts.attempts.lock().unwrap()[0].navigation_url.clone().unwrap();
+    assert_eq!(
+        alerts.attempts.lock().unwrap()[0].app.as_deref(),
+        Some("slack")
+    );
+    let navigation = alerts.attempts.lock().unwrap()[0]
+        .navigation_url
+        .clone()
+        .unwrap();
     let navigation = url::Url::parse(&navigation).unwrap();
     let (_, callback) = navigation
         .query_pairs()
@@ -759,7 +814,10 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(conversations[0]["unread_count"], 2);
     assert_eq!(
         conversations[0]["callback"],
-        format!("/slack/conversations/TTEAM.DDIRECT/open?message_ts={}&thread_ts={}", mock.reply, mock.root)
+        format!(
+            "/slack/conversations/TTEAM.DDIRECT/open?message_ts={}&thread_ts={}",
+            mock.reply, mock.root
+        )
     );
     assert_eq!(conversations[0]["team_name"], "工作区");
     assert_eq!(conversations[0]["session_id"], json!(session));
@@ -854,7 +912,15 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let cached_reply = mock.reply.clone();
     service
         .update_cache(session.unwrap(), move |cache, _| {
-            assert!(cache.conversations.get_mut("DDIRECT").unwrap().messages.remove(&cached_reply).is_some());
+            assert!(
+                cache
+                    .conversations
+                    .get_mut("DDIRECT")
+                    .unwrap()
+                    .messages
+                    .remove(&cached_reply)
+                    .is_some()
+            );
             Ok(())
         })
         .await
@@ -882,16 +948,24 @@ async fn socket_notifications_threads_and_idempotent_sends() {
 
     let subscription = Uuid::new_v4();
     let subscribe = format!("/slack/conversations/TTEAM.CWORK/subscriptions/{subscription}");
-    assert_eq!(invoke(&app, "PUT", &subscribe, None, None, None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invoke(&app, "PUT", &subscribe, None, None, None).await.0,
+        StatusCode::BAD_REQUEST
+    );
     let (code, _, created) = invoke(&app, "PUT", &subscribe, session, None, None).await;
     assert_eq!(code, StatusCode::CREATED);
     assert_eq!(created["subscription_id"], json!(subscription));
-    assert_eq!(invoke(&app, "PUT", &subscribe, session, None, None).await.0, StatusCode::OK);
+    assert_eq!(
+        invoke(&app, "PUT", &subscribe, session, None, None).await.0,
+        StatusCode::OK
+    );
     timeout(Duration::from_secs(3), async {
         while emacs.deliveries.lock().unwrap().is_empty() {
             sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(emacs.deliveries.lock().unwrap()[0]["kind"], "snapshot");
     assert_eq!(emacs.deliveries.lock().unwrap()[0]["sequence"], 1);
     assert_eq!(
@@ -925,7 +999,9 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             }
             sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     let delivered = emacs.deliveries.lock().unwrap();
     let first = delivered
         .iter()
@@ -950,6 +1026,58 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert!(icon.starts_with(directory.0.join("cache/TTEAM/icons")) && icon.is_file());
     assert!(first.get("icon_url").is_none());
     drop(delivered);
+
+    let message_path = directory.0.join(format!(
+        "cache/TTEAM/conversations/CWORK/messages/{}.txt",
+        mock.root
+    ));
+    let stored = fs::read(&message_path).unwrap();
+    watch_events
+        .send(json!({"type":"user_change","user":{
+            "id":"UYOU","real_name":"林舟新名","profile":{"display_name":"林舟新名"}
+        }}))
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if emacs.deliveries.lock().unwrap().iter().any(|batch| {
+                batch["kind"] == "changes"
+                    && batch["items"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["ts"] == mock.root
+                                && item["author"]["id"] == "TTEAM.UYOU"
+                                && item["author"]["name"] == "林舟新名"
+                        })
+                    })
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fs::read(&message_path).unwrap(), stored);
+    let (_, _, profile) = invoke(&app, "GET", "/slack/users/TTEAM.UYOU", None, None, None).await;
+    assert_eq!(profile["user"]["name"], "林舟新名");
+    watch_events
+        .send(json!({"type":"user_change","user":{
+            "id":"UYOU","real_name":"林舟","profile":{
+                "image_48":"https://avatars.slack-edge.com/media/user.png"
+            }
+        }}))
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, _, profile) =
+                invoke(&app, "GET", "/slack/users/TTEAM.UYOU", None, None, None).await;
+            if profile["user"]["name"] == "林舟" {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 
     let original_path = format!(
         "/slack/conversations/TTEAM.CWORK/messages/{}/attachments/0/original",
@@ -1011,13 +1139,30 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
     timeout(Duration::from_secs(3), async {
-        while service.state.lock().await.cache.subscriptions.contains_key(&("CWORK".into(), subscription)) {
+        while service
+            .state
+            .call(move |state| {
+                state
+                    .cache
+                    .subscriptions
+                    .contains_key(&("CWORK".into(), subscription))
+            })
+            .await
+        {
             sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     tokio::time::resume();
-    assert_eq!(emacs.deliveries.lock().unwrap().last().unwrap()["kind"], "probe");
-    assert_eq!(invoke(&app, "DELETE", &subscribe, None, None, None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        emacs.deliveries.lock().unwrap().last().unwrap()["kind"],
+        "probe"
+    );
+    assert_eq!(
+        invoke(&app, "DELETE", &subscribe, None, None, None).await.0,
+        StatusCode::NO_CONTENT
+    );
 
     let channel = timeout(Duration::from_secs(3), async {
         loop {
@@ -1123,10 +1268,19 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .unwrap();
     assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
     {
-        let state = service.state.lock().await;
-        let room = &state.cache.conversations["DDIRECT"];
-        let message = &room.messages[&mock.sent];
-        assert_eq!(message.author.as_ref().unwrap().id, "UME");
+        let sent = mock.sent.clone();
+        let author = service
+            .state
+            .call(move |state| {
+                state.cache.conversations["DDIRECT"].messages[&sent]
+                    .author
+                    .as_ref()
+                    .unwrap()
+                    .id
+                    .clone()
+            })
+            .await;
+        assert_eq!(author, "UME");
     }
     assert_eq!(alerts.attempts.lock().unwrap().len(), 2);
     assert_eq!(
@@ -1144,8 +1298,15 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     );
     mock.misplaced_reply.store(true, Ordering::SeqCst);
     let misplaced_key = Some(Uuid::new_v4());
-    let (status, headers, _) =
-        invoke(&app, "POST", &thread, session, misplaced_key, Some(body.clone())).await;
+    let (status, headers, _) = invoke(
+        &app,
+        "POST",
+        &thread,
+        session,
+        misplaced_key,
+        Some(body.clone()),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let location = headers["location"].to_str().unwrap();
     let receipt = timeout(Duration::from_secs(3), async {
@@ -1313,20 +1474,25 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     .await
     .unwrap();
     watch_events
-        .send(json!({"type":"message","subtype":"message_changed","channel":"CWORK",
-                     "message":{"ts":retry_ts,"user":"UYOU","text":"告警已更新"}}))
+        .send(
+            json!({"type":"message","subtype":"message_changed","channel":"CWORK",
+                     "message":{"ts":retry_ts,"user":"UYOU","text":"告警已更新"}}),
+        )
         .unwrap();
     timeout(Duration::from_secs(3), async {
         loop {
+            let retry_ts = retry_ts.clone();
             if service
                 .state
-                .lock()
+                .call(move |state| {
+                    state
+                        .cache
+                        .conversations
+                        .get("CWORK")
+                        .and_then(|room| room.messages.get(&retry_ts))
+                        .is_some_and(|message| message.text == "告警已更新")
+                })
                 .await
-                .cache
-                .conversations
-                .get("CWORK")
-                .and_then(|room| room.messages.get(&retry_ts))
-                .is_some_and(|message| message.text == "告警已更新")
             {
                 break;
             }
@@ -1387,12 +1553,25 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(code, StatusCode::OK);
     // 顶层已读后，尚未阅读的线程仍列在托盘中。
     let unread = read_status().await;
-    let channel = unread.as_array().unwrap().iter().find(|row| row["id"] == "TTEAM.CWORK").unwrap();
-    assert!(channel["callback"].as_str().unwrap().contains("&thread_ts="));
+    let channel = unread
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "TTEAM.CWORK")
+        .unwrap();
+    assert!(
+        channel["callback"]
+            .as_str()
+            .unwrap()
+            .contains("&thread_ts=")
+    );
     let (code, _, _) = invoke(
         &app,
         "PUT",
-        &format!("/slack/conversations/TTEAM.CWORK/threads/{}/read-position", mock.root),
+        &format!(
+            "/slack/conversations/TTEAM.CWORK/threads/{}/read-position",
+            mock.root
+        ),
         session,
         None,
         Some(json!({"through_ts":mock.reply})),
@@ -1401,23 +1580,45 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(code, StatusCode::OK);
     // 另一条线程仍有未读消息，推进对应线程的已读位置后移除。
     let unread = read_status().await;
-    let channel = unread.as_array().unwrap().iter().find(|row| row["id"] == "TTEAM.CWORK").unwrap();
-    assert_eq!(channel["callback"], format!("/slack/conversations/TTEAM.CWORK/open?message_ts={reply}&thread_ts=1.0"));
+    let channel = unread
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "TTEAM.CWORK")
+        .unwrap();
+    assert_eq!(
+        channel["callback"],
+        format!("/slack/conversations/TTEAM.CWORK/open?message_ts={reply}&thread_ts=1.0")
+    );
     let (code, _, _) = invoke(
-        &app, "PUT", "/slack/conversations/TTEAM.CWORK/threads/1.0/read-position",
-        session, None, Some(json!({"through_ts":reply})),
-    ).await;
+        &app,
+        "PUT",
+        "/slack/conversations/TTEAM.CWORK/threads/1.0/read-position",
+        session,
+        None,
+        Some(json!({"through_ts":reply})),
+    )
+    .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(read_status().await, json!([]));
     let cached_unread = format!("{now}.400000");
     let saved = cached_unread.clone();
-    service.update_cache(session.unwrap(), move |cache, _| {
-        let message = super::protocol::Message::from_slack(
-            &json!({"ts":saved,"text":"历史普通消息","user":"UYOU"}), None
-        ).unwrap();
-        cache.conversations.get_mut("CWORK").unwrap().ingest(message);
-        Ok(())
-    }).await.unwrap();
+    service
+        .update_cache(session.unwrap(), move |cache, _| {
+            let message = super::protocol::Message::from_slack(
+                &json!({"ts":saved,"text":"历史普通消息","user":"UYOU"}),
+                None,
+            )
+            .unwrap();
+            cache
+                .conversations
+                .get_mut("CWORK")
+                .unwrap()
+                .ingest(message);
+            Ok(())
+        })
+        .await
+        .unwrap();
     assert_eq!(read_status().await[0]["unread_count"], 1);
     projects.stop().await;
     worker.await.unwrap();
@@ -1427,11 +1628,22 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let service = ready_service(&projects, "TTEAM").await;
     let fresh_session = service.session_id().await;
     assert_ne!(fresh_session, session);
-    let unread_after_restart = invoke(&app, "GET", "/status/slack/new_conversations", None, None, None).await.2;
+    let unread_after_restart = invoke(
+        &app,
+        "GET",
+        "/status/slack/new_conversations",
+        None,
+        None,
+        None,
+    )
+    .await
+    .2;
     assert_eq!(unread_after_restart["value"][0]["id"], "TTEAM.CWORK");
     assert_eq!(unread_after_restart["value"][0]["unread_count"], 1);
-    assert_eq!(unread_after_restart["value"][0]["callback"],
-        format!("/slack/conversations/TTEAM.CWORK/open?message_ts={cached_unread}"));
+    assert_eq!(
+        unread_after_restart["value"][0]["callback"],
+        format!("/slack/conversations/TTEAM.CWORK/open?message_ts={cached_unread}")
+    );
 
     let (status, _, error) = invoke(&app, "GET", &download_path, fresh_session, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1461,25 +1673,35 @@ async fn socket_notifications_threads_and_idempotent_sends() {
 
     fs::remove_file(&cached_original).unwrap();
     let (_, _, created) = invoke(&app, "POST", &original_path, fresh_session, None, None).await;
-    let download = format!("/slack/downloads/{}", created["download_id"].as_str().unwrap());
+    let download = format!(
+        "/slack/downloads/{}",
+        created["download_id"].as_str().unwrap()
+    );
     wait_download(&app, &download, fresh_session, "downloading").await;
     interrupt_download.notify_one();
     wait_download(&app, &download, fresh_session, "failed").await;
     replace_original.store(true, Ordering::SeqCst);
     let (_, _, retried) = invoke(&app, "POST", &original_path, fresh_session, None, None).await;
-    let retried = format!("/slack/downloads/{}", retried["download_id"].as_str().unwrap());
+    let retried = format!(
+        "/slack/downloads/{}",
+        retried["download_id"].as_str().unwrap()
+    );
     wait_download(&app, &retried, fresh_session, "completed").await;
     assert_eq!(fs::read(&cached_original).unwrap(), b"ijklmnop");
 
     let recovered = Uuid::new_v4();
     let recovered_path = format!("/slack/conversations/TTEAM.DDIRECT/subscriptions/{recovered}");
     assert_eq!(
-        invoke(&app, "PUT", &recovered_path, session, None, None).await.0,
+        invoke(&app, "PUT", &recovered_path, session, None, None)
+            .await
+            .0,
         StatusCode::CONFLICT
     );
     emacs.emacs_exited.store(false, Ordering::SeqCst);
     assert_eq!(
-        invoke(&app, "PUT", &recovered_path, fresh_session, None, None).await.0,
+        invoke(&app, "PUT", &recovered_path, fresh_session, None, None)
+            .await
+            .0,
         StatusCode::CREATED
     );
     timeout(Duration::from_secs(3), async {
@@ -1500,12 +1722,21 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             }
             sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(
-        invoke(&app, "DELETE", &recovered_path, None, None, None).await.0,
+        invoke(&app, "DELETE", &recovered_path, None, None, None)
+            .await
+            .0,
         StatusCode::NO_CONTENT
     );
-    assert!(service.state.lock().await.cache.subscriptions.is_empty());
+    assert!(
+        service
+            .state
+            .call(|state| state.cache.subscriptions.is_empty())
+            .await
+    );
     let (code, _, restored) = invoke(&app, "GET", timeline, fresh_session, None, None).await;
     assert_eq!(code, StatusCode::OK, "{restored}");
     assert_eq!(restored["sync_state"], "cached");
@@ -2271,7 +2502,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     }
     timeout(Duration::from_secs(4), async {
         loop {
-            let connections = status.value("slack", "connections").unwrap().value;
+            let connections = status.value("slack", "connections").await.unwrap().value;
             if connections
                 .as_array()
                 .unwrap()
@@ -2298,7 +2529,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     .await;
     assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
     assert_eq!(invalid.2["error"]["code"], "invalid-config");
-    let public = status.value("slack", "connections").unwrap().value;
+    let public = status.value("slack", "connections").await.unwrap().value;
     assert_eq!(public[0]["team_id"], "TALPHA");
     assert_eq!(public[1]["team_id"], "TBETA");
     assert_eq!(public[0]["user_id"], "TALPHA.U1");
@@ -2362,40 +2593,125 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert!(users.get("next_cursor").is_none());
 
     let nickname_path = "/slack/users/TALPHA.U2/nickname";
-    for malformed in [json!({}), json!({"nickname":42}), json!({"nickname":"两行\n名字"})] {
-        let status = invoke(&app, "PUT", nickname_path, None, None, Some(malformed)).await.0;
+    for malformed in [
+        json!({}),
+        json!({"nickname":42}),
+        json!({"nickname":"两行\n名字"}),
+    ] {
+        let status = invoke(&app, "PUT", nickname_path, None, None, Some(malformed))
+            .await
+            .0;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    let (code, _, set) = invoke(&app, "PUT", nickname_path, None, None,
-        Some(json!({"nickname":" 小林 "}))).await;
+    let (code, _, set) = invoke(
+        &app,
+        "PUT",
+        nickname_path,
+        None,
+        None,
+        Some(json!({"nickname":" 小林 "})),
+    )
+    .await;
     assert_eq!(code, StatusCode::OK, "{set}");
     assert_eq!(set["user"]["name"], "林舟");
     assert_eq!(set["user"]["nickname"], "小林");
-    let persisted = ConfigService::load(&config_path).unwrap().value("slack", "nicknames").await.unwrap();
-    assert_eq!(persisted.value, json!([{"id":"TALPHA.U2","nickname":"小林"}]));
-    let users = invoke(&app, "GET", "/slack/users?id=TALPHA.U2&id=TBETA.U2", None, None, None).await.2;
+    let persisted = ConfigService::load(&config_path)
+        .unwrap()
+        .value("slack", "nicknames")
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted.value,
+        json!([{"id":"TALPHA.U2","nickname":"小林"}])
+    );
+    let users = invoke(
+        &app,
+        "GET",
+        "/slack/users?id=TALPHA.U2&id=TBETA.U2",
+        None,
+        None,
+        None,
+    )
+    .await
+    .2;
     assert_eq!(users["items"][0]["nickname"], "小林");
     assert!(users["items"][1]["nickname"].is_null());
-    let timeline = invoke(&app, "GET", "/slack/conversations/TALPHA.DSHARED/messages", None, None, None).await.2;
+    for (path, profile) in [
+        ("/slack/users/TALPHA.U2", &users["items"][0]),
+        ("/slack/users/TBETA%2EU2", &users["items"][1]),
+    ] {
+        let (status, headers, detail) = invoke(&app, "GET", path, None, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(detail, json!({"api_version":"1", "user":profile}));
+    }
+    let timeline = invoke(
+        &app,
+        "GET",
+        "/slack/conversations/TALPHA.DSHARED/messages",
+        None,
+        None,
+        None,
+    )
+    .await
+    .2;
     assert_eq!(timeline["items"][0]["author"]["nickname"], "小林");
+    assert_eq!(timeline["nicknames"], json!({"TALPHA.U2":"小林"}));
+    let (_, _, nickname) = invoke(&app, "GET", nickname_path, None, None, None).await;
+    assert_eq!(nickname["nickname"], "小林");
     timeout(Duration::from_secs(3), async {
         loop {
-            let picker = invoke(&app, "GET", "/slack/conversations/picker", None, None, None).await.2;
-            if let Some(room) = picker["items"].as_array().unwrap().iter()
-                .find(|room| room["id"] == "TALPHA.DSHARED" && room["title"] == "小林") {
+            let picker = invoke(&app, "GET", "/slack/conversations/picker", None, None, None)
+                .await
+                .2;
+            if let Some(room) = picker["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|room| room["id"] == "TALPHA.DSHARED" && room["title"] == "小林")
+            {
                 assert_eq!(room["participants"][0]["nickname"], "小林");
                 assert_eq!(room["last_message"]["author_name"], "小林");
-                assert!(room["search_terms"].as_array().unwrap().iter().any(|term| term == "小林"));
+                assert!(
+                    room["search_terms"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|term| term == "小林")
+                );
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
-    let (code, _, cleared) = invoke(&app, "PUT", nickname_path, None, None,
-        Some(json!({"nickname":null}))).await;
+    })
+    .await
+    .unwrap();
+    let (code, _, cleared) = invoke(
+        &app,
+        "PUT",
+        nickname_path,
+        None,
+        None,
+        Some(json!({"nickname":null})),
+    )
+    .await;
     assert_eq!(code, StatusCode::OK);
     assert!(cleared["user"]["nickname"].is_null());
-
+    let config_nickname = "/data/slack/nicknames/TALPHA.U2";
+    let (code, _, _) = invoke(
+        &app,
+        "PUT",
+        config_nickname,
+        None,
+        None,
+        Some(json!({"nickname":"新昵称"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (_, _, nickname) = invoke(&app, "GET", nickname_path, None, None, None).await;
+    assert_eq!(nickname["nickname"], "新昵称");
+    let (code, _, _) = invoke(&app, "DELETE", config_nickname, None, None, None).await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
 
     for query in [
         "id=".to_owned(),
@@ -2476,6 +2792,22 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             ("Bearer xoxc-TBETA".into(), "UMISSING".into())
         ]
     );
+    for (path, status, error) in [
+        (
+            "/slack/users/U1",
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+        ),
+        (
+            "/slack/users/TBETA.UMISSING",
+            StatusCode::NOT_FOUND,
+            "slack-user-not-found",
+        ),
+    ] {
+        let (actual, _, detail) = invoke(&app, "GET", path, None, None, None).await;
+        assert_eq!(actual, status);
+        assert_eq!(detail["error"]["code"], error);
+    }
 
     let (_, _, first) = invoke(
         &app,
@@ -2996,10 +3328,16 @@ fn test_display_account() -> super::store::Account {
     super::store::Account {
         nicknames: Default::default(),
         identity: super::protocol::Identity {
-            session_id: Uuid::new_v4(), team_id: "TTEAM".into(),
-            user_id: "UME".into(), team_name: "工作区".into(),
+            session_id: Uuid::new_v4(),
+            team_id: "TTEAM".into(),
+            user_id: "UME".into(),
+            team_name: "工作区".into(),
         },
-        access: String::new(), web_session: true, baseline: 0, imported_token_hash: None, revoked: false,
+        access: String::new(),
+        web_session: true,
+        baseline: 0,
+        imported_token_hash: None,
+        revoked: false,
     }
 }
 
@@ -3009,24 +3347,34 @@ fn message_mentions_embed_user_directory_names_and_ids() {
 
     let profile = serde_json::from_value(json!({
         "id":"TTEAM.UYOU","team_id":"TTEAM","name":"林舟","is_bot":false
-    })).unwrap();
+    }))
+    .unwrap();
     let users = UserDirectory::from_disk(Uuid::new_v4(), vec![profile]);
-    let message = Message::from_slack(&json!({
-        "ts":"100.000001", "text":"交给 <@UYOU> 和 <@WOTHER|替补>，代码 `<@UCODE>`",
-        "blocks":[{"type":"section","fields":[
-            {"type":"mrkdwn","text":"复核 <@UYOU>"},
-            {"type":"plain_text","text":"<@ULITERAL>"}
-        ]}]
-    }), None).unwrap();
+    let message = Message::from_slack(
+        &json!({
+            "ts":"100.000001", "text":"交给 <@UYOU> 和 <@WOTHER|替补>，代码 `<@UCODE>`",
+            "blocks":[{"type":"section","fields":[
+                {"type":"mrkdwn","text":"复核 <@UYOU>"},
+                {"type":"plain_text","text":"<@ULITERAL>"}
+            ]}]
+        }),
+        None,
+    )
+    .unwrap();
     let account = test_display_account();
-    account.nicknames.write().unwrap().insert("TTEAM.UYOU".into(), "小林".into());
-    let result = Conversation::new("CWORK", "public_channel", "产品讨论")
-        .message_result(&message, &account, Some(&users));
+    let result = Conversation::new("CWORK", "public_channel", "产品讨论").message_result(
+        &message,
+        &account,
+        Some(&users),
+    );
     assert_eq!(result["text"], message.text);
-    assert_eq!(result["mentions"], json!([
-        {"id":"TTEAM.UYOU","name":"林舟","nickname":"小林"},
-        {"id":"TTEAM.WOTHER","name":"替补","nickname":null}
-    ]));
+    assert_eq!(
+        result["mentions"],
+        json!([
+            {"id":"TTEAM.UYOU","name":"林舟"},
+            {"id":"TTEAM.WOTHER","name":"替补"}
+        ])
+    );
 }
 
 #[test]
@@ -3066,7 +3414,7 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     ] {
         room.ingest(Message::from_slack(&message, None).unwrap());
     }
-    let (_, _, summary) = room.summarize(&account);
+    let (_, _, summary) = room.summarize(&account, None);
     assert_eq!(summary["participant_ids"], json!(["TTEAM.UYOU"]));
     assert_eq!(summary["unread_count"], 3);
     assert_eq!(summary["last_unread_mention_ts"], "103.0");
@@ -3083,7 +3431,7 @@ fn conversation_summary_tracks_unread_mentions_and_latest_reply() {
     room.read_positions
         .cursors
         .insert("101.0".into(), "104.0".into());
-    let (_, _, summary) = room.summarize(&account);
+    let (_, _, summary) = room.summarize(&account, None);
     assert_eq!(summary["last_unread_mention_ts"], "101.0");
 }
 

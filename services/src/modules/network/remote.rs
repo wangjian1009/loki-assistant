@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -78,11 +78,13 @@ pub(crate) async fn strip_device_headers(mut request: Request<Body>, next: Next)
     next.run(request).await
 }
 
+use crate::process::Process;
+
 pub(super) struct Gateway {
-    dispatcher: RwLock<Option<Arc<dyn RequestDispatcher>>>,
+    dispatcher: Process<Option<Arc<dyn RequestDispatcher>>>,
     policy: Router,
     total: Arc<Semaphore>,
-    peers: std::sync::Mutex<BTreeMap<EndpointId, Weak<Semaphore>>>,
+    peers: Process<BTreeMap<EndpointId, Weak<Semaphore>>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -135,22 +137,25 @@ impl Gateway {
             );
         }
         Self {
-            dispatcher: RwLock::new(None),
+            dispatcher: Process::start(None),
             policy,
             total: Arc::new(Semaphore::new(64)),
-            peers: Default::default(),
+            peers: Process::start(BTreeMap::new()),
         }
     }
 
-    fn peer_limit(&self, id: EndpointId) -> Arc<Semaphore> {
-        let mut peers = self.peers.lock().unwrap();
-        peers.retain(|_, limit| limit.strong_count() > 0);
-        if let Some(limit) = peers.get(&id).and_then(Weak::upgrade) {
-            return limit;
-        }
-        let limit = Arc::new(Semaphore::new(8));
-        peers.insert(id, Arc::downgrade(&limit));
-        limit
+    async fn peer_limit(&self, id: EndpointId) -> Arc<Semaphore> {
+        self.peers
+            .call(move |peers| {
+                peers.retain(|_, limit| limit.strong_count() > 0);
+                if let Some(limit) = peers.get(&id).and_then(Weak::upgrade) {
+                    return limit;
+                }
+                let limit = Arc::new(Semaphore::new(8));
+                peers.insert(id, Arc::downgrade(&limit));
+                limit
+            })
+            .await
     }
 }
 
@@ -185,7 +190,9 @@ struct WireRequest {
 impl NetworkService {
     /// 组合根注入只捕获 Weak 引用的分发器，避免服务实例形成循环持有。
     pub fn set_remote_dispatcher(&self, dispatcher: Arc<dyn RequestDispatcher>) {
-        *self.remote.dispatcher.write().unwrap() = Some(dispatcher);
+        self.remote
+            .dispatcher
+            .post(move |current| *current = Some(dispatcher));
     }
 
     pub(super) async fn handle_remote(
@@ -193,7 +200,7 @@ impl NetworkService {
         session: &Arc<dyn RelaySession>,
         connection: &Connection,
     ) {
-        let limit = self.remote.peer_limit(connection.remote_id());
+        let limit = self.remote.peer_limit(connection.remote_id()).await;
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -301,7 +308,11 @@ impl NetworkService {
         if authorized.status() != StatusCode::NO_CONTENT {
             return authorized;
         }
-        let dispatcher = self.remote.dispatcher.read().unwrap().clone();
+        let dispatcher = self
+            .remote
+            .dispatcher
+            .call(|dispatcher| dispatcher.clone())
+            .await;
         let Some(dispatcher) = dispatcher else {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,

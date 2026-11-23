@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
@@ -24,7 +27,7 @@ use crate::modules::config::service::{NotificationConfirmedFields, NotificationV
 use super::{
     projects::{Projects, RegistrationStatus},
     protocol::{Error, Page},
-    service::SlackService,
+    team::Team,
 };
 
 type Service = State<Arc<Projects>>;
@@ -162,7 +165,7 @@ fn session_header(headers: &HeaderMap) -> Result<Option<Uuid>, Error> {
         .transpose()
 }
 
-async fn session(headers: &HeaderMap, service: &SlackService) -> Result<Uuid, Error> {
+async fn session(headers: &HeaderMap, service: &Team) -> Result<Uuid, Error> {
     match session_header(headers)? {
         Some(session) => Ok(session),
         None => service.session_id().await.ok_or(Error::Session),
@@ -326,10 +329,7 @@ async fn set_watch(
     .map_err(|_| Error::WatchStorage)?
 }
 
-async fn scoped(
-    projects: &Projects,
-    scope: Params<Scope>,
-) -> Result<(String, Arc<SlackService>), Error> {
+async fn scoped(projects: &Projects, scope: Params<Scope>) -> Result<(String, Arc<Team>), Error> {
     let Scope { team_id } = scope.map_err(|_| Error::Invalid)?.0;
     validate_team_id(&team_id)?;
     let service = projects.service(&team_id).await?;
@@ -339,7 +339,7 @@ async fn scoped(
 async fn conversation(
     projects: &Projects,
     composite_id: String,
-) -> Result<(String, String, Arc<SlackService>), Error> {
+) -> Result<(String, String, Arc<Team>), Error> {
     let (team_id, id) = split_id(&composite_id)?;
     let service = projects.service(team_id).await?;
     Ok((team_id.to_owned(), id.to_owned(), service))
@@ -357,12 +357,37 @@ fn identified(mut value: Value, team_id: &str) -> Value {
     value
 }
 
-pub(super) fn messages_result(mut value: Value, team_id: &str) -> Value {
-    fn qualify_author(message: &mut Value, team_id: &str) {
+pub(super) fn add_message_nicknames(
+    message: &mut Value,
+    nicknames: &std::collections::BTreeMap<String, String>,
+    team: &str,
+) {
+    if let Some(author) = message
+        .get_mut("author")
+        .filter(|author| author.is_object())
+        && let Some(id) = author["id"].as_str()
+    {
+        let qualified = format!("{team}.{id}");
+        author["nickname"] = json!(nicknames.get(&qualified));
+    }
+    if let Some(mentions) = message.get_mut("mentions").and_then(Value::as_array_mut) {
+        for mention in mentions {
+            mention["nickname"] = json!(mention["id"].as_str().and_then(|id| nicknames.get(id)));
+        }
+    }
+}
+
+pub(super) fn messages_result(
+    mut value: Value,
+    team_id: &str,
+    nicknames: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    let decorate = |message: &mut Value| {
+        add_message_nicknames(message, nicknames, team_id);
         if let Some(id) = message["author"]["id"].as_str() {
             message["author"]["id"] = json!(format!("{team_id}.{id}"));
         }
-    }
+    };
 
     for key in ["items", "thread_items"] {
         for message in value
@@ -371,13 +396,24 @@ pub(super) fn messages_result(mut value: Value, team_id: &str) -> Value {
             .into_iter()
             .flatten()
         {
-            qualify_author(message, team_id);
+            decorate(message);
         }
     }
     if let Some(root) = value.get_mut("root") {
-        qualify_author(root, team_id);
+        decorate(root);
     }
     conversation_result(value, team_id)
+}
+
+async fn http_messages_result(
+    projects: &Projects,
+    value: Value,
+    team: &str,
+) -> Result<Value, Error> {
+    let nicknames = projects.team_nicknames(team).await?;
+    let mut result = messages_result(value, team, &nicknames);
+    result["nicknames"] = json!(nicknames);
+    Ok(result)
 }
 
 #[loki_api(
@@ -402,9 +438,15 @@ async fn subscribe_messages(
         return Err(Error::Invalid);
     }
     let (_, room, service) = conversation(&projects, id.clone()).await?;
-    let created = service.subscribe_messages(session, room, subscription).await?;
+    let created = service
+        .subscribe_messages(session, room, subscription)
+        .await?;
     Ok((
-        if created { StatusCode::CREATED } else { StatusCode::OK },
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
         Json(json!({"api_version":"1", "subscription_id":subscription,
             "conversation_id":id, "session_id":session})),
     ))
@@ -431,8 +473,12 @@ async fn unsubscribe_messages(
         return Err(Error::Invalid);
     }
     match projects.service(team).await {
-        Ok(service) => service.unsubscribe_messages(room.to_owned(), subscription).await,
-        Err(Error::Project) => {},
+        Ok(service) => {
+            service
+                .unsubscribe_messages(room.to_owned(), subscription)
+                .await
+        }
+        Err(Error::Project) => {}
         Err(error) => return Err(error),
     }
     Ok(StatusCode::NO_CONTENT)
@@ -551,17 +597,69 @@ async fn users(State(projects): Service, uri: Uri) -> Result<Json<Value>, Error>
         }
         ids.push(value);
     }
-    if ids.is_empty() {
-        return projects.users().await.map(Json);
+    let mut result = if ids.is_empty() {
+        projects.users().await?
+    } else {
+        let mut seen = BTreeSet::new();
+        let users = ids
+            .iter()
+            .map(|id| id.as_ref())
+            .filter(|id| seen.insert(*id))
+            .map(|id| split_id(id).map(|(team, user)| (team.to_owned(), user.to_owned())))
+            .collect::<Result<Vec<_>, _>>()?;
+        projects.lookup_users(users).await
+    };
+    let nicknames = projects.nicknames().await?;
+    if let Some(items) = result["items"].as_array_mut() {
+        for item in items {
+            add_user_nickname(item, &nicknames);
+        }
     }
-    let mut seen = BTreeSet::new();
-    let users = ids
-        .iter()
-        .map(|id| id.as_ref())
-        .filter(|id| seen.insert(*id))
-        .map(|id| split_id(id).map(|(team, user)| (team.to_owned(), user.to_owned())))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(projects.lookup_users(users).await))
+    Ok(Json(result))
+}
+
+fn add_user_nickname(profile: &mut Value, nicknames: &BTreeMap<String, String>) {
+    profile["nickname"] = json!(profile["id"].as_str().and_then(|id| nicknames.get(id)));
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "user",
+    method = "GET",
+    path = "/slack/users/{id}",
+    summary = "读取单个 Slack 用户的完整资料",
+    description = "按复合用户 ID 查询资料，并合并本机配置中的昵称。"
+)]
+async fn user(State(projects): Service, id: Segment<String>) -> Result<Json<Value>, Error> {
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    let (team, id) = split_id(&id)?;
+    let mut profile = projects.lookup_user(team, id).await?;
+    add_user_nickname(&mut profile, &projects.nicknames().await?);
+    Ok(Json(json!({"api_version":"1", "user":profile})))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "user-nickname",
+    method = "GET",
+    path = "/slack/users/{id}/nickname",
+    summary = "查询本机 Slack 用户昵称",
+    description = "通过复合用户 ID 查询配置中的昵称。未设置时返回 null。"
+)]
+async fn user_nickname(
+    State(projects): Service,
+    id: Segment<String>,
+) -> Result<Json<Value>, Error> {
+    let Path(id) = id.map_err(|_| Error::Invalid)?;
+    split_id(&id)?;
+    let nicknames = projects.nicknames().await?;
+    Ok(Json(
+        json!({"api_version":"1", "id":id, "nickname":nicknames.get(&id)}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -599,7 +697,9 @@ async fn set_user_nickname(
     // 配置落盘后仍须刷新本机显示，即使请求方提前断开。
     tokio::spawn(async move {
         let (team, user) = split_id(&id)?;
-        let profile = projects.set_nickname(team, user, nickname.as_deref(), session).await?;
+        let profile = projects
+            .set_nickname(team, user, nickname.as_deref(), session)
+            .await?;
         Ok(Json(json!({"api_version":"1","user":profile})))
     })
     .await
@@ -689,13 +789,13 @@ async fn open_conversation(
         return Err(Error::Invalid.into_response());
     }
     let Path(id) = id.map_err(|_| Error::Invalid.into_response())?;
-    let (_, raw_id, service) = conversation(&projects, id.clone())
+    let (team, raw_id, service) = conversation(&projects, id.clone())
         .await
         .map_err(IntoResponse::into_response)?;
     let session = session(&headers, &service)
         .await
         .map_err(IntoResponse::into_response)?;
-    let target = service
+    let mut target = service
         .open_target(
             session,
             &raw_id,
@@ -704,6 +804,15 @@ async fn open_conversation(
         )
         .await
         .map_err(IntoResponse::into_response)?;
+    let nicknames = projects
+        .team_nicknames(&team)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    for key in ["root", "reply"] {
+        if let Some(message) = target.get_mut(key) {
+            add_message_nicknames(message, &nicknames, &team);
+        }
+    }
     let target = projects
         .emacs
         .open_slack_conversation(&target)
@@ -735,10 +844,10 @@ async fn timeline(
     let session = session(&headers, &service).await?;
     let value = service.messages(session, id.clone(), None, page).await?;
     let roots = super::subscriptions::thread_roots(&value);
-    if !roots.is_empty() && service.has_message_subscribers(&id).await {
-        tokio::spawn(async move { service.refresh_threads(session, &id, roots).await });
-    }
-    Ok(Json(messages_result(value, &team_id)))
+    service.refresh_subscribed_threads(session, id, roots).await;
+    Ok(Json(
+        http_messages_result(&projects, value, &team_id).await?,
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -824,10 +933,10 @@ async fn download_attachment_original(
     if super::protocol::timestamp(&ts).is_none() {
         return Err(Error::Invalid);
     }
-    let (team, id, service) = conversation(&projects, id).await?;
+    let (_, id, service) = conversation(&projects, id).await?;
     let session = session(&headers, &service).await?;
     let (download_id, cached) = projects
-        .start_download(&team, service, session, &id, &ts, index)
+        .start_download(service, session, &id, &ts, index)
         .await?;
     let status = if cached {
         StatusCode::OK
@@ -924,10 +1033,12 @@ async fn thread(
     let (id, thread) = path.map_err(|_| Error::Invalid)?.0;
     let (team_id, id, service) = conversation(&projects, id).await?;
     let page = query.map_err(|_| Error::Invalid)?.0.into();
-    service
+    let value = service
         .messages(session(&headers, &service).await?, id, Some(thread), page)
-        .await
-        .map(|value| Json(messages_result(value, &team_id)))
+        .await?;
+    Ok(Json(
+        http_messages_result(&projects, value, &team_id).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1000,7 +1111,7 @@ struct Text {
 }
 
 async fn submit(
-    service: Arc<SlackService>,
+    service: Arc<Team>,
     team_id: &str,
     headers: HeaderMap,
     id: String,

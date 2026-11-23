@@ -174,6 +174,10 @@ pub enum PasswordError {
 
 #[derive(Debug)]
 pub struct PasswordService {
+    process: crate::process::Process<Store>,
+}
+
+struct Store {
     environment: Option<PasswordEnvironment>,
     runner: Arc<dyn CommandRunner>,
     timeout: Duration,
@@ -194,17 +198,19 @@ impl PasswordService {
         timeout: Duration,
     ) -> Self {
         Self {
-            environment,
-            runner,
-            timeout,
+            process: crate::process::Process::start(Store {
+                environment,
+                runner,
+                timeout,
+            }),
         }
     }
 
     pub(crate) async fn save(&self, file: &str, secret: &str) -> Result<(), PasswordError> {
-        if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control) {
-            return Err(PasswordError::InvalidRequest);
-        }
-        self.write_entry(file, secret).await
+        let (file, secret) = (file.to_owned(), secret.to_owned());
+        self.process
+            .with(move |store| Box::pin(async move { store.save(&file, &secret).await }))
+            .await
     }
 
     pub(crate) async fn save_multiline(
@@ -212,6 +218,62 @@ impl PasswordService {
         file: &str,
         contents: &str,
     ) -> Result<(), PasswordError> {
+        let (file, contents) = (file.to_owned(), contents.to_owned());
+        self.process
+            .with(move |store| {
+                Box::pin(async move { store.save_multiline(&file, &contents).await })
+            })
+            .await
+    }
+
+    pub(crate) async fn remove(&self, file: &str) -> Result<(), PasswordError> {
+        let file = file.to_owned();
+        self.process
+            .with(move |store| Box::pin(async move { store.remove(&file).await }))
+            .await
+    }
+
+    pub async fn entries(&self, query: &str) -> Result<Vec<String>, PasswordError> {
+        let query = query.to_owned();
+        self.process
+            .with(move |store| Box::pin(async move { store.entries(&query).await }))
+            .await
+    }
+
+    pub async fn fetch(&self, file: &str) -> Result<String, PasswordError> {
+        self.fetch_entry(file, false).await
+    }
+
+    pub(super) async fn fetch_public(&self, file: &str) -> Result<String, PasswordError> {
+        self.fetch_entry(file, true).await
+    }
+
+    async fn fetch_entry(&self, file: &str, public: bool) -> Result<String, PasswordError> {
+        let file = file.to_owned();
+        self.process
+            .with(move |store| Box::pin(async move { store.fetch_entry(&file, public).await }))
+            .await
+    }
+
+    pub(crate) async fn missing_entries(
+        &self,
+        paths: HashSet<String>,
+    ) -> Result<HashSet<String>, PasswordError> {
+        self.process
+            .with(move |store| Box::pin(async move { store.missing_entries(paths).await }))
+            .await
+    }
+}
+
+impl Store {
+    async fn save(&self, file: &str, secret: &str) -> Result<(), PasswordError> {
+        if secret.is_empty() || secret.len() > 4096 || secret.chars().any(char::is_control) {
+            return Err(PasswordError::InvalidRequest);
+        }
+        self.write_entry(file, secret).await
+    }
+
+    async fn save_multiline(&self, file: &str, contents: &str) -> Result<(), PasswordError> {
         if contents.is_empty()
             || contents.len() > 16 * 1024
             || contents.chars().any(|ch| ch.is_control() && ch != '\n')
@@ -321,7 +383,7 @@ impl PasswordService {
         Ok(recipients)
     }
 
-    pub(crate) async fn remove(&self, file: &str) -> Result<(), PasswordError> {
+    async fn remove(&self, file: &str) -> Result<(), PasswordError> {
         validate_file(file)?;
         let store = self.store().await?;
         let file = file.to_owned();
@@ -379,7 +441,7 @@ impl PasswordService {
         Ok(output.stdout)
     }
 
-    pub async fn entries(&self, query: &str) -> Result<Vec<String>, PasswordError> {
+    async fn entries(&self, query: &str) -> Result<Vec<String>, PasswordError> {
         if query.chars().any(char::is_control) {
             return Err(PasswordError::InvalidRequest);
         }
@@ -388,14 +450,6 @@ impl PasswordService {
         tokio::task::spawn_blocking(move || list_files(&store, &query))
             .await
             .map_err(|_| PasswordError::StoreUnavailable)?
-    }
-
-    pub async fn fetch(&self, file: &str) -> Result<String, PasswordError> {
-        self.fetch_entry(file, false).await
-    }
-
-    pub(super) async fn fetch_public(&self, file: &str) -> Result<String, PasswordError> {
-        self.fetch_entry(file, true).await
     }
 
     async fn fetch_entry(&self, file: &str, public: bool) -> Result<String, PasswordError> {
@@ -429,7 +483,7 @@ impl PasswordService {
         String::from_utf8(output).map_err(|_| PasswordError::InvalidOutput)
     }
 
-    pub(crate) async fn missing_entries(
+    async fn missing_entries(
         &self,
         paths: HashSet<String>,
     ) -> Result<HashSet<String>, PasswordError> {

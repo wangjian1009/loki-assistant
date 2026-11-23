@@ -6,7 +6,7 @@
 
 当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块、只读密码查询、Emacs gateway 与浏览器全文捕获。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送、全文捕获和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
-`modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
+`modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；入口发出初始化请求，失败不影响本机 HTTP。中转设置、候选注册和连接状态监控由同一个内部服务任务处理。注册等待期间仍可查询活动连接。没有固定对端或备用 relay。网络模块通过 `StatusService` 的请求队列发布 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
 扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 通过配置模块读写设备绑定。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
 
@@ -30,7 +30,13 @@ HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/c
 
 ## 模块划分
 
-服务层采用单一 Cargo crate，按职责划分 Rust module。`main.rs` 是唯一进程入口和组合根；其他模块不自行启动线程、监听端口或读取全局配置。
+服务层采用单一 Cargo crate，按职责划分 Rust module。`main.rs` 是唯一操作系统进程入口，`Services` 负责组装各模块的内部服务。
+
+## 内部服务
+
+有状态的模块将可变数据定义在模块内部，由 Tokio 任务独占。HTTP handler 和其他模块通过服务句柄向 `mpsc` channel 发送请求，用 `oneshot` 接收响应，使用 `watch` 或 `broadcast` 订阅变化。跨模块调用传递命令和结果，禁止传递可变状态、状态锁或锁守卫。`src/process.rs` 提供进程内请求循环。需要发送响应的请求在入队后由内部服务完成，持久化成功后再更新内存和发布变化。
+
+Slack 为每个已配置的 team 启动独立的请求处理任务。 关注操作按复合会话 ID 路由到对应 team，每个 team 管理自己的下载记录并清理自己的缓存。昵称以配置为准，消息接口和订阅在生成响应时合并昵称。该任务接收会话查询、发送、订阅等操作，执行 Slack API 请求、接收 WebSocket 事件，并通过通知、告警和 Emacs 的服务句柄发送通知或回传订阅更新。team 内部状态顺序更新，等待外部 I/O 时可继续分发其他请求。移除 team 时退出请求处理并取消相关订阅。
 
 当前已经建立的目录和职责：
 
@@ -136,7 +142,7 @@ src/modules/<module>/
 | `modules/emacs`         | `emacsclient` gateway、buffer 查询和激活、通知转换、全文捕获     | 本模块 `protocol`、`CommandRunner` trait、配置服务、注入的通知服务 |
 | `modules/notification` | 系统通知发送、通用跳转封装和回执状态                           | 本模块 `protocol`、`NotificationLauncher` trait |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
-| `modules/status` | 由业务方设置的通用状态存储与查询 | JSON、内存锁；不依赖具体业务模块 |
+| `modules/status` | 由业务方设置的通用状态存储与查询 | JSON、进程内 channel |
 | `modules/network` | 身份持久化、中转注册和通知 | 配置处理器 trait、注入的通知服务、iroh 适配 |
 | `modules/control_center` | 控制中心配置、菜单栏登录启动与失败撤销 | 配置处理器 trait、平台 LaunchAgent 管理器 |
 | `modules/password` | 本地 pass 目录配置、条目列表与只读解密 | 本模块 `CommandRunner` trait、配置服务、文件元数据检查 |
@@ -154,6 +160,8 @@ modules/<module>
 ```
 
 `http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 通过 `#[loki_api(...)]` 统一声明方法、路径、访问范围和必填的挂载状态 `mount`。无状态接口声明 `mount = "()"`。模块 Router 通过 `mount_routes` 安装整组 handler 并应用中间件。`Services::build()` 负责模块组装、配置处理器注入和路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
+
+配置读取通过已提交的内存快照响应。记录凭据的读取与更新由专用请求队列串行处理，中转注册等配置提交前处理器可以独立等待外部 I/O。
 
 配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。网络身份和设备绑定写入同一文件的 `_system`，使用配置模块内部的 `Password` 引用。中转令牌、身份私钥和设备绑定凭据由 GPG 加密存储。网络专用条目仅供服务内部调用。配置元数据和 HTTP 接口只提供已登记的用户设置。
 

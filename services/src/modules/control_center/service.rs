@@ -3,13 +3,13 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
     modules::config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler},
     platform::macos::{CommandRunner, LaunchdManager, LaunchdServiceSpec},
+    process::Process,
 };
 
 /// 控制中心只在配置提交时同步系统设置，构造与服务启动不修改 LaunchAgent。
 #[derive(Debug)]
 pub struct ControlCenterService<R = crate::platform::macos::ProcessCommandRunner> {
-    manager: LaunchdManager<R>,
-    spec: LaunchdServiceSpec,
+    process: Process<(LaunchdManager<R>, LaunchdServiceSpec)>,
 }
 
 impl ControlCenterService {
@@ -31,20 +31,20 @@ impl ControlCenterService {
     }
 }
 
-impl<R: CommandRunner> ControlCenterService<R> {
+impl<R: CommandRunner + 'static> ControlCenterService<R> {
     pub fn with_manager(manager: LaunchdManager<R>, executable: PathBuf, home: PathBuf) -> Self {
         let mut spec = LaunchdServiceSpec::new("cc.loki-assistant.center", executable);
         spec.keep_alive = false;
         spec.session_type = Some("Aqua".to_owned());
         spec.stdout_path = Some(home.join("Library/Logs/LokiAssistant/center.log"));
         spec.stderr_path = Some(home.join("Library/Logs/LokiAssistant/center.error.log"));
-        Self { manager, spec }
+        Self {
+            process: Process::start((manager, spec)),
+        }
     }
 }
 
-impl<R: CommandRunner + std::fmt::Debug + Clone + 'static> ConfigChangeHandler
-    for ControlCenterService<R>
-{
+impl<R: CommandRunner + std::fmt::Debug + 'static> ConfigChangeHandler for ControlCenterService<R> {
     fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
         self.apply(change, false)
     }
@@ -54,10 +54,8 @@ impl<R: CommandRunner + std::fmt::Debug + Clone + 'static> ConfigChangeHandler
     }
 }
 
-impl<R: CommandRunner + Clone + 'static> ControlCenterService<R> {
+impl<R: CommandRunner + 'static> ControlCenterService<R> {
     fn apply(&self, change: ConfigChange, rollback: bool) -> ChangeFuture<'_> {
-        let manager = self.manager.clone();
-        let spec = self.spec.clone();
         Box::pin(async move {
             if change.module_id != "control-center" || change.key != "center_auto_start" {
                 return Ok(());
@@ -70,13 +68,13 @@ impl<R: CommandRunner + Clone + 'static> ControlCenterService<R> {
             let enabled = value
                 .and_then(|value| value.as_bool())
                 .ok_or_else(|| "登录启动配置必须是 boolean".to_owned())?;
-            tokio::task::spawn_blocking(move || {
-                manager
-                    .set_login_startup(&spec, enabled)
-                    .map_err(|error| error.to_string())
-            })
-            .await
-            .map_err(|error| format!("登录启动处理任务失败：{error}"))?
+            self.process
+                .blocking(move |(manager, spec)| {
+                    manager
+                        .set_login_startup(spec, enabled)
+                        .map_err(|error| error.to_string())
+                })
+                .await
         })
     }
 }

@@ -7,14 +7,15 @@ use url::Url;
 
 use super::{
     mailbox::UserDirectory,
-    store::Account,
     protocol::{BlockText, Message, MessageBlock, valid_id},
+    store::{Account, display_name},
 };
 
 const MAX_BODY_CHARS: usize = 240;
 
 pub(super) fn callback(conversation_id: &str, message_ts: &str, thread_ts: Option<&str>) -> String {
-    let mut callback = format!("/slack/conversations/{conversation_id}/open?message_ts={message_ts}");
+    let mut callback =
+        format!("/slack/conversations/{conversation_id}/open?message_ts={message_ts}");
     if let Some(thread) = thread_ts {
         callback.push_str("&thread_ts=");
         callback.push_str(thread);
@@ -107,12 +108,7 @@ pub(super) fn body_with_nicknames(
     }
     let summary = summary.trim();
     let output = if let Some(author) = &message.author {
-        let name = author.name.trim();
-        let name = if name.is_empty() || name == author.id {
-            display_name(users, &author.id)
-        } else {
-            name
-        };
+        let name = display_name(users, &author.id);
         let nickname = account.and_then(|account| account.nickname(&author.id));
         format!("{} · {summary}", nickname.as_deref().unwrap_or(name))
     } else {
@@ -150,14 +146,6 @@ fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn display_name<'a>(users: Option<&'a UserDirectory>, id: &'a str) -> &'a str {
-    users
-        .and_then(|directory| directory.find(id))
-        .map(|user| user.name.trim())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(id)
-}
-
 fn slack_entities(text: &str) -> String {
     static ENTITY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"&(amp|lt|gt);").unwrap());
     ENTITY
@@ -192,7 +180,12 @@ fn slack_text(text: &str, users: Option<&UserDirectory>, account: Option<&Accoun
             Some(b'@') if valid_id(&target[1..]) => {
                 let id = &target[1..];
                 let nickname = account.and_then(|account| account.nickname(id));
-                format!("@{}", nickname.as_deref().unwrap_or_else(|| display_name(users, id)))
+                format!(
+                    "@{}",
+                    nickname
+                        .as_deref()
+                        .unwrap_or_else(|| display_name(users, id))
+                )
             }
             Some(b'#') if valid_id(&target[1..]) => {
                 let name = label.unwrap_or(&target[1..]);
@@ -298,7 +291,7 @@ mod tests {
         }));
         assert_eq!(
             body(&message, None),
-            "值班机器人 · 值班 @U123: IP绑定不通\n已持续0.4小时: 有3个绑定的IP无法连通\n*按字面显示* &lt;\n#告警 example.net 过期 <@U123>\n执行结果\n成功\n{}"
+            "UAUTHOR · 值班 @U123: IP绑定不通\n已持续0.4小时: 有3个绑定的IP无法连通\n*按字面显示* &lt;\n#告警 example.net 过期 <@U123>\n执行结果\n成功\n{}"
         );
     }
 

@@ -57,7 +57,7 @@ async fn snapshot(
     State(service): State<Arc<StatusService>>,
     peer: Option<Extension<AuthenticatedPeer>>,
 ) -> Json<StatusResponse> {
-    Json(service.snapshot_for(peer.is_some()))
+    Json(service.snapshot_for(peer.is_some()).await)
 }
 
 #[loki_api(
@@ -77,6 +77,7 @@ async fn module_value(
 ) -> Result<Json<StatusModuleResponse>, Response> {
     service
         .module_value_for(&module, peer.is_some())
+        .await
         .map(Json)
         .map_err(error_response)
 }
@@ -98,6 +99,7 @@ async fn value(
 ) -> Result<Json<StatusValueResponse>, Response> {
     service
         .value_for(&module, &key, peer.is_some())
+        .await
         .map(Json)
         .map_err(error_response)
 }
@@ -119,6 +121,7 @@ async fn path_value(
 ) -> Result<Json<StatusPathResponse>, Response> {
     service
         .path_value_for(&module, &key, &path, peer.is_some())
+        .await
         .map(Json)
         .map_err(error_response)
 }

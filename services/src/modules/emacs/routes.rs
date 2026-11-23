@@ -272,6 +272,7 @@ async fn receive_status(
     })?;
     service
         .receive_status(values)
+        .await
         .map(Json)
         .map_err(error_response)
 }

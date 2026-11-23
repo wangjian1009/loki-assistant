@@ -418,7 +418,7 @@ async fn tray_startup_wakes_worker_and_retries_only_unconfirmed_notifications() 
 
 #[tokio::test]
 async fn startup_retry_leaves_in_flight_delivery_to_its_current_attempt() {
-    let tracker = NotificationTracker::default();
+    let mut tracker = NotificationTracker::default();
     let id = uuid::Uuid::new_v4();
     let content = NotificationContent {
         notification_id: id.to_string(),
@@ -427,13 +427,13 @@ async fn startup_retry_leaves_in_flight_delivery_to_its_current_attempt() {
         body: None,
         navigation_url: None,
     };
-    let attempt = tracker.register(content, id).await.unwrap();
-    tracker.schedule_retry().await;
-    assert!(tracker.due().await.is_empty());
+    let attempt = tracker.register(content, id).unwrap();
+    tracker.schedule_retry();
+    assert!(tracker.due().is_empty());
 
     drop(attempt);
-    tracker.schedule_retry().await;
-    assert_eq!(tracker.due().await, [id]);
-    assert!(tracker.retry(id).await.is_some());
-    assert!(tracker.retry(id).await.is_none());
+    tracker.schedule_retry();
+    assert_eq!(tracker.due(), [id]);
+    assert!(tracker.retry(id).is_some());
+    assert!(tracker.retry(id).is_none());
 }

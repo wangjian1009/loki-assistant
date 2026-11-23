@@ -27,6 +27,7 @@ pub(super) struct PendingAttachment {
     destination: PathBuf,
 }
 
+#[derive(Clone)]
 pub(super) struct PartialAttachment {
     pub path: PathBuf,
     metadata: PathBuf,
@@ -358,7 +359,9 @@ impl DiskCache {
     }
 
     pub fn message_icon_path(&self, url: &str) -> PathBuf {
-        self.0.join("icons").join(format!("{:x}.png", Sha256::digest(url.as_bytes())))
+        self.0
+            .join("icons")
+            .join(format!("{:x}.png", Sha256::digest(url.as_bytes())))
     }
 
     fn attachment_base(item: &Attachment, preview: bool) -> Option<String> {
@@ -469,12 +472,26 @@ impl DiskCache {
         Some(path)
     }
 
-    #[cfg(test)]
-    pub fn clean(root: &Path, retention: Duration) {
-        Self::clean_with_downloads(root, retention, &HashSet::new());
+    pub fn cached_teams(root: &Path) -> Vec<String> {
+        entries(root, true)
+            .filter_map(|path| {
+                let id = path.file_name()?.to_str()?;
+                (super::projects::valid_team_id(id) && regular_file(&path.join(".owner")))
+                    .then(|| id.to_owned())
+            })
+            .collect()
     }
 
-    pub fn clean_with_downloads(root: &Path, retention: Duration, active: &HashSet<PathBuf>) {
+    pub fn clean_team(root: &Path, id: &str, retention: Duration, active: &HashSet<PathBuf>) {
+        if !super::projects::valid_team_id(id) {
+            return;
+        }
+        let team = root.join(id);
+        if !regular_file(&team.join(".owner"))
+            || !fs::symlink_metadata(&team).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return;
+        }
         let now = SystemTime::now();
         let expired = |path: &Path| {
             fs::symlink_metadata(path)
@@ -483,55 +500,47 @@ impl DiskCache {
                 .and_then(|modified| now.duration_since(modified).ok())
                 .is_some_and(|age| age > retention)
         };
-        for team in entries(root, true).filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(super::projects::valid_team_id)
-                && regular_file(&path.join(".owner"))
-        }) {
-            let partial = team.join("attachments").join(".partial");
-            for path in entries(&partial, false) {
-                let data_path = if path.extension().is_some_and(|ext| ext == "json") {
-                    path.with_extension("")
-                } else {
-                    path.clone()
+        let partial = team.join("attachments").join(".partial");
+        for path in entries(&partial, false) {
+            let data_path = if path.extension().is_some_and(|ext| ext == "json") {
+                path.with_extension("")
+            } else {
+                path.clone()
+            };
+            let expired = expired(&data_path) || (!regular_file(&data_path) && expired(&path));
+            if !active.contains(&data_path) && expired {
+                let _ = fs::remove_file(path);
+            }
+        }
+        for path in
+            entries(&team.join("attachments"), false).chain(entries(&team.join("icons"), false))
+        {
+            if expired(&path) {
+                let _ = fs::remove_file(path);
+            }
+        }
+        for room in entries(&team.join("conversations"), true) {
+            let messages = room.join("messages");
+            let threads = room.join("threads");
+            for thread in entries(&threads, true) {
+                let Some(ts) = thread
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|ts| timestamp(ts).is_some())
+                else {
+                    continue;
                 };
-                let expired = expired(&data_path) || (!regular_file(&data_path) && expired(&path));
-                if !active.contains(&data_path) && expired {
-                    let _ = fs::remove_file(path);
+                let parent = messages.join(format!("{ts}.txt"));
+                if (!regular_file(&parent) || expired(&parent))
+                    && message_paths(&thread).all(|path| expired(&path))
+                    && fs::remove_dir_all(&thread).is_ok()
+                {
+                    let _ = fs::remove_file(parent);
                 }
             }
-            for path in
-                entries(&team.join("attachments"), false).chain(entries(&team.join("icons"), false))
-            {
-                if expired(&path) {
+            for path in message_paths(&messages) {
+                if expired(&path) && !threads.join(txt_stem(&path).unwrap_or_default()).is_dir() {
                     let _ = fs::remove_file(path);
-                }
-            }
-            for room in entries(&team.join("conversations"), true) {
-                let messages = room.join("messages");
-                let threads = room.join("threads");
-                for thread in entries(&threads, true) {
-                    let Some(ts) = thread
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .filter(|ts| timestamp(ts).is_some())
-                    else {
-                        continue;
-                    };
-                    let parent = messages.join(format!("{ts}.txt"));
-                    if (!regular_file(&parent) || expired(&parent))
-                        && message_paths(&thread).all(|path| expired(&path))
-                        && fs::remove_dir_all(&thread).is_ok()
-                    {
-                        let _ = fs::remove_file(parent);
-                    }
-                }
-                for path in message_paths(&messages) {
-                    if expired(&path) && !threads.join(txt_stem(&path).unwrap_or_default()).is_dir()
-                    {
-                        let _ = fs::remove_file(path);
-                    }
                 }
             }
         }
@@ -572,6 +581,10 @@ fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomically(path, bytes, None)
+}
+
+fn write_atomically(path: &Path, bytes: &[u8], modified: Option<SystemTime>) -> io::Result<()> {
     let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
     private_dir(parent)?;
     let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
@@ -582,6 +595,9 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .mode(0o600)
             .open(&temporary)?;
         file.write_all(bytes)?;
+        if let Some(modified) = modified {
+            file.set_modified(modified)?;
+        }
         fs::rename(&temporary, path)
     })();
     if result.is_err() {
@@ -620,7 +636,7 @@ fn message_paths(path: &Path) -> impl Iterator<Item = PathBuf> + use<> {
 }
 
 fn read_message(path: &Path) -> Option<Message> {
-    let value: Value = read_record(path)?;
+    let mut value: Value = read_record(path)?;
     let mut message: Message = serde_json::from_value(value.clone()).ok()?;
     let root = path.parent()?.file_name()?.to_str()?;
     let thread = (root != "messages").then_some(root);
@@ -636,6 +652,16 @@ fn read_message(path: &Path) -> Option<Message> {
             item.filename = value["filename"].as_str().map(str::to_owned);
             item.image_url = value["image_url"].as_str().map(str::to_owned);
             item.download_url = value["download_url"].as_str().map(str::to_owned);
+        }
+    }
+    if let Some(author) = value["author"].as_object()
+        && author.len() > 1
+        && let Some(current) = &message.author
+        && let Ok(modified) = fs::symlink_metadata(path).and_then(|metadata| metadata.modified())
+    {
+        value["author"] = json!(current);
+        if let Ok(text) = encode_record(&value) {
+            let _ = write_atomically(path, text.as_bytes(), Some(modified));
         }
     }
     Some(message)

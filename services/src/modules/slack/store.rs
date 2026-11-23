@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 use serde_json::{Value, json};
@@ -17,7 +17,7 @@ pub(super) struct Secrets {
     pub disabled_token: Option<String>,
 }
 
-pub(super) type Nicknames = Arc<RwLock<BTreeMap<String, String>>>;
+pub(super) type Nicknames = Arc<BTreeMap<String, String>>;
 
 pub(super) struct Account {
     pub nicknames: Nicknames,
@@ -32,8 +32,6 @@ pub(super) struct Account {
 impl Account {
     pub fn nickname(&self, user: &str) -> Option<String> {
         self.nicknames
-            .read()
-            .unwrap()
             .get(&format!("{}.{user}", self.identity.team_id))
             .cloned()
     }
@@ -41,8 +39,6 @@ impl Account {
     pub fn team_nicknames(&self) -> BTreeMap<String, String> {
         let prefix = format!("{}.", self.identity.team_id);
         self.nicknames
-            .read()
-            .unwrap()
             .range(prefix.clone()..)
             .take_while(|(id, _)| id.starts_with(&prefix))
             .map(|(id, name)| (id.clone(), name.clone()))
@@ -100,6 +96,14 @@ pub(super) struct ReadPositions {
     pub cursors: BTreeMap<String, String>,
 }
 
+pub(super) fn display_name<'a>(users: Option<&'a UserDirectory>, id: &'a str) -> &'a str {
+    users
+        .and_then(|directory| directory.find(id))
+        .map(|user| user.name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(id)
+}
+
 impl Conversation {
     pub fn message_result(
         &self,
@@ -109,7 +113,7 @@ impl Conversation {
     ) -> Value {
         let mut value = json!(message);
         if let Some(author) = &message.author {
-            value["author"]["nickname"] = json!(account.nickname(&author.id));
+            value["author"]["name"] = json!(display_name(users, &author.id));
         }
         let mut mentions = BTreeMap::new();
         for (id, label) in message.user_references() {
@@ -132,7 +136,6 @@ impl Conversation {
                     .map(|(id, name)| json!({
                         "id":format!("{}.{id}", account.identity.team_id),
                         "name":name.unwrap_or(id),
-                        "nickname":account.nickname(id),
                     }))
                     .collect::<Vec<_>>()
             );
@@ -215,7 +218,14 @@ impl Conversation {
                 .iter()
                 .find(|id| *id != &account.identity.user_id)
             {
-                return account.nickname(user).unwrap_or_else(|| self.title.clone());
+                return account
+                    .nickname(user)
+                    .or_else(|| {
+                        users
+                            .and_then(|directory| directory.find(user))
+                            .map(|profile| profile.name.clone())
+                    })
+                    .unwrap_or_else(|| self.title.clone());
             }
         }
         if self.kind == "mpim" {
@@ -242,7 +252,11 @@ impl Conversation {
         self.title.clone()
     }
 
-    pub fn summarize(&self, account: &Account) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
+    pub fn summarize(
+        &self,
+        account: &Account,
+        users: Option<&UserDirectory>,
+    ) -> (Option<(u64, u32)>, Option<(u64, u32)>, Value) {
         let latest = self
             .messages
             .values()
@@ -270,7 +284,7 @@ impl Conversation {
                 "history_loaded":self.loaded.contains_key(""),
                 "preview":preview,
                 "last_message":latest.map(|message| json!({"author":message.author.as_ref().map(|author| json!({
-                    "id":format!("{}.{}", account.identity.team_id, author.id),"name":author.name,
+                    "id":format!("{}.{}", account.identity.team_id, author.id),"name":display_name(users, &author.id),
                     "nickname":account.nickname(&author.id)})),
                     "ts":message.ts,"preview":preview})),
                 "unread_count":unread.len(),

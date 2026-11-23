@@ -147,40 +147,50 @@ impl SlackService {
     pub(super) async fn refreshing_picker(&self) {
         loop {
             self.picker_changed.notified().await;
-            let mut state = self.state.lock().await;
-            let Some(session) = state.cache.session_id else {
-                continue;
-            };
-            let Ok(account) = state.account(session) else {
-                continue;
-            };
-            let users = state
-                .user_directory
-                .as_ref()
-                .map_or(&[][..], |directory| &directory.users);
-            let items: Arc<[PickerItem]> = state
-                .cache
-                .conversations
-                .values()
-                .map(|room| {
-                    PickerItem::from_summary(
-                        self.conversation_summary(account, room, state.user_directory.as_ref())
-                            .2,
-                        users,
-                        state.cache.disk.as_ref(),
-                        account,
-                    )
+            self.state
+                .call(|state| {
+                    let Some(session) = state.cache.session_id else {
+                        return;
+                    };
+                    let Ok(account) = state.account(session) else {
+                        return;
+                    };
+                    let users = state
+                        .user_directory
+                        .as_ref()
+                        .map_or(&[][..], |directory| &directory.users);
+                    let items: Arc<[PickerItem]> = state
+                        .cache
+                        .conversations
+                        .values()
+                        .map(|room| {
+                            PickerItem::from_summary(
+                                Self::conversation_summary(
+                                    account,
+                                    room,
+                                    state.user_directory.as_ref(),
+                                )
+                                .2,
+                                users,
+                                state.cache.disk.as_ref(),
+                                account,
+                            )
+                        })
+                        .collect();
+                    state.picker_items = items;
                 })
-                .collect();
-            state.picker_items = items;
+                .await;
         }
     }
 
     pub(super) async fn picker_failure(&self, session: Uuid) {
-        let mut state = self.state.lock().await;
-        if state.account(session).is_ok() {
-            state.picker_failed = true;
-        }
+        self.state
+            .call(move |state| {
+                if state.account(session).is_ok() {
+                    state.picker_failed = true;
+                }
+            })
+            .await;
     }
 
     pub(super) async fn picker_workspace(
@@ -188,38 +198,42 @@ impl SlackService {
         id: &str,
         fallback_name: &str,
     ) -> (Value, Arc<[PickerItem]>) {
-        let state = self.state.lock().await;
-        let account = state
-            .cache
-            .session_id
-            .and_then(|session| state.account(session).ok());
-        let name = account.map_or(fallback_name, |account| &account.identity.team_name);
-        let ready = state.cache.directory_loaded
-            && state
-                .user_directory
-                .as_ref()
-                .is_some_and(|directory| directory.complete())
-            && state.picker_items.len() == state.cache.conversations.len()
-            && state
-                .picker_items
-                .iter()
-                .all(|item| item.summary["history_loaded"] == true);
-        let status = if account.is_some() && ready {
-            "ready"
-        } else if (account.is_none() && state.issue.is_some())
-            || state.picker_failed
-            || state.retired
-            || state.secrets.disabled_token.is_some()
-        {
-            "unavailable"
-        } else {
-            "warming_up"
-        };
-        let items = if account.is_some() {
-            state.picker_items.clone()
-        } else {
-            Arc::default()
-        };
-        (json!({"team_id":id,"team_name":name,"state":status}), items)
+        let (id, fallback_name) = (id.to_owned(), fallback_name.to_owned());
+        self.state
+            .call(move |state| {
+                let account = state
+                    .cache
+                    .session_id
+                    .and_then(|session| state.account(session).ok());
+                let name = account.map_or(&fallback_name, |account| &account.identity.team_name);
+                let ready = state.cache.directory_loaded
+                    && state
+                        .user_directory
+                        .as_ref()
+                        .is_some_and(|directory| directory.complete())
+                    && state.picker_items.len() == state.cache.conversations.len()
+                    && state
+                        .picker_items
+                        .iter()
+                        .all(|item| item.summary["history_loaded"] == true);
+                let status = if account.is_some() && ready {
+                    "ready"
+                } else if (account.is_none() && state.issue.is_some())
+                    || state.picker_failed
+                    || state.retired
+                    || state.secrets.disabled_token.is_some()
+                {
+                    "unavailable"
+                } else {
+                    "warming_up"
+                };
+                let items = if account.is_some() {
+                    state.picker_items.clone()
+                } else {
+                    Arc::default()
+                };
+                (json!({"team_id":id,"team_name":name,"state":status}), items)
+            })
+            .await
     }
 }

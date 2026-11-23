@@ -38,6 +38,7 @@ pub(super) async fn ensure(config: &ConfigService) -> Result<(SecretKey, bool), 
     let config = config.clone();
     tokio::spawn(async move {
         let password = Password::new(format!("{SYSTEM_PASSWORD_PREFIX}identity.gpg"));
+        let storage = config.clone();
         config
             .update_system_value(
                 "network_identity",
@@ -45,7 +46,7 @@ pub(super) async fn ensure(config: &ConfigService) -> Result<(SecretKey, bool), 
                     name: "identity.json",
                     limit: 4096,
                 }),
-                async |previous| {
+                async move |previous| {
                     let (key, created) = match previous {
                         Some(value) if value["version"] == 2 => {
                             let identity: StoredIdentity<Password> =
@@ -54,7 +55,7 @@ pub(super) async fn ensure(config: &ConfigService) -> Result<(SecretKey, bool), 
                             if identity.secret_key.path() != password.path() {
                                 return Err(invalid_identity());
                             }
-                            let key = decode(&identity.secret_key.read(&config).await?)?;
+                            let key = decode(&identity.secret_key.read(&storage).await?)?;
                             validate(&key, &identity.endpoint_id)?;
                             return Ok((Some(value), (key, false)));
                         }
@@ -66,16 +67,16 @@ pub(super) async fn ensure(config: &ConfigService) -> Result<(SecretKey, bool), 
                             }
                             validate(&identity.secret_key, &identity.endpoint_id)?;
                             password
-                                .import(&config, &STANDARD.encode(identity.secret_key.to_bytes()))
+                                .import(&storage, &STANDARD.encode(identity.secret_key.to_bytes()))
                                 .await?;
                             (identity.secret_key, false)
                         }
-                        None => match password.read_optional(&config).await? {
+                        None => match password.read_optional(&storage).await? {
                             Some(value) => (decode(&value)?, false),
                             None => {
                                 let key = SecretKey::generate();
                                 password
-                                    .import(&config, &STANDARD.encode(key.to_bytes()))
+                                    .import(&storage, &STANDARD.encode(key.to_bytes()))
                                     .await?;
                                 (key, true)
                             }

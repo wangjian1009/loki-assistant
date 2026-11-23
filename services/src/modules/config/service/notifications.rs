@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Mutex as SyncMutex, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use axum::{
     Router,
@@ -73,16 +73,16 @@ type Resource = (String, String, Option<String>);
 pub(super) type InFlight = HashSet<Resource>;
 
 struct NotificationGuard {
-    active: Arc<SyncMutex<InFlight>>,
+    active: crate::process::Process<InFlight>,
     resource: Resource,
 }
 
 impl Drop for NotificationGuard {
     fn drop(&mut self) {
-        self.active
-            .lock()
-            .expect("通知状态锁有效")
-            .remove(&self.resource);
+        let resource = self.resource.clone();
+        self.active.post(move |active| {
+            active.remove(&resource);
+        });
     }
 }
 
@@ -103,7 +103,7 @@ impl NotificationRequest {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Confirmed,
     Processing,
@@ -112,7 +112,9 @@ enum Outcome {
 
 impl ConfigService {
     pub(crate) fn attach_notifications(&self, router: &Arc<Router>) {
-        let _ = self.notification_router.set(Arc::downgrade(router));
+        let _ = self
+            .notification_router
+            .set(crate::process::Process::start(Arc::downgrade(router)));
     }
 
     pub(in crate::modules::config) fn notifications_attached(&self) -> bool {
@@ -139,7 +141,7 @@ impl ConfigService {
         module: &str,
     ) -> BTreeMap<String, Vec<Value>> {
         let mut result = BTreeMap::<String, Vec<Value>>::new();
-        for entry in pending(&*self.values.read().await)
+        for entry in pending(&self.stored_values().await)
             .into_iter()
             .filter(|entry| entry.module == module)
         {
@@ -167,7 +169,7 @@ impl ConfigService {
         key: &str,
         fields: [&str; N],
     ) -> Result<Option<[Option<String>; N]>, ConfigServiceError> {
-        let entry = pending(&*self.values.read().await)
+        let entry = pending(&self.stored_values().await)
             .into_iter()
             .find(|entry| {
                 entry.id == id
@@ -196,7 +198,7 @@ impl ConfigService {
             .ok_or_else(|| ConfigServiceError::Storage("密码模块不可用。".into()))
     }
 
-    fn reserve_notification(
+    async fn reserve_notification(
         &self,
         module: &str,
         item: &str,
@@ -207,15 +209,20 @@ impl ConfigService {
             item.to_owned(),
             instance.map(str::to_owned),
         );
-        let active = Arc::clone(&self.notifications_in_flight);
-        if !active
-            .lock()
-            .expect("通知状态锁有效")
-            .insert(resource.clone())
-        {
-            return Err(ConfigServiceError::RetryInProgress);
-        }
-        Ok(NotificationGuard { active, resource })
+        let active = self.notifications_in_flight.clone();
+        let sender = active.clone();
+        active
+            .call(move |active| {
+                if active.insert(resource.clone()) {
+                    Ok(NotificationGuard {
+                        active: sender,
+                        resource: resource.clone(),
+                    })
+                } else {
+                    Err(ConfigServiceError::RetryInProgress)
+                }
+            })
+            .await
     }
 
     pub(in crate::modules::config) async fn notify_write(
@@ -250,7 +257,9 @@ impl ConfigService {
         fields: [&str; N],
         expected: [Option<String>; N],
     ) -> Result<bool, ConfigServiceError> {
-        let guard = self.reserve_notification(module, item, Some(instance))?;
+        let guard = self
+            .reserve_notification(module, item, Some(instance))
+            .await?;
         if self
             .read_record_passwords(module, item, instance, fields)
             .await?
@@ -281,7 +290,9 @@ impl ConfigService {
         create_only: bool,
         patch: bool,
     ) -> Result<Option<(Value, bool)>, ConfigServiceError> {
-        let guard = self.reserve_notification(&module, &item, instance.as_deref())?;
+        let guard = self
+            .reserve_notification(&module, &item, instance.as_deref())
+            .await?;
         let service = self.clone();
         tokio::spawn(async move {
             let _guard = guard;
@@ -304,8 +315,8 @@ impl ConfigService {
         item: &str,
         instance: Option<&str>,
     ) -> Result<bool, ConfigServiceError> {
-        let guard = self.reserve_notification(module, item, instance)?;
-        let mut entry = pending(&*self.values.read().await)
+        let guard = self.reserve_notification(module, item, instance).await?;
+        let mut entry = pending(&self.stored_values().await)
             .into_iter()
             .find(|entry| {
                 entry.module == module
@@ -345,275 +356,309 @@ impl ConfigService {
         preserve_pending: bool,
     ) -> Result<Option<Pending>, ConfigServiceError> {
         let metadata = self.module_metadata(&module).await?;
-        let item_metadata =
-            metadata
-                .item(&item)
-                .ok_or_else(|| ConfigServiceError::ItemNotFound {
-                    module_id: module.clone(),
-                    key: item.clone(),
-                })?;
         let options = item_options(&module, &item);
-        let _commit = self.commits.lock().await;
-        let mut values = self.values.read().await.clone();
-        let existing = pending(&values).into_iter().find(|entry| {
-            entry.module == module && entry.item == item && entry.instance == instance
-        });
-        if let Some(entry) = &existing {
-            if create_only
-                || (instance.is_none() && !patch)
-                || entry.delete
-                || (preserve_pending && entry.validation_error.is_none())
-            {
-                return Err(ConfigServiceError::ChangePending);
-            }
-            values
-                .get_mut(JOURNAL)
-                .expect("待确认操作存在")
-                .remove(&entry.id.to_string());
-        }
-        let effective = self
-            .resolve_value(
-                item_metadata,
-                values.get(&module).and_then(|entries| entries.get(&item)),
-            )
-            .await?
-            .map(|data| data.value);
-        let id = Uuid::new_v4();
-        let delete = input.is_none();
-        let mut password_changes = Vec::new();
-        let mut removed_password_entries = Vec::new();
-        let (key, value, previous) = if let Some(instance) = &instance {
-            let structure = options
-                .structure
-                .as_ref()
-                .ok_or(ConfigServiceError::ActionNotFound)?;
-            let key_field = options.notification_key_field()?;
-            let mut records = effective
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default();
-            let index = records
-                .iter()
-                .position(|record| record[key_field].as_str() == Some(instance));
-            let previous = index.map(|index| records[index].clone());
-            if create_only && previous.is_some() {
-                return Err(ConfigServiceError::RecordExists);
-            }
-            let value = if let Some(input) = input {
-                let changes = input.as_object().ok_or_else(|| {
-                    ConfigServiceError::InvalidValue("配置记录必须为 JSON object。".into())
-                })?;
-                let mut record = existing
-                    .as_ref()
-                    .and_then(|entry| entry.value.as_object())
-                    .cloned()
-                    .or_else(|| previous.as_ref().and_then(Value::as_object).cloned())
-                    .unwrap_or_default();
-                if patch && previous.is_none() && existing.is_none() {
-                    return Err(ConfigServiceError::ActionNotFound);
-                }
-                if patch && changes.contains_key(key_field) {
-                    return Err(ConfigServiceError::InvalidValue(
-                        "不能修改配置记录主键。".into(),
-                    ));
-                }
-                let mut line_changes = BTreeMap::<String, BTreeMap<&str, Option<&str>>>::new();
-                for (key, value) in changes {
-                    let field = structure
-                        .fields
-                        .iter()
-                        .find(|field| &field.key == key)
-                        .ok_or_else(|| {
-                            ConfigServiceError::InvalidValue("配置记录包含未声明字段。".into())
-                        })?;
-                    if field.read_only {
-                        return Err(ConfigServiceError::InvalidValue(
-                            "配置记录包含只读字段。".into(),
-                        ));
-                    }
-                    if field.data_type.is_password() {
-                        let base = options.password_path(key, instance)?;
-                        let replacement = if patch && value.is_null() {
-                            None
-                        } else {
-                            if let Some(checker) = &field.checker {
-                                checker.validate(&field.label, value)?;
+        let service = self.clone();
+        self.commits
+            .run(async move {
+                let credentials = service.record_credentials.clone();
+                credentials
+                    .run(async move {
+                        let item_metadata = metadata.item(&item).ok_or_else(|| {
+                            ConfigServiceError::ItemNotFound {
+                                module_id: module.clone(),
+                                key: item.clone(),
                             }
-                            Some(
-                                value
-                                    .as_str()
-                                    .filter(|text| {
-                                        !text.trim().is_empty()
-                                            && !text.chars().any(char::is_control)
-                                    })
-                                    .ok_or_else(|| {
-                                        ConfigServiceError::InvalidValue(
-                                            "密码字段需要非空的单行字符串。".into(),
-                                        )
-                                    })?,
-                            )
-                        };
-                        line_changes
-                            .entry(base)
-                            .or_default()
-                            .insert(key, replacement);
-                    } else if patch && value.is_null() {
-                        record.remove(key);
-                    } else if patch {
-                        merge_patch(record.entry(key.clone()).or_insert(Value::Null), value);
-                    } else {
-                        record.insert(key.clone(), value.clone());
-                    }
-                }
-                if existing.is_none()
-                    && previous.is_none()
-                    && !options.create_fields.is_empty()
-                    && changes
-                        .keys()
-                        .any(|field| !options.create_fields.contains(&field.as_str()))
-                {
-                    return Err(ConfigServiceError::InvalidValue(
-                        "首次新增只能提交元数据声明的字段。".into(),
-                    ));
-                }
-                if record
-                    .get(key_field)
-                    .is_some_and(|key| key.as_str() != Some(instance))
-                {
-                    return Err(ConfigServiceError::InvalidValue(
-                        "配置记录标识不一致。".into(),
-                    ));
-                }
-                record.insert(key_field.to_owned(), Value::String(instance.clone()));
-                for (base, changes) in line_changes {
-                    if let Some(first) = options
-                        .password_entry_fields(instance, &base)
-                        .find(|field| field.data_type.password_key().is_none())
-                        && changes.get(first.key.as_str()).is_some_and(Option::is_none)
-                    {
-                        for field in options.password_entry_fields(instance, &base) {
-                            record.remove(&field.key);
-                        }
-                        removed_password_entries.push(first.key.clone());
-                        continue;
-                    }
-                    let (path, backup) = self
-                        .pending_password_destination(
-                            &options,
-                            instance,
-                            &base,
-                            id,
-                            &record,
-                            previous.as_ref(),
-                        )
-                        .await?;
-                    if let Some(contents) = self
-                        .stage_password_lines(
-                            &options,
-                            instance,
-                            &base,
-                            &path,
-                            &changes,
-                            &mut record,
-                        )
-                        .await?
-                    {
-                        password_changes.push(PasswordChange {
-                            path,
-                            contents: Some(contents),
-                            previous: backup,
+                        })?;
+                        let mut values = service.stored_values().await;
+                        let existing = pending(&values).into_iter().find(|entry| {
+                            entry.module == module
+                                && entry.item == item
+                                && entry.instance == instance
                         });
-                    }
-                }
-                let value = Value::Object(record);
-                if let Some(index) = index {
-                    records[index] = value.clone();
-                } else {
-                    records.push(value.clone());
-                }
-                item_metadata.validate_with(&options, &Value::Array(records))?;
-                value
-            } else {
-                if let Some(index) = index {
-                    records.remove(index);
-                    item_metadata.validate_with(&options, &Value::Array(records))?;
-                }
-                match existing
-                    .as_ref()
-                    .map(|entry| &entry.value)
-                    .or(previous.as_ref())
-                {
-                    Some(record) => record.clone(),
-                    None => return Ok(None),
-                }
-            };
-            (instance.clone(), value, previous)
-        } else {
-            if matches!(
-                item_metadata.data_type,
-                ConfigDataType::List | ConfigDataType::Dictionary | ConfigDataType::Password { .. }
-            ) {
-                return Err(ConfigServiceError::InvalidValue(
-                    "请使用带主键的配置记录接口。".into(),
-                ));
-            }
-            let value = match input {
-                Some(value) if patch => {
-                    let current = existing
-                        .as_ref()
-                        .map(|entry| entry.value.clone())
-                        .or_else(|| effective.clone());
-                    let merged = patch_structure(item_metadata, &options, current, &value)?;
-                    item_metadata.validate_with(&options, &merged)?;
-                    merged
-                }
-                Some(value) => self.normalize_value(&module, item_metadata, &value).await?,
-                None => match values
-                    .get(&module)
-                    .and_then(|entries| entries.get(&item))
-                    .cloned()
-                {
-                    Some(value) => value,
-                    None => return Ok(None),
-                },
-            };
-            let key = value
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| value.to_string());
-            (key, value, effective)
-        };
-        if key.is_empty() || key.chars().any(char::is_control) {
-            return Err(ConfigServiceError::InvalidValue(
-                "通知接入点的键无效。".into(),
-            ));
-        }
-        let entry = Pending {
-            id,
-            module,
-            item,
-            instance,
-            key,
-            value,
-            previous,
-            delete,
-            removed_password_entries,
-            validation_error: None,
-        };
-        values
-            .entry(JOURNAL.into())
-            .or_default()
-            .insert(id.to_string(), json!(entry));
-        self.persist_password_changes(values, &password_changes)
-            .await?;
-        if let Some(old) = existing {
-            self.discard_notification_passwords(
-                &entry,
-                &old.value,
-                &[Some(&entry.value), entry.previous.as_ref()],
-            )
-            .await;
-        }
-        Ok(Some(entry))
+                        if let Some(entry) = &existing {
+                            if create_only
+                                || (instance.is_none() && !patch)
+                                || entry.delete
+                                || (preserve_pending && entry.validation_error.is_none())
+                            {
+                                return Err(ConfigServiceError::ChangePending);
+                            }
+                            values
+                                .get_mut(JOURNAL)
+                                .expect("待确认操作存在")
+                                .remove(&entry.id.to_string());
+                        }
+                        let effective = service
+                            .resolve_value(
+                                item_metadata,
+                                values.get(&module).and_then(|entries| entries.get(&item)),
+                            )
+                            .await?
+                            .map(|data| data.value);
+                        let id = Uuid::new_v4();
+                        let delete = input.is_none();
+                        let mut password_changes = Vec::new();
+                        let mut removed_password_entries = Vec::new();
+                        let (key, value, previous) = if let Some(instance) = &instance {
+                            let structure = options
+                                .structure
+                                .as_ref()
+                                .ok_or(ConfigServiceError::ActionNotFound)?;
+                            let key_field = options.notification_key_field()?;
+                            let mut records = effective
+                                .and_then(|value| value.as_array().cloned())
+                                .unwrap_or_default();
+                            let index = records
+                                .iter()
+                                .position(|record| record[key_field].as_str() == Some(instance));
+                            let previous = index.map(|index| records[index].clone());
+                            if create_only && previous.is_some() {
+                                return Err(ConfigServiceError::RecordExists);
+                            }
+                            let value = if let Some(input) = input {
+                                let changes = input.as_object().ok_or_else(|| {
+                                    ConfigServiceError::InvalidValue(
+                                        "配置记录必须为 JSON object。".into(),
+                                    )
+                                })?;
+                                let mut record = existing
+                                    .as_ref()
+                                    .and_then(|entry| entry.value.as_object())
+                                    .cloned()
+                                    .or_else(|| {
+                                        previous.as_ref().and_then(Value::as_object).cloned()
+                                    })
+                                    .unwrap_or_default();
+                                if patch && previous.is_none() && existing.is_none() {
+                                    return Err(ConfigServiceError::ActionNotFound);
+                                }
+                                if patch && changes.contains_key(key_field) {
+                                    return Err(ConfigServiceError::InvalidValue(
+                                        "不能修改配置记录主键。".into(),
+                                    ));
+                                }
+                                let mut line_changes =
+                                    BTreeMap::<String, BTreeMap<&str, Option<&str>>>::new();
+                                for (key, value) in changes {
+                                    let field = structure
+                                        .fields
+                                        .iter()
+                                        .find(|field| &field.key == key)
+                                        .ok_or_else(|| {
+                                            ConfigServiceError::InvalidValue(
+                                                "配置记录包含未声明字段。".into(),
+                                            )
+                                        })?;
+                                    if field.read_only {
+                                        return Err(ConfigServiceError::InvalidValue(
+                                            "配置记录包含只读字段。".into(),
+                                        ));
+                                    }
+                                    if field.data_type.is_password() {
+                                        let base = options.password_path(key, instance)?;
+                                        let replacement = if patch && value.is_null() {
+                                            None
+                                        } else {
+                                            if let Some(checker) = &field.checker {
+                                                checker.validate(&field.label, value)?;
+                                            }
+                                            Some(
+                                                value
+                                                    .as_str()
+                                                    .filter(|text| {
+                                                        !text.trim().is_empty()
+                                                            && !text.chars().any(char::is_control)
+                                                    })
+                                                    .ok_or_else(|| {
+                                                        ConfigServiceError::InvalidValue(
+                                                            "密码字段需要非空的单行字符串。".into(),
+                                                        )
+                                                    })?,
+                                            )
+                                        };
+                                        line_changes
+                                            .entry(base)
+                                            .or_default()
+                                            .insert(key, replacement);
+                                    } else if patch && value.is_null() {
+                                        record.remove(key);
+                                    } else if patch {
+                                        merge_patch(
+                                            record.entry(key.clone()).or_insert(Value::Null),
+                                            value,
+                                        );
+                                    } else {
+                                        record.insert(key.clone(), value.clone());
+                                    }
+                                }
+                                if existing.is_none()
+                                    && previous.is_none()
+                                    && !options.create_fields.is_empty()
+                                    && changes.keys().any(|field| {
+                                        !options.create_fields.contains(&field.as_str())
+                                    })
+                                {
+                                    return Err(ConfigServiceError::InvalidValue(
+                                        "首次新增只能提交元数据声明的字段。".into(),
+                                    ));
+                                }
+                                if record
+                                    .get(key_field)
+                                    .is_some_and(|key| key.as_str() != Some(instance))
+                                {
+                                    return Err(ConfigServiceError::InvalidValue(
+                                        "配置记录标识不一致。".into(),
+                                    ));
+                                }
+                                record
+                                    .insert(key_field.to_owned(), Value::String(instance.clone()));
+                                for (base, changes) in line_changes {
+                                    if let Some(first) = options
+                                        .password_entry_fields(instance, &base)
+                                        .find(|field| field.data_type.password_key().is_none())
+                                        && changes
+                                            .get(first.key.as_str())
+                                            .is_some_and(Option::is_none)
+                                    {
+                                        for field in options.password_entry_fields(instance, &base)
+                                        {
+                                            record.remove(&field.key);
+                                        }
+                                        removed_password_entries.push(first.key.clone());
+                                        continue;
+                                    }
+                                    let (path, backup) = service
+                                        .pending_password_destination(
+                                            &options,
+                                            instance,
+                                            &base,
+                                            id,
+                                            &record,
+                                            previous.as_ref(),
+                                        )
+                                        .await?;
+                                    if let Some(contents) = service
+                                        .stage_password_lines(
+                                            &options,
+                                            instance,
+                                            &base,
+                                            &path,
+                                            &changes,
+                                            &mut record,
+                                        )
+                                        .await?
+                                    {
+                                        password_changes.push(PasswordChange {
+                                            path,
+                                            contents: Some(contents),
+                                            previous: backup,
+                                        });
+                                    }
+                                }
+                                let value = Value::Object(record);
+                                if let Some(index) = index {
+                                    records[index] = value.clone();
+                                } else {
+                                    records.push(value.clone());
+                                }
+                                item_metadata.validate_with(&options, &Value::Array(records))?;
+                                value
+                            } else {
+                                if let Some(index) = index {
+                                    records.remove(index);
+                                    item_metadata
+                                        .validate_with(&options, &Value::Array(records))?;
+                                }
+                                match existing
+                                    .as_ref()
+                                    .map(|entry| &entry.value)
+                                    .or(previous.as_ref())
+                                {
+                                    Some(record) => record.clone(),
+                                    None => return Ok(None),
+                                }
+                            };
+                            (instance.clone(), value, previous)
+                        } else {
+                            if matches!(
+                                item_metadata.data_type,
+                                ConfigDataType::List
+                                    | ConfigDataType::Dictionary
+                                    | ConfigDataType::Password { .. }
+                            ) {
+                                return Err(ConfigServiceError::InvalidValue(
+                                    "请使用带主键的配置记录接口。".into(),
+                                ));
+                            }
+                            let value = match input {
+                                Some(value) if patch => {
+                                    let current = existing
+                                        .as_ref()
+                                        .map(|entry| entry.value.clone())
+                                        .or_else(|| effective.clone());
+                                    let merged =
+                                        patch_structure(item_metadata, &options, current, &value)?;
+                                    item_metadata.validate_with(&options, &merged)?;
+                                    merged
+                                }
+                                Some(value) => {
+                                    service
+                                        .normalize_value(&module, item_metadata, &value)
+                                        .await?
+                                }
+                                None => match values
+                                    .get(&module)
+                                    .and_then(|entries| entries.get(&item))
+                                    .cloned()
+                                {
+                                    Some(value) => value,
+                                    None => return Ok(None),
+                                },
+                            };
+                            let key = value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string());
+                            (key, value, effective)
+                        };
+                        if key.is_empty() || key.chars().any(char::is_control) {
+                            return Err(ConfigServiceError::InvalidValue(
+                                "通知接入点的键无效。".into(),
+                            ));
+                        }
+                        let entry = Pending {
+                            id,
+                            module,
+                            item,
+                            instance,
+                            key,
+                            value,
+                            previous,
+                            delete,
+                            removed_password_entries,
+                            validation_error: None,
+                        };
+                        values
+                            .entry(JOURNAL.into())
+                            .or_default()
+                            .insert(id.to_string(), json!(entry));
+                        service
+                            .persist_password_changes(values, &password_changes)
+                            .await?;
+                        if let Some(old) = existing {
+                            service
+                                .discard_notification_passwords(
+                                    &entry,
+                                    &old.value,
+                                    &[Some(&entry.value), entry.previous.as_ref()],
+                                )
+                                .await;
+                        }
+                        Ok(Some(entry))
+                    })
+                    .await
+            })
+            .await
     }
 
     async fn persist_notifications(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
@@ -621,85 +666,97 @@ impl ConfigService {
     }
 
     pub async fn migrate_pending_password_paths(&self) -> Result<(), ConfigServiceError> {
-        let _commit = self.commits.lock().await;
-        let mut values = self.values.read().await.clone();
-        let mut migrated = Vec::new();
-        let mut password_changes = Vec::new();
-        for mut entry in pending(&values).into_iter().filter(|entry| !entry.delete) {
-            let (Some(instance), Some(record)) =
-                (entry.instance.as_deref(), entry.value.as_object_mut())
-            else {
-                continue;
-            };
-            let options = item_options(&entry.module, &entry.item);
-            let mut bases = std::collections::BTreeSet::new();
-            for field in options
-                .structure
-                .iter()
-                .flat_map(|structure| &structure.fields)
-            {
-                if !field.data_type.is_password() {
-                    continue;
-                }
-                if let Some(path) = record.get(&field.key).and_then(Value::as_str) {
-                    let base = options.password_path(&field.key, instance)?;
-                    if legacy_pending_password_id(&base, path).is_some() {
-                        bases.insert(base);
-                    }
-                }
-            }
-            if bases.is_empty() {
-                continue;
-            }
-            let old_value = Value::Object(record.clone());
-            for base in bases {
-                let (path, previous) = self
-                    .pending_password_destination(
-                        &options,
-                        instance,
-                        &base,
-                        entry.id,
-                        record,
-                        entry.previous.as_ref(),
-                    )
-                    .await?;
-                if let Some(contents) = self
-                    .stage_password_lines(
-                        &options,
-                        instance,
-                        &base,
-                        &path,
-                        &BTreeMap::new(),
-                        record,
-                    )
-                    .await?
-                {
-                    password_changes.push(PasswordChange {
-                        path,
-                        contents: Some(contents),
-                        previous,
-                    });
-                }
-            }
-            values
-                .get_mut(JOURNAL)
-                .expect("待确认操作存在")
-                .insert(entry.id.to_string(), json!(entry));
-            migrated.push((entry, old_value));
-        }
-        if !migrated.is_empty() {
-            self.persist_password_changes(values, &password_changes)
-                .await?;
-            for (entry, old_value) in migrated {
-                self.discard_notification_passwords(
-                    &entry,
-                    &old_value,
-                    &[Some(&entry.value), entry.previous.as_ref()],
-                )
-                .await;
-            }
-        }
-        Ok(())
+        let service = self.clone();
+        self.commits
+            .run(async move {
+                let credentials = service.record_credentials.clone();
+                credentials
+                    .run(async move {
+                        let mut values = service.stored_values().await;
+                        let mut migrated = Vec::new();
+                        let mut password_changes = Vec::new();
+                        for mut entry in pending(&values).into_iter().filter(|entry| !entry.delete)
+                        {
+                            let (Some(instance), Some(record)) =
+                                (entry.instance.as_deref(), entry.value.as_object_mut())
+                            else {
+                                continue;
+                            };
+                            let options = item_options(&entry.module, &entry.item);
+                            let mut bases = std::collections::BTreeSet::new();
+                            for field in options
+                                .structure
+                                .iter()
+                                .flat_map(|structure| &structure.fields)
+                            {
+                                if !field.data_type.is_password() {
+                                    continue;
+                                }
+                                if let Some(path) = record.get(&field.key).and_then(Value::as_str) {
+                                    let base = options.password_path(&field.key, instance)?;
+                                    if legacy_pending_password_id(&base, path).is_some() {
+                                        bases.insert(base);
+                                    }
+                                }
+                            }
+                            if bases.is_empty() {
+                                continue;
+                            }
+                            let old_value = Value::Object(record.clone());
+                            for base in bases {
+                                let (path, previous) = service
+                                    .pending_password_destination(
+                                        &options,
+                                        instance,
+                                        &base,
+                                        entry.id,
+                                        record,
+                                        entry.previous.as_ref(),
+                                    )
+                                    .await?;
+                                if let Some(contents) = service
+                                    .stage_password_lines(
+                                        &options,
+                                        instance,
+                                        &base,
+                                        &path,
+                                        &BTreeMap::new(),
+                                        record,
+                                    )
+                                    .await?
+                                {
+                                    password_changes.push(PasswordChange {
+                                        path,
+                                        contents: Some(contents),
+                                        previous,
+                                    });
+                                }
+                            }
+                            values
+                                .get_mut(JOURNAL)
+                                .expect("待确认操作存在")
+                                .insert(entry.id.to_string(), json!(entry));
+                            migrated.push((entry, old_value));
+                        }
+                        if !migrated.is_empty() {
+                            service
+                                .persist_password_changes(values, &password_changes)
+                                .await?;
+                            for (entry, old_value) in migrated {
+                                service
+                                    .discard_notification_passwords(
+                                        &entry,
+                                        &old_value,
+                                        &[Some(&entry.value), entry.previous.as_ref()],
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await
+            })
+            .await
     }
 
     async fn pending_password_destination(
@@ -945,22 +1002,37 @@ impl ConfigService {
                 }
             }
             rejected.validation_error = Some(error.clone());
-            let _commit = self.commits.lock().await;
-            let mut values = self.values.read().await.clone();
-            let stored = values
-                .get_mut(JOURNAL)
-                .and_then(|entries| entries.get_mut(&entry.id.to_string()))
-                .ok_or(ConfigServiceError::PendingNotFound)?;
-            *stored = json!(rejected);
-            self.persist_notifications(values).await?;
-            if !error.clear_password_fields.is_empty() {
-                self.discard_notification_passwords(
-                    entry,
-                    &entry.value,
-                    &[Some(&rejected.value), entry.previous.as_ref()],
-                )
-                .await;
-            }
+            let service = self.clone();
+            let pending = entry.clone();
+            let rejection = error.clone();
+            self.commits
+                .run(async move {
+                    let credentials = service.record_credentials.clone();
+                    credentials
+                        .run(async move {
+                            let entry = &pending;
+                            let mut values = service.stored_values().await;
+                            let stored = values
+                                .get_mut(JOURNAL)
+                                .and_then(|entries| entries.get_mut(&entry.id.to_string()))
+                                .ok_or(ConfigServiceError::PendingNotFound)?;
+                            *stored = json!(rejected);
+                            service.persist_notifications(values).await?;
+                            if !rejection.clear_password_fields.is_empty() {
+                                service
+                                    .discard_notification_passwords(
+                                        &entry,
+                                        &entry.value,
+                                        &[Some(&rejected.value), entry.previous.as_ref()],
+                                    )
+                                    .await;
+                            }
+
+                            Ok(())
+                        })
+                        .await
+                })
+                .await?;
             return Err(ConfigServiceError::PendingValidation(error));
         }
         let result = match response.as_ref().map(|response| response.status()) {
@@ -978,74 +1050,97 @@ impl ConfigService {
         {
             self.apply_confirmed_fields(entry, &fields.0).await?;
         }
-        let _commit = self.commits.lock().await;
-        let mut values = self.values.read().await.clone();
-        let id = entry.id.to_string();
-        if !values
-            .get(JOURNAL)
-            .is_some_and(|entries| entries.contains_key(&id))
-        {
-            return Err(ConfigServiceError::PendingNotFound);
-        }
-        let staged = entry.value.clone();
-        let password_changes = if result == Outcome::Confirmed && !entry.delete {
-            self.prepare_password_changes(entry).await?
-        } else {
-            Vec::new()
-        };
-        values.get_mut(JOURNAL).expect("待确认操作存在").remove(&id);
-        if result == Outcome::Confirmed {
-            let entries = values.entry(entry.module.clone()).or_default();
-            if let Some(instance) = &entry.instance {
-                let options = item_options(&entry.module, &entry.item);
-                let key_field = options.notification_key_field()?;
-                let default = self
-                    .module_metadata(&entry.module)
-                    .await?
-                    .item(&entry.item)
-                    .and_then(|item| item.default.clone())
-                    .unwrap_or_else(|| json!([]));
-                let records = entries
-                    .entry(entry.item.clone())
-                    .or_insert(default)
-                    .as_array_mut()
-                    .ok_or(ConfigServiceError::ActionNotFound)?;
-                if let Some(index) = records
-                    .iter()
-                    .position(|record| record[key_field].as_str() == Some(instance))
-                {
-                    if entry.delete {
-                        records.remove(index);
-                    } else {
-                        records[index] = entry.value.clone();
-                    }
-                } else if !entry.delete {
-                    records.push(entry.value.clone());
-                }
-            } else if entry.delete {
-                entries.remove(&entry.item);
-            } else {
-                entries.insert(entry.item.clone(), entry.value.clone());
-            }
-        }
-        self.persist_password_changes(values, &password_changes)
+        let service = self.clone();
+        let pending = entry.clone();
+        *entry = self
+            .commits
+            .run(async move {
+                let credentials = service.record_credentials.clone();
+                credentials
+                    .run(async move {
+                        let mut pending = pending;
+                        let entry = &mut pending;
+                        let mut values = service.stored_values().await;
+                        let id = entry.id.to_string();
+                        if !values
+                            .get(JOURNAL)
+                            .is_some_and(|entries| entries.contains_key(&id))
+                        {
+                            return Err(ConfigServiceError::PendingNotFound);
+                        }
+                        let staged = entry.value.clone();
+                        let password_changes = if result == Outcome::Confirmed && !entry.delete {
+                            service.prepare_password_changes(entry).await?
+                        } else {
+                            Vec::new()
+                        };
+                        values.get_mut(JOURNAL).expect("待确认操作存在").remove(&id);
+                        if result == Outcome::Confirmed {
+                            let entries = values.entry(entry.module.clone()).or_default();
+                            if let Some(instance) = &entry.instance {
+                                let options = item_options(&entry.module, &entry.item);
+                                let key_field = options.notification_key_field()?;
+                                let default = service
+                                    .module_metadata(&entry.module)
+                                    .await?
+                                    .item(&entry.item)
+                                    .and_then(|item| item.default.clone())
+                                    .unwrap_or_else(|| json!([]));
+                                let records = entries
+                                    .entry(entry.item.clone())
+                                    .or_insert(default)
+                                    .as_array_mut()
+                                    .ok_or(ConfigServiceError::ActionNotFound)?;
+                                if let Some(index) = records
+                                    .iter()
+                                    .position(|record| record[key_field].as_str() == Some(instance))
+                                {
+                                    if entry.delete {
+                                        records.remove(index);
+                                    } else {
+                                        records[index] = entry.value.clone();
+                                    }
+                                } else if !entry.delete {
+                                    records.push(entry.value.clone());
+                                }
+                            } else if entry.delete {
+                                entries.remove(&entry.item);
+                            } else {
+                                entries.insert(entry.item.clone(), entry.value.clone());
+                            }
+                        }
+                        service
+                            .persist_password_changes(values, &password_changes)
+                            .await?;
+                        if let Some(previous) =
+                            entry.previous.as_mut().and_then(Value::as_object_mut)
+                        {
+                            previous.retain(|_, value| {
+                                !password_changes.iter().any(|change| {
+                                    change.contents.is_none()
+                                        && value.as_str() == Some(&change.path)
+                                })
+                            });
+                        }
+                        service.clean_notification_passwords(entry, &result).await;
+                        if password_changes
+                            .iter()
+                            .any(|change| change.contents.is_some())
+                        {
+                            service
+                                .discard_notification_passwords(
+                                    entry,
+                                    &staged,
+                                    &[Some(&entry.value)],
+                                )
+                                .await;
+                        }
+
+                        Ok(pending)
+                    })
+                    .await
+            })
             .await?;
-        if let Some(previous) = entry.previous.as_mut().and_then(Value::as_object_mut) {
-            previous.retain(|_, value| {
-                !password_changes
-                    .iter()
-                    .any(|change| change.contents.is_none() && value.as_str() == Some(&change.path))
-            });
-        }
-        self.clean_notification_passwords(entry, &result).await;
-        if password_changes
-            .iter()
-            .any(|change| change.contents.is_some())
-        {
-            self.discard_notification_passwords(entry, &staged, &[Some(&entry.value)])
-                .await;
-        }
-        drop(_commit);
         if result == Outcome::Confirmed {
             let _ = completion.send(true);
         }
@@ -1151,7 +1246,7 @@ impl ConfigService {
         method: Method,
         completion: tokio::sync::watch::Receiver<bool>,
     ) -> Option<axum::response::Response> {
-        let router = self.notification_router.get()?.upgrade()?;
+        let dispatcher = self.notification_router.get()?;
         let options = item_options(&entry.module, &entry.item);
         let endpoint = options.notification_endpoint?;
         let uri = format!(
@@ -1186,10 +1281,21 @@ impl ConfigService {
             })
             .body(body)
             .ok()?;
-        tokio::time::timeout(Duration::from_secs(15), (*router).clone().oneshot(request))
-            .await
-            .ok()?
-            .ok()
+        let delivery = dispatcher
+            .call(move |router| {
+                let router = router.upgrade()?;
+                Some(tokio::spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(15),
+                        (*router).clone().oneshot(request),
+                    )
+                    .await
+                    .ok()?
+                    .ok()
+                }))
+            })
+            .await?;
+        delivery.await.ok()?
     }
 }
 
@@ -1228,7 +1334,10 @@ pub(super) fn clear_retired_pending_password_references(values: &mut StoredValue
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Mutex as SyncMutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use crate::modules::config::registry::ConfigItemRegistration;
     use axum::{Extension, Json, extract::Path, routing::post};

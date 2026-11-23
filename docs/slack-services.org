@@ -70,7 +70,7 @@ Slack 业务接口和工作区配置只接受本机调用，客户端可直接�
 
 ~GET /slack/users~ 一次返回已授权工作区的完整用户目录，优先使用 services 已缓存的资料。响应包含 ~api_version~ 、 ~items~ 和 ~issues~ 。每条用户记录含 ~id~ 、 ~team_id~ 、 ~team_name~ 、 ~session_id~ 、 ~name~ 、 ~display_name~ 、 ~nickname~ 、 ~username~ 和 ~is_bot~ 。 ~id~ 格式为 ~team_id.用户ID~ 。部分工作区查询失败时， ~issues~ 记录其 ~team_id~ 和 ~error~ ，其余工作区的用户仍可用。
 
-~GET /slack/users/{id}~ 计划按复合用户标识查询单条用户资料。响应字段待定。
+~GET /slack/users/{id}~ 按复合用户 ID 读取单条完整资料。成功时返回 HTTP 200、 ~Cache-Control: no-store~ 和 ~{"api_version":"1","user":{...}}~ 。 ~user~ 与用户目录中的记录字段一致，服务端从 ~slack.nicknames~ 合并 ~nickname~ ，未设置时返回 ~null~ 。资料优先从当前工作区的缓存读取，缺失时向 Slack 补查。ID 格式错误时返回 400 ~invalid-request~ ，用户不存在时返回 404 ~slack-user-not-found~ 。
 
 本机用户记录可带 ~cache_path~ 和 ~avatar_path~ ，分别指向资料和 PNG 头像。services 启动后预热头像，写入成功时通过 ~avatar_path~ 返回本机绝对路径。 ~GET /slack/users/{id}/avatar~ 支持显式获取头像并返回 ~cache_path~ ，其中 ~id~ 为复合用户 ID。
 
@@ -117,15 +117,13 @@ GET /slack/users?id=T123.U123&id=T456.U456
 
 services 按工作区当前授权查询，优先使用内存中的用户资料。缺失时只向 Slack 补查对应的用户，同一批次的重复 ID 共用查找结果。只有 Slack 明确返回用户不存在时使用 ~slack-user-not-found~ 。未知工作区、授权失败和 Slack 限流分别使用 ~slack-project-not-found~ 、 ~slack-authorization-required~ 和 ~slack-rate-limited~ 。客户端可仅重试失败项。
 
-** 设置本机昵称
+** 本机昵称
 
-~PUT /slack/users/{id}/nickname~ 使用复合用户 ID。请求体包含 ~nickname~ ，允许最多 80 个字符，保存前去掉首尾空白。传入 ~null~ 或空字符串清除昵称。成功返回 HTTP 200 和 ~{"api_version":"1","user":{...}}~ ， ~user~ 与用户目录使用相同字段。
+~GET /slack/users/{id}/nickname~ 通过复合用户 ID 读取配置中的昵称，返回 ~api_version~ 、 ~id~ 和 ~nickname~ 。未配置昵称时， ~nickname~ 为 ~null~ 。查询可以在 Slack 工作区离线时使用。
 
-#+begin_src json
-{"nickname":"小林"}
-#+end_src
+昵称保存在 ~slack.nicknames~ 。通过配置接口 ~PUT /data/slack/nicknames/{id}~ 保存，通过 ~DELETE /data/slack/nicknames/{id}~ 清除。 ~PUT /slack/users/{id}/nickname~ 作为兼容入口写入同一份配置，接受最多 80 个字符的 ~nickname~ ，保存前去掉首尾空白，传入 ~null~ 或空字符串时清除。兼容入口成功后返回 HTTP 200， ~user~ 与用户目录使用相同字段。
 
-services 按工作区和用户 ID 将昵称保存到 ~~/.assistant/config.yml~ 的 ~slack.nicknames~ ，并在启动时恢复。 ~name~ 保留 Slack 显示名， ~nickname~ 未设置时为 ~null~ 。消息作者、提及、私聊和群组私聊标题、选人及会话预览和新的通知摘要优先使用已设置的昵称。昵称变更随消息订阅传给打开的 Emacs 会话。昵称由本机 services 管理，提及资料包含 ~id~ 、 ~name~ 和 ~nickname~ 。
+服务端在生成结果时向消息作者和提及资料合并昵称， ~name~ 保留 Slack 显示名。消息缓存只保存 Slack 消息数据。响应顶层的 ~nicknames~ 按复合用户 ID 索引当前工作区的昵称。昵称变化通过原有消息订阅送达打开的会话。
 
 * 会话目录
 
@@ -159,6 +157,8 @@ services 按工作区和用户 ID 将昵称保存到 ~~/.assistant/config.yml~ �
 
 两个接口均接受 ~limit~ 和 ~cursor~ ，按 ~next_cursor~ 读取更早消息。响应包含 ~api_version~ 、 ~conversation_id~ 、 ~team_id~ 、 ~items~ 、 ~next_cursor~ 、 ~read_through_ts~ 、 ~first_unread_ts~ 、 ~covered_range~ 和 ~sync_state~ 。 ~sync_state~ 为 ~live~ 或 ~cached~ 。
 
+工作区任务根据消息中的用户 ID 查找当前资料。缓存缺少资料时向 Slack 补查，暂时无法取得时可用 ID 展示。生成分页与订阅结果时，服务端合并配置中的 ~nickname~ 。用户改名更新工作区资料，已有消息在读取时使用最新资料。已有订阅也会收到受影响的缓存消息更新。
+
 消息中可包含 ~attachments~ 和 ~tables~ 。附件包含 ~title~ 、 ~mimetype~ 、 ~size~ 、 ~url~ 、 ~text~ 和 ~image~ ，其中 ~url~ 是供用户打开的链接， ~image~ 表示可读取图片预览。 ~tables~ 以表格、行、单元格的数组返回 Slack 原生表格的文本。
 
 服务启动时预热用户与已知机器人的头像，历史分页及订阅投递可在 ~author.avatar_path~ 提供本地头像。services 获取消息后先尝试缓存支持的图片预览，缓存成功时在 ~attachments[].preview_path~ 提供本地绝对路径。下载失败或超时后继续提供消息与附件信息。Emacs 只显示由这些路径指向的本地图片。
@@ -184,7 +184,7 @@ services 复用已缓存的原件，缓存缺失时从 Slack 下载并在写入�
 | ~POST /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ | 提交原件下载。路径参数与原件查询接口相同，请求体为空。任务排队或下载中时返回 HTTP 202，命中原件缓存时返回 HTTP 200，响应体均为 ~{"download_id":"<UUID>"}~ 。 |
 | ~GET /slack/downloads/{download_id}~ | 查询任务。返回 HTTP 200 和当前进度，任务自身失败时通过响应中的 ~state~ 和 ~error~ 表示。 |
 
-两个接口仅供本机调用，可带 ~X-Loki-Slack-Session~ 。任务归属提交时的工作区授权会话。该会话中重复提交同一附件且任务仍在进行时，返回已有任务 ID。缓存命中时，可用任务 ID 立即查询到完成结果。失败后可重新提交，取得新的任务 ID。
+两个接口仅供本机调用，可带 ~X-Loki-Slack-Session~ 。任务由所属工作区管理，归属提交时的授权会话。该会话中重复提交同一附件且任务仍在进行时，返回已有任务 ID。缓存命中时，可用任务 ID 立即查询到完成结果。失败后可重新提交，取得新的任务 ID。
 
 services 将下载任务记录和 ID 仅保存在当前进程的内存中，运行期间保留所有记录，包括已完成和失败的任务。services 重启后从空任务表开始。查询未知 ID 或重启前的 ID 返回 HTTP 404 ~slack-download-not-found~ 。查询已知任务时，所属授权会话已失效则返回 HTTP 409 ~slack-session-changed~ 。
 
@@ -327,7 +327,7 @@ Emacs 按订阅 UUID 查找仍存活的主聊天 buffer，并核对会话和会�
 :CUSTOM_ID: conversation-watches
 :END:
 
-services 在本机持久化一份全局关注队列。配置项 ~slack/watches~ 是只读的 ~SlackWatch~ 数组，每条记录包含复合会话 ID ~id~ 和显示名称 ~display_name~ ，由 Slack 模块通过关注接口更新。主题聊天对应 Slack 的公开或私有频道（ ~public_channel~ 、 ~private_channel~ ）。关注范围包含主题聊天的顶层消息和该聊天中所有线索的回复。关闭聊天窗口、退出 Emacs 或重启 services 后仍保留关注。 [[file:slack-emacs.org::#conversation-watches][Emacs 主题聊天关注操作]]
+services 将关注记录持久化到本机配置，按复合会话 ID 将关注操作路由到对应工作区。配置项 ~slack/watches~ 是只读的 ~SlackWatch~ 数组，每条记录包含复合会话 ID ~id~ 和显示名称 ~display_name~ ，由 Slack 模块通过关注接口更新。主题聊天对应 Slack 的公开或私有频道（ ~public_channel~ 、 ~private_channel~ ）。关注范围包含主题聊天的顶层消息和该聊天中所有线索的回复。关闭聊天窗口、退出 Emacs 或重启 services 后仍保留关注。 [[file:slack-emacs.org::#conversation-watches][Emacs 主题聊天关注操作]]
 
 ** 本机 HTTP 接口
 

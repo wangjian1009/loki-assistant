@@ -42,6 +42,7 @@ async fn rust_publishers_preserve_json_values_and_http_reads_the_shared_snapshot
         "tools":{"enabled":false,"count":0,"empty":null,"list":[]}});
     let posted = service
         .publish_many(serde_json::from_value(values.clone()).unwrap())
+        .await
         .unwrap();
     assert_eq!(serde_json::to_value(&posted).unwrap()["status"], values);
     assert!(posted.updated_at.unwrap() > 0);
@@ -73,16 +74,17 @@ async fn rust_publishers_merge_items_and_reject_invalid_batches_atomically() {
             )
             .unwrap(),
         )
+        .await
         .unwrap();
-    service.publish("tasks", "items", json!([])).unwrap();
+    service.publish("tasks", "items", json!([])).await.unwrap();
     assert_eq!(
-        service.snapshot().status,
+        service.snapshot().await.status,
         serde_json::from_value(
             json!({"emacs":{"runtime":{"pid":123}},"tasks":{"count":2,"items":[]}})
         )
         .unwrap()
     );
-    let before = serde_json::to_value(service.snapshot()).unwrap();
+    let before = serde_json::to_value(service.snapshot().await).unwrap();
     for input in [
         json!({}),
         json!({"emacs":{}}),
@@ -93,9 +95,13 @@ async fn rust_publishers_merge_items_and_reject_invalid_batches_atomically() {
         assert!(
             service
                 .publish_many(serde_json::from_value(input).unwrap())
+                .await
                 .is_err()
         );
-        assert_eq!(serde_json::to_value(service.snapshot()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(service.snapshot().await).unwrap(),
+            before
+        );
     }
     let (status, body) = request(service, "GET", "/status/emacs/missing", Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -107,9 +113,11 @@ async fn status_http_is_read_only_and_cannot_overwrite_rust_published_values() {
     let service = Arc::new(StatusService::new());
     service
         .publish("network", "my", json!({"status":"disconnected"}))
+        .await
         .unwrap();
     service
         .publish("emacs", "runtime", json!({"pid":42}))
+        .await
         .unwrap();
     for (method, path) in [
         ("POST", "/stats/meta"),
@@ -134,10 +142,15 @@ async fn status_http_is_read_only_and_cannot_overwrite_rust_published_values() {
     let (_, value) = request(service.clone(), "GET", "/status/emacs/runtime", Value::Null).await;
     assert_eq!(value["value"], json!({"pid":42}));
     assert_eq!(
-        service.value("network", "my").unwrap().value,
+        service.value("network", "my").await.unwrap().value,
         json!({"status":"disconnected"})
     );
-    assert!(StatusService::new().value("emacs", "runtime").is_err());
+    assert!(
+        StatusService::new()
+            .value("emacs", "runtime")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -192,7 +205,7 @@ async fn status_module_is_discoverable_and_old_emacs_status_routes_are_removed()
 async fn service_state_has_no_node_layer_and_module_query_returns_all_fields() {
     let services = Arc::new(crate::Services::build());
     let status = Arc::clone(&services.status);
-    let snapshot = status.snapshot();
+    let snapshot = status.snapshot().await;
     let start_at = snapshot.status["service"]["start_at"].as_u64().unwrap();
     assert!(start_at > 0);
     assert_eq!(snapshot.status["service"].len(), 3);
@@ -220,25 +233,28 @@ async fn service_state_has_no_node_layer_and_module_query_returns_all_fields() {
     assert_eq!(code, StatusCode::NOT_FOUND);
 }
 
-#[test]
-fn concurrent_publishers_preserve_independent_items() {
+#[tokio::test]
+async fn concurrent_publishers_preserve_independent_items() {
     let service = Arc::new(StatusService::new());
-    std::thread::scope(|scope| {
-        for index in 0..12 {
-            let service = service.clone();
-            scope.spawn(move || {
-                service
-                    .publish("test", &format!("item{index}"), json!(index))
-                    .unwrap();
-            });
-        }
-    });
-    assert_eq!(service.snapshot().status["test"].len(), 12);
-    for name in ["", " ", ".", "..", "bad/name"] {
-        assert!(service.publish(name, "value", json!(1)).is_err());
-        assert!(service.publish("test", name, json!(1)).is_err());
+    let mut publishers = tokio::task::JoinSet::new();
+    for index in 0..12 {
+        let service = service.clone();
+        publishers.spawn(async move {
+            service
+                .publish("test", &format!("item{index}"), json!(index))
+                .await
+                .unwrap();
+        });
     }
-    assert_eq!(service.snapshot().status["test"].len(), 12);
+    while let Some(result) = publishers.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(service.snapshot().await.status["test"].len(), 12);
+    for name in ["", " ", ".", "..", "bad/name"] {
+        assert!(service.publish(name, "value", json!(1)).await.is_err());
+        assert!(service.publish("test", name, json!(1)).await.is_err());
+    }
+    assert_eq!(service.snapshot().await.status["test"].len(), 12);
 }
 
 #[tokio::test]
@@ -251,14 +267,15 @@ async fn metadata_is_complete_before_publication_and_contains_no_runtime_values(
     for id in ["emacs", "network", "service"] {
         assert!(modules.iter().any(|module| module["id"] == id));
     }
-    assert!(service.snapshot().status.is_empty());
-    assert_eq!(service.snapshot().updated_at, None);
+    assert!(service.snapshot().await.status.is_empty());
+    assert_eq!(service.snapshot().await.updated_at, None);
     service
         .publish(
             "custom",
             "value",
             json!({"private_runtime":"仅存于数据接口"}),
         )
+        .await
         .unwrap();
     let (_, reread) = request(service, "GET", "/stats/meta", Value::Null).await;
     assert_eq!(reread, metadata);
@@ -327,8 +344,8 @@ async fn metadata_describes_emacs_runtime_and_all_network_states() {
     assert_eq!(service_item["schema"]["data_type"], "integer");
 }
 
-#[test]
-fn external_validation_checks_primitive_types_optional_fields_and_nullable_values() {
+#[tokio::test]
+async fn external_validation_checks_primitive_types_optional_fields_and_nullable_values() {
     use super::{
         model::{StatusFieldMetadata as Field, StatusSchema},
         validation::validate,
@@ -361,9 +378,10 @@ fn external_validation_checks_primitive_types_optional_fields_and_nullable_value
             .publish_many_validated(
                 serde_json::from_value(json!({"network":{"my":{"status":state}}})).unwrap(),
             )
+            .await
             .unwrap();
         assert_eq!(
-            service.value("network", "my").unwrap().value["status"],
+            service.value("network", "my").await.unwrap().value["status"],
             state
         );
     }

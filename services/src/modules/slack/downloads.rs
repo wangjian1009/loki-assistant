@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
 
 use reqwest::{
     Response, StatusCode,
@@ -11,11 +6,10 @@ use reqwest::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, Semaphore},
-};
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
 use uuid::Uuid;
+
+use crate::process::Process;
 
 use super::{
     client::attachment_mime,
@@ -23,17 +17,18 @@ use super::{
     projects::Projects,
     protocol::{Attachment, Error},
     service::SlackService,
+    team::Team,
 };
 
 pub(super) struct Downloads {
-    registry: Mutex<Registry>,
+    registry: Process<Registry>,
     slots: Semaphore,
 }
 
 impl Default for Downloads {
     fn default() -> Self {
         Self {
-            registry: Mutex::default(),
+            registry: Process::start(Registry::default()),
             slots: Semaphore::new(4),
         }
     }
@@ -42,14 +37,13 @@ impl Default for Downloads {
 #[derive(Default)]
 struct Registry {
     tasks: HashMap<Uuid, Arc<Task>>,
-    active: HashMap<PathBuf, (Arc<Task>, Arc<Mutex<()>>)>,
+    active: HashMap<PathBuf, (Arc<Task>, Arc<Semaphore>)>,
 }
 
 struct Task {
     id: Uuid,
-    team: String,
     session: Uuid,
-    progress: Mutex<Progress>,
+    progress: Process<Progress>,
 }
 
 #[derive(Default)]
@@ -100,75 +94,24 @@ impl Progress {
 impl Projects {
     pub(super) async fn start_download(
         &self,
-        team: &str,
-        service: Arc<SlackService>,
+        service: Arc<Team>,
         session: Uuid,
         conversation: &str,
         ts: &str,
         index: usize,
     ) -> Result<(Uuid, bool), Error> {
-        let state = service.state.lock().await;
-        let account = state.account(session)?;
-        let item = state.message_attachment(conversation, ts, index)?;
-        let cache = state.cache.disk.clone().ok_or(Error::Unavailable)?;
-        let partial = cache
-            .partial_attachment(&item, &account.identity.user_id)
-            .ok_or(Error::Attachment)?;
-        let mut registry = self.downloads.registry.lock().await;
-        let existing = registry.active.get(&partial.path);
-        if let Some((task, _)) = existing
-            && task.session == session
-        {
-            return Ok((task.id, false));
-        }
-        let file_lock = existing.map_or_else(|| Arc::new(Mutex::new(())), |(_, lock)| lock.clone());
-        let mut progress = Progress::default();
-        let cached = cache.attachment(&item, false).and_then(|path| {
-            let size = fs::symlink_metadata(&path).ok()?.len();
-            Some((path, size))
-        });
-        let complete = cached.is_some();
-        if let Some((path, size)) = cached {
-            progress.complete(path, size);
-        }
-        let task = Arc::new(Task {
-            id: Uuid::new_v4(),
-            team: team.to_owned(),
-            session,
-            progress: Mutex::new(progress),
-        });
-        registry.tasks.insert(task.id, task.clone());
-        let task_id = task.id;
-        if !complete {
-            registry
-                .active
-                .insert(partial.path.clone(), (task.clone(), file_lock.clone()));
-            let downloads = self.downloads.clone();
-            drop(state);
-            tokio::spawn(async move {
-                let _file = file_lock.lock().await;
-                let original = Original {
-                    item,
-                    cache,
-                    partial,
-                };
-                let result = downloads.transfer(&service, &task, &original).await;
-                let mut registry = downloads.registry.lock().await;
-                let mut progress = task.progress.lock().await;
-                match result {
-                    Ok((path, bytes)) => progress.complete(path, bytes),
-                    Err(error) => progress.state = DownloadState::Failed(error),
-                }
-                if registry
-                    .active
-                    .get(&original.partial.path)
-                    .is_some_and(|(active, _)| active.id == task.id)
-                {
-                    registry.active.remove(&original.partial.path);
-                }
-            });
-        }
-        Ok((task_id, complete))
+        let (conversation, ts) = (conversation.to_owned(), ts.to_owned());
+        service
+            .request(move |service| {
+                Box::pin(async move {
+                    service
+                        .downloads
+                        .clone()
+                        .start(service, session, conversation, ts, index)
+                        .await
+                })
+            })
+            .await
     }
 
     pub(super) async fn download_status(
@@ -176,28 +119,155 @@ impl Projects {
         id: Uuid,
         session: Option<Uuid>,
     ) -> Result<Value, Error> {
-        let task = self
-            .downloads
-            .registry
-            .lock()
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+        let registries = self.teams.call(|teams| teams.downloads.clone()).await;
+        let lookups: FuturesUnordered<_> = registries
+            .into_iter()
+            .map(|(team, downloads)| async move {
+                let task = downloads
+                    .registry
+                    .call(move |registry| registry.tasks.get(&id).cloned())
+                    .await;
+                task.map(|task| (team, task))
+            })
+            .collect();
+        let (team, task) = lookups
+            .filter_map(std::future::ready)
+            .next()
             .await
-            .tasks
-            .get(&id)
-            .cloned()
             .ok_or(Error::Download)?;
         if session.is_some_and(|session| session != task.session) {
             return Err(Error::Session);
         }
-        let service = self.service(&task.team).await.map_err(|_| Error::Session)?;
-        let state = service.state.lock().await;
-        state.account(task.session).map_err(|_| Error::Session)?;
-        Ok(task.progress.lock().await.result(id))
+        let service = self.service(&team).await.map_err(|_| Error::Session)?;
+        service
+            .check_session(task.session)
+            .await
+            .map_err(|_| Error::Session)?;
+        Ok(task
+            .progress
+            .call(move |progress| progress.result(id))
+            .await)
     }
 }
 
 impl Downloads {
-    pub(super) async fn active_paths(&self) -> HashSet<PathBuf> {
-        self.registry.lock().await.active.keys().cloned().collect()
+    async fn start(
+        self: Arc<Self>,
+        service: Arc<SlackService>,
+        session: Uuid,
+        conversation: String,
+        ts: String,
+        index: usize,
+    ) -> Result<(Uuid, bool), Error> {
+        let downloads = self.clone();
+        let state = service.state.clone();
+        state
+            .with(move |state| {
+                Box::pin(async move {
+                    let account = state.account(session)?;
+                    let item = state.message_attachment(&conversation, &ts, index)?;
+                    let cache = state.cache.disk.clone().ok_or(Error::Unavailable)?;
+                    let partial = cache
+                        .partial_attachment(&item, &account.identity.user_id)
+                        .ok_or(Error::Attachment)?;
+                    self.registry
+                        .blocking(move |registry| {
+                            let existing = registry.active.get(&partial.path);
+                            if let Some((task, _)) = existing
+                                && task.session == session
+                            {
+                                return Ok((task.id, false));
+                            }
+                            let file_lock = existing.map_or_else(
+                                || Arc::new(Semaphore::new(1)),
+                                |(_, lock)| lock.clone(),
+                            );
+                            let mut progress = Progress::default();
+                            let cached = cache.attachment(&item, false).and_then(|path| {
+                                let size = fs::symlink_metadata(&path).ok()?.len();
+                                Some((path, size))
+                            });
+                            let complete = cached.is_some();
+                            if let Some((path, size)) = cached {
+                                progress.complete(path, size);
+                            }
+                            let task = Arc::new(Task {
+                                id: Uuid::new_v4(),
+                                session,
+                                progress: Process::start(progress),
+                            });
+                            registry.tasks.insert(task.id, task.clone());
+                            let task_id = task.id;
+                            if !complete {
+                                registry.active.insert(
+                                    partial.path.clone(),
+                                    (task.clone(), file_lock.clone()),
+                                );
+                                tokio::spawn(async move {
+                                    let _file =
+                                        file_lock.acquire().await.expect("下载文件许可不能关闭");
+                                    let original = Original {
+                                        item,
+                                        cache,
+                                        partial,
+                                    };
+                                    let result =
+                                        downloads.transfer(&service, &task, &original).await;
+                                    task.progress
+                                        .call(move |progress| match result {
+                                            Ok((path, bytes)) => progress.complete(path, bytes),
+                                            Err(error) => {
+                                                progress.state = DownloadState::Failed(error)
+                                            }
+                                        })
+                                        .await;
+                                    downloads
+                                        .registry
+                                        .call(move |registry| {
+                                            if registry
+                                                .active
+                                                .get(&original.partial.path)
+                                                .is_some_and(|(active, _)| active.id == task.id)
+                                            {
+                                                registry.active.remove(&original.partial.path);
+                                            }
+                                        })
+                                        .await;
+                                });
+                            }
+                            Ok((task_id, complete))
+                        })
+                        .await
+                })
+            })
+            .await
+    }
+
+    pub(super) async fn clean_cache(
+        &self,
+        root: PathBuf,
+        team: String,
+        retention: std::time::Duration,
+    ) {
+        self.registry
+            .blocking(move |registry| {
+                let active = registry.active.keys().cloned().collect();
+                DiskCache::clean_team(&root, &team, retention, &active);
+            })
+            .await;
+    }
+
+    pub(super) fn schedule_cache_cleanup(
+        &self,
+        root: PathBuf,
+        team: String,
+        retention: std::time::Duration,
+    ) {
+        self.registry.post_blocking(move |registry| {
+            let active = registry.active.keys().cloned().collect();
+            DiskCache::clean_team(&root, &team, retention, &active);
+        });
     }
 
     async fn transfer(
@@ -209,10 +279,16 @@ impl Downloads {
         let _slot = self.slots.acquire().await.map_err(|_| Error::Unavailable)?;
         let result = original.transfer(service, task).await;
         if result.is_err() {
-            let state = service.state.lock().await;
-            if state.account(task.session).is_ok() && original.partial.read().is_none() {
-                original.partial.discard();
-            }
+            let partial = original.partial.clone();
+            let session = task.session;
+            service
+                .state
+                .blocking(move |state| {
+                    if state.account(session).is_ok() && partial.read().is_none() {
+                        partial.discard();
+                    }
+                })
+                .await;
         }
         result
     }
@@ -229,22 +305,19 @@ impl Original {
         let url = self.item.download_url.as_deref().ok_or(Error::Attachment)?;
         let source = format!("{:x}", Sha256::digest(url.as_bytes()));
         let mut changes = service.change.subscribe();
-        let token = service
-            .state
-            .lock()
-            .await
-            .account(task.session)?
-            .access
-            .clone();
+        let session = task.session;
+        let token = service.session_token(session).await?;
         let web = service.web_session(task.session).await?;
         let mut resume = self.partial.read().filter(|(offset, metadata)| {
             metadata.source == source
                 && strong_etag(&metadata.etag)
                 && metadata.total.is_none_or(|total| *offset < total)
         });
-        task.progress.lock().await.state = DownloadState::Downloading;
+        task.progress
+            .call(|progress| progress.state = DownloadState::Downloading)
+            .await;
         loop {
-            let mut response = service
+            let response = service
                 .client
                 .transfer_original(
                     url,
@@ -255,77 +328,85 @@ impl Original {
                         .map(|(offset, data)| (*offset, data.etag.as_str())),
                 )
                 .await?;
-            let mut offset = 0;
-            let mut limit = response.content_length();
-            let mut total = limit;
-            let metadata;
-            let mime;
-            let file = {
-                let state = service.state.lock().await;
-                state.account(task.session)?;
-                let file = match response.status() {
-                    StatusCode::OK if identity_encoding(&response) => {
-                        total = total.or_else(|| self.item.file_id.as_ref().and(self.item.size));
-                        limit = total;
-                        mime = attachment_mime(&response).to_owned();
-                        metadata = response
-                            .headers()
-                            .get(ETAG)
-                            .and_then(|value| value.to_str().ok())
-                            .filter(|value| strong_etag(value))
-                            .map(|etag| PartialMetadata {
-                                etag: etag.to_owned(),
-                                source: source.clone(),
-                                total,
-                                mime: mime.clone(),
+            let partial = self.partial.clone();
+            let file_size = self.item.file_id.as_ref().and(self.item.size);
+            let source = source.clone();
+            let (mut response, setup) = service
+                .state
+                .blocking(move |state| {
+                    state.account(session)?;
+                    let mut offset = 0;
+                    let mut limit = response.content_length();
+                    let mut total = limit;
+                    let metadata;
+                    let mime;
+                    let file = match response.status() {
+                        StatusCode::OK if identity_encoding(&response) => {
+                            total = total.or_else(|| file_size);
+                            limit = total;
+                            mime = attachment_mime(&response).to_owned();
+                            metadata = response
+                                .headers()
+                                .get(ETAG)
+                                .and_then(|value| value.to_str().ok())
+                                .filter(|value| strong_etag(value))
+                                .map(|etag| PartialMetadata {
+                                    etag: etag.to_owned(),
+                                    source: source.clone(),
+                                    total,
+                                    mime: mime.clone(),
+                                });
+                            partial.reset()
+                        }
+                        StatusCode::PARTIAL_CONTENT => {
+                            let segment = resume.as_ref().and_then(|(offset, data)| {
+                                response_range(&response, *offset, data)
                             });
-                        self.partial.reset()
+                            let Some((end, length)) = segment else {
+                                if resume.take().is_some() {
+                                    partial.discard();
+                                    return Ok((response, None));
+                                }
+                                return Err(Error::Unavailable);
+                            };
+                            let (start, mut data) = resume.take().expect("已验证续传范围");
+                            offset = start;
+                            limit = Some(end + 1);
+                            total = Some(length);
+                            data.total = total;
+                            mime = data.mime.clone();
+                            metadata = Some(data);
+                            partial.append()
+                        }
+                        StatusCode::RANGE_NOT_SATISFIABLE if resume.take().is_some() => {
+                            partial.discard();
+                            return Ok((response, None));
+                        }
+                        status if status.is_server_error() => return Err(Error::Unavailable),
+                        _ => return Err(Error::Attachment),
                     }
-                    StatusCode::PARTIAL_CONTENT => {
-                        let segment = resume
-                            .as_ref()
-                            .and_then(|(offset, data)| response_range(&response, *offset, data));
-                        let Some((end, length)) = segment else {
-                            if resume.take().is_some() {
-                                self.partial.discard();
-                                continue;
-                            }
-                            return Err(Error::Unavailable);
-                        };
-                        let (start, mut data) = resume.take().expect("已验证续传范围");
-                        offset = start;
-                        limit = Some(end + 1);
-                        total = Some(length);
-                        data.total = total;
-                        mime = data.mime.clone();
-                        metadata = Some(data);
-                        self.partial.append()
+                    .map_err(|_| Error::Unavailable)?;
+                    if let Some(metadata) = &metadata {
+                        partial.save(metadata).map_err(|_| Error::Unavailable)?;
                     }
-                    StatusCode::RANGE_NOT_SATISFIABLE if resume.take().is_some() => {
-                        self.partial.discard();
-                        continue;
-                    }
-                    status if status.is_server_error() => return Err(Error::Unavailable),
-                    _ => return Err(Error::Attachment),
-                }
-                .map_err(|_| Error::Unavailable)?;
-                if let Some(metadata) = &metadata {
-                    self.partial
-                        .save(metadata)
-                        .map_err(|_| Error::Unavailable)?;
-                }
-                file
+                    Ok((response, Some((file, offset, limit, total, metadata, mime))))
+                })
+                .await?;
+            let Some((file, mut offset, limit, total, metadata, mime)) = setup else {
+                resume = None;
+                continue;
             };
             let mut file = tokio::fs::File::from_std(file);
-            {
-                let mut progress = task.progress.lock().await;
-                progress.bytes = offset;
-                progress.total = total;
-            }
+            task.progress
+                .call(move |progress| {
+                    progress.bytes = offset;
+                    progress.total = total;
+                })
+                .await;
             while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
                 if changes.has_changed().unwrap_or(true) {
                     changes.borrow_and_update();
-                    service.state.lock().await.account(task.session)?;
+                    service.check_session(session).await?;
                 }
                 let next = offset
                     .checked_add(chunk.len() as u64)
@@ -338,7 +419,9 @@ impl Original {
                     .map_err(|_| Error::Unavailable)?;
                 file.flush().await.map_err(|_| Error::Unavailable)?;
                 offset = next;
-                task.progress.lock().await.bytes = offset;
+                task.progress
+                    .call(move |progress| progress.bytes = offset)
+                    .await;
             }
             drop(file);
             if limit.is_some_and(|limit| offset != limit) {
@@ -348,17 +431,21 @@ impl Original {
                 resume = metadata.map(|metadata| (offset, metadata));
                 continue;
             }
-            let state = service.state.lock().await;
-            state.account(task.session)?;
             let path = self
                 .cache
                 .attachment_destination(&self.item, false, &mime)
                 .ok_or(Error::Unavailable)?;
-            return self
-                .partial
-                .commit(path)
-                .map(|path| (path, offset))
-                .map_err(|_| Error::Unavailable);
+            let partial = self.partial.clone();
+            return service
+                .state
+                .blocking(move |state| {
+                    state.account(session)?;
+                    partial
+                        .commit(path)
+                        .map(|path| (path, offset))
+                        .map_err(|_| Error::Unavailable)
+                })
+                .await;
         }
     }
 }

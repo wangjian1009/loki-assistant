@@ -1,13 +1,11 @@
+use crate::process::Process;
+
 use std::{collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
 use std::{io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::{
-    process::Command,
-    sync::{Mutex, RwLock},
-    time::timeout,
-};
+use tokio::{process::Command, time::timeout};
 
 use crate::modules::status::{
     StatusService,
@@ -121,8 +119,8 @@ pub struct EmacsService {
     notifications: Arc<NotificationService>,
     status: Arc<StatusService>,
     timeout: Duration,
-    evaluation: Mutex<()>,
-    handlers: RwLock<HashMap<String, Arc<dyn NotificationHandler>>>,
+    evaluation: Process<()>,
+    handlers: Process<HashMap<String, Arc<dyn NotificationHandler>>>,
 }
 
 impl Debug for EmacsService {
@@ -163,15 +161,16 @@ impl EmacsService {
             notifications,
             status,
             timeout,
-            evaluation: Mutex::new(()),
-            handlers: RwLock::new(HashMap::new()),
+            evaluation: Process::start(()),
+            handlers: Process::start(HashMap::new()),
         }
     }
 
     /// Emacs 业务入口接收上报后，通过共享 Rust 接口发布，不另建状态缓存。
-    pub fn receive_status(&self, values: StatusValues) -> Result<StatusResponse, EmacsError> {
+    pub async fn receive_status(&self, values: StatusValues) -> Result<StatusResponse, EmacsError> {
         self.status
             .publish_many_validated(values)
+            .await
             .map_err(|error| EmacsError::InvalidRequest(error.to_string()))
     }
 
@@ -188,54 +187,62 @@ impl EmacsService {
             return Err(EmacsError::InvalidRequest("script 不能为空".to_owned()));
         }
         // 同一 gateway 串行连接，避免多个请求同时触发 daemon 启动。
-        let _guard = self.evaluation.lock().await;
-        let program = match self.config.emacsclient_path().await {
-            Ok(value) => value
-                .value
-                .as_str()
-                .filter(|path| !path.trim().is_empty() && !path.contains('\0'))
-                .ok_or_else(|| EmacsError::Config("emacsclient_path 必须是非空路径".to_owned()))?
-                .to_owned(),
-            Err(error) => return Err(EmacsError::Config(error.to_string())),
-        };
-        let socket = self
-            .config
-            .socket_name()
+        let config = self.config.clone();
+        let runner = self.runner.clone();
+        let deadline = self.timeout;
+        let script = script.to_owned();
+        self.evaluation
+            .run(async move {
+                let program = match config.emacsclient_path().await {
+                    Ok(value) => value
+                        .value
+                        .as_str()
+                        .filter(|path| !path.trim().is_empty() && !path.contains('\0'))
+                        .ok_or_else(|| {
+                            EmacsError::Config("emacsclient_path 必须是非空路径".to_owned())
+                        })?
+                        .to_owned(),
+                    Err(error) => return Err(EmacsError::Config(error.to_string())),
+                };
+                let socket = config
+                    .socket_name()
+                    .await
+                    .map_err(|error| EmacsError::Config(error.to_string()))?;
+                let socket = socket
+                    .value
+                    .as_str()
+                    .filter(|name| !name.trim().is_empty() && !name.contains('\0'))
+                    .ok_or_else(|| {
+                        EmacsError::Config("socket_name 必须是非空 socket 名称或路径".to_owned())
+                    })?;
+                let args = vec![
+                    if auto_start {
+                        "--alternate-editor="
+                    } else {
+                        "--alternate-editor=/usr/bin/false"
+                    }
+                    .to_owned(),
+                    // 显式指定 socket，禁止 emacsclient 在连接失败后尝试 TCP server 文件。
+                    format!("--socket-name={socket}"),
+                    "--eval".to_owned(),
+                    eval_expression(&script),
+                ];
+                let output = timeout(deadline, runner.run(&program, &args))
+                    .await
+                    .map_err(|_| EmacsError::Timeout)??;
+                if !output.success {
+                    return Err(EmacsError::CommandFailed {
+                        status: output.status,
+                        message: if output.stderr.trim().is_empty() {
+                            output.stdout
+                        } else {
+                            output.stderr
+                        },
+                    });
+                }
+                decode_response(&output.stdout)
+            })
             .await
-            .map_err(|error| EmacsError::Config(error.to_string()))?;
-        let socket = socket
-            .value
-            .as_str()
-            .filter(|name| !name.trim().is_empty() && !name.contains('\0'))
-            .ok_or_else(|| {
-                EmacsError::Config("socket_name 必须是非空 socket 名称或路径".to_owned())
-            })?;
-        let args = vec![
-            if auto_start {
-                "--alternate-editor="
-            } else {
-                "--alternate-editor=/usr/bin/false"
-            }
-            .to_owned(),
-            // 显式指定 socket，禁止 emacsclient 在连接失败后尝试 TCP server 文件。
-            format!("--socket-name={socket}"),
-            "--eval".to_owned(),
-            eval_expression(script),
-        ];
-        let output = timeout(self.timeout, self.runner.run(&program, &args))
-            .await
-            .map_err(|_| EmacsError::Timeout)??;
-        if !output.success {
-            return Err(EmacsError::CommandFailed {
-                status: output.status,
-                message: if output.stderr.trim().is_empty() {
-                    output.stdout
-                } else {
-                    output.stderr
-                },
-            });
-        }
-        decode_response(&output.stdout)
     }
 
     pub async fn buffers(&self) -> Result<Vec<Buffer>, EmacsError> {
@@ -350,11 +357,16 @@ impl EmacsService {
         match self.eval(script).await?.as_str() {
             "t" => Ok(()),
             "nil" => Err(EmacsError::AppNotFound("slack".into())),
-            _ => Err(EmacsError::InvalidResponse("Slack 聊天激活回执无效。".into())),
+            _ => Err(EmacsError::InvalidResponse(
+                "Slack 聊天激活回执无效。".into(),
+            )),
         }
     }
 
-    pub(crate) async fn dispatch_slack_messages(&self, payload: &Value) -> Result<bool, EmacsError> {
+    pub(crate) async fn dispatch_slack_messages(
+        &self,
+        payload: &Value,
+    ) -> Result<bool, EmacsError> {
         let path = std::env::temp_dir().join(format!("loki-slack-{}.json", uuid::Uuid::new_v4()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -367,17 +379,26 @@ impl EmacsService {
             .and_then(|_| file.flush().map_err(serde_json::Error::io))
             .map_err(|_| EmacsError::InvalidResponse("无法写入 Slack 投递文件。".into()))?;
         drop(file);
-        let argument = serde_json::to_string(&path.0.to_string_lossy())
-            .expect("投递文件路径可序列化");
+        let argument =
+            serde_json::to_string(&path.0.to_string_lossy()).expect("投递文件路径可序列化");
         let script = format!(
             "(if (require 'loki-assistant-dispatch nil t) \
                  (loki-assistant-dispatch-slack-messages {argument}) 'buffer-closed)"
         );
-        match timeout(Duration::from_secs(10), self.eval_with_startup(&script, false)).await {
+        match timeout(
+            Duration::from_secs(10),
+            self.eval_with_startup(&script, false),
+        )
+        .await
+        {
             Ok(Ok(output)) if output == "applied" => Ok(true),
             Ok(Ok(output)) if output == "buffer-closed" => Ok(false),
-            Ok(Err(EmacsError::CommandFailed { .. } | EmacsError::ConnectionFailed(_))) => Ok(false),
-            Ok(Ok(_)) => Err(EmacsError::InvalidResponse("Slack 消息分发回执无效。".into())),
+            Ok(Err(EmacsError::CommandFailed { .. } | EmacsError::ConnectionFailed(_))) => {
+                Ok(false)
+            }
+            Ok(Ok(_)) => Err(EmacsError::InvalidResponse(
+                "Slack 消息分发回执无效。".into(),
+            )),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(EmacsError::Timeout),
         }
@@ -392,16 +413,22 @@ impl EmacsService {
         if module_id.trim().is_empty() {
             return Err(EmacsError::InvalidRequest("module_id 不能为空".to_owned()));
         }
-        let mut handlers = self.handlers.write().await;
-        if handlers.contains_key(&module_id) {
-            return Err(EmacsError::HandlerAlreadyRegistered(module_id));
-        }
-        handlers.insert(module_id, handler);
-        Ok(())
+        self.handlers
+            .call(move |handlers| {
+                if handlers.contains_key(&module_id) {
+                    return Err(EmacsError::HandlerAlreadyRegistered(module_id));
+                }
+                handlers.insert(module_id, handler);
+                Ok(())
+            })
+            .await
     }
 
     pub async fn unregister_notification_handler(&self, module_id: &str) -> bool {
-        self.handlers.write().await.remove(module_id).is_some()
+        let module_id = module_id.to_owned();
+        self.handlers
+            .call(move |handlers| handlers.remove(&module_id).is_some())
+            .await
     }
 
     pub async fn notify(&self, notification: Notification) -> Result<Value, EmacsError> {
@@ -425,13 +452,11 @@ impl EmacsService {
                 "module_id、title 不能为空；提供 buffer 时必须为非空字符串".to_owned(),
             ));
         }
+        let module_id = notification.module_id.clone();
         let handler = self
             .handlers
-            .read()
-            .await
-            .get(&notification.module_id)
-            .cloned();
-        // 不持有注册表锁执行模块代码，处理器可以继续调用 gateway 或修改注册表。
+            .call(move |handlers| handlers.get(&module_id).cloned())
+            .await;
         if let Some(handler) = handler {
             timeout(self.timeout, handler.handle(notification))
                 .await

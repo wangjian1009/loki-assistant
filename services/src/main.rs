@@ -38,7 +38,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(error) = network.start().await {
             eprintln!("网络初始化失败：{error}");
         }
-        network.monitor().await;
     });
     let network_pairings = tokio::spawn(services.network.clone().receive_pairings());
 

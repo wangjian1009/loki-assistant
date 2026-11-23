@@ -1,3 +1,5 @@
+use crate::process::Process;
+
 use std::{
     collections::BTreeMap,
     sync::Arc,
@@ -5,7 +7,6 @@ use std::{
 };
 
 use serde_json::json;
-use tokio::sync::Mutex;
 
 use super::{ACTIVE_KEY, Alert, AlertInput, MODULE_ID};
 use crate::modules::{
@@ -26,21 +27,25 @@ pub enum AlertError {
 
 #[derive(Debug)]
 pub struct AlertService {
-    active: Mutex<BTreeMap<String, Alert>>,
+    process: Process<State>,
+}
+
+#[derive(Debug)]
+struct State {
+    active: BTreeMap<String, Alert>,
     status: Arc<StatusService>,
     notification: Arc<NotificationService>,
 }
 
 impl AlertService {
     pub(crate) fn new(status: Arc<StatusService>, notification: Arc<NotificationService>) -> Self {
-        let active = BTreeMap::new();
-        status
-            .publish(MODULE_ID, ACTIVE_KEY, json!([]))
-            .expect("告警模块和状态项名称必须有效");
+        status.post(MODULE_ID, ACTIVE_KEY, json!([]));
         Self {
-            active: Mutex::new(active),
-            status,
-            notification,
+            process: Process::start(State {
+                active: BTreeMap::new(),
+                status,
+                notification,
+            }),
         }
     }
 
@@ -68,8 +73,24 @@ impl AlertService {
                 .map_err(|_| AlertError::InvalidRequest("callback_url 必须是本机服务的绝对路径"))?;
         }
 
-        let mut active = self.active.lock().await;
-        let previous = active.get(id);
+        let id = id.to_owned();
+        self.process
+            .with(move |state| Box::pin(async move { state.publish(&id, input).await }))
+            .await
+    }
+
+    pub async fn clear(&self, id: &str) -> Result<bool, AlertError> {
+        validate_id(id)?;
+        let id = id.to_owned();
+        self.process
+            .with(move |state| Box::pin(async move { state.clear(&id).await }))
+            .await
+    }
+}
+
+impl State {
+    async fn publish(&mut self, id: &str, input: AlertInput) -> Result<(Alert, bool), AlertError> {
+        let previous = self.active.get(id);
         if let Some(previous) = previous.filter(|alert| {
             alert.app == input.app
                 && alert.title == input.title
@@ -94,10 +115,10 @@ impl AlertService {
             created_at: previous.map_or(now, |alert| alert.created_at),
             updated_at: now,
         };
-        let mut next = active.clone();
+        let mut next = self.active.clone();
         next.insert(id.to_owned(), alert.clone());
-        self.publish_snapshot(&next)?;
-        *active = next;
+        self.publish_snapshot(&next).await?;
+        self.active = next;
 
         self.notification.trigger(NotificationRequest {
             app: alert.app.clone(),
@@ -108,25 +129,25 @@ impl AlertService {
         Ok((alert, created))
     }
 
-    pub async fn clear(&self, id: &str) -> Result<bool, AlertError> {
-        validate_id(id)?;
-        let mut active = self.active.lock().await;
-        if !active.contains_key(id) {
+    async fn clear(&mut self, id: &str) -> Result<bool, AlertError> {
+        if !self.active.contains_key(id) {
             return Ok(false);
         }
-        let mut next = active.clone();
+        let mut next = self.active.clone();
         next.remove(id);
-        self.publish_snapshot(&next)?;
-        *active = next;
+        self.publish_snapshot(&next).await?;
+        self.active = next;
         Ok(true)
     }
 
-    fn publish_snapshot(&self, active: &BTreeMap<String, Alert>) -> Result<(), StatusError> {
+    async fn publish_snapshot(&self, active: &BTreeMap<String, Alert>) -> Result<(), StatusError> {
         let alerts = json!(active.values().collect::<Vec<_>>());
-        self.status.publish_many_validated(BTreeMap::from([(
-            MODULE_ID.to_owned(),
-            BTreeMap::from([(ACTIVE_KEY.to_owned(), alerts)]),
-        )]))?;
+        self.status
+            .publish_many_validated(BTreeMap::from([(
+                MODULE_ID.to_owned(),
+                BTreeMap::from([(ACTIVE_KEY.to_owned(), alerts)]),
+            )]))
+            .await?;
         Ok(())
     }
 }

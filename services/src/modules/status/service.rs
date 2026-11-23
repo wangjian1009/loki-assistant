@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    sync::RwLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +9,8 @@ use super::protocol::{
     StatusValues,
 };
 use serde_json::Value;
+
+use crate::process::Process;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatusError {
@@ -35,14 +36,29 @@ struct Snapshot {
 }
 
 /// 通用内存状态存储；数据由发布方提供，不查询业务模块，不保存到配置文件。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StatusService {
-    snapshot: RwLock<Snapshot>,
+    snapshot: Process<Snapshot>,
+}
+
+impl Default for StatusService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StatusService {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            snapshot: Process::start(Snapshot::default()),
+        }
+    }
+
+    pub(crate) fn post(&self, module: &str, key: &str, value: Value) {
+        let (module, key) = (module.to_owned(), key.to_owned());
+        self.snapshot.post(move |state| {
+            Self::put(state, module, key, value, Self::now());
+        });
     }
 
     pub fn metadata(&self) -> Vec<StatusModuleMetadata> {
@@ -68,14 +84,15 @@ impl StatusService {
         }
     }
 
-    pub fn snapshot(&self) -> StatusResponse {
-        self.snapshot_for(false)
+    pub async fn snapshot(&self) -> StatusResponse {
+        self.snapshot_for(false).await
     }
 
-    pub(super) fn snapshot_for(&self, remote: bool) -> StatusResponse {
+    pub(super) async fn snapshot_for(&self, remote: bool) -> StatusResponse {
         let metadata = remote.then(|| self.metadata());
-        let state = self.snapshot.read().expect("状态锁不应中毒");
-        Self::snapshot_from(&state, metadata.as_deref())
+        self.snapshot
+            .call(move |state| Self::snapshot_from(state, metadata.as_deref()))
+            .await
     }
 
     fn snapshot_from(
@@ -147,70 +164,82 @@ impl StatusService {
         Ok(())
     }
 
-    pub fn value(&self, module_id: &str, key: &str) -> Result<StatusValueResponse, StatusError> {
-        self.value_for(module_id, key, false)
+    pub async fn value(
+        &self,
+        module_id: &str,
+        key: &str,
+    ) -> Result<StatusValueResponse, StatusError> {
+        self.value_for(module_id, key, false).await
     }
 
-    pub(crate) fn value_for(
+    pub(crate) async fn value_for(
         &self,
         module_id: &str,
         key: &str,
         remote: bool,
     ) -> Result<StatusValueResponse, StatusError> {
         self.check_access(module_id, key, remote)?;
-        let state = self.snapshot.read().expect("状态锁不应中毒");
-        let value = state
-            .values
-            .get(module_id)
-            .and_then(|values| values.get(key))
-            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), key.to_owned()))?;
-        Ok(StatusValueResponse {
-            api_version: API_VERSION.to_owned(),
-            module_id: module_id.to_owned(),
-            key: key.to_owned(),
-            value: value.clone(),
-            updated_at: state.timestamps[&(module_id.to_owned(), key.to_owned())],
-        })
+        let (module_id, key) = (module_id.to_owned(), key.to_owned());
+        self.snapshot
+            .call(move |state| {
+                let value = state
+                    .values
+                    .get(&module_id)
+                    .and_then(|values| values.get(&key))
+                    .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), key.to_owned()))?;
+                Ok(StatusValueResponse {
+                    api_version: API_VERSION.to_owned(),
+                    module_id: module_id.to_owned(),
+                    key: key.to_owned(),
+                    value: value.clone(),
+                    updated_at: state.timestamps[&(module_id.to_owned(), key.to_owned())],
+                })
+            })
+            .await
     }
 
-    pub fn module_value(&self, module_id: &str) -> Result<StatusModuleResponse, StatusError> {
-        self.module_value_for(module_id, false)
+    pub async fn module_value(&self, module_id: &str) -> Result<StatusModuleResponse, StatusError> {
+        self.module_value_for(module_id, false).await
     }
 
-    pub(super) fn module_value_for(
+    pub(super) async fn module_value_for(
         &self,
         module_id: &str,
         remote: bool,
     ) -> Result<StatusModuleResponse, StatusError> {
         Self::valid_name(module_id)?;
         let metadata = remote.then(|| self.metadata());
-        let state = self.snapshot.read().expect("状态锁不应中毒");
-        let values = state
-            .values
-            .get(module_id)
-            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
-        let (value, updated_at) =
-            Self::visible_module_values(&state, module_id, values, metadata.as_deref());
-        let updated_at =
-            updated_at.ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
-        Ok(StatusModuleResponse {
-            api_version: API_VERSION.to_owned(),
-            module_id: module_id.to_owned(),
-            value,
-            updated_at,
-        })
+        let module_id = module_id.to_owned();
+        self.snapshot
+            .call(move |state| {
+                let values = state
+                    .values
+                    .get(&module_id)
+                    .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
+                let (value, updated_at) =
+                    Self::visible_module_values(state, &module_id, values, metadata.as_deref());
+                let updated_at = updated_at
+                    .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), String::new()))?;
+                Ok(StatusModuleResponse {
+                    api_version: API_VERSION.to_owned(),
+                    module_id: module_id.to_owned(),
+                    value,
+                    updated_at,
+                })
+            })
+            .await
     }
 
-    pub fn path_value(
+    pub async fn path_value(
         &self,
         module_id: &str,
         key: &str,
         path: &str,
     ) -> Result<StatusPathResponse, StatusError> {
-        self.path_value_for(module_id, key, path, false)
+        self.path_value_for(module_id, key, path, false).await
     }
 
-    pub(super) fn path_value_for(
+    pub(super) async fn path_value_for(
         &self,
         module_id: &str,
         key: &str,
@@ -225,34 +254,40 @@ impl StatusService {
         for segment in &segments {
             Self::valid_name(segment)?;
         }
-        let state = self.snapshot.read().expect("状态锁不应中毒");
-        let root = state
-            .values
-            .get(module_id)
-            .and_then(|values| values.get(key))
-            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), key.to_owned()))?;
-        let mut value = root;
-        for segment in &segments {
-            value = match value {
-                Value::Object(object) => object.get(*segment),
-                Value::Array(array) => segment
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| array.get(index)),
-                _ => None,
-            }
-            .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), format!("{key}/{path}")))?;
-        }
-        Ok(StatusPathResponse {
-            api_version: API_VERSION.to_owned(),
-            module_id: module_id.to_owned(),
-            path: format!("{key}/{path}"),
-            value: value.clone(),
-            updated_at: state.timestamps[&(module_id.to_owned(), key.to_owned())],
-        })
+        let (module_id, key, path) = (module_id.to_owned(), key.to_owned(), path.to_owned());
+        self.snapshot
+            .call(move |state| {
+                let root = state
+                    .values
+                    .get(&module_id)
+                    .and_then(|values| values.get(&key))
+                    .ok_or_else(|| StatusError::NotFound(module_id.to_owned(), key.to_owned()))?;
+                let mut value = root;
+                for segment in path.split('/') {
+                    value = match value {
+                        Value::Object(object) => object.get(segment),
+                        Value::Array(array) => segment
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|index| array.get(index)),
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        StatusError::NotFound(module_id.to_owned(), format!("{key}/{path}"))
+                    })?;
+                }
+                Ok(StatusPathResponse {
+                    api_version: API_VERSION.to_owned(),
+                    module_id: module_id.to_owned(),
+                    path: format!("{key}/{path}"),
+                    value: value.clone(),
+                    updated_at: state.timestamps[&(module_id.to_owned(), key.to_owned())],
+                })
+            })
+            .await
     }
 
-    pub fn publish(
+    pub async fn publish(
         &self,
         module_id: &str,
         key: &str,
@@ -260,42 +295,49 @@ impl StatusService {
     ) -> Result<StatusValueResponse, StatusError> {
         Self::valid_name(module_id)?;
         Self::valid_name(key)?;
-        let mut state = self.snapshot.write().expect("状态锁不应中毒");
-        let updated_at = Self::now();
-        Self::put(
-            &mut state,
-            module_id.to_owned(),
-            key.to_owned(),
-            value.clone(),
-            updated_at,
-        );
-        Ok(StatusValueResponse {
-            api_version: API_VERSION.to_owned(),
-            module_id: module_id.to_owned(),
-            key: key.to_owned(),
-            value,
-            updated_at,
-        })
+        let (module_id, key) = (module_id.to_owned(), key.to_owned());
+        self.snapshot
+            .call(move |state| {
+                let updated_at = Self::now();
+                Self::put(
+                    state,
+                    module_id.to_owned(),
+                    key.to_owned(),
+                    value.clone(),
+                    updated_at,
+                );
+                Ok(StatusValueResponse {
+                    api_version: API_VERSION.to_owned(),
+                    module_id: module_id.to_owned(),
+                    key: key.to_owned(),
+                    value,
+                    updated_at,
+                })
+            })
+            .await
     }
 
-    pub fn publish_many(&self, values: StatusValues) -> Result<StatusResponse, StatusError> {
+    pub async fn publish_many(&self, values: StatusValues) -> Result<StatusResponse, StatusError> {
         Self::validate_names(&values)?;
-        Ok(self.publish_batch(values))
+        Ok(self.publish_batch(values).await)
     }
 
-    fn publish_batch(&self, values: StatusValues) -> StatusResponse {
-        let mut state = self.snapshot.write().expect("状态锁不应中毒");
-        let now = Self::now();
-        for (module, items) in values {
-            for (key, value) in items {
-                Self::put(&mut state, module.clone(), key, value, now);
-            }
-        }
-        Self::snapshot_from(&state, None)
+    async fn publish_batch(&self, values: StatusValues) -> StatusResponse {
+        self.snapshot
+            .call(move |state| {
+                let now = Self::now();
+                for (module, items) in values {
+                    for (key, value) in items {
+                        Self::put(state, module.clone(), key, value, now);
+                    }
+                }
+                Self::snapshot_from(state, None)
+            })
+            .await
     }
 
     /// 外部上报使用声明结构严格校验，整批通过后才更新共享状态。
-    pub fn publish_many_validated(
+    pub async fn publish_many_validated(
         &self,
         values: StatusValues,
     ) -> Result<StatusResponse, StatusError> {
@@ -313,7 +355,7 @@ impl StatusService {
                 super::validation::validate(&item.schema, value, &format!("{module_id}/{key}"))?;
             }
         }
-        Ok(self.publish_batch(values))
+        Ok(self.publish_batch(values).await)
     }
 
     fn validate_names(values: &StatusValues) -> Result<(), StatusError> {

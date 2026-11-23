@@ -16,20 +16,21 @@ pub(super) fn relay_password() -> Password {
 
 pub(super) async fn relay_token(config: &ConfigService) -> Result<String, ConfigServiceError> {
     let password = relay_password();
+    let storage = config.clone();
     config
-        .update_system_value(LEGACY_RELAY_TOKEN, None, async |legacy| {
+        .update_system_value(LEGACY_RELAY_TOKEN, None, async move |legacy| {
             if let Some(value) = legacy {
                 let value = value
                     .as_str()
                     .ok_or_else(|| ConfigServiceError::Storage("旧中转令牌格式无效。".into()))?;
                 if !value.trim().is_empty() {
-                    password.import(config, value).await?;
+                    password.import(&storage, value).await?;
                     return Ok((None, value.to_owned()));
                 }
             }
             Ok((
                 None,
-                password.read_optional(config).await?.unwrap_or_default(),
+                password.read_optional(&storage).await?.unwrap_or_default(),
             ))
         })
         .await

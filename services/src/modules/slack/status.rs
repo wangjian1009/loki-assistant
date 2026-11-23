@@ -1,7 +1,6 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use crate::process::Process;
+
+use std::{collections::BTreeMap, sync::Arc};
 
 use loki_services_macros::loki_status;
 use serde::Serialize;
@@ -158,45 +157,56 @@ struct ProjectSnapshot {
 }
 
 pub(super) struct ProjectsStatus {
+    entries: Process<Entries>,
+}
+
+struct Entries {
     status: Arc<StatusService>,
-    entries: Mutex<BTreeMap<String, ProjectSnapshot>>,
+    projects: BTreeMap<String, ProjectSnapshot>,
 }
 
 impl ProjectsStatus {
     pub fn new(status: Arc<StatusService>) -> Self {
-        let snapshot = Self {
-            status,
-            entries: Mutex::default(),
-        };
-        let entries = snapshot.entries.lock().unwrap();
-        snapshot.publish_connections(&entries);
-        snapshot.publish_new_conversations(&entries);
-        drop(entries);
-        snapshot
-    }
-
-    pub fn register(&self, id: &str, generation: Uuid, value: Value) {
-        let mut entries = self.entries.lock().unwrap();
-        entries.insert(
-            id.to_owned(),
-            ProjectSnapshot {
-                generation,
-                connection: value,
-                new_conversations: Vec::new(),
-            },
-        );
-        self.publish_connections(&entries);
-    }
-
-    pub fn update(&self, id: &str, generation: Uuid, value: Value) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(project) = entries.get_mut(id)
-            && project.generation == generation
-            && project.connection != value
-        {
-            project.connection = value;
-            self.publish_connections(&entries);
+        status.post("slack", "connections", json!([]));
+        status.post("slack", "new_conversations", json!([]));
+        Self {
+            entries: Process::start(Entries {
+                status,
+                projects: BTreeMap::new(),
+            }),
         }
+    }
+
+    pub async fn register(&self, id: &str, generation: Uuid, value: Value) {
+        let id = id.to_owned();
+        self.entries
+            .call(move |entries| {
+                entries.projects.insert(
+                    id,
+                    ProjectSnapshot {
+                        generation,
+                        connection: value,
+                        new_conversations: Vec::new(),
+                    },
+                );
+                entries.publish_connections();
+            })
+            .await;
+    }
+
+    pub async fn update(&self, id: &str, generation: Uuid, value: Value) {
+        let id = id.to_owned();
+        self.entries
+            .call(move |entries| {
+                if let Some(project) = entries.projects.get_mut(&id)
+                    && project.generation == generation
+                    && project.connection != value
+                {
+                    project.connection = value;
+                    entries.publish_connections();
+                }
+            })
+            .await;
     }
 
     pub fn update_new_conversations(
@@ -239,38 +249,51 @@ impl ProjectsStatus {
                 })
                 .collect()
         });
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(project) = entries.get_mut(id)
-            && project.generation == generation
-            && project.new_conversations != new_conversations
-        {
-            project.new_conversations = new_conversations;
-            self.publish_new_conversations(&entries);
-        }
-    }
-
-    pub fn remove(&self, id: &str) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(project) = entries.remove(id) {
-            self.publish_connections(&entries);
-            if !project.new_conversations.is_empty() {
-                self.publish_new_conversations(&entries);
+        let id = id.to_owned();
+        self.entries.post(move |entries| {
+            if let Some(project) = entries.projects.get_mut(&id)
+                && project.generation == generation
+                && project.new_conversations != new_conversations
+            {
+                project.new_conversations = new_conversations;
+                entries.publish_new_conversations();
             }
-        }
+        });
     }
 
-    fn publish_connections(&self, entries: &BTreeMap<String, ProjectSnapshot>) {
+    pub async fn remove(&self, id: &str) {
+        let id = id.to_owned();
+        self.entries
+            .call(move |entries| {
+                if let Some(project) = entries.projects.remove(&id) {
+                    entries.publish_connections();
+                    if !project.new_conversations.is_empty() {
+                        entries.publish_new_conversations();
+                    }
+                }
+            })
+            .await;
+    }
+
+    pub async fn flush(&self) {
+        self.entries.call(|_| ()).await;
+    }
+}
+
+impl Entries {
+    fn publish_connections(&self) {
         let value = json!(
-            entries
+            self.projects
                 .values()
                 .map(|project| &project.connection)
                 .collect::<Vec<_>>()
         );
-        let _ = self.status.publish("slack", "connections", value);
+        self.status.post("slack", "connections", value);
     }
 
-    fn publish_new_conversations(&self, entries: &BTreeMap<String, ProjectSnapshot>) {
-        let mut conversations: Vec<_> = entries
+    fn publish_new_conversations(&self) {
+        let mut conversations: Vec<_> = self
+            .projects
             .values()
             .flat_map(|project| &project.new_conversations)
             .collect();
@@ -280,8 +303,7 @@ impl ProjectsStatus {
                 .cmp(&left.order)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let _ = self
-            .status
-            .publish("slack", "new_conversations", json!(conversations));
+        self.status
+            .post("slack", "new_conversations", json!(conversations));
     }
 }

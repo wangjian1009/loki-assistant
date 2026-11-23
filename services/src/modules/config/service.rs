@@ -5,7 +5,9 @@ use std::{fmt::Debug, future::Future, pin::Pin};
 
 use regex::Regex;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::broadcast;
+
+use crate::process::Process;
 
 use crate::modules::password::service::{PasswordError, PasswordService, validate_file};
 
@@ -27,18 +29,24 @@ pub(crate) use system::{LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX};
 
 #[derive(Clone, Debug)]
 pub struct ConfigService {
-    metadata: Arc<RwLock<HashMap<String, ConfigModuleMetadata>>>,
-    values: Arc<RwLock<StoredValues>>,
-    system_values: Arc<RwLock<system::SystemValues>>,
-    persistence: Arc<Mutex<()>>,
+    metadata: Arc<HashMap<String, ConfigModuleMetadata>>,
+    data: Process<StoredConfig>,
+    values: Process<Arc<StoredValues>>,
+    record_credentials: Process<()>,
     changes: broadcast::Sender<ConfigChange>,
-    commits: Arc<Mutex<()>>,
+    commits: Process<()>,
     handlers: HashMap<String, Arc<dyn ConfigChangeHandler>>,
     passwords: Option<Arc<PasswordService>>,
-    storage: Option<FileStorage>,
     executable_search_path: Vec<PathBuf>,
-    notification_router: Arc<std::sync::OnceLock<std::sync::Weak<axum::Router>>>,
-    notifications_in_flight: Arc<std::sync::Mutex<notifications::InFlight>>,
+    notification_router: Arc<std::sync::OnceLock<Process<std::sync::Weak<axum::Router>>>>,
+    notifications_in_flight: Process<notifications::InFlight>,
+}
+
+#[derive(Default)]
+struct StoredConfig {
+    values: Arc<StoredValues>,
+    system: system::SystemValues,
+    storage: Option<FileStorage>,
 }
 
 #[derive(Clone, Debug)]
@@ -323,11 +331,14 @@ impl ConfigService {
         if let Some(cleaned) = cleaned {
             storage.write_atomic(cleaned)?;
         }
-        let mut service = Self::with_metadata(metadata);
-        service.values = Arc::new(RwLock::new(values));
-        service.system_values = Arc::new(RwLock::new(system::SystemValues(system_values)));
-        service.storage = Some(storage);
-        Ok(service)
+        Ok(Self::with_data(
+            metadata,
+            StoredConfig {
+                values: Arc::new(values),
+                system: system::SystemValues(system_values),
+                storage: Some(storage),
+            },
+        ))
     }
 
     /// 在服务组装阶段为模块配置提交处理器，每个模块至多一个。
@@ -351,6 +362,10 @@ impl ConfigService {
     }
 
     fn with_metadata(metadata: Vec<ConfigModuleMetadata>) -> Self {
+        Self::with_data(metadata, StoredConfig::default())
+    }
+
+    fn with_data(metadata: Vec<ConfigModuleMetadata>, data: StoredConfig) -> Self {
         let (changes, _) = broadcast::channel(32);
         let modules = metadata
             .into_iter()
@@ -358,17 +373,16 @@ impl ConfigService {
             .map(|metadata| (metadata.id.clone(), metadata))
             .collect();
         Self {
-            metadata: Arc::new(RwLock::new(modules)),
-            values: Arc::new(RwLock::new(HashMap::new())),
-            system_values: Arc::default(),
-            persistence: Arc::default(),
+            metadata: Arc::new(modules),
+            values: Process::start(data.values.clone()),
+            data: Process::start(data),
+            record_credentials: Process::start(()),
             changes,
-            commits: Arc::new(Mutex::new(())),
+            commits: Process::start(()),
             handlers: HashMap::new(),
             passwords: None,
-            storage: None,
             notification_router: Arc::default(),
-            notifications_in_flight: Arc::default(),
+            notifications_in_flight: Process::start(notifications::InFlight::default()),
             executable_search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
@@ -380,7 +394,7 @@ impl ConfigService {
     }
 
     pub(super) async fn metadata_for(&self, remote: bool) -> Vec<ConfigModuleMetadata> {
-        let mut modules: Vec<_> = self.metadata.read().await.values().cloned().collect();
+        let mut modules: Vec<_> = self.metadata.values().cloned().collect();
         if remote {
             for module in &mut modules {
                 module.items.retain(|item| item.remote_access.allows_read());
@@ -403,13 +417,11 @@ impl ConfigService {
         remote: bool,
     ) -> Result<BTreeMap<String, ConfigValue>, ConfigServiceError> {
         let metadata = self.module_metadata(module_id).await?;
+        let id = module_id.to_owned();
         let user_values = self
             .values
-            .read()
-            .await
-            .get(module_id)
-            .cloned()
-            .unwrap_or_default();
+            .call(move |values| values.get(&id).cloned().unwrap_or_default())
+            .await;
         let mut resolved = BTreeMap::new();
         for item in metadata
             .items
@@ -544,13 +556,16 @@ impl ConfigService {
         if item.data_type.is_password() {
             return Ok(self.secret_value(module_id, key).await);
         }
+        let (module, item_key) = (module_id.to_owned(), key.to_owned());
         let user_value = self
             .values
-            .read()
-            .await
-            .get(module_id)
-            .and_then(|values| values.get(key))
-            .cloned();
+            .call(move |values| {
+                values
+                    .get(&module)
+                    .and_then(|values| values.get(&item_key))
+                    .cloned()
+            })
+            .await;
         self.resolve_value(item, user_value.as_ref())
             .await?
             .ok_or_else(|| ConfigServiceError::ValueNotSet {
@@ -617,17 +632,17 @@ impl ConfigService {
         let service = self.clone();
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
         // HTTP 请求取消后仍完成已接受的落盘事务，避免内存与文件版本分离。
-        tokio::spawn(async move {
-            if secret {
-                service.replace_secret(&module_id, &key, value).await
-            } else {
-                service
-                    .update(&module_id, &key, value, ConfigChangeOperation::Replace)
-                    .await
-            }
-        })
-        .await
-        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+        self.commits
+            .run(async move {
+                if secret {
+                    service.replace_secret(&module_id, &key, value).await
+                } else {
+                    service
+                        .update(&module_id, &key, value, ConfigChangeOperation::Replace)
+                        .await
+                }
+            })
+            .await
     }
 
     pub async fn partial(
@@ -638,9 +653,9 @@ impl ConfigService {
     ) -> Result<Value, ConfigServiceError> {
         let service = self.clone();
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
-        tokio::spawn(async move { service.partial_inner(&module_id, &key, partial).await })
+        self.commits
+            .run(async move { service.partial_inner(&module_id, &key, partial).await })
             .await
-            .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
     }
 
     pub(super) fn has_record_creation_handler(&self, module: &str, key: &str) -> bool {
@@ -742,37 +757,36 @@ impl ConfigService {
         patch: Value,
     ) -> Result<Value, ConfigServiceError> {
         let service = self.clone();
-        tokio::spawn(async move {
-            let metadata = service.module_metadata(&module).await?;
-            let item = metadata
-                .item(&key)
-                .ok_or_else(|| ConfigServiceError::ItemNotFound {
-                    module_id: module.clone(),
-                    key: key.clone(),
-                })?;
-            let _commit = service.commits.lock().await;
-            let values = service.values.read().await.clone();
-            let current = service
-                .resolve_value(
-                    item,
-                    values.get(&module).and_then(|entries| entries.get(&key)),
-                )
-                .await?
-                .map(|data| data.value);
-            let value = patch_structure(item, &item_options(&module, &key), current, &patch)?;
-            service
-                .commit(
-                    values,
-                    item,
-                    &module,
-                    &key,
-                    value,
-                    ConfigChangeOperation::Merge,
-                )
-                .await
-        })
-        .await
-        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+        self.commits
+            .run(async move {
+                let metadata = service.module_metadata(&module).await?;
+                let item = metadata
+                    .item(&key)
+                    .ok_or_else(|| ConfigServiceError::ItemNotFound {
+                        module_id: module.clone(),
+                        key: key.clone(),
+                    })?;
+                let values = service.stored_values().await;
+                let current = service
+                    .resolve_value(
+                        item,
+                        values.get(&module).and_then(|entries| entries.get(&key)),
+                    )
+                    .await?
+                    .map(|data| data.value);
+                let value = patch_structure(item, &item_options(&module, &key), current, &patch)?;
+                service
+                    .commit(
+                        values,
+                        item,
+                        &module,
+                        &key,
+                        value,
+                        ConfigChangeOperation::Merge,
+                    )
+                    .await
+            })
+            .await
     }
 
     pub(super) async fn update_record_fields(
@@ -817,24 +831,36 @@ impl ConfigService {
         instance: &str,
         fields: [&str; N],
     ) -> Result<[Option<String>; N], ConfigServiceError> {
-        let _commit = self.commits.lock().await;
-        let options = item_options(module, key);
-        let id_field = options
-            .structure
-            .as_ref()
-            .and_then(|value| value.id_field.as_ref())
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        let data = self.value(module, key).await?;
-        let record = data
-            .value
-            .as_array()
-            .and_then(|records| {
-                records
-                    .iter()
-                    .find(|record| record[id_field].as_str() == Some(instance))
+        let service = self.clone();
+        let (module, key, instance) = (module.to_owned(), key.to_owned(), instance.to_owned());
+        let fields = fields.map(str::to_owned);
+        self.record_credentials
+            .run(async move {
+                let options = item_options(&module, &key);
+                let id_field = options
+                    .structure
+                    .as_ref()
+                    .and_then(|value| value.id_field.as_ref())
+                    .ok_or(ConfigServiceError::ActionNotFound)?;
+                let data = service.value(&module, &key).await?;
+                let record = data
+                    .value
+                    .as_array()
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .find(|record| record[id_field].as_str() == Some(instance.as_str()))
+                    })
+                    .ok_or(ConfigServiceError::ActionNotFound)?;
+                service
+                    .load_record_passwords(
+                        &options,
+                        record,
+                        &instance,
+                        fields.each_ref().map(String::as_str),
+                    )
+                    .await
             })
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        self.load_record_passwords(&options, record, instance, fields)
             .await
     }
 
@@ -935,101 +961,100 @@ impl ConfigService {
         let default = self.resolve_value(item, None).await?.map(|data| data.value);
         let item = item.clone();
         let service = self.clone();
-        tokio::spawn(async move {
-            let _commit = service.commits.lock().await;
-            let values = service.values.read().await.clone();
-            let mut collection = match values
-                .get(&module_id)
-                .and_then(|entries| entries.get(&key))
-                .cloned()
-                .or(default)
-            {
-                Some(Value::Array(records)) => records,
-                None => Vec::new(),
-                _ => {
-                    return Err(ConfigServiceError::InvalidValue(
-                        "配置集合必须为 JSON array。".into(),
-                    ));
-                }
-            };
-            let created = if let Some(current) = collection
-                .iter_mut()
-                .find(|value| value[&id_field].as_str() == Some(instance.as_str()))
-            {
-                if create_only {
-                    return Err(ConfigServiceError::RecordExists);
-                }
-                if preserve_record {
-                    let mut previous = current.as_object().cloned().ok_or_else(|| {
-                        ConfigServiceError::InvalidValue("配置记录必须为 JSON object。".into())
-                    })?;
-                    previous.extend(record);
-                    record = previous;
-                }
-                if !authorized {
-                    for key in &read_only {
-                        if let Some(value) = current.get(key) {
-                            record.insert(key.clone(), value.clone());
+        self.commits
+            .run(async move {
+                let values = service.stored_values().await;
+                let mut collection = match values
+                    .get(&module_id)
+                    .and_then(|entries| entries.get(&key))
+                    .cloned()
+                    .or(default)
+                {
+                    Some(Value::Array(records)) => records,
+                    None => Vec::new(),
+                    _ => {
+                        return Err(ConfigServiceError::InvalidValue(
+                            "配置集合必须为 JSON array。".into(),
+                        ));
+                    }
+                };
+                let created = if let Some(current) = collection
+                    .iter_mut()
+                    .find(|value| value[&id_field].as_str() == Some(instance.as_str()))
+                {
+                    if create_only {
+                        return Err(ConfigServiceError::RecordExists);
+                    }
+                    if preserve_record {
+                        let mut previous = current.as_object().cloned().ok_or_else(|| {
+                            ConfigServiceError::InvalidValue("配置记录必须为 JSON object。".into())
+                        })?;
+                        previous.extend(record);
+                        record = previous;
+                    }
+                    if !authorized {
+                        for key in &read_only {
+                            if let Some(value) = current.get(key) {
+                                record.insert(key.clone(), value.clone());
+                            }
                         }
                     }
-                }
-                if let Some(previous_id) = options
-                    .structure
-                    .as_ref()
-                    .and_then(|structure| structure.legacy_dictionary.as_ref())
-                    .and_then(|legacy| legacy.previous_id_field.as_deref())
-                    .and_then(|key| current.get(key).cloned().map(|value| (key, value)))
-                {
-                    record.insert(previous_id.0.to_owned(), previous_id.1);
-                }
-                let record = Value::Object(record);
-                if patch {
-                    merge_patch(current, &record);
-                } else {
-                    *current = record;
-                }
-                false
-            } else {
-                if patch {
-                    return Err(ConfigServiceError::ActionNotFound);
-                }
-                if preserve_record {
-                    return Err(ConfigServiceError::ItemNotFound { module_id, key });
-                }
-                collection.push(Value::Object(record));
-                true
-            };
-            let collection = Value::Array(collection);
-            item.validate_with(&options, &collection)?;
-            let stored = service
-                .commit_with_password(
-                    values,
-                    &item,
-                    &module_id,
-                    &key,
-                    collection,
-                    if authorized {
-                        ConfigChangeOperation::AuthorizedCreate
-                    } else if created {
-                        ConfigChangeOperation::Append
+                    if let Some(previous_id) = options
+                        .structure
+                        .as_ref()
+                        .and_then(|structure| structure.legacy_dictionary.as_ref())
+                        .and_then(|legacy| legacy.previous_id_field.as_deref())
+                        .and_then(|key| current.get(key).cloned().map(|value| (key, value)))
+                    {
+                        record.insert(previous_id.0.to_owned(), previous_id.1);
+                    }
+                    let record = Value::Object(record);
+                    if patch {
+                        merge_patch(current, &record);
                     } else {
-                        ConfigChangeOperation::Merge
-                    },
-                    password,
-                )
-                .await?;
-            stored
-                .as_array()
-                .and_then(|records| {
-                    records
-                        .iter()
-                        .find(|record| record[&id_field].as_str() == Some(instance.as_str()))
-                })
-                .cloned()
-                .ok_or_else(|| ConfigServiceError::Storage("保存结果缺少目标配置记录。".into()))
-        })
-        .await
-        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+                        *current = record;
+                    }
+                    false
+                } else {
+                    if patch {
+                        return Err(ConfigServiceError::ActionNotFound);
+                    }
+                    if preserve_record {
+                        return Err(ConfigServiceError::ItemNotFound { module_id, key });
+                    }
+                    collection.push(Value::Object(record));
+                    true
+                };
+                let collection = Value::Array(collection);
+                item.validate_with(&options, &collection)?;
+                let stored = service
+                    .commit_with_password(
+                        values,
+                        &item,
+                        &module_id,
+                        &key,
+                        collection,
+                        if authorized {
+                            ConfigChangeOperation::AuthorizedCreate
+                        } else if created {
+                            ConfigChangeOperation::Append
+                        } else {
+                            ConfigChangeOperation::Merge
+                        },
+                        password,
+                    )
+                    .await?;
+                stored
+                    .as_array()
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .find(|record| record[&id_field].as_str() == Some(instance.as_str()))
+                    })
+                    .cloned()
+                    .ok_or_else(|| ConfigServiceError::Storage("保存结果缺少目标配置记录。".into()))
+            })
+            .await
     }
 
     pub(crate) async fn remove_record(
@@ -1056,40 +1081,39 @@ impl ConfigService {
         let default = self.resolve_value(item, None).await?.map(|data| data.value);
         let item = item.clone();
         let service = self.clone();
-        tokio::spawn(async move {
-            let _commit = service.commits.lock().await;
-            let values = service.values.read().await.clone();
-            let Some(Value::Array(mut records)) = values
-                .get(&module_id)
-                .and_then(|entries| entries.get(&key))
-                .cloned()
-                .or(default)
-            else {
-                return Ok(());
-            };
-            let Some(index) = records
-                .iter()
-                .position(|record| record[&id_field].as_str() == Some(instance.as_str()))
-            else {
-                return Ok(());
-            };
-            records.remove(index);
-            let value = Value::Array(records);
-            item.validate_with(&options, &value)?;
-            service
-                .commit(
-                    values,
-                    &item,
-                    &module_id,
-                    &key,
-                    value,
-                    ConfigChangeOperation::Remove,
-                )
-                .await?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?
+        self.commits
+            .run(async move {
+                let values = service.stored_values().await;
+                let Some(Value::Array(mut records)) = values
+                    .get(&module_id)
+                    .and_then(|entries| entries.get(&key))
+                    .cloned()
+                    .or(default)
+                else {
+                    return Ok(());
+                };
+                let Some(index) = records
+                    .iter()
+                    .position(|record| record[&id_field].as_str() == Some(instance.as_str()))
+                else {
+                    return Ok(());
+                };
+                records.remove(index);
+                let value = Value::Array(records);
+                item.validate_with(&options, &value)?;
+                service
+                    .commit(
+                        values,
+                        &item,
+                        &module_id,
+                        &key,
+                        value,
+                        ConfigChangeOperation::Remove,
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await
     }
 
     async fn partial_inner(
@@ -1106,8 +1130,7 @@ impl ConfigService {
                 key: key.to_owned(),
             })?;
         let default = self.resolve_value(item, None).await?.map(|data| data.value);
-        let _commit = self.commits.lock().await;
-        let values = self.values.read().await.clone();
+        let values = self.stored_values().await;
         let current = values
             .get(module_id)
             .and_then(|values| values.get(key))
@@ -1154,6 +1177,10 @@ impl ConfigService {
             .await
     }
 
+    async fn stored_values(&self) -> StoredValues {
+        self.values.call(|values| (**values).clone()).await
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ConfigChange> {
         self.changes.subscribe()
     }
@@ -1170,8 +1197,6 @@ impl ConfigService {
         module_id: &str,
     ) -> Result<ConfigModuleMetadata, ConfigServiceError> {
         self.metadata
-            .read()
-            .await
             .get(module_id)
             .cloned()
             .ok_or_else(|| ConfigServiceError::ModuleNotFound(module_id.to_owned()))
@@ -1247,7 +1272,6 @@ impl ConfigService {
         key: &str,
         value: Value,
     ) -> Result<Value, ConfigServiceError> {
-        let _commit = self.commits.lock().await;
         let rejected = |message| ConfigServiceError::ChangeRejected {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
@@ -1319,8 +1343,7 @@ impl ConfigService {
                 module_id: module_id.to_owned(),
                 key: key.to_owned(),
             })?;
-        let _commit = self.commits.lock().await;
-        let values = self.values.read().await.clone();
+        let values = self.stored_values().await;
         self.commit(values, item, module_id, key, value, operation)
             .await
     }
@@ -1528,57 +1551,22 @@ impl ConfigService {
             change.value = processed;
         }
         let saved = change.value.clone();
-        let previous_password = if let Some((_, path, secret)) = password {
-            let result = async {
-                let store = self
-                    .passwords
-                    .as_ref()
-                    .ok_or_else(|| ConfigServiceError::Storage("密码模块不可用。".into()))?;
-                let previous = match store.fetch(&path).await {
-                    Ok(previous) => Some(previous),
-                    Err(PasswordError::EntryNotFound) => None,
-                    Err(error) => return Err(ConfigServiceError::Storage(error.to_string())),
-                };
-                store
-                    .save(&path, &secret)
+        let result = match password {
+            Some((_, path, secret)) => {
+                let service = self.clone();
+                self.record_credentials
+                    .run(async move { service.persist_record_password(values, path, secret).await })
                     .await
-                    .map_err(|error| ConfigServiceError::Storage(error.to_string()))?;
-                Ok((store, path, previous))
             }
-            .await;
-            match result {
-                Ok(previous) => Some(previous),
-                Err(error) => {
-                    if let Some(handler) = handler {
-                        let _ = handler.rollback(change).await;
-                    }
-                    return Err(error);
-                }
-            }
-        } else {
-            None
+            None => self.persist_values(values).await,
         };
-        if let Err(error) = self.persist_values(values).await {
-            let password_rollback = if let Some((store, path, previous)) = previous_password {
-                if let Some(previous) = previous {
-                    store.save(&path, previous.trim_end_matches('\n')).await
-                } else {
-                    store.remove(&path).await
-                }
-            } else {
-                Ok(())
-            };
+        if let Err(error) = result {
             if let Some(handler) = handler {
                 if let Err(message) = handler.rollback(change.clone()).await {
                     return Err(ConfigServiceError::Storage(format!(
                         "{error}；撤销配置处理失败：{message}"
                     )));
                 }
-            }
-            if let Err(rollback) = password_rollback {
-                return Err(ConfigServiceError::Storage(format!(
-                    "{error}。撤销密码写入失败：{rollback}"
-                )));
             }
             return Err(error);
         }
@@ -1589,6 +1577,32 @@ impl ConfigService {
             }
         }
         Ok(saved)
+    }
+    async fn persist_record_password(
+        &self,
+        values: StoredValues,
+        path: String,
+        secret: String,
+    ) -> Result<(), ConfigServiceError> {
+        let store = self.passwords()?;
+        let previous = self.load_password_entry(&path).await?;
+        store
+            .save(&path, &secret)
+            .await
+            .map_err(|error| ConfigServiceError::Storage(error.to_string()))?;
+        if let Err(error) = self.persist_values(values).await {
+            let restored = match previous {
+                Some(previous) => store.save(&path, previous.trim_end_matches('\n')).await,
+                None => store.remove(&path).await,
+            };
+            if let Err(rollback) = restored {
+                return Err(ConfigServiceError::Storage(format!(
+                    "{error}。撤销密码写入失败：{rollback}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -2380,8 +2394,8 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "module_a: [broken");
     }
 
-    #[test]
-    fn removes_retired_password_settings_from_the_file() {
+    #[tokio::test]
+    async fn removes_retired_password_settings_from_the_file() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.yml");
         fs::write(

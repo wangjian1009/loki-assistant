@@ -11,6 +11,7 @@ mod service;
 mod status;
 mod store;
 mod subscriptions;
+mod team;
 mod worker;
 
 #[cfg(test)]
@@ -202,11 +203,10 @@ static NICKNAME_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: "slack",
     key: NICKNAMES,
     options: || ConfigItemOptions {
-        read_only: true,
         structure: Some(StructureMetadata {
             id_field: Some("id".into()),
             label_field: Some("nickname".into()),
-            add_label: None,
+            add_label: Some("添加用户昵称".into()),
             legacy_dictionary: None,
             type_name: "SlackNickname".into(),
             show_all_fields: false,

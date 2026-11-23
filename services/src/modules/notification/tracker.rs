@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{sync::Mutex, time::Instant};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::{
@@ -71,7 +71,7 @@ struct Records {
 #[derive(Debug, Default)]
 pub(super) struct NotificationTracker {
     directory: Option<PathBuf>,
-    records: Mutex<Records>,
+    records: Records,
 }
 
 impl NotificationTracker {
@@ -106,16 +106,16 @@ impl NotificationTracker {
         }
         Ok(Self {
             directory: Some(directory),
-            records: Mutex::new(records),
+            records,
         })
     }
 
-    pub async fn register(
-        &self,
+    pub fn register(
+        &mut self,
         content: NotificationContent,
         id: Uuid,
     ) -> Result<DeliveryAttempt, NotificationError> {
-        let mut records = self.records.lock().await;
+        let records = &mut self.records;
         if records.pending.len() >= MAX_PENDING {
             return Err(NotificationError::Capacity);
         }
@@ -128,8 +128,8 @@ impl NotificationTracker {
         Ok(attempt)
     }
 
-    pub async fn schedule_retry(&self) {
-        let mut records = self.records.lock().await;
+    pub fn schedule_retry(&mut self) {
+        let records = &mut self.records;
         let now = Instant::now();
         for pending in records.pending.values_mut() {
             if !pending.is_in_flight() {
@@ -138,9 +138,9 @@ impl NotificationTracker {
         }
     }
 
-    pub async fn due(&self) -> Vec<Uuid> {
+    pub fn due(&self) -> Vec<Uuid> {
         let now = Instant::now();
-        let records = self.records.lock().await;
+        let records = &self.records;
         let mut due: Vec<_> = records
             .pending
             .iter()
@@ -151,22 +151,22 @@ impl NotificationTracker {
         due.into_iter().map(|(_, id)| id).collect()
     }
 
-    pub async fn retry(&self, id: Uuid) -> Option<DeliveryAttempt> {
-        let mut records = self.records.lock().await;
+    pub fn retry(&mut self, id: Uuid) -> Option<DeliveryAttempt> {
+        let records = &mut self.records;
         let pending = records.pending.get_mut(&id)?;
         let now = Instant::now();
         (pending.retry_at <= now && !pending.is_in_flight()).then(|| pending.begin_attempt(now))
     }
 
-    pub async fn get(&self, id: &str) -> Result<NotificationStatusResponse, NotificationError> {
+    pub fn get(&mut self, id: &str) -> Result<NotificationStatusResponse, NotificationError> {
         let id = parse_id(id)?;
-        let mut records = self.records.lock().await;
+        let records = &mut self.records;
         records.prune_confirmed();
         records.response(id)
     }
 
-    pub async fn receive(
-        &self,
+    pub fn receive(
+        &mut self,
         id: &str,
         receipt: NotificationReceipt,
     ) -> Result<NotificationStatusResponse, NotificationError> {
@@ -178,7 +178,7 @@ impl NotificationTracker {
             ));
         }
         let id = parse_id(id)?;
-        let mut records = self.records.lock().await;
+        let records = &mut self.records;
         records.prune_confirmed();
         match receipt {
             NotificationReceipt::Submitted {} if records.pending.contains_key(&id) => {
