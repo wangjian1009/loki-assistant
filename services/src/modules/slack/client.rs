@@ -59,7 +59,7 @@ pub(super) const WEB_TOKEN_PATTERN: &str = r"^xoxc-[A-Za-z0-9_-]{1,4091}$";
 static WEB_TOKEN_REGEX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(WEB_TOKEN_PATTERN).expect("Slack 网页令牌正则有效"));
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub(super) struct WebSession {
     pub token: String,
     pub d_cookie: String,
@@ -118,15 +118,6 @@ impl SlackClient {
         web: Option<&WebSession>,
     ) -> Result<(String, Vec<u8>), Error> {
         self.download(url, token, web, 5 * 1024 * 1024, false).await
-    }
-
-    pub async fn original(
-        &self,
-        url: &str,
-        token: &str,
-        web: Option<&WebSession>,
-    ) -> Result<(String, reqwest::Response), Error> {
-        self.download_response(url, token, web, false).await
     }
 
     pub async fn transfer_original(

@@ -24,7 +24,6 @@ use crate::modules::{
 
 use super::{
     CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS, NICKNAMES, WATCHES,
-    disk::DiskCache,
     downloads::Downloads,
     mailbox::{next_cursor, read_cursor},
     protocol::{Error, Page, valid_id},
@@ -180,7 +179,6 @@ impl Drop for Project {
 pub(super) struct Teams {
     projects: BTreeMap<String, Project>,
     nicknames: Nicknames,
-    pub(super) downloads: BTreeMap<String, Arc<Downloads>>,
 }
 
 pub struct Projects {
@@ -190,6 +188,7 @@ pub struct Projects {
     notification: Arc<NotificationService>,
     pub(super) status: Arc<ProjectsStatus>,
     pub(super) teams: Process<Teams>,
+    pub(super) downloads: Arc<Downloads>,
     port: std::sync::OnceLock<u16>,
     backend: Backend,
     shutdown: Notify,
@@ -288,6 +287,7 @@ impl Projects {
             notification,
             status: Arc::new(ProjectsStatus::new(status)),
             teams: Process::start(Teams::default()),
+            downloads: Arc::default(),
             port: std::sync::OnceLock::new(),
             backend,
             shutdown: Notify::new(),
@@ -348,15 +348,11 @@ impl Projects {
             .ok()
             .and_then(|value| retention(&value.value))
             .unwrap_or(Duration::from_secs(DEFAULT_CACHE_RETENTION_DAYS * 86_400));
-        let path = root.clone();
-        let Ok(cached) = tokio::task::spawn_blocking(move || DiskCache::cached_teams(&path)).await
-        else {
-            return;
-        };
+        let cached = self.downloads.cached_teams(root.clone()).await;
+        let downloads = self.downloads.clone();
         self.teams.post(move |teams| {
             for id in cached {
                 if !teams.projects.contains_key(&id) {
-                    let downloads = teams.downloads.entry(id.clone()).or_default();
                     downloads.schedule_cache_cleanup(root.clone(), id, retention);
                 }
             }
@@ -771,6 +767,7 @@ impl Projects {
         let notification = Arc::clone(&self.notification);
         let status = Arc::clone(&self.status);
         let backend = self.backend.clone();
+        let downloads = self.downloads.clone();
         let emacs = Arc::clone(&self.emacs);
         self.teams
             .call_async(move |mut teams| async move {
@@ -806,7 +803,7 @@ impl Projects {
                             continue;
                         }
                         let generation = Uuid::new_v4();
-                        let service = Arc::new(SlackService::for_project(
+                        let (service, user_inbox) = SlackService::for_project(
                             alert.clone(),
                             notification.clone(),
                             id.clone(),
@@ -815,13 +812,15 @@ impl Projects {
                             status.clone(),
                             &backend,
                             config.clone(),
-                            teams.downloads.entry(id.clone()).or_default().clone(),
+                            downloads.clone(),
                             teams.nicknames.clone(),
-                        ));
+                        );
+                        let service = Arc::new(service);
                         status
                             .register(&id, generation, service.public_status().await)
                             .await;
-                        let (team, worker) = Team::start(service.clone(), emacs.clone());
+                        let (team, worker) =
+                            Team::start(service.clone(), emacs.clone(), user_inbox);
                         projects.insert(
                             id,
                             Project {

@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -19,9 +20,12 @@ use super::{
     store::{Conversation, ReadPositions},
 };
 
-#[derive(Clone)]
-pub(super) struct DiskCache(PathBuf);
+pub(super) type CacheWrites = Arc<Mutex<()>>;
 
+#[derive(Clone)]
+pub(super) struct DiskCache(PathBuf, CacheWrites);
+
+#[cfg(test)]
 pub(super) struct PendingAttachment {
     temporary: PathBuf,
     destination: PathBuf,
@@ -90,6 +94,7 @@ impl PartialAttachment {
     }
 }
 
+#[cfg(test)]
 impl PendingAttachment {
     pub fn commit(self) -> io::Result<PathBuf> {
         fs::rename(&self.temporary, &self.destination)?;
@@ -97,6 +102,7 @@ impl PendingAttachment {
     }
 }
 
+#[cfg(test)]
 impl Drop for PendingAttachment {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.temporary);
@@ -122,26 +128,53 @@ struct ReadCursor {
 }
 
 impl DiskCache {
+    #[cfg(test)]
     pub fn open(root: &Path, team: &str, user: &str) -> io::Result<Self> {
+        Self::open_with_writes(root, team, user, CacheWrites::default(), || false)
+    }
+
+    pub fn open_with_writes(
+        root: &Path,
+        team: &str,
+        user: &str,
+        writes: CacheWrites,
+        cancelled: impl Fn() -> bool,
+    ) -> io::Result<Self> {
         private_dir(root)?;
-        let cache = Self(root.join(team));
+        let cache = Self(root.join(team), writes);
+        let _write = cache.1.lock().expect("缓存写入许可有效");
+        if cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         private_dir(&cache.0)?;
         let owner = cache.0.join(".owner");
         match fs::read_to_string(&owner) {
-            Ok(previous) if previous == user => return Ok(cache),
+            Ok(previous) if previous == user => return Ok(cache.clone()),
             Ok(_) => {
-                for name in ["users", "conversations", "attachments", "icons"] {
-                    match fs::remove_dir_all(cache.0.join(name)) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
-                    }
+                let retired = root.join(format!(".retired-{team}-{}", Uuid::new_v4()));
+                fs::rename(&cache.0, &retired)?;
+                if let Err(error) =
+                    private_dir(&cache.0).and_then(|()| atomic_write(&owner, user.as_bytes()))
+                {
+                    let _ = fs::remove_dir(&cache.0);
+                    let _ = fs::rename(&retired, &cache.0);
+                    return Err(error);
                 }
+                drop(_write);
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn_blocking(move || {
+                        let _ = fs::remove_dir_all(retired);
+                    });
+                } else {
+                    let _ = fs::remove_dir_all(retired);
+                }
+                return Ok(cache);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         atomic_write(&owner, user.as_bytes())?;
+        drop(_write);
         Ok(cache)
     }
 
@@ -266,7 +299,7 @@ impl DiskCache {
                 }
                 paths.sort_unstable_by_key(|path| txt_stem(path).and_then(timestamp));
                 for path in paths.into_iter().rev().take(1000) {
-                    if let Some(message) = read_message(&path) {
+                    if let Some(message) = read_message(&path, &self.1) {
                         room.messages.insert(message.ts.clone(), message);
                     }
                 }
@@ -286,20 +319,22 @@ impl DiskCache {
     }
 
     pub fn message(&self, id: &str, thread: Option<&str>, ts: &str) -> Option<Message> {
-        read_message(&self.message_path(id, thread, ts))
+        read_message(&self.message_path(id, thread, ts), &self.1)
     }
 
     pub fn find_message(&self, id: &str, ts: &str) -> Option<Message> {
         self.message(id, None, ts).or_else(|| {
             let threads = self.0.join("conversations").join(id).join("threads");
             entries(&threads, true)
-                .find_map(|thread| read_message(&thread.join(format!("{ts}.txt"))))
+                .find_map(|thread| read_message(&thread.join(format!("{ts}.txt")), &self.1))
         })
     }
 
     pub fn messages(&self, id: &str, thread: Option<&str>) -> impl Iterator<Item = Message> {
         let path = self.message_path(id, thread, "_");
-        message_paths(path.parent().expect("Slack 消息目录")).filter_map(|path| read_message(&path))
+        let writes = self.1.clone();
+        message_paths(path.parent().expect("Slack 消息目录"))
+            .filter_map(move |path| read_message(&path, &writes))
     }
 
     pub fn save_message(&self, id: &str, message: &Message) {
@@ -315,6 +350,7 @@ impl DiskCache {
                 value["download_url"] = json!(item.download_url);
             }
         }
+        let _write = self.1.lock().expect("缓存写入许可有效");
         save_record(
             &self.message_path(id, message.thread_ts.as_deref(), &message.ts),
             &value,
@@ -441,6 +477,7 @@ impl DiskCache {
         })
     }
 
+    #[cfg(test)]
     pub fn begin_original(
         &self,
         item: &Attachment,
@@ -468,8 +505,21 @@ impl DiskCache {
 
     pub fn save_preview(&self, item: &Attachment, mime: &str, bytes: &[u8]) -> Option<PathBuf> {
         let path = self.attachment_destination(item, true, mime)?;
-        atomic_write(&path, bytes).ok()?;
+        self.write_media(&path, bytes).ok()?;
         Some(path)
+    }
+
+    pub fn write_media(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        write_atomically(path, bytes, None, Some(&self.1))
+    }
+
+    pub fn commit_original(
+        &self,
+        partial: &PartialAttachment,
+        destination: PathBuf,
+    ) -> io::Result<PathBuf> {
+        let _write = self.1.lock().expect("缓存写入许可有效");
+        partial.commit(destination)
     }
 
     pub fn cached_teams(root: &Path) -> Vec<String> {
@@ -482,7 +532,28 @@ impl DiskCache {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn clean_team(root: &Path, id: &str, retention: Duration, active: &HashSet<PathBuf>) {
+        Self::clean_team_until(
+            root,
+            id,
+            retention,
+            active,
+            &CacheWrites::default(),
+            || false,
+            || {},
+        );
+    }
+
+    pub fn clean_team_until(
+        root: &Path,
+        id: &str,
+        retention: Duration,
+        active: &HashSet<PathBuf>,
+        writes: &CacheWrites,
+        cancelled: impl Fn() -> bool,
+        partial_done: impl FnOnce(),
+    ) {
         if !super::projects::valid_team_id(id) {
             return;
         }
@@ -500,29 +571,47 @@ impl DiskCache {
                 .and_then(|modified| now.duration_since(modified).ok())
                 .is_some_and(|age| age > retention)
         };
+        let remove_if = |path: &Path, condition: &dyn Fn() -> bool| {
+            let _write = writes.lock().expect("缓存写入许可有效");
+            if !cancelled() && condition() {
+                let _ = fs::remove_file(path);
+            }
+        };
         let partial = team.join("attachments").join(".partial");
         for path in entries(&partial, false) {
+            if cancelled() {
+                return;
+            }
             let data_path = if path.extension().is_some_and(|ext| ext == "json") {
                 path.with_extension("")
             } else {
                 path.clone()
             };
-            let expired = expired(&data_path) || (!regular_file(&data_path) && expired(&path));
-            if !active.contains(&data_path) && expired {
-                let _ = fs::remove_file(path);
+            if !active.contains(&data_path) {
+                remove_if(&path, &|| {
+                    expired(&data_path) || (!regular_file(&data_path) && expired(&path))
+                });
             }
         }
+        partial_done();
         for path in
             entries(&team.join("attachments"), false).chain(entries(&team.join("icons"), false))
         {
-            if expired(&path) {
-                let _ = fs::remove_file(path);
+            if cancelled() {
+                return;
             }
+            remove_if(&path, &|| expired(&path));
         }
         for room in entries(&team.join("conversations"), true) {
+            if cancelled() {
+                return;
+            }
             let messages = room.join("messages");
             let threads = room.join("threads");
             for thread in entries(&threads, true) {
+                if cancelled() {
+                    return;
+                }
                 let Some(ts) = thread
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -531,17 +620,47 @@ impl DiskCache {
                     continue;
                 };
                 let parent = messages.join(format!("{ts}.txt"));
-                if (!regular_file(&parent) || expired(&parent))
-                    && message_paths(&thread).all(|path| expired(&path))
-                    && fs::remove_dir_all(&thread).is_ok()
+                let Ok(scanned) =
+                    fs::symlink_metadata(&thread).and_then(|metadata| metadata.modified())
+                else {
+                    continue;
+                };
+                let parent_expired = || !regular_file(&parent) || expired(&parent);
+                if !parent_expired()
+                    || !message_paths(&thread).all(|path| !cancelled() && expired(&path))
                 {
-                    let _ = fs::remove_file(parent);
+                    continue;
+                }
+
+                // 有回复写入或根消息更新时保留整个线程。锁内只移走目录。
+                let retired = threads.join(format!(".retired-thread-{}", Uuid::new_v4()));
+                let moved = {
+                    let _write = writes.lock().expect("缓存写入许可有效");
+                    let unchanged = fs::symlink_metadata(&thread)
+                        .and_then(|metadata| metadata.modified())
+                        .is_ok_and(|modified| modified == scanned);
+                    if !cancelled()
+                        && unchanged
+                        && parent_expired()
+                        && fs::rename(&thread, &retired).is_ok()
+                    {
+                        let _ = fs::remove_file(&parent);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if moved {
+                    let _ = fs::remove_dir_all(retired);
                 }
             }
             for path in message_paths(&messages) {
-                if expired(&path) && !threads.join(txt_stem(&path).unwrap_or_default()).is_dir() {
-                    let _ = fs::remove_file(path);
+                if cancelled() {
+                    return;
                 }
+                remove_if(&path, &|| {
+                    expired(&path) && !threads.join(txt_stem(&path).unwrap_or_default()).is_dir()
+                });
             }
         }
     }
@@ -581,10 +700,15 @@ fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomically(path, bytes, None)
+    write_atomically(path, bytes, None, None)
 }
 
-fn write_atomically(path: &Path, bytes: &[u8], modified: Option<SystemTime>) -> io::Result<()> {
+fn write_atomically(
+    path: &Path,
+    bytes: &[u8],
+    modified: Option<SystemTime>,
+    writes: Option<&CacheWrites>,
+) -> io::Result<()> {
     let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
     private_dir(parent)?;
     let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
@@ -598,6 +722,7 @@ fn write_atomically(path: &Path, bytes: &[u8], modified: Option<SystemTime>) -> 
         if let Some(modified) = modified {
             file.set_modified(modified)?;
         }
+        let _write = writes.map(|writes| writes.lock().expect("缓存写入许可有效"));
         fs::rename(&temporary, path)
     })();
     if result.is_err() {
@@ -635,7 +760,7 @@ fn message_paths(path: &Path) -> impl Iterator<Item = PathBuf> + use<> {
     entries(path, false).filter(|path| txt_stem(path).and_then(timestamp).is_some())
 }
 
-fn read_message(path: &Path) -> Option<Message> {
+fn read_message(path: &Path, writes: &CacheWrites) -> Option<Message> {
     let mut value: Value = read_record(path)?;
     let mut message: Message = serde_json::from_value(value.clone()).ok()?;
     let root = path.parent()?.file_name()?.to_str()?;
@@ -654,14 +779,20 @@ fn read_message(path: &Path) -> Option<Message> {
             item.download_url = value["download_url"].as_str().map(str::to_owned);
         }
     }
-    if let Some(author) = value["author"].as_object()
-        && author.len() > 1
+    if value["author"]
+        .as_object()
+        .is_some_and(|author| author.len() > 1)
         && let Some(current) = &message.author
-        && let Ok(modified) = fs::symlink_metadata(path).and_then(|metadata| metadata.modified())
     {
-        value["author"] = json!(current);
-        if let Ok(text) = encode_record(&value) {
-            let _ = write_atomically(path, text.as_bytes(), Some(modified));
+        let _write = writes.lock().expect("缓存写入许可有效");
+        if read_record::<Value>(path).as_ref() == Some(&value)
+            && let Ok(modified) =
+                fs::symlink_metadata(path).and_then(|metadata| metadata.modified())
+        {
+            value["author"] = json!(current);
+            if let Ok(text) = encode_record(&value) {
+                let _ = write_atomically(path, text.as_bytes(), Some(modified), None);
+            }
         }
     }
     Some(message)

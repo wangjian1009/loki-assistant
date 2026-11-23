@@ -115,7 +115,7 @@ GET /slack/users?id=T123.U123&id=T456.U456
 }
 #+end_src
 
-services 按工作区当前授权查询，优先使用内存中的用户资料。缺失时只向 Slack 补查对应的用户，同一批次的重复 ID 共用查找结果。只有 Slack 明确返回用户不存在时使用 ~slack-user-not-found~ 。未知工作区、授权失败和 Slack 限流分别使用 ~slack-project-not-found~ 、 ~slack-authorization-required~ 和 ~slack-rate-limited~ 。客户端可仅重试失败项。
+每个 team 的独立任务负责目录拉取和用户补查，按当前授权查询并优先使用内存中的用户资料。WebSocket 循环提交用户资料事件后继续接收消息。目录拉取和按 ID 补查有限并发，期间收到的资料更新优先采用。同一用户的并发补查共用结果。只有 Slack 明确返回用户不存在时使用 ~slack-user-not-found~ 。未知工作区、授权失败和 Slack 限流分别使用 ~slack-project-not-found~ 、 ~slack-authorization-required~ 和 ~slack-rate-limited~ 。客户端可仅重试失败项。
 
 ** 本机昵称
 
@@ -146,7 +146,7 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 * 按用户打开私聊
 
-~POST /slack/users/{id}/dm~ 按 ~team_id.用户ID~ 打开一对一私聊。请求无需消息正文，可带 ~X-Loki-Slack-Session~ 指定用户候选的授权会话。services 复用已知私聊，首次打开时调用 Slack 的 ~conversations.open~ 。响应返回 ~api_version~ 和 ~conversation~ ，后者包含会话目录中的会话标识、名称和授权会话等字段。Emacs 用该会话标识打开或聚焦聊天窗口。
+~POST /slack/users/{id}/dm~ 按 ~team_id.用户ID~ 打开一对一私聊。请求无需消息正文，可带 ~X-Loki-Slack-Session~ 指定用户候选的授权会话。services 复用已知私聊，首次打开时调用 Slack 的 ~conversations.open~ 。同一用户的并发创建共用结果，已发出的目录查询回来后会保留其间创建的私聊。响应返回 ~api_version~ 和 ~conversation~ ，后者包含会话目录中的会话标识、名称和授权会话等字段。Emacs 用该会话标识打开或聚焦聊天窗口。
 
 * 消息读取
 
@@ -183,8 +183,10 @@ services 复用已缓存的原件，缓存缺失时从 Slack 下载并在写入�
 |------------+------------|
 | ~POST /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ | 提交原件下载。路径参数与原件查询接口相同，请求体为空。任务排队或下载中时返回 HTTP 202，命中原件缓存时返回 HTTP 200，响应体均为 ~{"download_id":"<UUID>"}~ 。 |
 | ~GET /slack/downloads/{download_id}~ | 查询任务。返回 HTTP 200 和当前进度，任务自身失败时通过响应中的 ~state~ 和 ~error~ 表示。 |
+| ~DELETE /slack/teams/{team_id}/cache/tasks~ | 按 team 取消排队或运行中的附件下载、预览、头像、图标下载和缓存清理。成功返回 HTTP 204。 |
 
-两个接口仅供本机调用，可带 ~X-Loki-Slack-Session~ 。任务由所属工作区管理，归属提交时的授权会话。该会话中重复提交同一附件且任务仍在进行时，返回已有任务 ID。缓存命中时，可用任务 ID 立即查询到完成结果。失败后可重新提交，取得新的任务 ID。
+
+这些接口仅供本机调用。原件下载和进度查询可带 ~X-Loki-Slack-Session~ 。下载由共享缓存任务按 team 管理，归属提交时的授权会话。取消的原件任务进入 ~failed~ ，错误码为 ~slack-download-cancelled~ 。已保存的完整文件和可续传半成品保留在缓存目录。该会话中重复提交同一附件且任务仍在进行时，返回已有任务 ID。缓存命中时，可用任务 ID 立即查询到完成结果。失败后可重新提交，取得新的任务 ID。
 
 services 将下载任务记录和 ID 仅保存在当前进程的内存中，运行期间保留所有记录，包括已完成和失败的任务。services 重启后从空任务表开始。查询未知 ID 或重启前的 ID 返回 HTTP 404 ~slack-download-not-found~ 。查询已知任务时，所属授权会话已失效则返回 HTTP 409 ~slack-session-changed~ 。
 

@@ -39,7 +39,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("网络初始化失败：{error}");
         }
     });
-    let network_pairings = tokio::spawn(services.network.clone().receive_pairings());
 
     eprintln!(
         "loki-services listening on http://{} (health: /healthz)",
@@ -55,10 +54,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     notification_retry.abort();
     let _ = notification_retry.await;
     network_start.abort();
-    network_pairings.abort();
     services.stop_extensions(extensions).await;
     let _ = network_start.await;
-    let _ = network_pairings.await;
     services.network.shutdown().await;
     service_pfile.remove_if_owner()?;
     result?;

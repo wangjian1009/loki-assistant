@@ -901,17 +901,13 @@ async fn attachment_original(
         return Err(Error::Invalid);
     }
     let (_, id, service) = conversation(&projects, id).await?;
-    let (_, _, path) = service
-        .attachment(
-            session(&headers, &service).await?,
-            &id,
-            &ts,
-            index,
-            false,
-            true,
-        )
+    let session = session(&headers, &service).await?;
+    let (task, _) = projects
+        .start_download(service, session, &id, &ts, index)
         .await?;
-    Ok(Json(json!({"cache_path":path.ok_or(Error::Unavailable)?})))
+    Ok(Json(
+        json!({"cache_path":projects.original_path(task).await?}),
+    ))
 }
 
 #[loki_api(
@@ -973,6 +969,26 @@ async fn download_status(
     module = "slack",
     mount = "Arc<Projects>",
     mount_group = "slack-local",
+    id = "cancel-cache-tasks",
+    method = "DELETE",
+    path = "/slack/teams/{team_id}/cache/tasks",
+    summary = "按工作区取消 Slack 缓存任务",
+    description = "取消当前工作区排队和运行中的附件下载与缓存清理。"
+)]
+async fn cancel_cache_tasks(
+    State(projects): Service,
+    team: Segment<String>,
+) -> Result<StatusCode, Error> {
+    let Path(team) = team.map_err(|_| Error::Invalid)?;
+    validate_team_id(&team)?;
+    projects.downloads.cancel_team(&team).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
     id = "attachment-preview",
     method = "GET",
     path = "/slack/conversations/{id}/messages/{ts}/attachments/{index}/preview",
@@ -997,7 +1013,6 @@ async fn attachment_preview(
             &id,
             &ts,
             index,
-            true,
             query.local_path,
         )
         .await?;

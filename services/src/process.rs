@@ -72,20 +72,6 @@ impl<S: Send + 'static> Process<S> {
         response.await.expect("内部服务未返回响应")
     }
 
-    pub(crate) fn post_blocking(&self, operation: impl FnOnce(&mut S) + Send + 'static) {
-        let request = Request::ApplyAsync(Box::new(move |mut state| {
-            Box::pin(async move {
-                tokio::task::spawn_blocking(move || {
-                    operation(&mut state);
-                    state
-                })
-                .await
-                .expect("内部服务磁盘任务失败")
-            })
-        }));
-        let _ = self.0.send(request);
-    }
-
     /// 在同一请求队列中完成磁盘操作，避免占用异步执行线程。
     pub(crate) async fn blocking<T: Send + 'static>(
         &self,

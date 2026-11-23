@@ -5,7 +5,6 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use super::{
@@ -162,6 +161,11 @@ impl UserDirectory {
                 .collect(),
         }
     }
+    #[cfg(test)]
+    pub fn expire(&mut self) {
+        self.expires_at = None;
+    }
+
     pub fn complete(&self) -> bool {
         self.expires_at.is_some()
     }
@@ -214,8 +218,16 @@ impl State {
         }
     }
 
+    fn revise_profiles(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.user_revision += 1;
+        for id in ids {
+            self.user_revisions.insert(id, self.user_revision);
+        }
+    }
+
     fn store_profile(&mut self, session: Uuid, profile: UserProfile, deleted: bool) {
         let id = profile.slack_id().to_owned();
+        self.revise_profiles([id.clone()]);
         let directory = self
             .user_directory
             .get_or_insert_with(|| UserDirectory::from_disk(session, Vec::new()));
@@ -235,6 +247,36 @@ impl State {
     }
 }
 
+pub(super) enum UserRequest {
+    List(
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<std::sync::Arc<[UserProfile]>, Error>>,
+    ),
+    Lookup(
+        Uuid,
+        String,
+        tokio::sync::oneshot::Sender<Result<UserProfile, Error>>,
+    ),
+    Changed(Uuid, String, Value),
+    Warm(Uuid, std::collections::BTreeSet<String>),
+}
+
+enum UserFetch {
+    List(Uuid),
+    Lookup(Uuid, String),
+}
+
+enum UserFetchResult {
+    List(Uuid, Result<std::sync::Arc<[UserProfile]>, Error>),
+    Lookup((Uuid, String), Result<UserProfile, Error>),
+}
+
+enum OpenDm {
+    Cached(Value),
+    Pending(tokio::sync::watch::Receiver<Option<Result<Value, Error>>>),
+    Start(tokio::sync::watch::Sender<Option<Result<Value, Error>>>),
+}
+
 pub(super) struct ConversationRow {
     pub order: Option<(u64, u32)>,
     pub id: String,
@@ -242,16 +284,116 @@ pub(super) struct ConversationRow {
 }
 
 impl SlackService {
+    pub(super) async fn run_users(
+        &self,
+        mut requests: tokio::sync::mpsc::UnboundedReceiver<UserRequest>,
+    ) {
+        use futures_util::stream::FuturesUnordered;
+        use std::collections::VecDeque;
+
+        const CONCURRENT_FETCHES: usize = 4;
+        const MAX_BACKGROUND_LOOKUPS: usize = 64;
+        let mut queued = VecDeque::new();
+        let mut running = FuturesUnordered::new();
+        let mut lists = BTreeMap::<_, Vec<_>>::new();
+        let mut lookups = BTreeMap::<_, Vec<_>>::new();
+        loop {
+            while running.len() < CONCURRENT_FETCHES {
+                let Some(fetch) = queued.pop_front() else {
+                    break;
+                };
+                running.push(async move {
+                    match fetch {
+                        UserFetch::List(session) => {
+                            UserFetchResult::List(session, self.load_users(session).await)
+                        }
+                        UserFetch::Lookup(session, id) => {
+                            let result = self.fetch_user(session, &id).await;
+                            UserFetchResult::Lookup((session, id), result)
+                        }
+                    }
+                });
+            }
+            tokio::select! {
+                request = requests.recv() => match request {
+                    Some(UserRequest::List(session, reply)) if !reply.is_closed() => {
+                        lists.entry(session).or_insert_with(|| {
+                            queued.push_back(UserFetch::List(session));
+                            Vec::new()
+                        }).push(reply);
+                    }
+                    Some(UserRequest::Lookup(session, id, reply)) if !reply.is_closed() => {
+                        lookups.entry((session, id.clone())).or_insert_with(|| {
+                            queued.push_back(UserFetch::Lookup(session, id));
+                            Vec::new()
+                        }).push(reply);
+                    }
+                    Some(UserRequest::Changed(session, id, user)) => {
+                        self.apply_directory_user(session, &id, &user).await;
+                    }
+                    Some(UserRequest::Warm(session, ids)) => {
+                        for id in ids.into_iter().take(MAX_BACKGROUND_LOOKUPS.saturating_sub(lookups.len())) {
+                            lookups.entry((session, id.clone())).or_insert_with(|| {
+                                queued.push_back(UserFetch::Lookup(session, id));
+                                Vec::new()
+                            });
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                result = running.next(), if !running.is_empty() => match result {
+                    Some(UserFetchResult::List(session, result)) => {
+                        for reply in lists.remove(&session).unwrap_or_default() {
+                            let _ = reply.send(result.clone());
+                        }
+                    }
+                    Some(UserFetchResult::Lookup(key, result)) => {
+                        for reply in lookups.remove(&key).unwrap_or_default() {
+                            let _ = reply.send(result.clone());
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
     pub(super) async fn users(
         &self,
         session: Uuid,
     ) -> Result<std::sync::Arc<[UserProfile]>, Error> {
-        let _fetch = self
-            .user_fetch
-            .acquire()
+        if let Some(users) = self.cached_users(session).await? {
+            return Ok(users);
+        }
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.user_requests
+            .send(UserRequest::List(session, reply))
+            .map_err(|_| Error::Project)?;
+        response.await.map_err(|_| Error::Project)?
+    }
+
+    async fn cached_users(
+        &self,
+        session: Uuid,
+    ) -> Result<Option<std::sync::Arc<[UserProfile]>>, Error> {
+        self.state
+            .call(move |state| {
+                state.account(session)?;
+                Ok(state
+                    .user_directory
+                    .as_ref()
+                    .filter(|directory| {
+                        directory.session == session
+                            && directory.expires_at.is_some_and(|expires| expires > now())
+                    })
+                    .map(|directory| directory.users.clone()))
+            })
             .await
-            .expect("Slack 操作许可不能关闭");
-        let (team_id, cached) = self
+    }
+
+    async fn load_users(&self, session: Uuid) -> Result<std::sync::Arc<[UserProfile]>, Error> {
+        let (team_id, cached, revision) = self
             .state
             .call(move |state| {
                 let account = state.account(session)?;
@@ -262,6 +404,7 @@ impl SlackService {
                 Ok((
                     account.identity.team_id.clone(),
                     cached.map(|current| current.users.clone()),
+                    state.user_revision,
                 ))
             })
             .await?;
@@ -319,53 +462,49 @@ impl SlackService {
             }
             cursor = next.to_owned();
         }
-        let users: std::sync::Arc<[UserProfile]> = users.into_values().collect();
-        let saved = users.clone();
-        self.state
+        let users = self
+            .state
             .blocking(move |state| {
                 state.account(session)?;
-                if let Some(disk) = &state.cache.disk {
-                    let previous = state.user_directory.as_ref();
-                    for user in saved.iter() {
-                        disk.save_user(
-                            user,
-                            previous.and_then(|directory| directory.find(user.slack_id())),
-                        );
-                    }
-                    if let Some(previous) = previous {
-                        for user in previous.users.iter() {
-                            if saved
-                                .binary_search_by(|candidate| candidate.id.cmp(&user.id))
-                                .is_err()
-                            {
-                                disk.remove_user(user.slack_id());
-                            }
+                let directory = state
+                    .user_directory
+                    .get_or_insert_with(|| UserDirectory::from_disk(session, Vec::new()));
+                for (id, updated) in &state.user_revisions {
+                    if *updated > revision && !id.starts_with('B') {
+                        let key = format!("{team_id}.{id}");
+                        if let Some(profile) = directory.find(id) {
+                            users.insert(key, profile.clone());
+                        } else {
+                            users.remove(&key);
                         }
                     }
                 }
                 let mut changed = std::collections::BTreeSet::new();
-                if let Some(previous) = &state.user_directory {
-                    for profile in saved.iter() {
-                        if previous.find(profile.slack_id()) != Some(profile) {
-                            changed.insert(profile.slack_id().to_owned());
-                        }
-                    }
-                    for profile in previous.users.iter() {
-                        if saved
-                            .binary_search_by(|item| item.id.cmp(&profile.id))
-                            .is_err()
-                        {
-                            changed.insert(profile.slack_id().to_owned());
+                for profile in users.values() {
+                    let previous = directory.find(profile.slack_id());
+                    if previous != Some(profile) {
+                        changed.insert(profile.slack_id().to_owned());
+                        if let Some(disk) = &state.cache.disk {
+                            disk.save_user(profile, previous);
                         }
                     }
                 }
-                let directory = state
-                    .user_directory
-                    .get_or_insert_with(|| UserDirectory::from_disk(session, Vec::new()));
+                for previous in directory.users.iter() {
+                    if !users.contains_key(&previous.id) {
+                        changed.insert(previous.slack_id().to_owned());
+                        if let Some(disk) = &state.cache.disk {
+                            disk.remove_user(previous.slack_id());
+                        }
+                    }
+                }
                 directory.expires_at = Some(now() + 300);
-                directory.users = saved;
-                state.notify_profile_changes(changed);
-                Ok(())
+                directory.users = users.into_values().collect();
+                let users = directory.users.clone();
+                if !changed.is_empty() {
+                    state.revise_profiles(changed.iter().cloned());
+                    state.notify_profile_changes(changed);
+                }
+                Ok(users)
             })
             .await?;
         self.picker_changed.notify_one();
@@ -377,12 +516,28 @@ impl SlackService {
         if let Some(profile) = self.cached_user(session, id).await? {
             return Ok(profile);
         }
-        let _fetch = self
-            .user_fetch
-            .acquire()
-            .await
-            .expect("Slack 操作许可不能关闭");
-        if let Some(profile) = self.cached_user(session, id).await? {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.user_requests
+            .send(UserRequest::Lookup(session, id.to_owned(), reply))
+            .map_err(|_| Error::Project)?;
+        response.await.map_err(|_| Error::Project)?
+    }
+
+    async fn fetch_user(&self, session: Uuid, id: &str) -> Result<UserProfile, Error> {
+        let lookup = id.to_owned();
+        let (cached, revision) = self
+            .state
+            .call(move |state| {
+                state.account(session)?;
+                let cached = state
+                    .user_directory
+                    .as_ref()
+                    .and_then(|dir| dir.find(&lookup))
+                    .cloned();
+                Ok((cached, state.user_revision))
+            })
+            .await?;
+        if let Some(profile) = cached {
             return Ok(profile);
         }
         let bot = id.starts_with('B');
@@ -401,6 +556,19 @@ impl SlackService {
         let profile = self
             .state
             .blocking(move |state| {
+                state.account(session)?;
+                if state
+                    .user_revisions
+                    .get(&id)
+                    .is_some_and(|updated| *updated > revision)
+                {
+                    return state
+                        .user_directory
+                        .as_ref()
+                        .and_then(|directory| directory.find(&id))
+                        .cloned()
+                        .ok_or(Error::UserNotFound);
+                }
                 let team = &state.account(session)?.identity.team_id;
                 let user = &response[parameter];
                 let profile = if bot {
@@ -434,15 +602,15 @@ impl SlackService {
             .await
     }
 
-    pub(super) async fn update_directory_user(&self, session: Uuid, id: &str, user: &Value) {
-        if !user.is_object() || !valid_id(id) {
-            return;
+    pub(super) fn update_directory_user(&self, session: Uuid, id: &str, user: &Value) {
+        if user.is_object() && valid_id(id) {
+            let _ =
+                self.user_requests
+                    .send(UserRequest::Changed(session, id.to_owned(), user.clone()));
         }
-        let _fetch = self
-            .user_fetch
-            .acquire()
-            .await
-            .expect("Slack 操作许可不能关闭");
+    }
+
+    async fn apply_directory_user(&self, session: Uuid, id: &str, user: &Value) {
         let (id, user) = (id.to_owned(), user.clone());
         self.state
             .blocking(move |state| {
@@ -526,11 +694,14 @@ impl SlackService {
     }
 
     pub(super) async fn refresh_directory(&self, session: Uuid) -> Result<(), Error> {
-        let _fetch = self
-            .directory_fetch
-            .acquire()
-            .await
-            .expect("Slack 操作许可不能关闭");
+        let revision = self
+            .state
+            .call(move |state| {
+                state.account(session)?;
+                state.cache.directory_revision += 1;
+                Ok(state.cache.directory_revision)
+            })
+            .await?;
         let directory = match self
             .directory(session, "im,mpim,public_channel,private_channel")
             .await
@@ -540,18 +711,29 @@ impl SlackService {
             result => result?,
         };
         self.update_cache(session, move |cache, account| {
-            if let Some(disk) = &cache.disk {
-                for id in cache
-                    .conversations
-                    .keys()
-                    .filter(|id| !directory.contains_key(*id))
-                {
+            if cache.directory_applied >= revision {
+                return Ok(());
+            }
+            cache.directory_applied = revision;
+            let keep = |id: &String| {
+                directory.contains_key(id)
+                    || cache
+                        .local_conversations
+                        .get(id)
+                        .is_some_and(|updated| *updated > revision)
+            };
+            cache.conversations.retain(|id, _| {
+                if keep(id) {
+                    return true;
+                }
+                if let Some(disk) = &cache.disk {
                     disk.remove_room(id);
                 }
-            }
+                false
+            });
             cache
-                .conversations
-                .retain(|id, _| directory.contains_key(id));
+                .local_conversations
+                .retain(|_, updated| *updated > revision);
             for (id, mut entry) in directory {
                 entry.disk.clone_from(&cache.disk);
                 entry.read_positions.baseline = Some(account.baseline);
@@ -581,15 +763,9 @@ impl SlackService {
 
     pub(super) async fn open_dm(&self, session: Uuid, user: &str) -> Result<Value, Error> {
         let profile = self.lookup_user(session, user).await?;
-        // 等待已开始的目录刷新，避免旧快照移除刚打开的私聊。
-        let _fetch = self
-            .directory_fetch
-            .acquire()
-            .await
-            .expect("Slack 操作许可不能关闭");
         let user_id = user.to_owned();
         let cached_name = profile.name.clone();
-        if let Some(summary) = self
+        let open = self
             .state
             .call(move |state| {
                 let account = state.account(session)?;
@@ -602,14 +778,43 @@ impl SlackService {
                     let mut summary =
                         Self::conversation_summary(account, room, state.user_directory.as_ref()).2;
                     summary["title"] = json!(account.nickname(&user_id).unwrap_or(cached_name));
-                    return Ok(Some(summary));
+                    return Ok(OpenDm::Cached(summary));
                 }
-                Ok(None)
+                if let Some(pending) = state.cache.dm_opens.get(&user_id)
+                    && pending.has_changed().is_ok()
+                {
+                    return Ok(OpenDm::Pending(pending.clone()));
+                }
+                let (completion, pending) = tokio::sync::watch::channel(None);
+                state.cache.dm_opens.insert(user_id, pending);
+                Ok(OpenDm::Start(completion))
             })
-            .await?
-        {
-            return Ok(summary);
-        }
+            .await?;
+        let completion = match open {
+            OpenDm::Cached(value) => return Ok(value),
+            OpenDm::Pending(mut result) => {
+                let outcome = result
+                    .wait_for(Option::is_some)
+                    .await
+                    .map_err(|_| Error::Unavailable)?;
+                return outcome.clone().expect("私聊已打开");
+            }
+            OpenDm::Start(completion) => completion,
+        };
+        let result = self.create_dm(session, user, profile.name).await;
+        let user = user.to_owned();
+        self.state
+            .call(move |state| {
+                if state.cache.session_id == Some(session) {
+                    state.cache.dm_opens.remove(&user);
+                }
+            })
+            .await;
+        completion.send_replace(Some(result.clone()));
+        result
+    }
+
+    async fn create_dm(&self, session: Uuid, user: &str, title: String) -> Result<Value, Error> {
         let response = self
             .slack_post(session, "conversations.open", &json!({"users":user}))
             .await?;
@@ -619,9 +824,12 @@ impl SlackService {
             .ok_or(Error::Upstream)?
             .to_owned();
         let user = user.to_owned();
-        let title = profile.name;
         let id = self
             .update_cache(session, move |cache, account| {
+                cache.directory_revision += 1;
+                cache
+                    .local_conversations
+                    .insert(id.clone(), cache.directory_revision);
                 let room = cache.conversations.entry(id.clone()).or_insert_with(|| {
                     let mut room = Conversation::new(&id, "im", &title);
                     room.disk.clone_from(&cache.disk);
@@ -896,7 +1104,6 @@ impl SlackService {
         id: &str,
         ts: &str,
         index: usize,
-        preview: bool,
         local_path: bool,
     ) -> Result<(String, Vec<u8>, Option<std::path::PathBuf>), Error> {
         let (item, token, cache) = {
@@ -905,7 +1112,7 @@ impl SlackService {
                 .blocking(move |state| {
                     let account = state.account(session)?;
                     let item = state.message_attachment(&id, &ts, index)?;
-                    if preview && !item.image {
+                    if !item.image {
                         return Err(Error::Attachment);
                     }
                     Ok((item, account.access.clone(), state.cache.disk.clone()))
@@ -914,7 +1121,7 @@ impl SlackService {
         };
         if let Some(path) = cache
             .as_ref()
-            .and_then(|cache| cache.attachment(&item, preview))
+            .and_then(|cache| cache.attachment(&item, true))
         {
             if local_path {
                 return Ok((String::new(), Vec::new(), Some(path)));
@@ -928,44 +1135,7 @@ impl SlackService {
                 return Ok((mime.into(), bytes, Some(path)));
             }
         }
-        let url = if preview {
-            &item.image_url
-        } else {
-            &item.download_url
-        };
-        let url = url.as_deref().ok_or(Error::Attachment)?;
         let web = self.web_session(session).await?;
-        if !preview {
-            let cache = cache.ok_or(Error::Unavailable)?;
-            let (mime, mut response) = self.client.original(url, &token, web.as_ref()).await?;
-            let (pending, file) = {
-                let mime = mime.clone();
-                self.state
-                    .blocking(move |state| {
-                        state.account(session)?;
-                        cache
-                            .begin_original(&item, &mime)
-                            .map_err(|_| Error::Unavailable)
-                    })
-                    .await?
-            };
-            let mut file = tokio::fs::File::from_std(file);
-            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
-            }
-            file.flush().await.map_err(|_| Error::Unavailable)?;
-            drop(file);
-            let path = self
-                .state
-                .blocking(move |state| {
-                    state.account(session)?;
-                    pending.commit().map_err(|_| Error::Unavailable)
-                })
-                .await?;
-            return Ok((mime, Vec::new(), Some(path)));
-        }
         self.download_preview(session, &item, &token, web.as_ref(), cache)
             .await
     }
@@ -988,11 +1158,19 @@ impl SlackService {
             return Ok(path);
         }
         let url = profile.avatar_url.as_deref().ok_or(Error::Attachment)?;
-        let bytes = self.client.avatar(url).await?;
         let (id, url) = (id.to_owned(), url.to_owned());
+        let client = self.client.clone();
+        let source = url.clone();
+        let (bytes, cancellation) = self
+            .downloads
+            .media(&self.project.0, async move { client.avatar(&source).await })
+            .await?;
         self.state
             .blocking(move |state| {
                 state.account(session)?;
+                if cancellation.has_changed().unwrap_or(true) {
+                    return Err(Error::DownloadCancelled);
+                }
                 if state
                     .user_directory
                     .as_ref()
@@ -1003,7 +1181,9 @@ impl SlackService {
                     return Err(Error::Attachment);
                 }
                 let png = disk::avatar_png(&bytes).ok_or(Error::Attachment)?;
-                disk::atomic_write(&path, &png).map_err(|_| Error::Unavailable)?;
+                cache
+                    .write_media(&path, &png)
+                    .map_err(|_| Error::Unavailable)?;
                 Ok(path)
             })
             .await
@@ -1068,17 +1248,31 @@ impl SlackService {
                     .map(|author| author.id.as_str())
                     .chain(message.user_references().map(|(id, _)| id))
             })
+            .map(str::to_owned)
             .collect();
         if ids.is_empty() {
             return;
         }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream::iter(ids).for_each_concurrent(4, |id| async move {
-                let _ = self.lookup_user(session, id).await;
-            }),
-        )
-        .await;
+        let missing = self
+            .state
+            .call(move |state| {
+                if state.account(session).is_err() {
+                    return std::collections::BTreeSet::new();
+                }
+                ids.into_iter()
+                    .filter(|id| {
+                        state
+                            .user_directory
+                            .as_ref()
+                            .and_then(|directory| directory.find(id))
+                            .is_none()
+                    })
+                    .collect()
+            })
+            .await;
+        if !missing.is_empty() {
+            let _ = self.user_requests.send(UserRequest::Warm(session, missing));
+        }
     }
 
     pub(super) async fn warm_message_media(&self, session: Uuid, messages: &[Message]) {
@@ -1145,21 +1339,27 @@ impl SlackService {
         cache: &disk::DiskCache,
         url: &str,
     ) -> Result<(), Error> {
-        let _permit = self
-            .preview_downloads
-            .acquire()
-            .await
-            .map_err(|_| Error::Unavailable)?;
         let path = cache.message_icon_path(url);
         if disk::regular_file(&path) {
             return Ok(());
         }
-        let bytes = self.client.avatar(url).await?;
+        let client = self.client.clone();
+        let url = url.to_owned();
+        let (bytes, cancellation) = self
+            .downloads
+            .media(&self.project.0, async move { client.avatar(&url).await })
+            .await?;
+        let cache = cache.clone();
         self.state
             .blocking(move |state| {
                 state.account(session)?;
+                if cancellation.has_changed().unwrap_or(true) {
+                    return Err(Error::DownloadCancelled);
+                }
                 let png = disk::avatar_png(&bytes).ok_or(Error::Attachment)?;
-                disk::atomic_write(&path, &png).map_err(|_| Error::Unavailable)
+                cache
+                    .write_media(&path, &png)
+                    .map_err(|_| Error::Unavailable)
             })
             .await
     }
@@ -1172,11 +1372,6 @@ impl SlackService {
         web: Option<&super::client::WebSession>,
         cache: Option<disk::DiskCache>,
     ) -> Result<(String, Vec<u8>, Option<std::path::PathBuf>), Error> {
-        let _permit = self
-            .preview_downloads
-            .acquire()
-            .await
-            .map_err(|_| Error::Unavailable)?;
         if let Some(path) = cache
             .as_ref()
             .and_then(|cache| cache.attachment(item, true))
@@ -1188,12 +1383,23 @@ impl SlackService {
         {
             return Ok((mime.into(), bytes, Some(path)));
         }
-        let url = item.image_url.as_deref().ok_or(Error::Attachment)?;
-        let (mime, bytes) = self.client.image(url, token, web).await?;
+        let url = item.image_url.clone().ok_or(Error::Attachment)?;
+        let client = self.client.clone();
+        let token = token.to_owned();
+        let web = web.cloned();
+        let ((mime, bytes), cancellation) = self
+            .downloads
+            .media(&self.project.0, async move {
+                client.image(&url, &token, web.as_ref()).await
+            })
+            .await?;
         let item = item.clone();
         self.state
             .blocking(move |state| {
                 state.account(session)?;
+                if cancellation.has_changed().unwrap_or(true) {
+                    return Err(Error::DownloadCancelled);
+                }
                 let path = cache.and_then(|cache| cache.save_preview(&item, &mime, &bytes));
                 Ok((mime, bytes, path))
             })

@@ -3,13 +3,16 @@ use crate::process::Process;
 use std::{
     fmt,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use uuid::Uuid;
 
 use crate::modules::{
@@ -20,9 +23,8 @@ use crate::modules::{
 
 use super::{
     client::{SlackClient, WebSession},
-    disk::DiskCache,
-    downloads::Downloads,
-    mailbox::UserDirectory,
+    downloads::{Downloads, OpenedCache},
+    mailbox::{UserDirectory, UserRequest},
     picker::PickerItem,
     projects::{Backend, SlackTeam, SlackWatch, read_watches},
     protocol::{Error, Identity, valid_id},
@@ -33,6 +35,9 @@ use super::{
 #[derive(Default)]
 pub(super) struct State {
     pub user_directory: Option<UserDirectory>,
+    cache_restore: Option<Arc<AtomicBool>>,
+    pub(super) user_revision: u64,
+    pub(super) user_revisions: std::collections::BTreeMap<String, u64>,
     pub picker_items: Arc<[PickerItem]>,
     pub picker_failed: bool,
     pub secrets: Secrets,
@@ -46,6 +51,14 @@ pub(super) struct State {
 
 impl State {
     pub fn account(&self, session: Uuid) -> Result<&Account, Error> {
+        let account = self.authorized_account(session)?;
+        if self.cache_restore.is_some() {
+            return Err(Error::Unavailable);
+        }
+        Ok(account)
+    }
+
+    fn authorized_account(&self, session: Uuid) -> Result<&Account, Error> {
         if self.retired {
             return Err(Error::Project);
         }
@@ -72,16 +85,13 @@ pub struct SlackService {
     pub(super) outgoing: Notify,
     pub(super) sync: Notify,
     pub(super) alerts: Notify,
-    pub(super) user_fetch: Semaphore,
-    pub(super) directory_fetch: Semaphore,
+    pub(super) user_requests: mpsc::UnboundedSender<UserRequest>,
     pub(super) picker_changed: Notify,
     pub(super) avatars_changed: Notify,
-    pub(super) preview_downloads: Semaphore,
     pub(super) subscriptions_changed: Notify,
     pub(super) watch_changes: Semaphore,
     pub(super) project: (String, SlackTeam, Uuid, Arc<ProjectsStatus>),
     pub(super) config: Arc<ConfigService>,
-    credential_import: Semaphore,
 }
 
 impl fmt::Debug for SlackService {
@@ -104,35 +114,36 @@ impl SlackService {
         config: Arc<ConfigService>,
         downloads: Arc<Downloads>,
         nicknames: Nicknames,
-    ) -> Self {
+    ) -> (Self, mpsc::UnboundedReceiver<UserRequest>) {
+        let (user_requests, user_inbox) = mpsc::unbounded_channel();
         let state = Process::start(State {
             socket_state: "stopped",
             nicknames,
             ..State::default()
         });
-        Self {
-            state,
-            cache_root: backend.cache_root.clone(),
-            client: SlackClient::new(&backend.api),
-            alert,
-            notification,
-            change: watch::channel(0).0,
-            outgoing: Notify::new(),
-            sync: Notify::new(),
-            alerts: Notify::new(),
-            user_fetch: Semaphore::new(1),
-            directory_fetch: Semaphore::new(1),
-            picker_changed: Notify::new(),
-            avatars_changed: Notify::new(),
-            preview_downloads: Semaphore::new(4),
-            subscriptions_changed: Notify::new(),
-            watch_changes: Semaphore::new(1),
-            downloads,
-            clean_cache: Notify::new(),
-            project: (id, settings, generation, reporter),
-            config,
-            credential_import: Semaphore::new(1),
-        }
+        (
+            Self {
+                state,
+                cache_root: backend.cache_root.clone(),
+                client: SlackClient::new(&backend.api),
+                alert,
+                notification,
+                change: watch::channel(0).0,
+                outgoing: Notify::new(),
+                sync: Notify::new(),
+                alerts: Notify::new(),
+                user_requests,
+                picker_changed: Notify::new(),
+                avatars_changed: Notify::new(),
+                subscriptions_changed: Notify::new(),
+                watch_changes: Semaphore::new(1),
+                downloads,
+                clean_cache: Notify::new(),
+                project: (id, settings, generation, reporter),
+                config,
+            },
+            user_inbox,
+        )
     }
 
     pub(super) async fn team_nicknames(
@@ -157,14 +168,11 @@ impl SlackService {
         watching: bool,
     ) -> Result<(), Error> {
         let display_name = if watching {
-            if read_watches(&self.config)
-                .await?
-                .iter()
-                .any(|watch| watch.id == id)
-            {
-                return Ok(());
-            }
-            Some(self.watch_conversation_name(conversation).await?)
+            let watches = read_watches(&self.config).await?;
+            Some(match watches.into_iter().find(|watch| watch.id == id) {
+                Some(watch) => watch.display_name,
+                None => self.watch_conversation_name(conversation).await?,
+            })
         } else {
             None
         };
@@ -227,10 +235,14 @@ impl SlackService {
         self.state
             .call(|state| {
                 state.retired = true;
+                if let Some(restore) = state.cache_restore.take() {
+                    restore.store(true, Ordering::Release);
+                }
                 state.cache.clear_subscriptions();
             })
             .await;
         self.signal_change();
+        self.downloads.cancel_team(&self.project.0).await;
     }
 
     pub(super) async fn nicknames_changed(&self, nicknames: Nicknames) {
@@ -267,6 +279,11 @@ impl SlackService {
         let watch = watch.to_owned();
         self.state
             .call(move |state| {
+                *state
+                    .cache
+                    .watch_revisions
+                    .entry(watch.clone())
+                    .or_default() += 1;
                 state
                     .cache
                     .notifications
@@ -316,11 +333,12 @@ impl SlackService {
         &self,
         operation: impl FnOnce(&mut Secrets, &Nicknames) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let root = self.cache_root.clone();
+        let has_cache = self.cache_root.is_some();
+        let downloads = self.downloads.clone();
         let (id, _, generation, reporter) = self.project.clone();
-        let result = self
+        let (result, restore) = self
             .state
-            .blocking(move |state| {
+            .call(move |state| {
                 if state.retired {
                     return Err(Error::Project);
                 }
@@ -332,21 +350,66 @@ impl SlackService {
                     .map(|account| account.identity.clone());
                 let session = identity.as_ref().map(|identity| identity.session_id);
                 let authorization_lost =
-                    session.is_some_and(|session| state.account(session).is_err());
+                    session.is_some_and(|session| state.authorized_account(session).is_err());
+                let mut restore = None;
                 if state.cache.session_id != session || authorization_lost {
                     reporter.update_new_conversations(&id, generation, None);
+                    if state.cache.session_id.is_some() {
+                        downloads.request_cancel_team(&id);
+                    }
+                    if let Some(previous) = state.cache_restore.take() {
+                        previous.store(true, Ordering::Release);
+                    }
                 }
                 if state.cache.session_id != session {
                     state.user_directory = None;
+                    state.user_revision = 0;
+                    state.user_revisions.clear();
                     state.picker_items = Arc::default();
                     state.picker_failed = false;
                     state.cache.reset(session);
-                    if let (Some(root), Some(identity)) = (root, identity)
-                        && let Ok(disk) =
-                            DiskCache::open(&root, &identity.team_id, &identity.user_id)
+                    if let Some(identity) = identity.filter(|_| has_cache && !authorization_lost) {
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        state.cache_restore = Some(cancelled.clone());
+                        restore = Some((identity, cancelled));
+                    }
+                } else if authorization_lost {
+                    state.cache.clear_subscriptions();
+                }
+                Ok((result, restore))
+            })
+            .await?;
+
+        if let Some((identity, cancelled)) = restore {
+            let opened = self
+                .downloads
+                .open_cache(
+                    self.cache_root.clone().expect("已配置 Slack 缓存目录"),
+                    identity.team_id.clone(),
+                    identity.user_id.clone(),
+                    cancelled.clone(),
+                )
+                .await
+                .ok();
+            let (id, _, generation, reporter) = self.project.clone();
+            self.state
+                .call(move |state| {
+                    if !state
+                        .cache_restore
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &cancelled))
+                        || state.authorized_account(identity.session_id).is_err()
+                    {
+                        return;
+                    }
+                    state.cache_restore = None;
+                    if let Some(OpenedCache {
+                        disk,
+                        mut rooms,
+                        users,
+                    }) = opened
                     {
                         let account = state.secrets.account.as_mut().expect("已验证的 Slack 会话");
-                        let mut rooms = disk.rooms();
                         if let Some(baseline) = rooms
                             .values()
                             .filter_map(|room| room.read_positions.baseline)
@@ -357,28 +420,21 @@ impl SlackService {
                         for room in rooms.values_mut() {
                             room.read_positions.baseline.get_or_insert(account.baseline);
                         }
-                        state.user_directory = Some(UserDirectory::from_disk(
-                            identity.session_id,
-                            disk.users(&identity.team_id),
-                        ));
+                        state.user_directory =
+                            Some(UserDirectory::from_disk(identity.session_id, users));
                         state.cache.conversations = rooms;
                         state.cache.disk = Some(disk);
-                        if let Ok(account) = state.account(identity.session_id) {
-                            reporter.update_new_conversations(
-                                &id,
-                                generation,
-                                Some((&state.cache, account, state.user_directory.as_ref())),
-                            );
-                        }
+                        reporter.update_new_conversations(
+                            &id,
+                            generation,
+                            Some((&state.cache, account, state.user_directory.as_ref())),
+                        );
                     }
-                } else if authorization_lost {
-                    state.cache.clear_subscriptions();
-                }
-                Ok(result)
-            })
-            .await;
+                })
+                .await;
+        }
         self.picker_changed.notify_one();
-        result
+        Ok(result)
     }
 
     pub(super) async fn has_conversation(&self, id: &str) -> bool {
@@ -563,11 +619,6 @@ impl SlackService {
         if self.project.1.token.is_none() && self.project.1.d_cookie.is_none() {
             return Ok(());
         }
-        let _lock = self
-            .credential_import
-            .acquire()
-            .await
-            .expect("Slack 操作许可不能关闭");
         let passwords = self.read_passwords().await?;
         let token = imported_token(&passwords)?;
         let hash = imported_token_hash(token, &passwords);

@@ -391,6 +391,7 @@ async fn http_lifecycle_uses_committed_settings_and_never_returns_tokens_in_quer
         .replace("network", "relay_token", json!("relay-secret"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     let (status, created) = http(app.clone(), "POST", "/network/pairings").await;
     assert_eq!(status, 201);
     assert_eq!(created["qr_payload"]["relay_token"], "relay-secret");
@@ -406,12 +407,11 @@ async fn http_lifecycle_uses_committed_settings_and_never_returns_tokens_in_quer
         .registrar
         .fail
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        config
-            .replace("network", "relay_token", json!("rejected-token"))
-            .await
-            .is_err()
-    );
+    config
+        .replace("network", "relay_token", json!("rejected-token"))
+        .await
+        .unwrap();
+    assert!(service.start().await.is_err());
     assert_eq!(http(app.clone(), "GET", &path).await.1["status"], "pending");
     fixture
         .registrar
@@ -421,6 +421,7 @@ async fn http_lifecycle_uses_committed_settings_and_never_returns_tokens_in_quer
         .replace("network", "relay_token", json!("new-token"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     assert_eq!(
         http(app.clone(), "GET", &path).await.1["status"],
         "cancelled"
@@ -545,7 +546,6 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
                 ))
         })
     })));
-    let receiver = tokio::spawn(service.clone().receive_pairings());
     config
         .replace("network", "relay_url", json!(address))
         .await
@@ -554,6 +554,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .replace("network", "relay_token", json!(token))
         .await
         .unwrap();
+    service.start().await.unwrap();
     let created = service.create_pairing().await.unwrap();
     let phone_key = SecretKey::generate();
     let phone_id = phone_key.public();
@@ -963,8 +964,6 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         BindingState::Failed { .. }
     ));
     workspace.close().await;
-    receiver.abort();
-    let _ = receiver.await;
     service.shutdown().await;
     phone.close().await.unwrap();
     relay.shutdown().await.unwrap();

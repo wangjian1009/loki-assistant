@@ -442,6 +442,47 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         misplaced_reply: AtomicBool::default(),
         history_unavailable: AtomicBool::default(),
     });
+    let user_lookup_started = Arc::new(tokio::sync::Notify::new());
+    let finish_user_lookup = Arc::new(tokio::sync::Notify::new());
+    let user_lookup = get({
+        let started = user_lookup_started.clone();
+        let finish = finish_user_lookup.clone();
+        move |axum::extract::Query(query): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >| {
+            let started = started.clone();
+            let finish = finish.clone();
+            async move {
+                let id = &query["user"];
+                if id == "UWAIT" {
+                    started.notify_one();
+                    finish.notified().await;
+                }
+                Json(json!({"ok":true,"user":{"id":id,"real_name":"林舟"}}))
+            }
+        }
+    });
+    let pause_users = Arc::new(std::sync::Mutex::new(
+        None::<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ));
+    let users_list = get({
+        let pause = pause_users.clone();
+        move || {
+            let pending = pause.lock().unwrap().take();
+            async move {
+                if let Some((started, release)) = pending {
+                    let _ = started.send(());
+                    let _ = release.await;
+                }
+                Json(json!({"ok":true,"members":[
+                    {"id":"UYOU","name":"林舟","profile":{"image_48":"https://avatars.slack-edge.com/media/user.png"}}
+                ]}))
+            }
+        }
+    });
     let media = get(
         |axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap| async move {
             if name == "preview.png" {
@@ -522,12 +563,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 {"id":"CWORK","name":"产品讨论","is_channel":true}
             ]}))
         }))
-        .route("/users.info", get(|| async { Json(json!({"ok":true,"user":{"real_name":"林舟"}})) }))
-        .route("/users.list", get(|| async {
-            Json(json!({"ok":true,"members":[
-                {"id":"UYOU","name":"林舟","profile":{"image_48":"https://avatars.slack-edge.com/media/user.png"}}
-            ]}))
-        }))
+        .route("/users.info", user_lookup)
+        .route("/users.list", users_list)
         .route("/bots.info", get(|| async {
             Json(json!({"ok":true,"bot":{"id":"BNEWS","icons":{"image_48":"https://avatars.slack-edge.com/media/bot.png"}}}))
         }))
@@ -1027,6 +1064,55 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert!(first.get("icon_url").is_none());
     drop(delivered);
 
+    let lookup = tokio::spawn({
+        let app = app.clone();
+        async move { invoke(&app, "GET", "/slack/users/TTEAM.UWAIT", None, None, None).await }
+    });
+    timeout(Duration::from_secs(2), user_lookup_started.notified())
+        .await
+        .unwrap();
+    watch_events
+        .send(json!({"type":"user_change","user":{"id":"UME","real_name":"本人"}}))
+        .unwrap();
+    let deleted = format!("{now}.790123");
+    watch_events.send(json!({"type":"message","subtype":"message_deleted","channel":"CWORK","deleted_ts":deleted})).unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let deleted = deleted.clone();
+            if service
+                .state
+                .call(move |state| {
+                    state.cache.conversations["CWORK"]
+                        .deleted
+                        .contains(&deleted)
+                })
+                .await
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("用户补查挂起时 WebSocket 仍应处理随后到达的消息事件");
+    finish_user_lookup.notify_one();
+    assert_eq!(lookup.await.unwrap().0, StatusCode::OK);
+
+    let (list_started, list_waiting) = tokio::sync::oneshot::channel();
+    let (complete_list, hold_list) = tokio::sync::oneshot::channel();
+    *pause_users.lock().unwrap() = Some((list_started, hold_list));
+    service
+        .state
+        .call(|state| state.user_directory.as_mut().unwrap().expire())
+        .await;
+    let listing = tokio::spawn({
+        let app = app.clone();
+        async move { invoke(&app, "GET", "/slack/users", None, None, None).await }
+    });
+    timeout(Duration::from_secs(2), list_waiting)
+        .await
+        .unwrap()
+        .unwrap();
     let message_path = directory.0.join(format!(
         "cache/TTEAM/conversations/CWORK/messages/{}.txt",
         mock.root
@@ -1059,6 +1145,20 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert_eq!(fs::read(&message_path).unwrap(), stored);
     let (_, _, profile) = invoke(&app, "GET", "/slack/users/TTEAM.UYOU", None, None, None).await;
     assert_eq!(profile["user"]["name"], "林舟新名");
+    complete_list.send(()).unwrap();
+    let (code, _, listed) = timeout(Duration::from_secs(2), listing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(code, StatusCode::OK);
+    let user = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "TTEAM.UYOU")
+        .unwrap();
+    assert_eq!(user["name"], "林舟新名");
+
     watch_events
         .send(json!({"type":"user_change","user":{
             "id":"UYOU","real_name":"林舟","profile":{
@@ -1083,7 +1183,65 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         "/slack/conversations/TTEAM.CWORK/messages/{}/attachments/0/original",
         mock.root
     );
-    let (status, _, created) = invoke(&app, "POST", &original_path, session, None, None).await;
+    let (entered_cleanup, cleanup_waiting) = tokio::sync::oneshot::channel();
+    let (resume_cleanup, hold_cleanup) = tokio::sync::oneshot::channel();
+    *projects.downloads.pause_cleanup.lock().unwrap() = Some((entered_cleanup, hold_cleanup));
+    projects.downloads.schedule_cache_cleanup(
+        directory.0.join("cache"),
+        "TTEAM".into(),
+        Duration::from_secs(86_400),
+    );
+    timeout(Duration::from_secs(2), cleanup_waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let (code, _, _) = timeout(
+        Duration::from_secs(2),
+        invoke(
+            &app,
+            "GET",
+            "/slack/conversations/TTEAM.DDIRECT/messages",
+            session,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("后台清理等待时，本队的消息读取仍可完成");
+    assert_eq!(code, StatusCode::OK);
+
+    let (entered_probe, probe_waiting) = tokio::sync::oneshot::channel();
+    let (resume_probe, hold_probe) = tokio::sync::oneshot::channel();
+    *projects.downloads.pause_probe.lock().unwrap() = Some((entered_probe, hold_probe));
+    let registering = tokio::spawn({
+        let app = app.clone();
+        let path = original_path.clone();
+        async move { invoke(&app, "POST", &path, session, None, None).await }
+    });
+    timeout(Duration::from_secs(2), probe_waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let (code, _, _) = timeout(
+        Duration::from_secs(2),
+        invoke(
+            &app,
+            "DELETE",
+            "/slack/teams/TOTHER/cache/tasks",
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("慢文件检查不能阻塞其他团队的取消请求");
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    resume_probe.send(()).unwrap();
+    let (status, _, created) = timeout(Duration::from_secs(2), registering)
+        .await
+        .expect("下载登记无需等待后台扫描")
+        .unwrap();
+    resume_cleanup.send(()).unwrap();
     assert_eq!(status, StatusCode::ACCEPTED, "{created}");
     assert_eq!(created.as_object().unwrap().len(), 1);
     let download_id = created["download_id"].as_str().unwrap();
@@ -1678,8 +1836,39 @@ async fn socket_notifications_threads_and_idempotent_sends() {
         created["download_id"].as_str().unwrap()
     );
     wait_download(&app, &download, fresh_session, "downloading").await;
+    assert_eq!(
+        invoke(
+            &app,
+            "DELETE",
+            "/slack/teams/TOTHER/cache/tasks",
+            None,
+            None,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        wait_download(&app, &download, fresh_session, "downloading").await["downloaded_bytes"],
+        4
+    );
+    assert_eq!(
+        invoke(
+            &app,
+            "DELETE",
+            "/slack/teams/TTEAM/cache/tasks",
+            None,
+            None,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let cancelled = wait_download(&app, &download, fresh_session, "failed").await;
+    assert_eq!(cancelled["error"]["code"], "slack-download-cancelled");
     interrupt_download.notify_one();
-    wait_download(&app, &download, fresh_session, "failed").await;
     replace_original.store(true, Ordering::SeqCst);
     let (_, _, retried) = invoke(&app, "POST", &original_path, fresh_session, None, None).await;
     let retried = format!(
@@ -2195,6 +2384,13 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let requested_rooms = Arc::clone(&history_requests);
     let dm_open_requests = Arc::new(AtomicUsize::new(0));
     let opened_dms = Arc::clone(&dm_open_requests);
+    let pause_directory = Arc::new(Mutex::new(
+        None::<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ));
+    let directory_gate = pause_directory.clone();
     let slack = Router::new()
         .route(
             "/conversations.open",
@@ -2240,12 +2436,20 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         )
         .route(
             "/users.conversations",
-            get(|| async {
-                Json(json!({"ok":true,"channels":[
-                    {"id":"DSHARED","user":"U2","is_im":true},
-                    {"id":"CCHAT","name":"项目讨论","is_channel":true},
-                    {"id":"GCHAT","name":"内部讨论","is_channel":true,"is_private":true}
-                ]}))
+            get(move |headers: HeaderMap| {
+                let pending = (headers["authorization"] == "Bearer xoxc-TALPHA")
+                    .then(|| directory_gate.lock().unwrap().take()).flatten();
+                async move {
+                    if let Some((entered, release)) = pending {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                    }
+                    Json(json!({"ok":true,"channels":[
+                        {"id":"DSHARED","user":"U2","is_im":true},
+                        {"id":"CCHAT","name":"项目讨论","is_channel":true},
+                        {"id":"GCHAT","name":"内部讨论","is_channel":true,"is_private":true}
+                    ]}))
+                }
             }),
         )
         .route(
@@ -2900,10 +3104,28 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let (code, _, error) = invoke(&app, "POST", dm_path, Some(beta), None, None).await;
     assert_eq!(code, StatusCode::CONFLICT);
     assert_eq!(error["error"]["code"], "slack-session-changed");
-    let (left, right) = tokio::join!(
-        invoke(&app, "POST", dm_path, Some(alpha), None, None),
-        invoke(&app, "POST", dm_path, Some(alpha), None, None)
-    );
+    let (refresh_entered, refresh_waiting) = tokio::sync::oneshot::channel();
+    let (refresh_continue, hold_refresh) = tokio::sync::oneshot::channel();
+    *pause_directory.lock().unwrap() = Some((refresh_entered, hold_refresh));
+    let team = projects.service("TALPHA").await.unwrap();
+    let refresh = tokio::spawn(async move {
+        team.request(move |service| Box::pin(async move { service.refresh_directory(alpha).await }))
+            .await
+    });
+    timeout(Duration::from_secs(2), refresh_waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let (left, right) = timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            invoke(&app, "POST", dm_path, Some(alpha), None, None),
+            invoke(&app, "POST", dm_path, Some(alpha), None, None)
+        )
+    })
+    .await
+    .expect("私聊创建无需等待正在拉取的会话目录");
+    refresh_continue.send(()).unwrap();
+    refresh.await.unwrap().unwrap();
     for (code, _, dm) in [left, right] {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(dm["conversation"]["id"], "TALPHA.DNEW");

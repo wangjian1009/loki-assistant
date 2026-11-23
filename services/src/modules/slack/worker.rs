@@ -57,15 +57,8 @@ impl SlackService {
             .unwrap_or(Duration::from_secs(
                 super::DEFAULT_CACHE_RETENTION_DAYS * 86_400,
             ));
-        let downloads = self.downloads.clone();
-        let team = self.project.0.clone();
-        self.state
-            .with(move |_| {
-                Box::pin(async move {
-                    downloads.clean_cache(root, team, retention).await;
-                })
-            })
-            .await;
+        self.downloads
+            .schedule_cache_cleanup(root, self.project.0.clone(), retention);
     }
 
     async fn restore_user_token(&self) {
@@ -295,7 +288,7 @@ impl SlackService {
                 Some("user_change" | "team_join") => {
                     let user = &event["user"];
                     if let Some(id) = user["id"].as_str() {
-                        self.update_directory_user(session, id, user).await;
+                        self.update_directory_user(session, id, user);
                     }
                 }
                 _ => {}
@@ -380,16 +373,18 @@ impl SlackService {
             .as_ref()
             .and_then(|message| message.author.as_ref())
             .is_some_and(|author| author.id.starts_with('B'));
-        let _watch_change = if new {
-            Some(
-                self.watch_changes
-                    .acquire()
-                    .await
-                    .expect("Slack 操作许可不能关闭"),
-            )
-        } else {
-            None
-        };
+        let watch_id = conversation_id.clone();
+        let watch_revision = self
+            .state
+            .call(move |state| {
+                state
+                    .cache
+                    .watch_revisions
+                    .get(&watch_id)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .await;
         let watched = new && self.watching(&conversation_id).await;
         let result = self
             .update_cache(session, move |cache, account| {
@@ -399,6 +394,13 @@ impl SlackService {
                 {
                     return Ok(false);
                 }
+                let watched = watched
+                    && cache
+                        .watch_revisions
+                        .get(&conversation_id)
+                        .copied()
+                        .unwrap_or(0)
+                        == watch_revision;
                 let kind = match cache.conversations.get(&id) {
                     Some(room) => room.kind.as_str(),
                     None if id.starts_with('D') || channel_type.as_deref() == Some("im") => "im",
@@ -648,22 +650,11 @@ impl SlackService {
             if names.get(&id).is_some_and(|name| name != &id) {
                 continue;
             }
-            match self
-                .slack_get(session, "users.info", &[("user", &id)])
-                .await
-            {
-                Ok(value) => {
-                    if let Some(name) = value["user"]["profile"]["display_name"]
-                        .as_str()
-                        .filter(|name| !name.is_empty())
-                        .or(value["user"]["real_name"].as_str())
-                        .or(value["user"]["name"].as_str())
-                    {
-                        self.update_directory_user(session, &id, &value["user"])
-                            .await;
-                        names.insert(id, name.to_owned());
-                    }
+            match self.lookup_user(session, &id).await {
+                Ok(user) if user.name != id => {
+                    names.insert(id, user.name);
                 }
+                Ok(_) => {}
                 Err(
                     Error::Permission
                     | Error::RateLimited(_)

@@ -27,12 +27,15 @@ pub(crate) use notifications::{NotificationConfirmedFields, NotificationRequest}
 use notifications::{legacy_pending_password_id, pending_password_id};
 pub(crate) use system::{LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX};
 
+type SecretWriters = HashMap<(String, String), Process<()>>;
+
 #[derive(Clone, Debug)]
 pub struct ConfigService {
     metadata: Arc<HashMap<String, ConfigModuleMetadata>>,
     data: Process<StoredConfig>,
     values: Process<Arc<StoredValues>>,
     record_credentials: Process<()>,
+    secret_writers: Process<SecretWriters>,
     changes: broadcast::Sender<ConfigChange>,
     commits: Process<()>,
     handlers: HashMap<String, Arc<dyn ConfigChangeHandler>>,
@@ -377,6 +380,7 @@ impl ConfigService {
             values: Process::start(data.values.clone()),
             data: Process::start(data),
             record_credentials: Process::start(()),
+            secret_writers: Process::start(HashMap::new()),
             changes,
             commits: Process::start(()),
             handlers: HashMap::new(),
@@ -631,16 +635,27 @@ impl ConfigService {
         let secret = item.data_type.is_password();
         let service = self.clone();
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
-        // HTTP 请求取消后仍完成已接受的落盘事务，避免内存与文件版本分离。
+        // HTTP 请求取消后仍完成已接受的落盘事务。
+        if secret {
+            let id = (module_id.clone(), key.clone());
+            let writer = self
+                .secret_writers
+                .call(move |writers| {
+                    writers
+                        .entry(id)
+                        .or_insert_with(|| Process::start(()))
+                        .clone()
+                })
+                .await;
+            return writer
+                .run(async move { service.replace_secret(&module_id, &key, value).await })
+                .await;
+        }
         self.commits
             .run(async move {
-                if secret {
-                    service.replace_secret(&module_id, &key, value).await
-                } else {
-                    service
-                        .update(&module_id, &key, value, ConfigChangeOperation::Replace)
-                        .await
-                }
+                service
+                    .update(&module_id, &key, value, ConfigChangeOperation::Replace)
+                    .await
             })
             .await
     }
@@ -1281,23 +1296,28 @@ impl ConfigService {
             .handlers
             .get(module_id)
             .ok_or_else(|| rejected("此配置项没有注册凭据存储。".into()))?;
+        let previous_value = Value::Bool(handler.secret_is_set(key).await);
+        handler.write_secret(key, value).await.map_err(rejected)?;
+        let value = Value::Bool(handler.secret_is_set(key).await);
         let mut module_values: BTreeMap<_, _> = self
             .module_values(module_id)
             .await?
             .into_iter()
             .map(|(key, value)| (key, value.value))
             .collect();
-        handler.write_secret(key, value).await.map_err(rejected)?;
-        let value = Value::Bool(handler.secret_is_set(key).await);
-        let previous_value = module_values.insert(key.to_owned(), value.clone());
-        let _ = self.changes.send(ConfigChange {
+        module_values.insert(key.to_owned(), value.clone());
+        let change = ConfigChange {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
             value: value.clone(),
             operation: ConfigChangeOperation::Replace,
-            previous_value,
+            previous_value: Some(previous_value),
             module_values,
-        });
+        };
+        let _ = self.changes.send(change.clone());
+        if let Err(error) = handler.committed(change).await {
+            eprintln!("凭据已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
+        }
         Ok(value)
     }
 
@@ -2100,6 +2120,87 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn slow_secret_writes_only_serialize_the_same_key() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::{
+            sync::Notify,
+            time::{Duration, timeout},
+        };
+
+        #[derive(Debug, Default)]
+        struct DelayedWriter {
+            entered: Notify,
+            release: Notify,
+            saved: AtomicBool,
+        }
+
+        impl ConfigChangeHandler for DelayedWriter {
+            fn secret_is_set<'a>(
+                &'a self,
+                _key: &'a str,
+            ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+                Box::pin(async move { self.saved.load(Ordering::SeqCst) })
+            }
+
+            fn write_secret<'a>(&'a self, _key: &'a str, value: Value) -> ChangeFuture<'a> {
+                Box::pin(async move {
+                    if value == json!("慢写入") {
+                        self.entered.notify_one();
+                        self.release.notified().await;
+                    }
+                    self.saved.store(value != json!(""), Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        let mut metadata = metadata();
+        let mut secret = metadata.items[0].clone();
+        secret.key = "secret".into();
+        secret.data_type = ConfigDataType::Password {
+            path: "secret.gpg".into(),
+            key: None,
+        };
+        secret.default = None;
+        metadata.items.push(secret);
+        let writer = Arc::new(DelayedWriter::default());
+        let service = ConfigService::new(metadata).with_change_handler("module_a", writer.clone());
+        let mut changes = service.subscribe();
+        let first = tokio::spawn({
+            let service = service.clone();
+            async move { service.replace("module_a", "secret", json!("慢写入")).await }
+        });
+        timeout(Duration::from_secs(1), writer.entered.notified())
+            .await
+            .unwrap();
+        let mut second = tokio::spawn({
+            let service = service.clone();
+            async move { service.replace("module_a", "secret", json!("")).await }
+        });
+        assert!(
+            timeout(Duration::from_millis(30), &mut second)
+                .await
+                .is_err()
+        );
+        let other = timeout(
+            Duration::from_secs(1),
+            service.replace("module_a", "config_a", json!("并发写入")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(other, json!("并发写入"));
+        assert_eq!(changes.try_recv().unwrap().key, "config_a");
+        assert!(changes.try_recv().is_err());
+
+        writer.release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap(), json!(true));
+        assert_eq!(second.await.unwrap().unwrap(), json!(false));
+        assert_eq!(changes.try_recv().unwrap().value, json!(true));
+        assert_eq!(changes.try_recv().unwrap().value, json!(false));
     }
 
     #[tokio::test]

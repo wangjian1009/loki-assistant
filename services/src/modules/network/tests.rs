@@ -264,16 +264,19 @@ async fn saving_relay_creates_identity_notifies_and_keeps_connection_until_repla
         .replace("network", "relay_url", json!("https://first.example"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册成功"]);
     config
         .replace("network", "relay_url", json!("https://first.example"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     assert_eq!(fixture.registrar.calls.lock().unwrap().len(), 1);
     config
         .replace("network", "relay_url", json!("https://second.example"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     let calls = fixture.registrar.calls.lock().unwrap().clone();
     assert_eq!(calls[0].1, calls[1].1);
     let sessions = fixture.registrar.sessions.lock().unwrap().clone();
@@ -283,6 +286,7 @@ async fn saving_relay_creates_identity_notifies_and_keeps_connection_until_repla
         .replace("network", "relay_url", json!(""))
         .await
         .unwrap();
+    service.start().await.unwrap();
     assert!(sessions[1].0.load(Ordering::SeqCst));
     service.shutdown().await;
 }
@@ -310,6 +314,7 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
         .replace("network", "relay_url", json!("https://saved.example"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     service.shutdown().await;
     let restarted = fixture.service();
     restarted.start().await.unwrap();
@@ -329,7 +334,7 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
 }
 
 #[tokio::test]
-async fn failed_change_returns_http_error_and_preserves_old_connection_and_file() {
+async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -346,7 +351,7 @@ async fn failed_change_returns_http_error_and_preserves_old_connection_and_file(
         .replace("network", "relay_url", json!("https://old.example"))
         .await
         .unwrap();
-    let saved = fs::read(fixture.root.join("config.yml")).unwrap();
+    service.start().await.unwrap();
     let mut changes = config.subscribe();
     fixture.registrar.fail.store(true, Ordering::SeqCst);
     let config = Arc::try_unwrap(config).unwrap();
@@ -363,11 +368,11 @@ async fn failed_change_returns_http_error_and_preserves_old_connection_and_file(
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), 500);
+    assert_eq!(response.status(), 200);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "config-change-rejected");
-    assert_eq!(fs::read(fixture.root.join("config.yml")).unwrap(), saved);
+    assert_eq!(body["value"], "https://failed.example");
+    assert!(service.start().await.is_err());
     assert_eq!(
         module
             .service()
@@ -375,20 +380,20 @@ async fn failed_change_returns_http_error_and_preserves_old_connection_and_file(
             .await
             .unwrap()
             .value,
-        json!("https://old.example")
+        json!("https://failed.example")
     );
     assert!(
         !fixture.registrar.sessions.lock().unwrap()[0]
             .0
             .load(Ordering::SeqCst)
     );
-    assert!(changes.try_recv().is_err());
+    assert_eq!(changes.try_recv().unwrap().key, "relay_url");
     assert_eq!(fixture.titles().last().unwrap(), "中转注册失败");
     service.shutdown().await;
 }
 
 #[tokio::test]
-async fn storage_failure_discards_candidate_without_success_notification() {
+async fn storage_failure_does_not_start_registration() {
     let fixture = Fixture::new();
     let path = fixture.root.join("config.yml");
     fs::write(&path, "network:\n  relay_token: test-token\n").unwrap();
@@ -407,12 +412,9 @@ async fn storage_failure_discards_candidate_without_success_notification() {
         config.value("network", "relay_url").await.unwrap().value,
         json!("")
     );
-    assert!(
-        fixture.registrar.sessions.lock().unwrap()[0]
-            .0
-            .load(Ordering::SeqCst)
-    );
-    assert_eq!(fixture.titles(), ["已生成本地身份", "中转配置保存失败"]);
+    service.start().await.unwrap();
+    assert!(fixture.registrar.sessions.lock().unwrap().is_empty());
+    assert_eq!(fixture.titles(), ["已生成本地身份"]);
 }
 
 #[tokio::test]
@@ -426,14 +428,11 @@ async fn timeout_and_identity_failure_are_notified_and_notification_failure_does
         .await
         .unwrap();
     fixture.registrar.hang.store(true, Ordering::SeqCst);
-    assert!(
-        config
-            .replace("network", "relay_url", json!("https://timeout.example"))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("超时")
-    );
+    config
+        .replace("network", "relay_url", json!("https://timeout.example"))
+        .await
+        .unwrap();
+    assert!(service.start().await.unwrap_err().contains("超时"));
     assert_eq!(fixture.titles().last().unwrap(), "中转注册失败");
     fixture.registrar.hang.store(false, Ordering::SeqCst);
     fixture.launcher.fail.store(true, Ordering::SeqCst);
@@ -441,12 +440,13 @@ async fn timeout_and_identity_failure_are_notified_and_notification_failure_does
         .replace("network", "relay_url", json!("https://ok.example"))
         .await
         .unwrap();
+    service.start().await.unwrap();
     service.shutdown().await;
     config
         .set_system_value("network_identity", "损坏")
         .await
         .unwrap();
-    assert!(service.start().await.is_err());
+    assert!(fixture.service().start().await.is_err());
     assert_eq!(fixture.titles().last().unwrap(), "网络身份初始化失败");
 }
 
@@ -496,6 +496,7 @@ async fn real_iroh_registration_uses_only_the_configured_ephemeral_relay() {
         .replace("network", "relay_url", json!(address))
         .await
         .unwrap();
+    service.start().await.unwrap();
     assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册成功"]);
     assert_eq!(fixture.phase().await, "connected");
     let denied = IrohRelayRegistrar::new();
@@ -574,6 +575,7 @@ async fn incomplete_settings_are_saved_without_registration_on_startup_or_update
             .replace("network", "relay_token", json!(token))
             .await
             .unwrap();
+        service.start().await.unwrap();
         assert!(fixture.registrar.calls.lock().unwrap().is_empty());
         assert_eq!(fixture.phase().await, "offline");
         assert_eq!(fixture.titles(), ["已生成本地身份"]);
@@ -598,6 +600,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
                 "first-token"
             };
             config.replace("network", key, json!(value)).await.unwrap();
+            service.start().await.unwrap();
             assert_eq!(
                 fixture.registrar.calls.lock().unwrap().len(),
                 if key == first { 0 } else { 1 }
@@ -609,6 +612,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
             .replace("network", "relay_token", json!("rotated-token"))
             .await
             .unwrap();
+        service.start().await.unwrap();
         assert_eq!(fixture.registrar.calls.lock().unwrap().len(), 2);
         assert_eq!(
             fixture.registrar.calls.lock().unwrap()[1].2,
@@ -628,6 +632,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
             .replace("network", "relay_token", json!(""))
             .await
             .unwrap();
+        service.start().await.unwrap();
         assert_eq!(fixture.phase().await, "offline");
         assert_eq!(fixture.registrar.calls.lock().unwrap().len(), 2);
         assert!(
@@ -639,7 +644,7 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
 }
 
 #[tokio::test]
-async fn status_read_during_registration_is_immediate_and_rejected_token_preserves_connection() {
+async fn configuration_remains_available_during_background_registration() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -677,12 +682,10 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
         .await
         .unwrap();
     fixture.registrar.hang.store(true, Ordering::SeqCst);
-    let saving = config.clone();
-    let task = tokio::spawn(async move {
-        saving
-            .replace("network", "relay_url", json!("https://relay.example"))
-            .await
-    });
+    config
+        .replace("network", "relay_url", json!("https://relay.example"))
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while fixture.registrar.calls.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
@@ -690,6 +693,14 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     })
     .await
     .unwrap();
+    let changed = tokio::time::timeout(
+        Duration::from_millis(200),
+        config.replace("slack", "cache_retention_days", json!(29)),
+    )
+    .await
+    .expect("无关配置写入无需等待中转注册")
+    .unwrap();
+    assert_eq!(changed, json!(29));
     let invitation = tokio::time::timeout(Duration::from_millis(100), service.create_pairing())
         .await
         .expect("候选注册期间应及时响应绑定邀请请求");
@@ -735,7 +746,7 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     assert!(!body.to_string().contains("valid-token"));
     fixture.registrar.hang.store(false, Ordering::SeqCst);
     fixture.registrar.resume.notify_one();
-    task.await.unwrap().unwrap();
+    service.start().await.unwrap();
     assert!(
         super::peers::load(&fixture.stored_config())
             .await
@@ -745,14 +756,15 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     assert_eq!(fixture.phase().await, "connected");
     fixture.registrar.fail.store(true, Ordering::SeqCst);
     *fixture.registrar.failure_message.lock().unwrap() = Some("拒绝 secret-token".to_owned());
-    let error = config
+    config
         .replace("network", "relay_token", json!("secret-token"))
         .await
-        .unwrap_err();
+        .unwrap();
+    let error = service.start().await.unwrap_err();
     assert!(!error.to_string().contains("secret-token"));
     assert_eq!(
         super::config::relay_token(&config).await.unwrap(),
-        "valid-token"
+        "secret-token"
     );
     assert_eq!(fixture.phase().await, "connected");
     assert!(

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
-use super::{NetworkService, relay::RelaySession};
+use super::{relay::RelaySession, service::RelayContext};
 use crate::{
     http::error::{ErrorSource, response as api_error},
     modules::discover::registry::API_DESCRIPTORS,
@@ -187,16 +187,16 @@ struct WireRequest {
     body: Option<Value>,
 }
 
-impl NetworkService {
-    /// 组合根注入只捕获 Weak 引用的分发器，避免服务实例形成循环持有。
-    pub fn set_remote_dispatcher(&self, dispatcher: Arc<dyn RequestDispatcher>) {
-        self.remote
-            .dispatcher
+impl Gateway {
+    pub(super) fn set_dispatcher(&self, dispatcher: Arc<dyn RequestDispatcher>) {
+        self.dispatcher
             .post(move |current| *current = Some(dispatcher));
     }
+}
 
+impl RelayContext {
     pub(super) async fn handle_remote(
-        self: Arc<Self>,
+        &self,
         session: &Arc<dyn RelaySession>,
         connection: &Connection,
     ) {

@@ -1,4 +1,12 @@
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use reqwest::{
     Response, StatusCode,
@@ -6,30 +14,50 @@ use reqwest::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Semaphore, oneshot, watch},
+};
 use uuid::Uuid;
 
 use crate::process::Process;
 
 use super::{
     client::attachment_mime,
-    disk::{DiskCache, PartialAttachment, PartialMetadata},
+    disk::{CacheWrites, DiskCache, PartialAttachment, PartialMetadata},
+    mailbox::UserProfile,
     projects::Projects,
     protocol::{Attachment, Error},
     service::SlackService,
+    store::Conversation,
     team::Team,
 };
 
+pub(super) struct OpenedCache {
+    pub disk: DiskCache,
+    pub rooms: std::collections::BTreeMap<String, Conversation>,
+    pub users: Vec<UserProfile>,
+}
+
+#[cfg(test)]
+type TestPause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
 pub(super) struct Downloads {
     registry: Process<Registry>,
-    slots: Semaphore,
+    #[cfg(test)]
+    pub(super) pause_probe: std::sync::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    pub(super) pause_cleanup: std::sync::Mutex<Option<TestPause>>,
 }
 
 impl Default for Downloads {
     fn default() -> Self {
         Self {
             registry: Process::start(Registry::default()),
-            slots: Semaphore::new(4),
+            #[cfg(test)]
+            pause_probe: Default::default(),
+            #[cfg(test)]
+            pause_cleanup: Default::default(),
         }
     }
 }
@@ -38,12 +66,69 @@ impl Default for Downloads {
 struct Registry {
     tasks: HashMap<Uuid, Arc<Task>>,
     active: HashMap<PathBuf, (Arc<Task>, Arc<Semaphore>)>,
+    teams: HashMap<String, TeamWork>,
+}
+
+impl Registry {
+    fn cancel_team(&self, team: &str) {
+        if let Some(work) = self.teams.get(team) {
+            work.generation.send_replace(());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TeamWork {
+    directories: Arc<Semaphore>,
+    partial_cleanup: Arc<Semaphore>,
+    writes: CacheWrites,
+    slots: Arc<Semaphore>,
+    media_slots: Arc<Semaphore>,
+    generation: watch::Sender<()>,
+}
+
+impl Default for TeamWork {
+    fn default() -> Self {
+        Self {
+            directories: Arc::new(Semaphore::new(1)),
+            partial_cleanup: Arc::new(Semaphore::new(1)),
+            writes: CacheWrites::default(),
+            slots: Arc::new(Semaphore::new(4)),
+            media_slots: Arc::new(Semaphore::new(4)),
+            generation: watch::channel(()).0,
+        }
+    }
 }
 
 struct Task {
     id: Uuid,
+    team: String,
     session: Uuid,
+    cancellation: watch::Receiver<()>,
     progress: Process<Progress>,
+    completed: watch::Sender<Option<Result<PathBuf, Error>>>,
+    registered: watch::Sender<Option<Result<bool, Error>>>,
+}
+
+impl Task {
+    fn check_cancelled(&self) -> Result<(), Error> {
+        if self.cancellation.has_changed().unwrap_or(true) {
+            return Err(Error::DownloadCancelled);
+        }
+        Ok(())
+    }
+
+    async fn wait<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let mut cancellation = self.cancellation.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(Error::DownloadCancelled),
+            result = operation => result,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -114,32 +199,36 @@ impl Projects {
             .await
     }
 
+    pub(super) async fn original_path(&self, id: Uuid) -> Result<PathBuf, Error> {
+        let task = self
+            .downloads
+            .registry
+            .call(move |registry| registry.tasks.get(&id).cloned())
+            .await
+            .ok_or(Error::Download)?;
+        let mut completed = task.completed.subscribe();
+        let result = completed
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        result.clone().expect("下载已完成")
+    }
+
     pub(super) async fn download_status(
         &self,
         id: Uuid,
         session: Option<Uuid>,
     ) -> Result<Value, Error> {
-        use futures_util::{StreamExt, stream::FuturesUnordered};
-        let registries = self.teams.call(|teams| teams.downloads.clone()).await;
-        let lookups: FuturesUnordered<_> = registries
-            .into_iter()
-            .map(|(team, downloads)| async move {
-                let task = downloads
-                    .registry
-                    .call(move |registry| registry.tasks.get(&id).cloned())
-                    .await;
-                task.map(|task| (team, task))
-            })
-            .collect();
-        let (team, task) = lookups
-            .filter_map(std::future::ready)
-            .next()
+        let task = self
+            .downloads
+            .registry
+            .call(move |registry| registry.tasks.get(&id).cloned())
             .await
             .ok_or(Error::Download)?;
         if session.is_some_and(|session| session != task.session) {
             return Err(Error::Session);
         }
-        let service = self.service(&team).await.map_err(|_| Error::Session)?;
+        let service = self.service(&task.team).await.map_err(|_| Error::Session)?;
         service
             .check_session(task.session)
             .await
@@ -152,6 +241,98 @@ impl Projects {
 }
 
 impl Downloads {
+    async fn work(&self, team: &str) -> TeamWork {
+        let team = team.to_owned();
+        self.registry
+            .call(move |registry| registry.teams.entry(team).or_default().clone())
+            .await
+    }
+
+    pub(super) fn request_cancel_team(&self, team: &str) {
+        let team = team.to_owned();
+        self.registry
+            .post(move |registry| registry.cancel_team(&team));
+    }
+
+    pub(super) async fn cancel_team(&self, team: &str) {
+        let team = team.to_owned();
+        self.registry
+            .call(move |registry| registry.cancel_team(&team))
+            .await;
+    }
+
+    pub(super) async fn cached_teams(&self, root: PathBuf) -> Vec<String> {
+        let (reply, response) = oneshot::channel();
+        self.registry.post(move |_| {
+            tokio::task::spawn_blocking(move || {
+                let _ = reply.send(DiskCache::cached_teams(&root));
+            });
+        });
+        response.await.unwrap_or_default()
+    }
+
+    pub(super) async fn open_cache(
+        &self,
+        root: PathBuf,
+        team: String,
+        user: String,
+        cancelled: Arc<AtomicBool>,
+    ) -> std::io::Result<OpenedCache> {
+        let (reply, response) = oneshot::channel();
+        self.registry.post(move |registry| {
+            let work = registry.teams.entry(team.clone()).or_default().clone();
+            tokio::spawn(async move {
+                let _directory = work
+                    .directories
+                    .acquire()
+                    .await
+                    .expect("缓存目录许可不能关闭");
+                let result = tokio::task::spawn_blocking(move || {
+                    let disk =
+                        DiskCache::open_with_writes(&root, &team, &user, work.writes, || {
+                            cancelled.load(Ordering::Acquire)
+                        })?;
+                    Ok(OpenedCache {
+                        rooms: disk.rooms(),
+                        users: disk.users(&team),
+                        disk,
+                    })
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|result| result);
+                let _ = reply.send(result);
+            });
+        });
+        response.await.map_err(std::io::Error::other)?
+    }
+
+    pub(super) async fn media<T: Send + 'static>(
+        &self,
+        team: &str,
+        operation: impl std::future::Future<Output = Result<T, Error>> + Send + 'static,
+    ) -> Result<(T, watch::Receiver<()>), Error> {
+        let (reply, response) = oneshot::channel();
+        let team = team.to_owned();
+        self.registry.post(move |registry| {
+            let work = registry.teams.entry(team).or_default().clone();
+            let cancellation = work.generation.subscribe();
+            tokio::spawn(async move {
+                let mut changed = cancellation.clone();
+                let result = tokio::select! {
+                    biased;
+                    _ = changed.changed() => Err(Error::DownloadCancelled),
+                    result = async {
+                        let _slot = work.media_slots.acquire().await.map_err(|_| Error::Unavailable)?;
+                        operation.await
+                    } => result,
+                };
+                let _ = reply.send(result.map(|value| (value, cancellation)));
+            });
+        });
+        response.await.map_err(|_| Error::Unavailable)?
+    }
+
     async fn start(
         self: Arc<Self>,
         service: Arc<SlackService>,
@@ -160,113 +341,201 @@ impl Downloads {
         ts: String,
         index: usize,
     ) -> Result<(Uuid, bool), Error> {
+        let team = service.project.0.clone();
+        let work = self.work(&team).await;
+        let cancellation = work.generation.subscribe();
+        let (item, cache, partial) = service
+            .state
+            .blocking(move |state| {
+                let account = state.account(session)?;
+                let item = state.message_attachment(&conversation, &ts, index)?;
+                let cache = state.cache.disk.clone().ok_or(Error::Unavailable)?;
+                let partial = cache
+                    .partial_attachment(&item, &account.identity.user_id)
+                    .ok_or(Error::Attachment)?;
+                Ok((item, cache, partial))
+            })
+            .await?;
         let downloads = self.clone();
-        let state = service.state.clone();
-        state
-            .with(move |state| {
-                Box::pin(async move {
-                    let account = state.account(session)?;
-                    let item = state.message_attachment(&conversation, &ts, index)?;
-                    let cache = state.cache.disk.clone().ok_or(Error::Unavailable)?;
-                    let partial = cache
-                        .partial_attachment(&item, &account.identity.user_id)
-                        .ok_or(Error::Attachment)?;
-                    self.registry
-                        .blocking(move |registry| {
-                            let existing = registry.active.get(&partial.path);
-                            if let Some((task, _)) = existing
-                                && task.session == session
-                            {
-                                return Ok((task.id, false));
+        let task = self
+            .registry
+            .call(move |registry| {
+                if cancellation.has_changed().unwrap_or(true) {
+                    return Err(Error::DownloadCancelled);
+                }
+                let existing = registry.active.get(&partial.path);
+                if let Some((task, _)) = existing
+                    && task.session == session
+                    && task.check_cancelled().is_ok()
+                    && task.completed.borrow().is_none()
+                {
+                    return Ok(task.clone());
+                }
+                let file_lock =
+                    existing.map_or_else(|| Arc::new(Semaphore::new(1)), |(_, lock)| lock.clone());
+                let task = Arc::new(Task {
+                    id: Uuid::new_v4(),
+                    team,
+                    session,
+                    cancellation,
+                    progress: Process::start(Progress::default()),
+                    completed: watch::channel(None).0,
+                    registered: watch::channel(None).0,
+                });
+                registry.tasks.insert(task.id, task.clone());
+                registry
+                    .active
+                    .insert(partial.path.clone(), (task.clone(), file_lock.clone()));
+                let running = task.clone();
+                tokio::spawn(async move {
+                    let task = running;
+                    let original = Original {
+                        item,
+                        cache,
+                        partial,
+                    };
+                    let result = async {
+                        let _file = task
+                            .wait(async {
+                                file_lock.acquire().await.map_err(|_| Error::Unavailable)
+                            })
+                            .await?;
+                        let probe = original.cache.clone();
+                        let item = original.item.clone();
+                        #[cfg(test)]
+                        let test_pause = downloads.pause_probe.lock().unwrap().take();
+                        let cached = tokio::task::spawn_blocking(move || {
+                            #[cfg(test)]
+                            if let Some((entered, release)) = test_pause {
+                                let _ = entered.send(());
+                                let _ = release.blocking_recv();
                             }
-                            let file_lock = existing.map_or_else(
-                                || Arc::new(Semaphore::new(1)),
-                                |(_, lock)| lock.clone(),
-                            );
-                            let mut progress = Progress::default();
-                            let cached = cache.attachment(&item, false).and_then(|path| {
+                            probe.attachment(&item, false).and_then(|path| {
                                 let size = fs::symlink_metadata(&path).ok()?.len();
                                 Some((path, size))
-                            });
-                            let complete = cached.is_some();
-                            if let Some((path, size)) = cached {
-                                progress.complete(path, size);
-                            }
-                            let task = Arc::new(Task {
-                                id: Uuid::new_v4(),
-                                session,
-                                progress: Process::start(progress),
-                            });
-                            registry.tasks.insert(task.id, task.clone());
-                            let task_id = task.id;
-                            if !complete {
-                                registry.active.insert(
-                                    partial.path.clone(),
-                                    (task.clone(), file_lock.clone()),
-                                );
-                                tokio::spawn(async move {
-                                    let _file =
-                                        file_lock.acquire().await.expect("下载文件许可不能关闭");
-                                    let original = Original {
-                                        item,
-                                        cache,
-                                        partial,
-                                    };
-                                    let result =
-                                        downloads.transfer(&service, &task, &original).await;
-                                    task.progress
-                                        .call(move |progress| match result {
-                                            Ok((path, bytes)) => progress.complete(path, bytes),
-                                            Err(error) => {
-                                                progress.state = DownloadState::Failed(error)
-                                            }
-                                        })
-                                        .await;
-                                    downloads
-                                        .registry
-                                        .call(move |registry| {
-                                            if registry
-                                                .active
-                                                .get(&original.partial.path)
-                                                .is_some_and(|(active, _)| active.id == task.id)
-                                            {
-                                                registry.active.remove(&original.partial.path);
-                                            }
-                                        })
-                                        .await;
-                                });
-                            }
-                            Ok((task_id, complete))
+                            })
                         })
                         .await
-                })
+                        .map_err(|_| Error::Unavailable)?;
+                        task.check_cancelled()?;
+                        if let Some(cached) = cached {
+                            return Ok(cached);
+                        }
+                        task.registered.send_replace(Some(Ok(false)));
+                        let _slot = task
+                            .wait(async {
+                                work.slots.acquire().await.map_err(|_| Error::Unavailable)
+                            })
+                            .await?;
+                        // 清理对半成品的快照在线程开始写之前完成。
+                        let partial_ready = task
+                            .wait(async {
+                                work.partial_cleanup
+                                    .acquire()
+                                    .await
+                                    .map_err(|_| Error::Unavailable)
+                            })
+                            .await?;
+                        drop(partial_ready);
+                        downloads.transfer(&service, &task, &original).await
+                    }
+                    .await;
+                    let completed = result.clone().map(|(path, _)| path);
+                    let registered = result.as_ref().map(|_| true).map_err(|error| *error);
+                    task.progress
+                        .call(move |progress| match result {
+                            Ok((path, bytes)) => progress.complete(path, bytes),
+                            Err(error) => progress.state = DownloadState::Failed(error),
+                        })
+                        .await;
+                    task.completed.send_replace(Some(completed));
+                    downloads
+                        .registry
+                        .call({
+                            let task = task.clone();
+                            move |registry| {
+                                if registry
+                                    .active
+                                    .get(&original.partial.path)
+                                    .is_some_and(|(active, _)| active.id == task.id)
+                                {
+                                    registry.active.remove(&original.partial.path);
+                                }
+                            }
+                        })
+                        .await;
+                    task.registered.send_if_modified(|current| {
+                        if current.is_some() {
+                            return false;
+                        }
+                        *current = Some(registered);
+                        true
+                    });
+                });
+                Ok(task)
             })
+            .await?;
+        let mut registration = task.registered.subscribe();
+        let result = registration
+            .wait_for(Option::is_some)
             .await
-    }
-
-    pub(super) async fn clean_cache(
-        &self,
-        root: PathBuf,
-        team: String,
-        retention: std::time::Duration,
-    ) {
-        self.registry
-            .blocking(move |registry| {
-                let active = registry.active.keys().cloned().collect();
-                DiskCache::clean_team(&root, &team, retention, &active);
-            })
-            .await;
+            .map_err(|_| Error::Unavailable)?;
+        Ok((task.id, result.expect("下载已登记")?))
     }
 
     pub(super) fn schedule_cache_cleanup(
-        &self,
+        self: &Arc<Self>,
         root: PathBuf,
         team: String,
         retention: std::time::Duration,
     ) {
-        self.registry.post_blocking(move |registry| {
-            let active = registry.active.keys().cloned().collect();
-            DiskCache::clean_team(&root, &team, retention, &active);
+        let downloads = self.clone();
+        self.registry.post(move |registry| {
+            let work = registry.teams.entry(team.clone()).or_default().clone();
+            let cancellation = work.generation.subscribe();
+            tokio::spawn(async move {
+                let partial_cleanup = work
+                    .partial_cleanup
+                    .acquire_owned()
+                    .await
+                    .expect("半成品维护许可不能关闭");
+                if cancellation.has_changed().unwrap_or(true) {
+                    return;
+                }
+                let current_team = team.clone();
+                let active = downloads
+                    .registry
+                    .call(move |registry| {
+                        registry
+                            .active
+                            .iter()
+                            .filter(|(_, (task, _))| task.team == current_team)
+                            .map(|(path, _)| path.clone())
+                            .collect()
+                    })
+                    .await;
+                #[cfg(test)]
+                let test_pause = downloads.pause_cleanup.lock().unwrap().take();
+                let _ = tokio::task::spawn_blocking(move || {
+                    DiskCache::clean_team_until(
+                        &root,
+                        &team,
+                        retention,
+                        &active,
+                        &work.writes,
+                        || cancellation.has_changed().unwrap_or(true),
+                        || {
+                            drop(partial_cleanup);
+                            #[cfg(test)]
+                            if let Some((entered, release)) = test_pause {
+                                let _ = entered.send(());
+                                let _ = release.blocking_recv();
+                            }
+                        },
+                    );
+                })
+                .await;
+            });
         });
     }
 
@@ -276,7 +545,6 @@ impl Downloads {
         task: &Task,
         original: &Original,
     ) -> Result<(PathBuf, u64), Error> {
-        let _slot = self.slots.acquire().await.map_err(|_| Error::Unavailable)?;
         let result = original.transfer(service, task).await;
         if result.is_err() {
             let partial = original.partial.clone();
@@ -306,8 +574,8 @@ impl Original {
         let source = format!("{:x}", Sha256::digest(url.as_bytes()));
         let mut changes = service.change.subscribe();
         let session = task.session;
-        let token = service.session_token(session).await?;
-        let web = service.web_session(task.session).await?;
+        let token = task.wait(service.session_token(session)).await?;
+        let web = task.wait(service.web_session(task.session)).await?;
         let mut resume = self.partial.read().filter(|(offset, metadata)| {
             metadata.source == source
                 && strong_etag(&metadata.etag)
@@ -317,24 +585,29 @@ impl Original {
             .call(|progress| progress.state = DownloadState::Downloading)
             .await;
         loop {
-            let response = service
-                .client
-                .transfer_original(
-                    url,
-                    &token,
-                    web.as_ref(),
-                    resume
-                        .as_ref()
-                        .map(|(offset, data)| (*offset, data.etag.as_str())),
+            let response = task
+                .wait(
+                    service.client.transfer_original(
+                        url,
+                        &token,
+                        web.as_ref(),
+                        resume
+                            .as_ref()
+                            .map(|(offset, data)| (*offset, data.etag.as_str())),
+                    ),
                 )
                 .await?;
             let partial = self.partial.clone();
             let file_size = self.item.file_id.as_ref().and(self.item.size);
             let source = source.clone();
+            let cancellation = task.cancellation.clone();
             let (mut response, setup) = service
                 .state
                 .blocking(move |state| {
                     state.account(session)?;
+                    if cancellation.has_changed().unwrap_or(true) {
+                        return Err(Error::DownloadCancelled);
+                    }
                     let mut offset = 0;
                     let mut limit = response.content_length();
                     let mut total = limit;
@@ -403,7 +676,10 @@ impl Original {
                     progress.total = total;
                 })
                 .await;
-            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+            while let Some(chunk) = task
+                .wait(async { response.chunk().await.map_err(|_| Error::Unavailable) })
+                .await?
+            {
                 if changes.has_changed().unwrap_or(true) {
                     changes.borrow_and_update();
                     service.check_session(session).await?;
@@ -436,12 +712,17 @@ impl Original {
                 .attachment_destination(&self.item, false, &mime)
                 .ok_or(Error::Unavailable)?;
             let partial = self.partial.clone();
+            let cache = self.cache.clone();
+            let cancellation = task.cancellation.clone();
             return service
                 .state
                 .blocking(move |state| {
                     state.account(session)?;
-                    partial
-                        .commit(path)
+                    if cancellation.has_changed().unwrap_or(true) {
+                        return Err(Error::DownloadCancelled);
+                    }
+                    cache
+                        .commit_original(&partial, path)
                         .map(|path| (path, offset))
                         .map_err(|_| Error::Unavailable)
                 })

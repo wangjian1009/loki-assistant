@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::modules::emacs::service::EmacsService;
 
 use super::{
-    mailbox::{ConversationRow, UserProfile},
+    mailbox::{ConversationRow, UserProfile, UserRequest},
     picker::PickerItem,
     protocol::{Error, Page},
     service::SlackService,
@@ -31,6 +31,7 @@ impl Team {
     pub fn start(
         service: Arc<SlackService>,
         emacs: Arc<EmacsService>,
+        user_inbox: mpsc::UnboundedReceiver<UserRequest>,
     ) -> (Arc<Self>, JoinHandle<()>) {
         let (requests, mut inbox) = mpsc::channel::<Request>(REQUEST_CAPACITY);
         let team = Arc::new(Self {
@@ -39,12 +40,16 @@ impl Team {
             state: service.state.clone(),
         });
         let worker = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            let users = service.clone();
+            children.spawn(async move { users.run_users(user_inbox).await });
             let mut active = FuturesUnordered::new();
             let background = service.clone().run(emacs);
             tokio::pin!(background);
             loop {
                 tokio::select! {
                     _ = &mut background => break,
+                    _ = children.join_next() => break,
                     request = inbox.recv(), if active.len() < REQUEST_CAPACITY => {
                         let Some(request) = request else { break; };
                         active.push(request(service.clone()));
@@ -182,14 +187,13 @@ impl Team {
         id: &str,
         ts: &str,
         index: usize,
-        preview: bool,
         local_path: bool,
     ) -> Result<(String, Vec<u8>, Option<PathBuf>), Error> {
         let (id, ts) = (id.to_owned(), ts.to_owned());
         self.request(move |service| {
             Box::pin(async move {
                 service
-                    .attachment(session, &id, &ts, index, preview, local_path)
+                    .attachment(session, &id, &ts, index, local_path)
                     .await
             })
         })

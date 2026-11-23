@@ -1,6 +1,9 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use tokio::{sync::Notify, time::timeout};
+use tokio::{
+    sync::{Notify, mpsc, oneshot, watch},
+    time::timeout,
+};
 
 use super::{
     config::{relay_password, relay_token, relay_token_is_set},
@@ -50,29 +53,34 @@ enum Candidate {
     Replace(Option<Registration>),
 }
 
-#[derive(Debug)]
-struct PendingRegistration {
-    candidate: Option<Registration>,
-    previous_status: ConnectionStatus,
-}
-
 #[derive(Debug, Default)]
 struct State {
     active: Option<Registration>,
-    pending: Option<PendingRegistration>,
     registering: bool,
     phase: ConnectionStatus,
 }
 
-/// 持有当前中转连接；新地址完成注册并落盘后才替换原连接。
+enum RelayCommand {
+    Start(oneshot::Sender<Result<(), String>>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+/// 本机和配置模块使用的网络服务句柄。
 #[derive(Clone, Debug)]
 pub struct NetworkService {
+    context: RelayContext,
+    commands: mpsc::UnboundedSender<RelayCommand>,
+    settings_changed: watch::Sender<()>,
+    pub(super) pairings: Arc<PairingService>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RelayContext {
     pub(super) remote: Arc<super::remote::Gateway>,
     config: ConfigService,
     registrar: Arc<dyn RelayRegistrar>,
     notification: Arc<NotificationService>,
     state: Process<State>,
-    relay: Process<()>,
     registration_timeout: Duration,
     status: Arc<StatusService>,
     connection_changed: Arc<Notify>,
@@ -89,17 +97,15 @@ impl NetworkService {
         &self,
     ) -> Result<super::protocol::CreatePairingResponse, super::protocol::NetworkError> {
         use super::protocol::NetworkError;
-        let service = self.clone();
-        self.state
+        let service = self.context.clone();
+        self.context
+            .state
             .with(move |state| {
                 Box::pin(async move {
                     let active = state
                         .active
                         .as_ref()
-                        .filter(|active| {
-                            state.pending.is_none()
-                                && active.session.status() == ConnectionStatus::Connected
-                        })
+                        .filter(|active| active.session.status() == ConnectionStatus::Connected)
                         .ok_or(NetworkError::NotReady)?;
                     service
                         .pairings
@@ -133,8 +139,151 @@ impl NetworkService {
         self.pairings.remove(id).await
     }
 
-    /// 由进程入口显式调度，分发绑定、设备状态及复用的业务连接。
-    pub async fn receive_pairings(self: Arc<Self>) {
+    pub(super) async fn peer_session(
+        &self,
+        id: iroh::EndpointId,
+    ) -> Result<serde_json::Value, super::protocol::NetworkError> {
+        self.context.peer_session(id).await
+    }
+
+    pub fn new(
+        config: ConfigService,
+        registrar: Arc<dyn RelayRegistrar>,
+        notification: Arc<NotificationService>,
+        status: Arc<StatusService>,
+        registration_timeout: Duration,
+    ) -> Self {
+        status.post(
+            "network",
+            "my",
+            serde_json::json!({"status": ConnectionStatus::Offline}),
+        );
+        let pairings = Arc::new(PairingService::new(config.clone()));
+        let (state, state_requests) = Process::channel(State::default());
+        let (commands, inbox) = mpsc::unbounded_channel();
+        let (settings_changed, changes) = watch::channel(());
+        let context = RelayContext {
+            remote: Arc::new(super::remote::Gateway::new()),
+            config,
+            registrar,
+            notification,
+            state,
+            registration_timeout,
+            status,
+            connection_changed: Arc::new(Notify::new()),
+            pairing_changed: Arc::new(Notify::new()),
+            pairings: pairings.clone(),
+        };
+        let relay = context.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = relay.run(inbox, changes) => {}
+                _ = state_requests => {}
+                _ = relay.monitor() => {}
+                _ = relay.receive_pairings() => {}
+            }
+        });
+        Self {
+            context,
+            commands,
+            settings_changed,
+            pairings,
+        }
+    }
+
+    pub async fn start(&self) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RelayCommand::Start(reply))
+            .map_err(|_| "中转任务已关闭".to_owned())?;
+        response.await.map_err(|_| "中转任务已关闭".to_owned())?
+    }
+
+    #[cfg(test)]
+    pub(super) fn config(&self) -> ConfigService {
+        self.context.config.clone()
+    }
+
+    pub async fn shutdown(&self) {
+        let (reply, response) = oneshot::channel();
+        if self.commands.send(RelayCommand::Shutdown(reply)).is_ok() {
+            let _ = response.await;
+        }
+    }
+
+    pub fn set_remote_dispatcher(&self, dispatcher: Arc<dyn super::remote::RequestDispatcher>) {
+        self.context.remote.set_dispatcher(dispatcher);
+    }
+}
+
+impl RelayContext {
+    async fn run(
+        &self,
+        mut inbox: mpsc::UnboundedReceiver<RelayCommand>,
+        mut changes: watch::Receiver<()>,
+    ) {
+        let mut result = None;
+        loop {
+            tokio::select! {
+                command = inbox.recv() => match command {
+                    Some(RelayCommand::Start(reply)) => {
+                        if result.is_none() || changes.has_changed().unwrap_or(false) {
+                            result = Some(self.reload(&mut changes).await);
+                        }
+                        let _ = reply.send(result.clone().expect("中转初始化已完成"));
+                    }
+                    Some(RelayCommand::Shutdown(reply)) => {
+                        self.shutdown().await;
+                        let _ = reply.send(());
+                        return;
+                    }
+                    None => break,
+                },
+                change = changes.changed() => {
+                    if change.is_err() {
+                        break;
+                    }
+                    result = Some(self.reload(&mut changes).await);
+                }
+            }
+        }
+        self.shutdown().await;
+    }
+
+    async fn reload(&self, changes: &mut watch::Receiver<()>) -> Result<(), String> {
+        loop {
+            changes.borrow_and_update();
+            if let Err(error) = self.pairings.initialize().await {
+                eprintln!("加载设备绑定失败：{error}");
+            }
+            let settings: Result<_, String> = async {
+                let url = self.relay_url().await?;
+                let token = relay_token(&self.config)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(RelaySettings { url, token })
+            }
+            .await;
+            let result = match settings {
+                Ok(settings) => self.apply(settings, changes).await,
+                Err(error) => {
+                    let status = self.status.clone();
+                    self.state
+                        .call(move |state| {
+                            Self::restore_active_phase(&status, state, ConnectionStatus::Failed);
+                        })
+                        .await;
+                    self.notify("读取中转配置失败", error.clone()).await;
+                    Err(error)
+                }
+            };
+            if !changes.has_changed().unwrap_or(false) {
+                return result;
+            }
+        }
+    }
+
+    async fn receive_pairings(&self) {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             let changed = self.pairing_changed.notified();
@@ -195,11 +344,9 @@ impl NetworkService {
                             self.state
                                 .with(move |state| {
                                     Box::pin(async move {
-                                        if state.pending.is_some()
-                                            || !state.active.as_ref().is_some_and(|active| {
-                                                Arc::ptr_eq(&active.session, &session)
-                                            })
-                                        {
+                                        if !state.active.as_ref().is_some_and(|active| {
+                                            Arc::ptr_eq(&active.session, &session)
+                                        }) {
                                             Err(NetworkError::NotReady)
                                         } else {
                                             match service
@@ -238,11 +385,9 @@ impl NetworkService {
                         self.state
                             .with(move |state| {
                                 Box::pin(async move {
-                                    if state.pending.is_some()
-                                        || !state.active.as_ref().is_some_and(|active| {
-                                            Arc::ptr_eq(&active.session, &session)
-                                        })
-                                    {
+                                    if !state.active.as_ref().is_some_and(|active| {
+                                        Arc::ptr_eq(&active.session, &session)
+                                    }) {
                                         Err(NetworkError::NotReady)
                                     } else {
                                         service.pairings.bind(remote, request).await.map(
@@ -290,11 +435,10 @@ impl NetworkService {
         self.state
             .with(move |state| {
                 Box::pin(async move {
-                    if state.pending.is_some()
-                        || !state
-                            .active
-                            .as_ref()
-                            .is_some_and(|active| Arc::ptr_eq(&active.session, &session))
+                    if !state
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(&active.session, &session))
                     {
                         return Err(NetworkError::NotReady);
                     }
@@ -320,7 +464,6 @@ impl NetworkService {
         let active = state
             .active
             .as_ref()
-            .filter(|_| state.pending.is_none())
             .ok_or(NetworkError::NotReady)?;
         let peer = service
             .pairings
@@ -340,47 +483,6 @@ impl NetworkService {
             serde_json::json!({"api_version":"1","endpoint_id":active.endpoint_id,"status":"online","bound_at":peer.bound_at,"name":name,"device_type":"computer"}),
         )
         })).await
-    }
-
-    pub fn new(
-        config: ConfigService,
-        registrar: Arc<dyn RelayRegistrar>,
-        notification: Arc<NotificationService>,
-        status: Arc<StatusService>,
-        registration_timeout: Duration,
-    ) -> Self {
-        status.post(
-            "network",
-            "my",
-            serde_json::json!({"status": ConnectionStatus::Offline}),
-        );
-        let pairings = Arc::new(PairingService::new(config.clone()));
-        let (state, state_requests) = Process::channel(State::default());
-        let (relay, commands) = Process::channel(());
-        let connection_changed = Arc::new(Notify::new());
-        let monitor_state = state.clone();
-        let monitor_changed = connection_changed.clone();
-        let monitor_status = status.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = commands => {}
-                _ = state_requests => {}
-                _ = Self::monitor(monitor_state, monitor_changed, monitor_status) => {}
-            }
-        });
-        Self {
-            remote: Arc::new(super::remote::Gateway::new()),
-            config,
-            registrar,
-            notification,
-            state,
-            relay,
-            registration_timeout,
-            status,
-            connection_changed,
-            pairing_changed: Arc::new(Notify::new()),
-            pairings,
-        }
     }
 
     async fn notify(&self, title: &str, body: String) {
@@ -441,55 +543,78 @@ impl NetworkService {
         Self::publish_phase(status, state, phase);
     }
 
-    async fn prepare(&self, settings: RelaySettings) -> Result<(), String> {
+    async fn apply(
+        &self,
+        settings: RelaySettings,
+        changes: &watch::Receiver<()>,
+    ) -> Result<(), String> {
         let configured = settings.configured();
         let status = self.status.clone();
-        let previous_status = self
-            .state
+        self.state
             .call(move |state| {
-                if state.pending.is_some() {
-                    return Err("网络配置正在提交，请稍后重试".to_owned());
-                }
-                let previous = state.phase;
                 state.registering = true;
                 if configured {
                     Self::publish_phase(&status, state, ConnectionStatus::Connecting);
                 }
-                Ok(previous)
             })
-            .await?;
-
+            .await;
         let candidate = self.register_candidate(settings).await;
         let status = self.status.clone();
-        let outcome = self
+        let pairings = self.pairings.clone();
+        let changes = changes.clone();
+        let (old, notice, outcome) = self
             .state
-            .call(move |state| {
-                state.registering = false;
-                match candidate {
-                    Ok(Candidate::Replace(candidate)) => {
-                        state.pending = Some(PendingRegistration {
-                            candidate,
-                            previous_status,
-                        });
-                        Ok(())
-                    }
-                    Ok(Candidate::Keep) => {
-                        Self::restore_active_phase(&status, state, ConnectionStatus::Connected);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let fallback = if configured {
-                            ConnectionStatus::Failed
-                        } else {
-                            ConnectionStatus::Offline
+            .with(move |state| {
+                Box::pin(async move {
+                    state.registering = false;
+                    if changes.has_changed().unwrap_or(false) {
+                        Self::restore_active_phase(&status, state, ConnectionStatus::Offline);
+                        let stale = match candidate {
+                            Ok(Candidate::Replace(value)) => value,
+                            _ => None,
                         };
-                        Self::restore_active_phase(&status, state, fallback);
-                        Err(error)
+                        return (stale, None, Ok(()));
                     }
-                }
+                    match candidate {
+                        Ok(Candidate::Replace(current)) => {
+                            pairings.invalidate().await;
+                            let old = std::mem::replace(&mut state.active, current);
+                            Self::restore_active_phase(&status, state, ConnectionStatus::Offline);
+                            let notice = state.active.as_ref().map(|active| {
+                                format!(
+                                    "中转地址：{}\nEndpoint ID：{}",
+                                    active.settings.url, active.endpoint_id
+                                )
+                            });
+                            (old, notice, Ok(()))
+                        }
+                        Ok(Candidate::Keep) => {
+                            Self::restore_active_phase(&status, state, ConnectionStatus::Connected);
+                            (None, None, Ok(()))
+                        }
+                        Err(error) => {
+                            let fallback = if configured {
+                                ConnectionStatus::Failed
+                            } else {
+                                ConnectionStatus::Offline
+                            };
+                            Self::restore_active_phase(&status, state, fallback);
+                            (None, None, Err(error))
+                        }
+                    }
+                })
             })
             .await;
         self.connection_changed.notify_one();
+        self.pairing_changed.notify_one();
+        if let Some(old) = old
+            && let Err(error) = old.session.close().await
+        {
+            eprintln!("关闭中转连接失败：{error}");
+        }
+        if let Some(notice) = notice {
+            self.notify("中转注册成功", notice).await;
+        }
         outcome
     }
 
@@ -542,65 +667,6 @@ impl NetworkService {
         }
     }
 
-    async fn finish(&self) {
-        let status = self.status.clone();
-        let pairings = self.pairings.clone();
-        let switched = self
-            .state
-            .with(move |state| {
-                Box::pin(async move {
-                    let pending = state.pending.take()?;
-                    pairings.invalidate().await;
-                    let old = std::mem::replace(&mut state.active, pending.candidate);
-                    Self::restore_active_phase(&status, state, ConnectionStatus::Offline);
-                    let notice = state.active.as_ref().map(|active| {
-                        format!(
-                            "中转地址：{}\nEndpoint ID：{}",
-                            active.settings.url, active.endpoint_id
-                        )
-                    });
-                    Some((old, notice))
-                })
-            })
-            .await;
-        if let Some((old, notice)) = switched {
-            self.connection_changed.notify_one();
-            self.pairing_changed.notify_one();
-            if let Some(old) = old
-                && let Err(error) = old.session.close().await
-            {
-                eprintln!("关闭原中转连接失败：{error}");
-            }
-            if let Some(notice) = notice {
-                self.notify("中转注册成功", notice).await;
-            }
-        }
-    }
-
-    async fn discard_pending(&self) -> Result<(), String> {
-        let status = self.status.clone();
-        let pending = self
-            .state
-            .call(move |state| {
-                let pending = state.pending.take()?;
-                Self::publish_phase(&status, state, pending.previous_status);
-                Some(pending)
-            })
-            .await;
-        if let Some(pending) = pending {
-            self.connection_changed.notify_one();
-            if let Some(candidate) = pending.candidate {
-                candidate.session.close().await?;
-            }
-            self.notify(
-                "中转配置保存失败",
-                "配置未能保存，已撤销本次注册并保留原连接。".to_owned(),
-            )
-            .await;
-        }
-        Ok(())
-    }
-
     async fn relay_url(&self) -> Result<String, String> {
         self.config
             .value("network", "relay_url")
@@ -612,27 +678,24 @@ impl NetworkService {
             .ok_or_else(|| "网络配置 relay_url 必须是字符串".into())
     }
 
-    async fn monitor(
-        state: Process<State>,
-        connection_changed: Arc<Notify>,
-        status: Arc<StatusService>,
-    ) {
+    async fn monitor(&self) {
         loop {
-            let changed = connection_changed.notified();
+            let changed = self.connection_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let active = state
+            let active = self
+                .state
                 .call(|state| {
                     state
                         .active
                         .as_ref()
-                        .filter(|_| state.pending.is_none() && !state.registering)
+                        .filter(|_| !state.registering)
                         .map(|active| active.session.clone())
                 })
                 .await;
             if let Some(session) = active {
                 let phase = session.status();
-                Self::publish_session_phase(&state, &status, &session, phase).await;
+                Self::publish_session_phase(&self.state, &self.status, &session, phase).await;
                 if phase == ConnectionStatus::Disconnected {
                     changed.await;
                     continue;
@@ -640,7 +703,7 @@ impl NetworkService {
                 tokio::select! {
                     _ = &mut changed => {},
                     result = session.status_changed(phase) => {
-                        if let Ok(next) = result { Self::publish_session_phase(&state, &status, &session, next).await; }
+                        if let Ok(next) = result { Self::publish_session_phase(&self.state, &self.status, &session, next).await; }
                     }
                 }
             } else {
@@ -659,8 +722,7 @@ impl NetworkService {
         let status = status.clone();
         state
             .call(move |state| {
-                if state.pending.is_none()
-                    && !state.registering
+                if !state.registering
                     && state
                         .active
                         .as_ref()
@@ -672,59 +734,22 @@ impl NetworkService {
             .await;
     }
 
-    /// 由进程入口显式调用；失败不影响本机 HTTP 服务，配置提交后仍可重试。
-    pub async fn start(&self) -> Result<(), String> {
-        if let Err(error) = self.pairings.initialize().await {
-            eprintln!("加载设备绑定失败：{error}");
-        }
-        let service = self.clone();
-        self.relay
-            .run(async move {
-                if service.state.call(|state| state.pending.is_some()).await {
-                    return Ok(());
-                }
-                let url = service.relay_url().await?;
-                let token = relay_token(&service.config)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                service.prepare(RelaySettings { url, token }).await?;
-                service.finish().await;
-                Ok(())
-            })
-            .await
-    }
-
-    #[cfg(test)]
-    pub(super) fn config(&self) -> ConfigService {
-        self.config.clone()
-    }
-
-    pub async fn shutdown(&self) {
-        let service = self.clone();
-        self.relay
-            .run(async move {
-                let status = service.status.clone();
-                let pairings = service.pairings.clone();
-                let (pending, active) = service
-                    .state
-                    .with(move |state| {
-                        Box::pin(async move {
-                            pairings.invalidate().await;
-                            Self::publish_phase(&status, state, ConnectionStatus::Disconnected);
-                            (state.pending.take(), state.active.take())
-                        })
-                    })
-                    .await;
-                service.connection_changed.notify_one();
-                service.pairing_changed.notify_one();
-                if let Some(candidate) = pending.and_then(|pending| pending.candidate) {
-                    let _ = candidate.session.close().await;
-                }
-                if let Some(active) = active {
-                    let _ = active.session.close().await;
-                }
+    async fn shutdown(&self) {
+        let status = self.status.clone();
+        let pairings = self.pairings.clone();
+        let active = self
+            .state
+            .with(move |state| {
+                Box::pin(async move {
+                    pairings.invalidate().await;
+                    Self::publish_phase(&status, state, ConnectionStatus::Disconnected);
+                    state.active.take()
+                })
             })
             .await;
+        if let Some(active) = active {
+            let _ = active.session.close().await;
+        }
     }
 }
 
@@ -733,7 +758,9 @@ impl ConfigChangeHandler for NetworkService {
         &'a self,
         key: &'a str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move { key == "relay_token" && relay_token_is_set(&self.config).await })
+        Box::pin(
+            async move { key == "relay_token" && relay_token_is_set(&self.context.config).await },
+        )
     }
 
     fn write_secret<'a>(&'a self, key: &'a str, value: serde_json::Value) -> ChangeFuture<'a> {
@@ -742,77 +769,29 @@ impl ConfigChangeHandler for NetworkService {
                 return Err("未找到中转凭据配置。".into());
             }
             let token = value.as_str().ok_or("中转令牌必须是字符串。")?;
-            let token = token.to_owned();
-            let service = self.clone();
-            self.relay
-                .run(async move {
-                    // 先导入旧令牌，避免换新后留下待迁移的旧值。
-                    relay_token(&service.config)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let url = service.relay_url().await?;
-                    service
-                        .prepare(RelaySettings {
-                            url,
-                            token: token.to_owned(),
-                        })
-                        .await?;
-                    let password = relay_password();
-                    let saved = if token.trim().is_empty() {
-                        password.remove(&service.config).await
-                    } else {
-                        password.write(&service.config, &token).await
-                    };
-                    if let Err(error) = saved {
-                        service.discard_pending().await?;
-                        return Err(error.to_string());
-                    }
-                    service.finish().await;
-                    Ok(())
-                })
+            let config = &self.context.config;
+            // 先导入旧令牌，避免换新后留下待迁移的旧值。
+            relay_token(config)
                 .await
-        })
-    }
-
-    fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
-        Box::pin(async move {
-            if change.module_id != "network" || change.key != "relay_url" {
-                return Ok(());
+                .map_err(|error| error.to_string())?;
+            let password = relay_password();
+            if token.trim().is_empty() {
+                password.remove(config).await
+            } else {
+                password.write(config, token).await
             }
-            let url = change
-                .value
-                .as_str()
-                .ok_or("中转地址必须是字符串。")?
-                .to_owned();
-            let service = self.clone();
-            self.relay
-                .run(async move {
-                    let token = relay_token(&service.config)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    service.prepare(RelaySettings { url, token }).await
-                })
-                .await
+            .map_err(|error| error.to_string())
         })
     }
 
     fn committed(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
-            if change.module_id == "network" && change.key == "relay_url" {
-                let service = self.clone();
-                self.relay.run(async move { service.finish().await }).await;
-            }
-            Ok(())
-        })
-    }
-
-    fn rollback(&self, change: ConfigChange) -> ChangeFuture<'_> {
-        Box::pin(async move {
-            if change.module_id == "network" && change.key == "relay_url" {
-                let service = self.clone();
-                self.relay
-                    .run(async move { service.discard_pending().await })
-                    .await?;
+            if change.module_id == "network"
+                && matches!(change.key.as_str(), "relay_url" | "relay_token")
+            {
+                self.settings_changed
+                    .send(())
+                    .map_err(|_| "中转任务已关闭".to_owned())?;
             }
             Ok(())
         })
