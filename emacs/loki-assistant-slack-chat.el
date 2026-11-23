@@ -2296,7 +2296,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
     (define-key map (kbd "<return>") #'loki-assistant-slack--submit)
     (define-key map (kbd "S-<return>") #'loki-assistant-slack--shift-return)
     (define-key map (kbd "q") #'loki-assistant-slack-quit-thread)
-    (define-key map (kbd "C-c C-q") #'loki-assistant-slack-quit-thread)
+    (define-key map (kbd "C-c C-q") #'kill-current-buffer)
     (define-key map (kbd "C-c C-r") #'loki-assistant-slack-refresh)
     (define-key map (kbd "C-c n") #'loki-assistant-slack-set-nickname)
     (define-key map (kbd "C-c C-w")

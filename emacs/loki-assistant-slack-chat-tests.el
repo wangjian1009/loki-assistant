@@ -809,7 +809,8 @@
                 (should (= (loki-assistant-slack--draft-start) (point-max)))
                 (should-not (loki-assistant-slack--message-position "126.000001"))
                 (should (equal (get-char-property loki-assistant-slack--history-end 'display) "  ❯ "))
-                (execute-kbd-macro (kbd "C-c C-q")))
+                (goto-char (loki-assistant-slack--message-position "123.000001"))
+                (execute-kbd-macro "q"))
               (should (eq (window-buffer (selected-window)) buffer))
               (set-buffer buffer)
               (should (eq (current-buffer) buffer))
@@ -849,7 +850,7 @@
               (should (buffer-modified-p))
               (cl-letf (((symbol-function 'y-or-n-p)
                          (lambda (&rest _) (ert-fail "关闭 Slack 聊天时弹出保存提示"))))
-                (should (kill-buffer buffer)))
+                (execute-kbd-macro (kbd "C-c C-q")))
               (should-not (buffer-live-p buffer))
               (should (seq-some (lambda (path) (string-suffix-p subscription path)) canceled))
               (should (eq 'buffer-closed
