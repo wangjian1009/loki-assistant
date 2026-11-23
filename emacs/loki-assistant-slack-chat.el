@@ -92,6 +92,7 @@
 (defvar loki-assistant-slack--subscription-buffers (make-hash-table :test #'equal))
 (defvar loki-assistant-slack--refresh-timer nil)
 (defvar-local loki-assistant-slack--profiles nil)
+(defvar-local loki-assistant-slack--attachment-downloads nil)
 (defvar loki-assistant-slack--selection nil)
 (defvar loki-assistant-slack--completion-choices nil)
 (defconst loki-assistant-slack--user-group 3)
@@ -1663,23 +1664,73 @@
 
 (defun loki-assistant-slack--open-attachment (attachment endpoint room)
   "打开 ROOM 中 ENDPOINT 对应的 ATTACHMENT。"
-  (let ((open (lambda (path)
-                (when-let ((path (loki-assistant-slack--local-file path)))
-                  (let ((enable-local-variables nil)
-                        (enable-local-eval nil))
-                    (find-file path))
-                  t))))
-    (unless (funcall open (alist-get 'original_path attachment))
-      (loki-assistant-slack--request
-       "GET" (concat endpoint "/original")
-       (lambda (response)
-         (unless (and (plist-get response :ok)
-                      (funcall open (alist-get 'cache_path (plist-get response :data))))
-           (let ((url (alist-get 'url attachment)))
-             (if (loki-assistant-slack--link-p url)
-                 (browse-url url)
-               (message "%s" (or (plist-get response :error-message) "Slack 附件暂不可用"))))))
-       :room room))))
+  (unless (loki-assistant-slack--display-attachment (alist-get 'original_path attachment))
+    (let ((buffer (current-buffer))
+          (title (or (alist-get 'title attachment) "附件")))
+      (unless loki-assistant-slack--attachment-downloads
+        (setq loki-assistant-slack--attachment-downloads (make-hash-table :test #'equal)))
+      (unless (gethash endpoint loki-assistant-slack--attachment-downloads)
+        (puthash endpoint t loki-assistant-slack--attachment-downloads)
+        (message "正在准备下载 %s" title)
+        (loki-assistant-slack--request
+         "POST" (concat endpoint "/original")
+         (lambda (response)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (let ((id (alist-get 'download_id (plist-get response :data))))
+                 (when (and loki-assistant-slack--attachment-downloads
+                            (gethash endpoint loki-assistant-slack--attachment-downloads))
+                   (if (and (plist-get response :ok) (stringp id))
+                       (loki-assistant-slack--poll-attachment buffer endpoint id title room)
+                     (remhash endpoint loki-assistant-slack--attachment-downloads)
+                     (message "%s" (or (plist-get response :error-message)
+                                       "无法创建 Slack 下载任务"))))))))
+         :room room)))))
+
+(defun loki-assistant-slack--display-attachment (path)
+  "打开 PATH 指向的本机附件。"
+  (when-let ((path (loki-assistant-slack--local-file path)))
+    (let ((enable-local-variables nil)
+          (enable-local-eval nil))
+      (find-file path))
+    t))
+
+(defun loki-assistant-slack--poll-attachment (buffer endpoint id title room)
+  "在 BUFFER 查询 ROOM 中 ENDPOINT 对应的下载 ID，显示 TITLE 的进度。"
+  (when (buffer-live-p buffer)
+    (loki-assistant-slack--request
+     "GET" (concat "/slack/downloads/" (url-hexify-string id))
+     (lambda (response)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when (and loki-assistant-slack--attachment-downloads
+                      (gethash endpoint loki-assistant-slack--attachment-downloads))
+             (loki-assistant-slack--attachment-status buffer endpoint id title room response)))))
+     :room room)))
+
+(defun loki-assistant-slack--attachment-status (buffer endpoint id title room response)
+  "处理 BUFFER 中 ROOM 附件 ENDPOINT、ID 和 TITLE 的进度 RESPONSE。"
+  (let* ((data (plist-get response :data))
+         (state (and (plist-get response :ok) (alist-get 'state data))))
+    (pcase state
+      ((or "pending" "downloading")
+       (let ((bytes (or (alist-get 'downloaded_bytes data) 0))
+             (total (alist-get 'total_bytes data)))
+         (message "下载 %s：%s" title
+                  (if (numberp total)
+                      (format "%s / %s" (file-size-human-readable bytes)
+                              (file-size-human-readable total))
+                    (format "已下载 %s" (file-size-human-readable bytes)))))
+       (run-at-time 1 nil #'loki-assistant-slack--poll-attachment buffer endpoint id title room))
+      (_
+       (remhash endpoint loki-assistant-slack--attachment-downloads)
+       (if (equal state "completed")
+           (unless (loki-assistant-slack--display-attachment (alist-get 'cache_path data))
+             (message "Slack 附件缓存文件不可读：%s" title))
+         (message "下载 %s 失败：%s" title
+                  (or (alist-get 'message (alist-get 'error data))
+                      (plist-get response :error-message)
+                      "Slack 附件暂不可用")))))))
 
 (defun loki-assistant-slack--insert-label (name face profile)
   "为 NAME 的身份色块保留一行，并按 FACE 显示姓名和 PROFILE 的头像。"

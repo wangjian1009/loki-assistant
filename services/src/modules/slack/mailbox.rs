@@ -11,9 +11,29 @@ use uuid::Uuid;
 use super::{
     disk,
     protocol::{Attachment, Error, Message, Page, timestamp, valid_id},
-    service::{SlackService, now},
+    service::{SlackService, State, now},
     store::{Account, Conversation, SendRecord, SendState},
 };
+
+impl State {
+    pub(super) fn message_attachment(
+        &self,
+        id: &str,
+        ts: &str,
+        index: usize,
+    ) -> Result<Attachment, Error> {
+        let room = self.cache.conversations.get(id).ok_or(Error::Attachment)?;
+        if room.deleted.contains(ts) {
+            return Err(Error::Attachment);
+        }
+        room.messages
+            .get(ts)
+            .cloned()
+            .or_else(|| room.disk.as_ref()?.find_message(id, ts))
+            .and_then(|message| message.attachments.into_iter().nth(index))
+            .ok_or(Error::Attachment)
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 struct Cursor {
@@ -733,22 +753,10 @@ impl SlackService {
         let (item, token, cache) = {
             let state = self.state.lock().await;
             let account = state.account(session)?;
-            let room = state.cache.conversations.get(id).ok_or(Error::Attachment)?;
-            if room.deleted.contains(ts) {
+            let item = state.message_attachment(id, ts, index)?;
+            if preview && !item.image {
                 return Err(Error::Attachment);
             }
-            let message = room
-                .messages
-                .get(ts)
-                .cloned()
-                .or_else(|| room.disk.as_ref()?.find_message(id, ts))
-                .ok_or(Error::Attachment)?;
-            let item = message
-                .attachments
-                .into_iter()
-                .nth(index)
-                .filter(|item| !preview || item.image)
-                .ok_or(Error::Attachment)?;
             (item, account.access.clone(), state.cache.disk.clone())
         };
         if let Some(path) = cache

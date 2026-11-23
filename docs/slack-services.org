@@ -146,7 +146,44 @@ services 按工作区当前授权查询，优先使用内存中的用户资料�
 
 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/preview~ 读取当前会话消息中的单张图片。 ~index~ 是 ~attachments~ 中从零起算的位置。成功响应为 PNG、JPEG、GIF 或 WebP，最大 5 MiB。附件或预览不可用时返回 ~slack-attachment-not-found~ 。
 
-会话和消息记录可带 ~cache_path~ ，附件可带 ~original_path~ 、 ~preview_path~ 和 ~original_available~ 。预览接口传入 ~local_path=true~ 时按需缓存图片并返回 ~cache_path~ 。 ~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ 按需缓存原件并返回 ~cache_path~ 。路径均为本机绝对路径，文件格式和清理规则见 [[file:slack.org::*缓存设计][缓存设计]]。
+会话和消息记录可带 ~cache_path~ ，附件可带 ~original_path~ 、 ~preview_path~ 和 ~original_available~ 。预览接口传入 ~local_path=true~ 时按需缓存图片并返回 ~cache_path~ 。路径均为本机绝对路径，文件格式和清理规则见 [[file:slack.org::*缓存设计][缓存设计]]。
+
+** 获取附件原件路径
+
+~GET /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ 获取附件原件的本机绝对路径。请求体为空，可携带 ~X-Loki-Slack-Session~ 。 ~id~ 为 ~{team_id}.{conversation_id}~ ， ~ts~ 取附件所属消息自身的时间戳，线程回复使用回复的时间戳。 ~index~ 是附件在 ~attachments~ 中从零起算的位置。
+
+services 复用已缓存的原件，缓存缺失时从 Slack 下载并在写入完成后返回 HTTP 200，响应为 ~{"cache_path":"<本机绝对路径>"}~ 。原件的打开和显示由 Emacs 负责。用户点击附件时，Emacs 直接显示 ~original_path~ 指向的可读文件，缓存缺失时启动异步下载。
+
+找不到可读取的附件时返回 HTTP 404 ~slack-attachment-not-found~ ，下载或写入暂时失败时返回 HTTP 503 ~slack-data-unavailable~ 。会话校验沿用 Slack 接口的通用约定。
+
+** 附件原件下载与进度查询
+
+| 方法与路径 | 请求与响应 |
+|------------+------------|
+| ~POST /slack/conversations/{id}/messages/{ts}/attachments/{index}/original~ | 提交原件下载。路径参数与原件查询接口相同，请求体为空。任务排队或下载中时返回 HTTP 202，命中原件缓存时返回 HTTP 200，响应体均为 ~{"download_id":"<UUID>"}~ 。 |
+| ~GET /slack/downloads/{download_id}~ | 查询任务。返回 HTTP 200 和当前进度，任务自身失败时通过响应中的 ~state~ 和 ~error~ 表示。 |
+
+两个接口仅供本机调用，可带 ~X-Loki-Slack-Session~ 。任务归属提交时的工作区授权会话。该会话中重复提交同一附件且任务仍在进行时，返回已有任务 ID。缓存命中时，可用任务 ID 立即查询到完成结果。失败后可重新提交，取得新的任务 ID。
+
+services 将下载任务记录和 ID 仅保存在当前进程的内存中，运行期间保留所有记录，包括已完成和失败的任务。services 重启后从空任务表开始。查询未知 ID 或重启前的 ID 返回 HTTP 404 ~slack-download-not-found~ 。查询已知任务时，所属授权会话已失效则返回 HTTP 409 ~slack-session-changed~ 。
+
+| 状态查询字段 | 含义 |
+|--------------+------|
+| ~download_id~ | 下载任务 UUID。 |
+| ~state~ | ~pending~ 表示排队， ~downloading~ 表示下载中， ~completed~ 表示原件已写入缓存， ~failed~ 表示下载失败。 |
+| ~downloaded_bytes~ | 已写入的字节数。命中缓存时为原件大小。 |
+| ~total_bytes~ | 已知的总字节数。下载期间未知时为 ~null~ ，完成后为原件大小。 |
+| ~cache_path~ | 仅在 ~completed~ 时提供，值为原件的本机绝对路径。 |
+| ~error~ | 仅在 ~failed~ 时提供，结构沿用通用错误的 ~error~ 对象。 |
+
+services 在后台流式写入临时文件，连接或传输停滞时可超时，持续传输的大文件可超过普通 Slack HTTP 请求的超时时间。写入完成并提交缓存后，任务才进入 ~completed~ 。Emacs 按任务 ID 轮询，按字节数显示进度，总量未知时显示已下载大小。任务完成时，Emacs 打开 ~cache_path~ 指向的文件，失败时显示 ~error.message~ 。
+
+*** 下载中断与断点续传
+
+- 连接中断、超时或响应提前结束时，当前任务进入 ~failed~ 。services 将可续传的半成品保留为工作区缓存内的 ~.part~ 文件，并记录来源标识、强 ~ETag~ 和已知的总大小。半成品按工作区、当前授权用户和附件原件缓存键查找，同一半成品只由一个任务写入。闲置半成品按 ~cache_retention_days~ 清理。
+- 用户重试时通过同一 ~POST~ 创建新任务。services 校验当前授权与下载来源后，从半成品的实际长度发起 ~Range: bytes=<offset>-~ 请求，并用 ~If-Range~ 携带保存的强 ~ETag~ 。services 重启后，新任务也可使用仍可校验的半成品。
+- Slack 返回 ~206 Partial Content~ 时，services 确认资源版本与字节编码一致，并校验 ~Content-Range~ 的起止位置及总长度后再追加。下载进度计入已确认复用的字节。Slack 返回 ~200 OK~ 时，使用该完整响应从头写入。收到 ~416 Range Not Satisfiable~ 、范围校验不通过或缺少可用的强 ~ETag~ 时，清理旧半成品并重新完整下载。
+- HTTP 响应正常结束后，services 校验已知的响应字节数和文件总大小，再将临时文件原子重命名为正式缓存文件。只有提交成功的原件才会通过 ~cache_path~ 交给 Emacs。
 
 ** Block Kit 消息正文
 

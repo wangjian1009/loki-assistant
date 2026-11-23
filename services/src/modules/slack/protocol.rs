@@ -16,6 +16,7 @@ pub(super) enum Error {
     Permission,
     Conversation,
     Attachment,
+    Download,
     UserNotFound,
     Project,
     TeamMismatch,
@@ -58,6 +59,7 @@ impl Error {
                 "slack-attachment-not-found",
                 "找不到可读取的 Slack 附件。",
             ),
+            Self::Download => (404, "slack-download-not-found", "找不到 Slack 下载任务。"),
             Self::UserNotFound => (404, "slack-user-not-found", "找不到 Slack 用户。"),
             Self::Project => (404, "slack-project-not-found", "请选择有效的 Slack 项目。"),
             Self::TeamMismatch => (

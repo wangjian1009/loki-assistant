@@ -4,7 +4,10 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{Client, Method, StatusCode, header::RETRY_AFTER};
+use reqwest::{
+    Client, Method, RequestBuilder, StatusCode,
+    header::{ACCEPT_ENCODING, IF_RANGE, RANGE, RETRY_AFTER},
+};
 use serde_json::Value;
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
 use tokio_tungstenite::{
@@ -15,6 +18,15 @@ use url::Url;
 use super::protocol::Error;
 
 pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub(super) fn attachment_mime(response: &reqwest::Response) -> &str {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("application/octet-stream")
+}
 
 pub(super) fn slack_image_url(value: &str) -> bool {
     Url::parse(value).ok().is_some_and(|url| {
@@ -95,6 +107,7 @@ impl WebSession {
 #[derive(Clone)]
 pub(super) struct SlackClient {
     http: Client,
+    attachments: Client,
     api: String,
     limits: Arc<Mutex<HashMap<String, Instant>>>,
 }
@@ -116,6 +129,24 @@ impl SlackClient {
         web: Option<&WebSession>,
     ) -> Result<(String, reqwest::Response), Error> {
         self.download_response(url, token, web, false).await
+    }
+
+    pub async fn transfer_original(
+        &self,
+        url: &str,
+        token: &str,
+        web: Option<&WebSession>,
+        range: Option<(u64, &str)>,
+    ) -> Result<reqwest::Response, Error> {
+        let mut request = self
+            .download_request(&self.attachments, url, token, web, false)?
+            .header(ACCEPT_ENCODING, "identity");
+        if let Some((offset, etag)) = range {
+            request = request
+                .header(RANGE, format!("bytes={offset}-"))
+                .header(IF_RANGE, etag);
+        }
+        request.send().await.map_err(|_| Error::Unavailable)
     }
 
     pub async fn avatar(&self, url: &str) -> Result<Vec<u8>, Error> {
@@ -159,6 +190,25 @@ impl SlackClient {
         web: Option<&WebSession>,
         avatar: bool,
     ) -> Result<(String, reqwest::Response), Error> {
+        let response = self
+            .download_request(&self.http, url, token, web, avatar)?
+            .send()
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(Error::Attachment);
+        }
+        Ok((attachment_mime(&response).to_owned(), response))
+    }
+
+    fn download_request(
+        &self,
+        client: &Client,
+        url: &str,
+        token: &str,
+        web: Option<&WebSession>,
+        avatar: bool,
+    ) -> Result<RequestBuilder, Error> {
         let approved_avatar = avatar
             && Url::parse(url).ok().is_some_and(|url| {
                 url.scheme() == "https"
@@ -189,24 +239,14 @@ impl SlackClient {
                 api.set_query(url.query());
                 api
             });
-        let mut request = self.http.get(url);
+        let mut request = client.get(url);
         if private && !avatar {
             request = request.bearer_auth(web.map_or(token, |web| &web.token));
             if let Some(web) = web {
                 request = request.header(reqwest::header::COOKIE, format!("d={}", web.d_cookie));
             }
         }
-        let response = request.send().await.map_err(|_| Error::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(Error::Attachment);
-        }
-        let mime = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .unwrap_or("application/octet-stream");
-        Ok((mime.to_owned(), response))
+        Ok(request)
     }
 
     pub fn new(api: &str) -> Self {
@@ -218,6 +258,17 @@ impl SlackClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Slack HTTP 客户端配置有效"),
+            attachments: Client::builder()
+                .connect_timeout(Duration::from_secs(8))
+                .read_timeout(Duration::from_secs(30))
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Slack 附件 HTTP 客户端配置有效"),
             api: api.trim_end_matches('/').to_owned(),
             limits: Arc::new(Mutex::new(HashMap::new())),
         }

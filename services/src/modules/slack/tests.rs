@@ -332,6 +332,23 @@ async fn ready_service(projects: &Projects, team: &str) -> Arc<super::service::S
     .unwrap()
 }
 
+async fn wait_download(app: &Router, path: &str, session: Option<Uuid>, state: &str) -> Value {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (status, _, result) = invoke(app, "GET", path, session, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            if result["state"] == state
+                && (state != "downloading" || result["downloaded_bytes"] == 4)
+            {
+                break result;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn socket_notifications_threads_and_idempotent_sends() {
     let directory = Directory::new();
@@ -360,7 +377,54 @@ async fn socket_notifications_threads_and_idempotent_sends() {
                 .unwrap();
             ([("content-type", "image/png")], png.into_inner())
         });
+    let interrupt_download = Arc::new(tokio::sync::Notify::new());
+    let server_interrupt = interrupt_download.clone();
+    let replace_original = Arc::new(AtomicBool::default());
+    let server_replace = replace_original.clone();
+    let original = get(move |headers: HeaderMap| {
+        let interrupt = server_interrupt.clone();
+        let replaced = server_replace.load(Ordering::SeqCst);
+        async move {
+            assert_eq!(headers["authorization"], "Bearer xoxc-test-user");
+            assert_eq!(headers["accept-encoding"], "identity");
+            let response = axum::response::Response::builder()
+                .header("etag", "\"original-v1\"")
+                .header("content-type", "image/png");
+            if let Some(range) = headers.get("range") {
+                assert_eq!(range, "bytes=4-");
+                assert_eq!(headers["if-range"], "\"original-v1\"");
+                if replaced {
+                    return axum::response::Response::builder()
+                        .header("etag", "\"original-v2\"")
+                        .header("content-type", "image/png")
+                        .body(Body::from("ijklmnop"))
+                        .unwrap();
+                }
+                return response
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("content-range", "bytes 4-7/8")
+                    .body(Body::from("efgh"))
+                    .unwrap();
+            }
+            let stream =
+                futures_util::stream::unfold((0, interrupt), |(step, interrupt)| async move {
+                    match step {
+                        0 => Some((Ok(axum::body::Bytes::from_static(b"abcd")), (1, interrupt))),
+                        1 => {
+                            interrupt.notified().await;
+                            Some((Err(std::io::Error::other("断开附件下载")), (2, interrupt)))
+                        }
+                        _ => None,
+                    }
+                });
+            response
+                .header("content-length", 8)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+    });
     let slack = Router::new()
+        .route("/original-fixture", original)
         .route("/media/{name}", media.clone())
         .route("/slack-files2/bot_icons/{name}", media)
         .route("/rtm.connect", post(|State(mock): State<Arc<Mock>>, headers: HeaderMap| async move {
@@ -480,7 +544,8 @@ async fn socket_notifications_threads_and_idempotent_sends() {
             "blocks":[alert_section("&gt;实时告警 `节点记录冲突`")],
             "icons":{"image_48":"https://s3-us-west-2.amazonaws.com/slack-files2/bot_icons/alert.png"},
             "files":[{"id":"FPREVIEW","name":"截图.png","mimetype":"image/png",
-                       "thumb_480":"https://files.slack.com/media/preview.png"}]});
+                       "thumb_480":"https://files.slack.com/media/preview.png",
+                       "url_private_download":"https://files.slack.com/original-fixture"}]});
         let mention = json!({"type":"message","channel":"CWORK","ts":socket_mock.reply,
             "thread_ts":socket_mock.root,"user":"UYOU","text":"请 <@UME> 看一下"});
         for payload in [&ordinary, &mention, &mention] {
@@ -838,6 +903,34 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     assert!(icon.starts_with(directory.0.join("cache/TTEAM/icons")) && icon.is_file());
     assert!(first.get("icon_url").is_none());
     drop(delivered);
+
+    let original_path = format!(
+        "/slack/conversations/TTEAM.CWORK/messages/{}/attachments/0/original",
+        mock.root
+    );
+    let (status, _, created) = invoke(&app, "POST", &original_path, session, None, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    assert_eq!(created.as_object().unwrap().len(), 1);
+    let download_id = created["download_id"].as_str().unwrap();
+    let download_path = format!("/slack/downloads/{download_id}");
+    let progress = wait_download(&app, &download_path, session, "downloading").await;
+    assert_eq!(progress["total_bytes"], 8);
+    assert!(progress.get("cache_path").is_none());
+    assert_eq!(
+        invoke(&app, "POST", &original_path, session, None, None)
+            .await
+            .2,
+        created
+    );
+    interrupt_download.notify_one();
+    let failed = wait_download(&app, &download_path, session, "failed").await;
+    assert_eq!(failed["error"]["code"], "slack-data-unavailable");
+    assert_eq!(failed["downloaded_bytes"], 4);
+    assert!(failed.get("cache_path").is_none());
+    let cached_original = directory
+        .0
+        .join("cache/TTEAM/attachments/FPREVIEW.original.png");
+    assert!(!cached_original.exists());
     let sent = mock.sent.clone();
     let root = mock.root.clone();
     service
@@ -1153,6 +1246,44 @@ async fn socket_notifications_threads_and_idempotent_sends() {
     let service = ready_service(&projects, "TTEAM").await;
     let fresh_session = service.session_id().await;
     assert_ne!(fresh_session, session);
+    let (status, _, error) = invoke(&app, "GET", &download_path, fresh_session, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error["error"]["code"], "slack-download-not-found");
+    let (status, _, resumed) =
+        invoke(&app, "POST", &original_path, fresh_session, None, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resumed}");
+    let resumed_id = resumed["download_id"].as_str().unwrap();
+    assert_ne!(resumed_id, download_id);
+    let resumed_path = format!("/slack/downloads/{resumed_id}");
+    let completed = wait_download(&app, &resumed_path, fresh_session, "completed").await;
+    assert_eq!(completed["downloaded_bytes"], 8);
+    assert_eq!(completed["total_bytes"], 8);
+    assert_eq!(completed["cache_path"], json!(cached_original));
+    assert_eq!(fs::read(&cached_original).unwrap(), b"abcdefgh");
+    let (status, _, cached) = invoke(&app, "POST", &original_path, fresh_session, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{cached}");
+    let cache_task = format!(
+        "/slack/downloads/{}",
+        cached["download_id"].as_str().unwrap()
+    );
+    let completed = wait_download(&app, &cache_task, fresh_session, "completed").await;
+    assert_eq!(completed["cache_path"], json!(cached_original));
+    let (status, _, error) = invoke(&app, "GET", &cache_task, session, None, None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["error"]["code"], "slack-session-changed");
+
+    fs::remove_file(&cached_original).unwrap();
+    let (_, _, created) = invoke(&app, "POST", &original_path, fresh_session, None, None).await;
+    let download = format!("/slack/downloads/{}", created["download_id"].as_str().unwrap());
+    wait_download(&app, &download, fresh_session, "downloading").await;
+    interrupt_download.notify_one();
+    wait_download(&app, &download, fresh_session, "failed").await;
+    replace_original.store(true, Ordering::SeqCst);
+    let (_, _, retried) = invoke(&app, "POST", &original_path, fresh_session, None, None).await;
+    let retried = format!("/slack/downloads/{}", retried["download_id"].as_str().unwrap());
+    wait_download(&app, &retried, fresh_session, "completed").await;
+    assert_eq!(fs::read(&cached_original).unwrap(), b"ijklmnop");
+
     let recovered = Uuid::new_v4();
     let recovered_path = format!("/slack/conversations/TTEAM.DDIRECT/subscriptions/{recovered}");
     assert_eq!(

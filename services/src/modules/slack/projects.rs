@@ -25,6 +25,7 @@ use crate::modules::{
 use super::{
     CACHE_RETENTION_DAYS, DEFAULT_CACHE_RETENTION_DAYS, WATCHES,
     disk::DiskCache,
+    downloads::Downloads,
     mailbox::{next_cursor, read_cursor},
     protocol::{Error, Page, valid_id},
     routes,
@@ -136,6 +137,7 @@ pub struct Projects {
     backend: Backend,
     shutdown: Notify,
     clean_cache: Notify,
+    pub(super) downloads: Arc<Downloads>,
 }
 
 impl std::fmt::Debug for Projects {
@@ -249,6 +251,7 @@ impl Projects {
             backend,
             shutdown: Notify::new(),
             clean_cache: Notify::new(),
+            downloads: Arc::default(),
         }
     }
 
@@ -293,8 +296,9 @@ impl Projects {
         for state in states {
             guards.push(state.lock_owned().await);
         }
+        let active = self.downloads.active_paths().await;
         let _ = tokio::task::spawn_blocking(move || {
-            DiskCache::clean(&root, retention);
+            DiskCache::clean_with_downloads(&root, retention, &active);
             drop(guards);
         })
         .await;

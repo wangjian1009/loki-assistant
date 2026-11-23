@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, DirBuilder, OpenOptions},
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -25,6 +25,68 @@ pub(super) struct DiskCache(PathBuf);
 pub(super) struct PendingAttachment {
     temporary: PathBuf,
     destination: PathBuf,
+}
+
+pub(super) struct PartialAttachment {
+    pub path: PathBuf,
+    metadata: PathBuf,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct PartialMetadata {
+    pub source: String,
+    pub etag: String,
+    pub total: Option<u64>,
+    pub mime: String,
+}
+
+impl PartialAttachment {
+    pub fn read(&self) -> Option<(u64, PartialMetadata)> {
+        let file = fs::symlink_metadata(&self.path).ok()?;
+        if !file.is_file() || file.len() == 0 || !regular_file(&self.metadata) {
+            return None;
+        }
+        let metadata = serde_json::from_slice(&fs::read(&self.metadata).ok()?).ok()?;
+        Some((file.len(), metadata))
+    }
+
+    pub fn reset(&self) -> io::Result<fs::File> {
+        if let Err(error) = fs::remove_file(&self.metadata)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+        private_dir(self.path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.path)
+    }
+
+    pub fn append(&self) -> io::Result<fs::File> {
+        OpenOptions::new().append(true).open(&self.path)
+    }
+
+    pub fn save(&self, metadata: &PartialMetadata) -> io::Result<()> {
+        atomic_write(&self.metadata, &serde_json::to_vec(metadata)?)
+    }
+
+    pub fn discard(&self) {
+        let _ = fs::remove_file(&self.metadata);
+        let _ = fs::remove_file(&self.path);
+    }
+
+    pub fn commit(&self, destination: PathBuf) -> io::Result<PathBuf> {
+        fs::rename(&self.path, &destination)?;
+        self.discard();
+        Ok(destination)
+    }
 }
 
 impl PendingAttachment {
@@ -350,7 +412,7 @@ impl DiskCache {
         })
     }
 
-    fn attachment_destination(
+    pub fn attachment_destination(
         &self,
         item: &Attachment,
         preview: bool,
@@ -365,6 +427,15 @@ impl DiskCache {
                 .unwrap_or("bin")
         };
         Some(self.0.join("attachments").join(format!("{base}.{ext}")))
+    }
+
+    pub fn partial_attachment(&self, item: &Attachment, user: &str) -> Option<PartialAttachment> {
+        let base = Self::attachment_base(item, false)?;
+        let dir = self.0.join("attachments").join(".partial");
+        Some(PartialAttachment {
+            path: dir.join(format!("{user}.{base}.part")),
+            metadata: dir.join(format!("{user}.{base}.part.json")),
+        })
     }
 
     pub fn begin_original(
@@ -398,7 +469,12 @@ impl DiskCache {
         Some(path)
     }
 
+    #[cfg(test)]
     pub fn clean(root: &Path, retention: Duration) {
+        Self::clean_with_downloads(root, retention, &HashSet::new());
+    }
+
+    pub fn clean_with_downloads(root: &Path, retention: Duration, active: &HashSet<PathBuf>) {
         let now = SystemTime::now();
         let expired = |path: &Path| {
             fs::symlink_metadata(path)
@@ -413,7 +489,21 @@ impl DiskCache {
                 .is_some_and(super::projects::valid_team_id)
                 && regular_file(&path.join(".owner"))
         }) {
-            for path in entries(&team.join("attachments"), false).chain(entries(&team.join("icons"), false)) {
+            let partial = team.join("attachments").join(".partial");
+            for path in entries(&partial, false) {
+                let data_path = if path.extension().is_some_and(|ext| ext == "json") {
+                    path.with_extension("")
+                } else {
+                    path.clone()
+                };
+                let expired = expired(&data_path) || (!regular_file(&data_path) && expired(&path));
+                if !active.contains(&data_path) && expired {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            for path in
+                entries(&team.join("attachments"), false).chain(entries(&team.join("icons"), false))
+            {
                 if expired(&path) {
                     let _ = fs::remove_file(path);
                 }

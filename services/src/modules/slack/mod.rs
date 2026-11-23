@@ -1,5 +1,6 @@
 mod client;
 mod disk;
+mod downloads;
 mod mailbox;
 mod picker;
 mod projects;

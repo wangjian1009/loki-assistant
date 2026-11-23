@@ -726,6 +726,61 @@ async fn attachment_original(
     module = "slack",
     mount = "Arc<Projects>",
     mount_group = "slack-local",
+    id = "download-attachment-original",
+    method = "POST",
+    path = "/slack/conversations/{id}/messages/{ts}/attachments/{index}/original",
+    summary = "提交 Slack 附件原件下载",
+    description = "返回下载任务 ID。"
+)]
+async fn download_attachment_original(
+    State(projects): Service,
+    headers: HeaderMap,
+    path: Segment<(String, String, usize)>,
+) -> Result<Response, Error> {
+    let Path((id, ts, index)) = path.map_err(|_| Error::Invalid)?;
+    if super::protocol::timestamp(&ts).is_none() {
+        return Err(Error::Invalid);
+    }
+    let (team, id, service) = conversation(&projects, id).await?;
+    let session = session(&headers, &service).await?;
+    let (download_id, cached) = projects
+        .start_download(&team, service, session, &id, &ts, index)
+        .await?;
+    let status = if cached {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(json!({"download_id":download_id}))).into_response())
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
+    id = "download-status",
+    method = "GET",
+    path = "/slack/downloads/{download_id}",
+    summary = "查询 Slack 附件下载进度",
+    description = "返回任务状态、字节进度和已完成原件的本机路径。"
+)]
+async fn download_status(
+    State(projects): Service,
+    headers: HeaderMap,
+    path: Segment<Uuid>,
+) -> Result<Json<Value>, Error> {
+    let Path(id) = path.map_err(|_| Error::Invalid)?;
+    Ok(Json(
+        projects
+            .download_status(id, session_header(&headers)?)
+            .await?,
+    ))
+}
+
+#[loki_api(
+    module = "slack",
+    mount = "Arc<Projects>",
+    mount_group = "slack-local",
     id = "attachment-preview",
     method = "GET",
     path = "/slack/conversations/{id}/messages/{ts}/attachments/{index}/preview",
