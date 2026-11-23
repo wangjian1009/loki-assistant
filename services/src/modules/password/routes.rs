@@ -13,6 +13,7 @@ use axum::{
 use loki_services_macros::loki_api;
 
 use crate::http::error::{ErrorSource, response as api_error};
+use crate::modules::config::service::SYSTEM_PASSWORD_PREFIX;
 
 use super::{
     protocol::{API_VERSION, EntriesResponse, EntryResponse, ListRequest},
@@ -56,10 +57,11 @@ async fn entries(
     request: Result<Query<ListRequest>, QueryRejection>,
 ) -> Result<Json<EntriesResponse>, Response> {
     let Query(request) = request.map_err(|_| error_response(PasswordError::InvalidRequest))?;
-    let files = service
+    let mut files = service
         .entries(&request.query)
         .await
         .map_err(error_response)?;
+    files.retain(|file| !file.starts_with(SYSTEM_PASSWORD_PREFIX));
     Ok(Json(EntriesResponse {
         api_version: API_VERSION.to_owned(),
         files,
@@ -80,6 +82,9 @@ async fn entry(
     file: Result<Path<String>, PathRejection>,
 ) -> Result<Json<EntryResponse>, Response> {
     let Path(file) = file.map_err(|_| error_response(PasswordError::InvalidPath))?;
+    if file.starts_with(SYSTEM_PASSWORD_PREFIX) {
+        return Err(error_response(PasswordError::EntryNotFound));
+    }
     let contents = service.fetch(&file).await.map_err(error_response)?;
     Ok(Json(EntryResponse {
         api_version: API_VERSION.to_owned(),

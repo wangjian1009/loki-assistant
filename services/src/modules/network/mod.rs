@@ -10,7 +10,6 @@ mod routes;
 mod service;
 mod status;
 
-pub use identity::IdentityStore;
 pub use relay::{IrohRelayRegistrar, RelayRegistrar, RelaySession};
 pub use service::NetworkService;
 

@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
-    io::{ErrorKind, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    io::{self, ErrorKind, Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -26,16 +26,28 @@ impl FileStorage {
     }
 
     pub fn read(&self) -> Result<StoredValues, ConfigServiceError> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(text) => text,
+        let mut file = match open_private_file(&self.path) {
+            Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(StoredValues::new()),
             Err(error) => return Err(storage_error(error)),
         };
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(storage_error)?;
         serde_yaml_ng::from_str::<Option<StoredValues>>(&text)
             .map(Option::unwrap_or_default)
             .map_err(|error| {
-                ConfigServiceError::Storage(format!("读取 {} 失败：{error}", self.path.display()))
+                let location = error.location().map_or_else(String::new, |location| {
+                    format!("（第 {} 行，第 {} 列）", location.line(), location.column())
+                });
+                ConfigServiceError::Storage(format!(
+                    "配置文件 {} 格式无效{location}。",
+                    self.path.display()
+                ))
             })
+    }
+
+    pub fn sibling(&self, name: &str) -> PathBuf {
+        self.path.with_file_name(name)
     }
 
     pub async fn write(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
@@ -53,6 +65,13 @@ impl FileStorage {
             .mode(0o700)
             .create(parent)
             .map_err(storage_error)?;
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(storage_error("配置文件必须是普通文件。"));
+            }
+            Err(error) if error.kind() != ErrorKind::NotFound => return Err(storage_error(error)),
+            _ => {}
+        }
         let temporary = parent.join(format!(
             ".config.{}.{}.tmp",
             std::process::id(),
@@ -76,6 +95,21 @@ impl FileStorage {
         }
         result
     }
+}
+
+pub(super) fn open_private_file(path: &Path) -> io::Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("配置文件必须是普通文件。"));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn storage_error(error: impl std::fmt::Display) -> ConfigServiceError {

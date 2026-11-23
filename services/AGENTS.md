@@ -8,7 +8,7 @@
 
 `modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。通过配置提交前处理器注册候选连接，落盘成功后才切换并通知，落盘失败撤销；启动初始化由 `main.rs` 显式调度，失败不影响本机 HTTP。构造模块不启动任务，没有固定对端或备用 relay，网络状态通过注入的 `StatusService` 发布到 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
-扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 安全读写 `~/.assistant/peers.json`。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
+扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 通过配置模块读写设备绑定。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由 `main.rs` 显式调度 `receive_pairings`。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
 
 同一 Endpoint 同时接收 `loki-assistant/device-status/1`，仅响应已绑定手机的 `device.status` 请求，逐次查询同一份设备授权记录；此兼容协议只提供固定状态查询。连接纳入既有跟踪和解绑撤销；未绑定或已解绑返回 `peer-not-bound`。状态请求必须携带绑定后签发的凭据；只有绑定接口允许无凭据。真实 relay 测试调用手机 Rust 客户端，验证绑定、配置恢复、状态和解绑。
 
@@ -65,9 +65,9 @@ src/
     │   ├── mod.rs       网络模块描述和导出
     │   ├── config.rs    中转地址和令牌元数据
     │   ├── protocol.rs  网络连接状态值
-    │   ├── identity.rs  ~/.assistant/identity.json 安全读写与随机身份生成
+    │   ├── identity.rs  本地身份校验与随机生成
     │   ├── pairing.rs   绑定邀请、单次消费和设备授权事务
-    │   ├── peers.rs     ~/.assistant/peers.json 安全读写
+    │   ├── peers.rs     设备绑定校验与配置读写
     │   ├── qr_code.rs   绑定 JSON 二维码的 PNG 与 Base64 编码
     │   ├── routes.rs    绑定邀请与设备管理 HTTP
     │   ├── relay.rs     可注入的中转注册器与 iroh 连接
@@ -155,7 +155,7 @@ modules/<module>
 
 `http` 不直接执行 `emacsclient`，业务模块不依赖 SwiftUI 或菜单栏窗口。协议只在所属模块内定义，不建立集中式 `protocol` 目录；跨模块共享字段必须先证明其稳定且确有复用需求。模块描述通过 `linkme` distributed slice 在编译/链接阶段收集，HTTP 请求只读取静态描述并序列化，不调用运行时注册函数。每个 HTTP handler 通过 `#[loki_api(...)]` 统一声明方法、路径、访问范围和必填的挂载状态 `mount`。无状态接口声明 `mount = "()"`。模块 Router 通过 `mount_routes` 安装整组 handler 并应用中间件。`Services::build()` 负责模块组装、配置处理器注入和路由组合，`RuntimeState` 持有它。当前启动配置属于 `runtime`，配置中心使用 `modules/config`，不得新增顶层 `config.rs`。配置模块的业务代码通过 `ConfigService::module_values`、`value` 和 `subscribe_module` 访问配置及变化。
 
-配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。
+配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。网络身份和设备绑定写入同一文件的 `_system`，使用配置模块内部的 `Password` 引用。中转令牌、身份私钥和设备绑定凭据由 pass 加密存储。网络专用条目仅供服务内部调用。配置元数据和 HTTP 接口只提供已登记的用户设置。
 
 Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `Arc<ConfigService>`，每个配置项对应独立异步方法，例如 `emacsclient_path()`。方法每次调用配置中心并返回带 `value`、`source` 的 `ConfigValue`，不缓存属性值；`EmacsService` 持有 `EmacsConfig` 并通过这些方法读取。配置项键、默认值和搜索目录均由该文件维护。`EmacsConfig::metadata()` 是不依赖实例的静态函数，经 `#[loki_config]` 注册，配置中心与 API 发现一样通过编译期目录获取元数据。配置项声明 `remote_access`，配置中心对远端请求按项限制读取、写入和预检，列表过滤本机专用项。
 

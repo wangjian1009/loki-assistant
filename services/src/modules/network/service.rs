@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use tokio::{
     sync::{Mutex, Notify},
@@ -6,7 +6,8 @@ use tokio::{
 };
 
 use super::{
-    identity::IdentityStore,
+    config::{relay_password, relay_token, relay_token_is_set},
+    identity,
     pairing::PairingService,
     protocol::ConnectionStatus,
     relay::{RelayRegistrar, RelaySession},
@@ -24,20 +25,6 @@ struct RelaySettings {
 }
 
 impl RelaySettings {
-    fn from_values(values: &BTreeMap<String, serde_json::Value>) -> Result<Self, String> {
-        let read = |key: &str| {
-            values
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-                .ok_or_else(|| format!("网络配置 {key} 必须是字符串"))
-        };
-        Ok(Self {
-            url: read("relay_url")?,
-            token: read("relay_token")?,
-        })
-    }
-
     fn configured(&self) -> bool {
         !self.url.trim().is_empty() && !self.token.trim().is_empty()
     }
@@ -77,7 +64,7 @@ struct State {
 #[derive(Debug)]
 pub struct NetworkService {
     pub(super) remote: super::remote::Gateway,
-    identity: Result<IdentityStore, String>,
+    config: ConfigService,
     registrar: Arc<dyn RelayRegistrar>,
     notification: Arc<NotificationService>,
     state: Mutex<State>,
@@ -320,7 +307,7 @@ impl NetworkService {
     }
 
     pub fn new(
-        identity: Result<IdentityStore, String>,
+        config: ConfigService,
         registrar: Arc<dyn RelayRegistrar>,
         notification: Arc<NotificationService>,
         status: Arc<StatusService>,
@@ -333,13 +320,10 @@ impl NetworkService {
                 serde_json::json!({"status": ConnectionStatus::Offline}),
             )
             .expect("固定状态路径有效");
-        let peers_path = identity
-            .as_ref()
-            .map(IdentityStore::peers_path)
-            .map_err(Clone::clone);
+        let pairings = Arc::new(PairingService::new(config.clone()));
         Self {
             remote: super::remote::Gateway::new(),
-            identity,
+            config,
             registrar,
             notification,
             state: Mutex::new(State::default()),
@@ -347,7 +331,7 @@ impl NetworkService {
             status,
             connection_changed: Notify::new(),
             pairing_changed: Notify::new(),
-            pairings: Arc::new(PairingService::new(peers_path)),
+            pairings,
         }
     }
 
@@ -371,17 +355,14 @@ impl NetworkService {
     }
 
     async fn identity(&self) -> Result<iroh::SecretKey, String> {
-        let result = match &self.identity {
-            Ok(store) => store.ensure().await,
-            Err(message) => Err(message.clone()),
-        };
+        let result = identity::ensure(&self.config).await;
         match result {
             Ok((identity, created)) => {
                 if created {
                     self.notify(
                         "已生成本地身份",
                         format!(
-                            "身份已保存到 ~/.assistant/identity.json。\nEndpoint ID：{}",
+                            "身份私钥已保存到 pass 密码库。\nEndpoint ID：{}",
                             identity.public()
                         ),
                     )
@@ -511,6 +492,33 @@ impl NetworkService {
         }
     }
 
+    async fn discard_pending(&self, state: &mut State) -> Result<(), String> {
+        if let Some(pending) = state.pending.take() {
+            self.publish_phase(state, pending.previous_status);
+            self.connection_changed.notify_one();
+            if let Some(candidate) = pending.candidate {
+                candidate.session.close().await?;
+            }
+            self.notify(
+                "中转配置保存失败",
+                "配置未能保存，已撤销本次注册并保留原连接。".to_owned(),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn relay_url(&self) -> Result<String, String> {
+        self.config
+            .value("network", "relay_url")
+            .await
+            .map_err(|error| error.to_string())?
+            .value
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "网络配置 relay_url 必须是字符串".into())
+    }
+
     /// 由 main 显式运行，监听活动连接变化；状态中心只接收发布值。
     pub async fn monitor(&self) {
         loop {
@@ -564,23 +572,28 @@ impl NetworkService {
     }
 
     /// 由进程入口显式调用；失败不影响本机 HTTP 服务，配置提交后仍可重试。
-    pub async fn start(&self, config: Arc<ConfigService>) -> Result<(), String> {
+    pub async fn start(&self) -> Result<(), String> {
+        if let Err(error) = self.pairings.initialize().await {
+            eprintln!("加载设备绑定失败：{error}");
+        }
         let mut state = self.state.lock().await;
         // 配置提交已在处理新连接时，由该事务负责完成，不重放旧配置。
         if state.pending.is_some() {
             return Ok(());
         }
-        let values = config
-            .module_values("network")
+        let url = self.relay_url().await?;
+        let token = relay_token(&self.config)
             .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|(key, value)| (key, value.value))
-            .collect();
-        self.prepare(&mut state, RelaySettings::from_values(&values)?)
+            .map_err(|error| error.to_string())?;
+        self.prepare(&mut state, RelaySettings { url, token })
             .await?;
         self.finish(&mut state).await;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn config(&self) -> ConfigService {
+        self.config.clone()
     }
 
     pub async fn shutdown(&self) {
@@ -601,24 +614,69 @@ impl NetworkService {
 }
 
 impl ConfigChangeHandler for NetworkService {
+    fn secret_is_set<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { key == "relay_token" && relay_token_is_set(&self.config).await })
+    }
+
+    fn write_secret<'a>(&'a self, key: &'a str, value: serde_json::Value) -> ChangeFuture<'a> {
+        Box::pin(async move {
+            if key != "relay_token" {
+                return Err("未找到中转凭据配置。".into());
+            }
+            let token = value.as_str().ok_or("中转令牌必须是字符串。")?;
+            let mut state = self.state.lock().await;
+            // 先导入旧令牌，避免换新后留下待迁移的旧值。
+            relay_token(&self.config)
+                .await
+                .map_err(|error| error.to_string())?;
+            let url = self.relay_url().await?;
+            self.prepare(
+                &mut state,
+                RelaySettings {
+                    url,
+                    token: token.to_owned(),
+                },
+            )
+            .await?;
+            let password = relay_password();
+            let saved = if token.trim().is_empty() {
+                password.remove(&self.config).await
+            } else {
+                password.write(&self.config, token).await
+            };
+            if let Err(error) = saved {
+                self.discard_pending(&mut state).await?;
+                return Err(error.to_string());
+            }
+            self.finish(&mut state).await;
+            Ok(())
+        })
+    }
+
     fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
-            if change.module_id != "network"
-                || !matches!(change.key.as_str(), "relay_url" | "relay_token")
-            {
+            if change.module_id != "network" || change.key != "relay_url" {
                 return Ok(());
             }
-            let settings = RelaySettings::from_values(&change.module_values)?;
+            let url = change
+                .value
+                .as_str()
+                .ok_or("中转地址必须是字符串。")?
+                .to_owned();
             let mut state = self.state.lock().await;
-            self.prepare(&mut state, settings).await
+            let token = relay_token(&self.config)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.prepare(&mut state, RelaySettings { url, token }).await
         })
     }
 
     fn committed(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
-            if change.module_id == "network"
-                && matches!(change.key.as_str(), "relay_url" | "relay_token")
-            {
+            if change.module_id == "network" && change.key == "relay_url" {
                 self.finish(&mut *self.state.lock().await).await;
             }
             Ok(())
@@ -627,22 +685,8 @@ impl ConfigChangeHandler for NetworkService {
 
     fn rollback(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
-            if change.module_id == "network"
-                && matches!(change.key.as_str(), "relay_url" | "relay_token")
-            {
-                let mut state = self.state.lock().await;
-                if let Some(pending) = state.pending.take() {
-                    self.publish_phase(&mut state, pending.previous_status);
-                    self.connection_changed.notify_one();
-                    if let Some(candidate) = pending.candidate {
-                        candidate.session.close().await?;
-                    }
-                    self.notify(
-                        "中转配置保存失败",
-                        "配置未能落盘，已撤销本次注册并保留原连接。".to_owned(),
-                    )
-                    .await;
-                }
+            if change.module_id == "network" && change.key == "relay_url" {
+                self.discard_pending(&mut *self.state.lock().await).await?;
             }
             Ok(())
         })

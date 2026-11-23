@@ -125,7 +125,7 @@ pub enum NetworkError {
     PeerNotBound,
     #[error("绑定凭据无效或已失效，请重新扫码绑定")]
     InvalidBindingToken,
-    #[error("设备记录无法读取或保存，请检查 ~/.assistant/peers.json")]
+    #[error("设备记录无法读取或保存，请检查本机配置和待迁移的旧设备记录")]
     Storage,
     #[error("绑定信息无法生成二维码，请检查中继地址和令牌长度")]
     QrCode,

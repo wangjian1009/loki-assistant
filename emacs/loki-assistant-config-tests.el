@@ -68,13 +68,15 @@
   (loki-assistant-config-test--with-buffer
     (loki-assistant-config--render
      '(((id . "network") (name . "网络")
-        (items . [((key . "relay_token") (name . "中转令牌") (data_type . "string") (read_only . t))
+        (items . [((key . "relay_token") (name . "中转令牌")
+                   (data_type . ((password . ((path . "loki-assistant/network/relay.gpg")))))
+                   (read_only . t))
                   ((key . "plain") (name . "普通字段") (data_type . "string") (checker . :null))
                   ((key . "checked") (name . "带校验字段") (data_type . "string")
                    (checker . ((pattern . "^T[0-9]+$") (emacs_pattern . "\\`T[0-9]+\\'"))))])))
-     '(("network" . ((relay_token . ((value . "test-token")))))))
+     '(("network" . ((relay_token . ((value . :false)))))))
     (should-not (loki-assistant-config-test--entry "relay_token"))
-    (should (string-match-p "中转令牌：test-token  只读" (buffer-string)))
+    (should (string-match-p "中转令牌：未设置  只读" (buffer-string)))
     (dolist (key '("plain" "checked"))
       (let ((labels (mapcar #'widget-value
                             (loki-assistant-config--entry-buttons

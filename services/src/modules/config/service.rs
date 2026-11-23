@@ -19,14 +19,18 @@ use super::{
 };
 
 mod notifications;
+mod system;
 pub use notifications::NotificationValidationError;
 pub(crate) use notifications::{NotificationConfirmedFields, NotificationRequest};
 use notifications::{legacy_pending_password_id, pending_password_id};
+pub(crate) use system::{LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX};
 
 #[derive(Clone, Debug)]
 pub struct ConfigService {
     metadata: Arc<RwLock<HashMap<String, ConfigModuleMetadata>>>,
     values: Arc<RwLock<StoredValues>>,
+    system_values: Arc<RwLock<system::SystemValues>>,
+    persistence: Arc<Mutex<()>>,
     changes: broadcast::Sender<ConfigChange>,
     commits: Arc<Mutex<()>>,
     handlers: HashMap<String, Arc<dyn ConfigChangeHandler>>,
@@ -264,6 +268,13 @@ impl ConfigService {
     ) -> Result<Self, ConfigServiceError> {
         let storage = FileStorage::new(path)?;
         let mut values = storage.read()?;
+        let mut system_values = values.remove(system::SECTION).unwrap_or_default();
+        if let Some(token) = values
+            .get_mut("network")
+            .and_then(|network| network.remove("relay_token"))
+        {
+            system_values.entry("network_relay_token").or_insert(token);
+        }
         for (module_id, entries) in &mut values {
             // 保留其他版本或插件的配置，仅校验当前已知配置项。
             if let Some(module) = metadata.iter().find(|module| &module.id == module_id) {
@@ -300,6 +311,7 @@ impl ConfigService {
         notifications::clear_retired_pending_password_references(&mut values);
         let mut service = Self::with_metadata(metadata);
         service.values = Arc::new(RwLock::new(values));
+        service.system_values = Arc::new(RwLock::new(system::SystemValues(system_values)));
         service.storage = Some(storage);
         Ok(service)
     }
@@ -328,11 +340,14 @@ impl ConfigService {
         let (changes, _) = broadcast::channel(32);
         let modules = metadata
             .into_iter()
+            .filter(|metadata| metadata.id != system::SECTION)
             .map(|metadata| (metadata.id.clone(), metadata))
             .collect();
         Self {
             metadata: Arc::new(RwLock::new(modules)),
             values: Arc::new(RwLock::new(HashMap::new())),
+            system_values: Arc::default(),
+            persistence: Arc::default(),
             changes,
             commits: Arc::new(Mutex::new(())),
             handlers: HashMap::new(),
@@ -1234,17 +1249,18 @@ impl ConfigService {
             .into_iter()
             .map(|(key, value)| (key, value.value))
             .collect();
-        let previous_value = module_values.insert(key.to_owned(), Value::Bool(true));
         handler.write_secret(key, value).await.map_err(rejected)?;
+        let value = Value::Bool(handler.secret_is_set(key).await);
+        let previous_value = module_values.insert(key.to_owned(), value.clone());
         let _ = self.changes.send(ConfigChange {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
-            value: Value::Bool(true),
+            value: value.clone(),
             operation: ConfigChangeOperation::Replace,
             previous_value,
             module_values,
         });
-        Ok(Value::Bool(true))
+        Ok(value)
     }
 
     async fn normalize_value(
@@ -1528,33 +1544,30 @@ impl ConfigService {
         } else {
             None
         };
-        if let Some(storage) = &self.storage {
-            if let Err(error) = storage.write(values.clone()).await {
-                let password_rollback = if let Some((store, path, previous)) = previous_password {
-                    if let Some(previous) = previous {
-                        store.save(&path, previous.trim_end_matches('\n')).await
-                    } else {
-                        store.remove(&path).await
-                    }
+        if let Err(error) = self.persist_values(values).await {
+            let password_rollback = if let Some((store, path, previous)) = previous_password {
+                if let Some(previous) = previous {
+                    store.save(&path, previous.trim_end_matches('\n')).await
                 } else {
-                    Ok(())
-                };
-                if let Some(handler) = handler {
-                    if let Err(message) = handler.rollback(change.clone()).await {
-                        return Err(ConfigServiceError::Storage(format!(
-                            "{error}；撤销配置处理失败：{message}"
-                        )));
-                    }
+                    store.remove(&path).await
                 }
-                if let Err(rollback) = password_rollback {
+            } else {
+                Ok(())
+            };
+            if let Some(handler) = handler {
+                if let Err(message) = handler.rollback(change.clone()).await {
                     return Err(ConfigServiceError::Storage(format!(
-                        "{error}。撤销密码写入失败：{rollback}"
+                        "{error}；撤销配置处理失败：{message}"
                     )));
                 }
-                return Err(error);
             }
+            if let Err(rollback) = password_rollback {
+                return Err(ConfigServiceError::Storage(format!(
+                    "{error}。撤销密码写入失败：{rollback}"
+                )));
+            }
+            return Err(error);
         }
-        *self.values.write().await = values;
         let _ = self.changes.send(change.clone());
         if let Some(handler) = handler {
             if let Err(error) = handler.committed(change).await {

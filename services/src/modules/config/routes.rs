@@ -907,7 +907,7 @@ mod tests {
                 Value::Null
             )
             .await["value"],
-            ""
+            false
         );
         for method in ["PUT", "PATCH", "POST", "DELETE"] {
             let response = router(service.clone())

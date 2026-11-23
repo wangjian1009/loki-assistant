@@ -1,26 +1,43 @@
-use std::{
-    collections::BTreeMap,
-    fs::{self, DirBuilder, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
-};
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::modules::config::service::{
+    ConfigService, ConfigServiceError, LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX,
+};
 
 use super::protocol::{BindingToken, DeviceType, NetworkError, Peer};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct StoredPeer {
+#[serde(
+    deny_unknown_fields,
+    bound = "T: Serialize + serde::de::DeserializeOwned"
+)]
+pub(super) struct PeerRecord<T> {
     #[serde(default)]
     pub device_type: DeviceType,
     pub endpoint_id: String,
     pub name: String,
     pub bound_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_token: Option<BindingToken>,
+    pub binding_token: Option<T>,
 }
+pub(super) type StoredPeer = PeerRecord<BindingToken>;
+
+impl<T> PeerRecord<T> {
+    fn with_password<U>(self, binding_token: Option<U>) -> PeerRecord<U> {
+        PeerRecord {
+            device_type: self.device_type,
+            endpoint_id: self.endpoint_id,
+            name: self.name,
+            bound_at: self.bound_at,
+            binding_token,
+        }
+    }
+}
+
 impl StoredPeer {
     pub fn public(&self) -> Peer {
         Peer {
@@ -33,102 +50,201 @@ impl StoredPeer {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredPeers {
+#[serde(
+    deny_unknown_fields,
+    bound = "T: Serialize + serde::de::DeserializeOwned"
+)]
+struct StoredPeers<T> {
     version: u32,
-    peers: Vec<StoredPeer>,
+    peers: Vec<PeerRecord<T>>,
 }
 
 pub(super) fn valid_name(name: &str) -> bool {
     !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
 }
 
-pub(super) fn load(path: &Path) -> Result<BTreeMap<String, StoredPeer>, NetworkError> {
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(_) => return Err(NetworkError::Storage),
-    };
-    if !file
-        .metadata()
-        .map_err(|_| NetworkError::Storage)?
-        .is_file()
-    {
-        return Err(NetworkError::Storage);
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|_| NetworkError::Storage)?;
-    let mut data = Vec::new();
-    Read::by_ref(&mut file)
-        .take(1_048_577)
-        .read_to_end(&mut data)
-        .map_err(|_| NetworkError::Storage)?;
-    if data.len() > 1_048_576 {
-        return Err(NetworkError::Storage);
-    }
-    let stored: StoredPeers = serde_json::from_slice(&data).map_err(|_| NetworkError::Storage)?;
-    if stored.version != 1 || stored.peers.len() > 256 {
-        return Err(NetworkError::Storage);
-    }
-    let mut peers = BTreeMap::new();
-    for peer in stored.peers {
-        let id = peer
-            .endpoint_id
-            .parse::<iroh::EndpointId>()
-            .map_err(|_| NetworkError::Storage)?;
-        if id.to_string() != peer.endpoint_id
-            || !valid_name(&peer.name)
-            || peer.binding_token.as_ref().is_some_and(|token| {
-                token.0.len() != 64
-                    || !token
-                        .0
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-            || peer.bound_at == 0
-            || peers.insert(peer.endpoint_id.clone(), peer).is_some()
-        {
-            return Err(NetworkError::Storage);
+fn invalid() -> ConfigServiceError {
+    ConfigServiceError::Storage("设备绑定记录格式无效。".into())
+}
+
+impl<T> StoredPeers<T> {
+    fn validate(&self) -> Result<(), ConfigServiceError> {
+        if self.peers.len() > 256 {
+            return Err(invalid());
         }
+        let mut ids = HashSet::new();
+        for peer in &self.peers {
+            let id = peer
+                .endpoint_id
+                .parse::<iroh::EndpointId>()
+                .map_err(|_| invalid())?;
+            if id.to_string() != peer.endpoint_id
+                || !valid_name(&peer.name)
+                || peer.bound_at == 0
+                || !ids.insert(id)
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+}
+
+const KEY: &str = "network_peers";
+
+fn valid_token(token: &str) -> bool {
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn password_path(endpoint_id: &str, token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("{SYSTEM_PASSWORD_PREFIX}peers/{endpoint_id}/{digest:x}.gpg")
+}
+
+fn decode<T: serde::de::DeserializeOwned + Serialize>(
+    value: Value,
+    version: u32,
+) -> Result<StoredPeers<T>, ConfigServiceError> {
+    let peers: StoredPeers<T> = serde_json::from_value(value).map_err(|_| invalid())?;
+    if peers.version != version {
+        return Err(invalid());
+    }
+    peers.validate()?;
+    Ok(peers)
+}
+
+async fn to_passwords(
+    config: &ConfigService,
+    peers: &[StoredPeer],
+    existing: &HashSet<String>,
+) -> Result<StoredPeers<Password>, ConfigServiceError> {
+    let mut records = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let password = match &peer.binding_token {
+            Some(token) if valid_token(&token.0) => {
+                let password = Password::new(password_path(&peer.endpoint_id, &token.0));
+                if !existing.contains(password.path()) {
+                    password.import(config, &token.0).await?;
+                }
+                Some(password)
+            }
+            Some(_) => return Err(invalid()),
+            None => None,
+        };
+        records.push(peer.clone().with_password(password));
+    }
+    Ok(StoredPeers {
+        version: 2,
+        peers: records,
+    })
+}
+
+async fn from_passwords(
+    config: &ConfigService,
+    records: StoredPeers<Password>,
+) -> Result<Vec<StoredPeer>, ConfigServiceError> {
+    let mut peers = Vec::with_capacity(records.peers.len());
+    for record in records.peers {
+        let token = match &record.binding_token {
+            Some(password) => {
+                let prefix = format!("{SYSTEM_PASSWORD_PREFIX}peers/{}/", record.endpoint_id);
+                if !password
+                    .path()
+                    .strip_prefix(&prefix)
+                    .and_then(|suffix| suffix.strip_suffix(".gpg"))
+                    .is_some_and(valid_token)
+                {
+                    return Err(invalid());
+                }
+                let token = password.read(config).await?;
+                if !valid_token(&token)
+                    || password.path() != password_path(&record.endpoint_id, &token)
+                {
+                    return Err(invalid());
+                }
+                Some(BindingToken(token))
+            }
+            None => None,
+        };
+        peers.push(record.with_password(token));
     }
     Ok(peers)
 }
 
-pub(super) fn save(path: PathBuf, peers: Vec<StoredPeer>) -> Result<(), NetworkError> {
-    let parent = path.parent().ok_or(NetworkError::Storage)?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
+pub(super) async fn load(
+    config: &ConfigService,
+) -> Result<BTreeMap<String, StoredPeer>, NetworkError> {
+    let peers = config
+        .update_system_value(
+            KEY,
+            Some(LegacySystemFile {
+                name: "peers.json",
+                limit: 1_048_576,
+            }),
+            async |previous| {
+                let Some(value) = previous else {
+                    return Ok((None, Vec::new()));
+                };
+                if value["version"] == 2 {
+                    let peers = from_passwords(config, decode(value.clone(), 2)?).await?;
+                    return Ok((Some(value), peers));
+                }
+                let peers = decode(value, 1)?.peers;
+                let records = to_passwords(config, &peers, &HashSet::new()).await?;
+                Ok((
+                    Some(serde_json::to_value(records).map_err(|_| invalid())?),
+                    peers,
+                ))
+            },
+        )
+        .await
         .map_err(|_| NetworkError::Storage)?;
-    // 不替换符号链接或非普通文件；损坏记录只由显式人工修复。
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if !meta.is_file() => return Err(NetworkError::Storage),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(NetworkError::Storage);
+    Ok(peers
+        .into_iter()
+        .map(|peer| (peer.endpoint_id.clone(), peer))
+        .collect())
+}
+
+pub(super) async fn save(
+    config: &ConfigService,
+    peers: Vec<StoredPeer>,
+) -> Result<(), NetworkError> {
+    let retired = config
+        .update_system_value(KEY, None, async |previous| {
+            let existing = previous
+                .map(|value| decode::<Password>(value, 2))
+                .transpose()?
+                .into_iter()
+                .flat_map(|records| records.peers)
+                .filter_map(|record| record.binding_token)
+                .map(|password| password.path().to_owned())
+                .collect();
+            let records = to_passwords(config, &peers, &existing).await?;
+            let retained: HashSet<_> = records
+                .peers
+                .iter()
+                .filter_map(|record| record.binding_token.as_ref())
+                .map(Password::path)
+                .collect();
+            let retired: Vec<_> = existing
+                .iter()
+                .filter(|path| !retained.contains(path.as_str()))
+                .map(|path| Password::new(path.clone()))
+                .collect();
+            Ok((
+                Some(serde_json::to_value(records).map_err(|_| invalid())?),
+                retired,
+            ))
+        })
+        .await
+        .map_err(|_| NetworkError::Storage)?;
+    for password in retired {
+        if let Err(error) = password.remove(config).await {
+            eprintln!("清理旧设备绑定凭据失败：{error}");
         }
-        _ => {}
     }
-    let temporary = parent.join(format!(".peers-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|_| NetworkError::Storage)?;
-        let data = serde_json::to_vec_pretty(&StoredPeers { version: 1, peers })
-            .map_err(|_| NetworkError::Storage)?;
-        file.write_all(&data)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| NetworkError::Storage)?;
-        fs::rename(&temporary, &path).map_err(|_| NetworkError::Storage)?;
-        Ok(())
-    })();
-    let _ = fs::remove_file(temporary);
-    result
+    Ok(())
 }

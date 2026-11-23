@@ -99,15 +99,15 @@ control-center:
 
 * 网络身份与中转注册
 
-「网络」分组提供「中转地址」 ~relay_url~ 和「中转令牌」 ~relay_token~ 。中转令牌为只读，从 ~~/.assistant/config.yml~ 读取服务器已有的共享访问令牌，重启 services 后加载。中转地址可在配置界面保存。地址和令牌配齐后开始注册。
+在「网络」分组设置「中转地址」 ~relay_url~ 。通过 Loki 已配置的 pass 密码库将共享中转令牌保存到 ~loki-assistant/network/relay.gpg~ 的首行，再重启 services。只读的「中转令牌」配置项显示凭据是否可用。地址和令牌配齐后开始注册。
 
-服务启动或提交上述配置时，缺少 ~~/.assistant/identity.json~ 则自动生成随机身份，以 ~0600~ 权限保存并通知。身份与中转令牌相互独立，重启或更改配置会复用本地身份，损坏的身份不会自动覆盖。
+services 使用已配置的 pass 密码库保存本机身份私钥和设备绑定令牌，在 ~~/.assistant/config.yml~ 保留条目引用。升级时自动迁移旧中转令牌、原身份和设备绑定，手机可继续使用原绑定。
 
 完整配置变化时先注册新连接，成功且落盘后才替换旧连接并通知成功；注册失败或超时会通知并拒绝保存，保留原配置和连接。清空任意一项成功后关闭连接；首次只保存一项不连接、不发出注册失败通知。启动时配置完整才注册，失败不影响本机 HTTP 服务；可修复后重新提交。每次注册最多等待 10 秒。
 
 本机网络状态完整项读取 ~GET /status/network/my~，连接字段读取 ~GET /status/network/my/status~，其值为 ~offline~、~disconnected~、~connecting~、~connected~ 或 ~failed~ 。查询不会等待注册过程；连接断开、恢复时由网络模块继续发布更新。状态与通知不包含令牌或私钥。
 
-Emacs 的设备管理界面默认只显示已绑定设备；点击“新增设备”后，通过 ~POST /network/pairings~ 创建五分钟有效的邀请，services 生成包含电脑 Endpoint ID、中继地址、中继访问令牌和一次性绑定凭据的二维码 PNG，以 ~qr_code_png_base64~ 返回，Emacs 在当前 buffer 中展开图片与有效期。手机按 ~loki-assistant/pair/1~ ALPN 连接现有 Endpoint，使用自己生成的身份提交绑定；services 验证后将设备保存到权限为 ~0600~ 的 ~~/.assistant/peers.json~ ，并消费邀请。同一设备重试幂等，刷新、取消、过期或中继配置成功切换都会使未完成的旧邀请失效。
+Emacs 的设备管理界面默认只显示已绑定设备；点击“新增设备”后，通过 ~POST /network/pairings~ 创建五分钟有效的邀请，services 生成包含电脑 Endpoint ID、中继地址、中继访问令牌和一次性绑定凭据的二维码 PNG，以 ~qr_code_png_base64~ 返回，Emacs 在当前 buffer 中展开图片与有效期。手机按 ~loki-assistant/pair/1~ ALPN 连接现有 Endpoint，使用自己生成的身份提交绑定；services 验证后保存设备记录和加密绑定凭据，并消费邀请。同一设备重试幂等，刷新、取消、过期或中继配置成功切换都会使未完成的旧邀请失效。
 
 ~GET /network/pairings/{id}~ 查询进度，~DELETE /network/pairings/{id}~ 取消邀请，~GET /network/peers~ 列出设备，~DELETE /network/peers/{endpoint_id}~ 解除绑定。管理接口仅供电脑本机 HTTP 调用。查询省略令牌，所有绑定响应禁止缓存。HarmonyOS 首页已接入扫码绑定和电脑状态查询，后者通过同一 Endpoint 的 ~loki-assistant/services/1~ 通用通道调用 ~GET /network/session~ ，旧 ~device-status/1~ 保留兼容，仅向已绑定手机返回在线状态；解绑后拒绝状态查询。测试通过本机随机端口 relay 调用实际手机客户端入口，覆盖绑定、响应丢失恢复和解绑。后续跨设备业务仍在规划；完整字段、传输和错误见 [[file:../docs/control-center-services.org::*扫码绑定][扫码绑定协议]]。
 

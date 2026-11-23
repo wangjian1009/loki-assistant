@@ -34,7 +34,7 @@ fn request(id: &str, token: &str) -> BindRequest {
 #[tokio::test]
 async fn services_png_decodes_to_the_exact_invitation_and_keeps_a_quiet_zone() {
     let fixture = Fixture::new();
-    let manager = PairingService::new(Ok(fixture.root.join("peers.json")));
+    let manager = PairingService::new(fixture.stored_config());
     let created = manager
         .create(
             SecretKey::generate().public().to_string(),
@@ -86,7 +86,7 @@ async fn services_png_decodes_to_the_exact_invitation_and_keeps_a_quiet_zone() {
 #[tokio::test]
 async fn invitations_expire_refresh_cancel_and_reject_wrong_tokens() {
     let fixture = Fixture::new();
-    let manager = Arc::new(PairingService::new(Ok(fixture.root.join("peers.json"))));
+    let manager = Arc::new(PairingService::new(fixture.stored_config()));
     let server = SecretKey::generate().public().to_string();
     let first = manager
         .create(
@@ -160,8 +160,8 @@ async fn invitations_expire_refresh_cancel_and_reject_wrong_tokens() {
 #[tokio::test]
 async fn concurrent_binding_consumes_invitation_and_later_attempts_expire() {
     let fixture = Fixture::new();
-    let path = fixture.root.join("peers.json");
-    let manager = Arc::new(PairingService::new(Ok(path.clone())));
+    let path = fixture.root.join("config.yml");
+    let manager = Arc::new(PairingService::new(fixture.stored_config()));
     let created = manager
         .create(
             SecretKey::generate().public().to_string(),
@@ -204,7 +204,7 @@ async fn concurrent_binding_consumes_invitation_and_later_attempts_expire() {
     let stored = fs::read_to_string(&path).unwrap();
     assert!(!stored.contains("relay-secret"));
     assert!(!stored.contains(&created.qr_payload.pairing_token));
-    let restarted = PairingService::new(Ok(path));
+    let restarted = PairingService::new(fixture.stored_config());
     assert_eq!(
         restarted.list().await.unwrap()[0].endpoint_id,
         winner.to_string()
@@ -225,8 +225,8 @@ async fn concurrent_binding_consumes_invitation_and_later_attempts_expire() {
 #[tokio::test]
 async fn storage_failure_keeps_invitation_available_and_corrupt_records_are_preserved() {
     let fixture = Fixture::new();
-    let path = fixture.root.join("peers.json");
-    let manager = Arc::new(PairingService::new(Ok(path.clone())));
+    let path = fixture.root.join("config.yml");
+    let manager = Arc::new(PairingService::new(fixture.stored_config()));
     let created = manager
         .create(
             SecretKey::generate().public().to_string(),
@@ -274,12 +274,23 @@ async fn storage_failure_keeps_invitation_available_and_corrupt_records_are_pres
     assert_eq!(manager.list().await.unwrap().len(), 1);
     fs::remove_dir(&path).unwrap();
     fs::rename(backup, &path).unwrap();
-    fs::write(&path, "损坏的记录").unwrap();
-    assert!(PairingService::new(Ok(path.clone())).list().await.is_err());
-    assert_eq!(fs::read_to_string(&path).unwrap(), "损坏的记录");
-    let link = fixture.root.join("linked.json");
-    symlink(&path, &link).unwrap();
-    assert!(PairingService::new(Ok(link)).list().await.is_err());
+    let corrupt = "_system:\n  network_peers: 损坏的记录\n";
+    fs::write(&path, corrupt).unwrap();
+    assert!(
+        PairingService::new(fixture.stored_config())
+            .list()
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
+    fs::remove_file(&path).unwrap();
+    symlink(&path, fixture.root.join("peers.json")).unwrap();
+    assert!(
+        PairingService::new(fixture.stored_config())
+            .list()
+            .await
+            .is_err()
+    );
 }
 
 async fn http(app: axum::Router, method: &str, path: &str) -> (u16, Value) {
@@ -298,6 +309,69 @@ async fn http(app: axum::Router, method: &str, path: &str) -> (u16, Value) {
     let value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65_536).await.unwrap()).unwrap();
     (status, value)
+}
+
+#[tokio::test]
+async fn startup_migrates_network_credentials_without_exposing_or_changing_them() {
+    let fixture = Fixture::new();
+    let identity = SecretKey::generate();
+    let phone = SecretKey::generate().public();
+    let token = "ab".repeat(32);
+    let old_identity = fixture.root.join("identity.json");
+    let old_peers = fixture.root.join("peers.json");
+    fs::write(
+        &old_identity,
+        serde_json::to_vec(&json!({
+            "version": 1, "secret_key": identity, "endpoint_id": identity.public().to_string()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &old_peers,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "peers": [{
+                "endpoint_id": phone.to_string(), "name": "测试手机",
+                "bound_at": 1, "binding_token": token
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let service = fixture.service();
+    service.start().await.unwrap();
+    assert!(!old_identity.exists());
+    assert!(!old_peers.exists());
+
+    let config = fixture.config(service);
+    config
+        .replace("network", "relay_url", json!("https://relay.example"))
+        .await
+        .unwrap();
+    let reloaded = fixture.stored_config();
+    let (saved, created) = super::identity::ensure(&reloaded).await.unwrap();
+    assert!(!created);
+    assert_eq!(saved.public(), identity.public());
+    PairingService::new(reloaded.clone())
+        .authenticate(phone, &token)
+        .await
+        .unwrap();
+    let routes = crate::modules::config::Module::from_service(reloaded.clone()).router();
+    for (path, status) in [("/data/network", 200), ("/data/_system/network_peers", 404)] {
+        let response = routes
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(!body.contains("secret_key"));
+        assert!(!body.contains("binding_token"));
+        assert!(!body.contains(&token));
+    }
+    assert!(!format!("{reloaded:?}").contains(&token));
 }
 
 #[tokio::test]
@@ -432,14 +506,20 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         ),
     );
     let service = Arc::new(NetworkService::new(
-        Ok(fixture.store()),
+        fixture.stored_config(),
         Arc::new(IrohRelayRegistrar::new()),
         notification.clone(),
         fixture.status.clone(),
         Duration::from_secs(10),
     ));
     let config = fixture.config(service.clone());
-    let remote_config = crate::modules::config::Module::new();
+    let remote_fixture = Fixture::new();
+    let remote_network = remote_fixture.service();
+    let remote_config = crate::modules::config::Module::from_service(
+        remote_network
+            .config()
+            .with_change_handler("network", remote_network),
+    );
     let remote_config_service = remote_config.service();
     let routes = remote_config
         .router()
@@ -1045,7 +1125,7 @@ async fn check_remote_config_and_status(
     );
     assert_eq!(
         config.value("network", "relay_token").await.unwrap().value,
-        "本机配置"
+        true
     );
     assert_eq!(
         fixture.status.value("emacs", "runtime").unwrap().value["pid"],
@@ -1196,8 +1276,7 @@ async fn mobile_http(address: std::net::SocketAddr, path: &str) -> (u16, Value) 
 #[tokio::test]
 async fn binding_credentials_are_persistent_peer_scoped_and_revoked_on_rebinding() {
     let fixture = Fixture::new();
-    let path = fixture.root.join("peers.json");
-    let manager = Arc::new(PairingService::new(Ok(path.clone())));
+    let manager = Arc::new(PairingService::new(fixture.stored_config()));
     let server = SecretKey::generate().public().to_string();
     let phone = SecretKey::generate().public();
     let other = SecretKey::generate().public();
@@ -1245,7 +1324,7 @@ async fn binding_credentials_are_persistent_peer_scoped_and_revoked_on_rebinding
             .unwrap()
             .contains(&token)
     );
-    let restarted = PairingService::new(Ok(path));
+    let restarted = PairingService::new(fixture.stored_config());
     restarted.authenticate(phone, &token).await.unwrap();
     let next = manager
         .create(server, "https://relay.example/".into(), "relay".into())

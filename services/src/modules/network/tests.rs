@@ -13,7 +13,7 @@ use iroh::SecretKey;
 use serde_json::{Value, json};
 
 use super::{
-    IdentityStore, IrohRelayRegistrar, NetworkService, RelayRegistrar, RelaySession,
+    IrohRelayRegistrar, NetworkService, RelayRegistrar, RelaySession, identity,
     protocol::ConnectionStatus, relay::RelayFuture,
 };
 use crate::{
@@ -116,6 +116,34 @@ impl Fixture {
     pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!("loki-network-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("pass-store")).unwrap();
+        let pass = root.join("test-pass");
+        fs::write(
+            &pass,
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+    show) cat "$PASSWORD_STORE_DIR/$3.gpg" ;;
+    insert)
+        entry="$PASSWORD_STORE_DIR/$5.gpg"
+        mkdir -p "$(dirname "$entry")"
+        cat > "$entry"
+        ;;
+    rm) rm -f "$PASSWORD_STORE_DIR/$4.gpg" ;;
+    *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&pass, fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = json!({"password":{
+            "store_dir":root.join("pass-store"), "pass_path":pass
+        }});
+        fs::write(
+            root.join("pass-config.yml"),
+            serde_yaml_ng::to_string(&settings).unwrap(),
+        )
+        .unwrap();
         Self {
             root,
             registrar: Arc::default(),
@@ -123,12 +151,17 @@ impl Fixture {
             status: Arc::default(),
         }
     }
-    pub(super) fn store(&self) -> IdentityStore {
-        IdentityStore::new(self.root.join("identity.json"))
+    pub(super) fn stored_config(&self) -> ConfigService {
+        use crate::modules::password::{config::PasswordConfig, service::PasswordService};
+        let settings = Arc::new(ConfigService::load(self.root.join("pass-config.yml")).unwrap());
+        let passwords = Arc::new(PasswordService::new(PasswordConfig::new(settings)));
+        ConfigService::load(self.root.join("config.yml"))
+            .unwrap()
+            .with_password_service(passwords)
     }
     pub(super) fn service(&self) -> Arc<NetworkService> {
         Arc::new(NetworkService::new(
-            Ok(self.store()),
+            self.stored_config(),
             self.registrar.clone(),
             Arc::new(NotificationService::with_launcher(
                 self.launcher.clone(),
@@ -139,11 +172,7 @@ impl Fixture {
         ))
     }
     pub(super) fn config(&self, service: Arc<NetworkService>) -> Arc<ConfigService> {
-        Arc::new(
-            ConfigService::load(self.root.join("config.yml"))
-                .unwrap()
-                .with_change_handler("network", service),
-        )
+        Arc::new(service.config().with_change_handler("network", service))
     }
     fn phase(&self) -> Value {
         self.status.value("network", "my").unwrap().value["status"].clone()
@@ -167,18 +196,21 @@ impl Drop for Fixture {
 #[tokio::test]
 async fn creates_private_identity_atomically_and_reuses_it_across_instances() {
     let fixture = Fixture::new();
-    let first_store = fixture.store();
-    let second_store = fixture.store();
-    let (first, second) = tokio::join!(first_store.ensure(), second_store.ensure());
+    let first_store = fixture.stored_config();
+    let second_store = first_store.clone();
+    let (first, second) = tokio::join!(
+        identity::ensure(&first_store),
+        identity::ensure(&second_store)
+    );
     let (first, created_first) = first.unwrap();
     let (second, created_second) = second.unwrap();
     assert_ne!(created_first, created_second);
     assert_eq!(first.public(), second.public());
-    let (loaded, created) = fixture.store().ensure().await.unwrap();
+    let (loaded, created) = identity::ensure(&fixture.stored_config()).await.unwrap();
     assert!(!created);
     assert_eq!(loaded.public(), first.public());
     assert_eq!(
-        fs::metadata(fixture.root.join("identity.json"))
+        fs::metadata(fixture.root.join("config.yml"))
             .unwrap()
             .permissions()
             .mode()
@@ -187,7 +219,11 @@ async fn creates_private_identity_atomically_and_reuses_it_across_instances() {
     );
     let other = Fixture::new();
     assert_ne!(
-        other.store().ensure().await.unwrap().0.public(),
+        identity::ensure(&other.stored_config())
+            .await
+            .unwrap()
+            .0
+            .public(),
         first.public()
     );
 }
@@ -197,13 +233,13 @@ async fn corrupt_or_symlinked_identity_is_not_overwritten() {
     let fixture = Fixture::new();
     let path = fixture.root.join("identity.json");
     fs::write(&path, "损坏的身份").unwrap();
-    assert!(fixture.store().ensure().await.is_err());
+    assert!(identity::ensure(&fixture.stored_config()).await.is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), "损坏的身份");
     fs::remove_file(&path).unwrap();
     let target = fixture.root.join("target");
     fs::write(&target, "保留原文件").unwrap();
     symlink(&target, &path).unwrap();
-    assert!(fixture.store().ensure().await.is_err());
+    assert!(identity::ensure(&fixture.stored_config()).await.is_err());
     assert_eq!(fs::read_to_string(target).unwrap(), "保留原文件");
 }
 
@@ -211,9 +247,8 @@ async fn corrupt_or_symlinked_identity_is_not_overwritten() {
 async fn startup_without_relay_generates_identity_once_and_never_connects() {
     let fixture = Fixture::new();
     let service = fixture.service();
-    let config = fixture.config(service.clone());
-    service.start(config.clone()).await.unwrap();
-    service.start(config).await.unwrap();
+    service.start().await.unwrap();
+    service.start().await.unwrap();
     assert_eq!(fixture.titles(), ["已生成本地身份"]);
     assert!(fixture.registrar.calls.lock().unwrap().is_empty());
 }
@@ -265,7 +300,7 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
     let service = fixture.service();
     let config = fixture.config(service.clone());
     fixture.registrar.fail.store(true, Ordering::SeqCst);
-    assert!(service.start(config.clone()).await.is_err());
+    assert!(service.start().await.is_err());
     assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册失败"]);
     assert_eq!(
         config.value("network", "relay_url").await.unwrap().value,
@@ -279,7 +314,7 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
         .unwrap();
     service.shutdown().await;
     let restarted = fixture.service();
-    restarted.start(config).await.unwrap();
+    restarted.start().await.unwrap();
     assert_eq!(fixture.registrar.calls.lock().unwrap().len(), 3);
     assert_eq!(
         fixture
@@ -357,16 +392,13 @@ async fn failed_change_returns_http_error_and_preserves_old_connection_and_file(
 #[tokio::test]
 async fn storage_failure_discards_candidate_without_success_notification() {
     let fixture = Fixture::new();
-    let service = fixture.service();
-    let path = fixture.root.join("blocked/config.yml");
-    fs::create_dir(path.parent().unwrap()).unwrap();
+    let path = fixture.root.join("config.yml");
     fs::write(&path, "network:\n  relay_token: test-token\n").unwrap();
-    let config = ConfigService::load(&path)
-        .unwrap()
-        .with_change_handler("network", service.clone());
+    let service = fixture.service();
+    let config = fixture.config(service.clone());
+    service.start().await.unwrap();
     fs::remove_file(&path).unwrap();
-    fs::remove_dir(path.parent().unwrap()).unwrap();
-    fs::write(path.parent().unwrap(), "阻止落盘").unwrap();
+    fs::create_dir(&path).unwrap();
     assert!(matches!(
         config
             .replace("network", "relay_url", json!("https://new.example"))
@@ -412,8 +444,11 @@ async fn timeout_and_identity_failure_are_notified_and_notification_failure_does
         .await
         .unwrap();
     service.shutdown().await;
-    fs::write(fixture.root.join("identity.json"), "损坏").unwrap();
-    assert!(service.start(config).await.is_err());
+    config
+        .set_system_value("network_identity", "损坏")
+        .await
+        .unwrap();
+    assert!(service.start().await.is_err());
     assert_eq!(fixture.titles().last().unwrap(), "网络身份初始化失败");
 }
 
@@ -445,7 +480,7 @@ async fn real_iroh_registration_uses_only_the_configured_ephemeral_relay() {
     let address = format!("http://{}", relay.http_addr().unwrap());
     let fixture = Fixture::new();
     let service = Arc::new(NetworkService::new(
-        Ok(fixture.store()),
+        fixture.stored_config(),
         Arc::new(IrohRelayRegistrar::new()),
         Arc::new(NotificationService::with_launcher(
             fixture.launcher.clone(),
@@ -536,7 +571,7 @@ async fn incomplete_settings_are_saved_without_registration_on_startup_or_update
         .unwrap();
         let service = fixture.service();
         let config = fixture.config(service.clone());
-        service.start(config.clone()).await.unwrap();
+        service.start().await.unwrap();
         config
             .replace("network", "relay_url", json!(url))
             .await
@@ -590,9 +625,9 @@ async fn either_setting_order_registers_only_after_both_are_saved_and_token_chan
                 .0
                 .load(Ordering::SeqCst)
         );
-        let loaded = ConfigService::load(fixture.root.join("config.yml")).unwrap();
+        let loaded = fixture.stored_config();
         assert_eq!(
-            loaded.value("network", "relay_token").await.unwrap().value,
+            super::config::relay_token(&loaded).await.unwrap(),
             "rotated-token"
         );
         config
@@ -618,7 +653,7 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     use tower::ServiceExt;
     let fixture = Fixture::new();
     let service = Arc::new(NetworkService::new(
-        Ok(fixture.store()),
+        fixture.stored_config(),
         fixture.registrar.clone(),
         Arc::new(NotificationService::with_launcher(
             fixture.launcher.clone(),
@@ -646,6 +681,15 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     })
     .await
     .unwrap();
+    let peer = super::peers::StoredPeer {
+        device_type: super::protocol::DeviceType::default(),
+        endpoint_id: SecretKey::generate().public().to_string(),
+        name: "测试设备".into(),
+        bound_at: 1,
+        binding_token: None,
+    };
+    let endpoint_id = peer.endpoint_id.clone();
+    super::peers::save(&config, vec![peer]).await.unwrap();
     let response = tokio::time::timeout(
         Duration::from_millis(100),
         fixture.status.router().oneshot(
@@ -665,6 +709,12 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
     fixture.registrar.hang.store(false, Ordering::SeqCst);
     fixture.registrar.resume.notify_one();
     task.await.unwrap().unwrap();
+    assert!(
+        super::peers::load(&fixture.stored_config())
+            .await
+            .unwrap()
+            .contains_key(&endpoint_id)
+    );
     assert_eq!(fixture.phase(), "connected");
     fixture.registrar.fail.store(true, Ordering::SeqCst);
     *fixture.registrar.failure_message.lock().unwrap() = Some("拒绝 secret-token".to_owned());
@@ -674,7 +724,7 @@ async fn status_read_during_registration_is_immediate_and_rejected_token_preserv
         .unwrap_err();
     assert!(!error.to_string().contains("secret-token"));
     assert_eq!(
-        config.value("network", "relay_token").await.unwrap().value,
+        super::config::relay_token(&config).await.unwrap(),
         "valid-token"
     );
     assert_eq!(fixture.phase(), "connected");

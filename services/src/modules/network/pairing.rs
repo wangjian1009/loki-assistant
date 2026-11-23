@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,6 +8,8 @@ use iroh::{EndpointId, SecretKey, endpoint::Connection};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::{sync::Mutex, time::Instant};
+
+use crate::modules::config::service::ConfigService;
 
 use super::{
     peers::{self, StoredPeer},
@@ -67,7 +68,7 @@ impl State {
 /// 邀请仅驻留内存；设备保存成功后才提交消费结果。
 #[derive(Debug)]
 pub(super) struct PairingService {
-    path: Result<PathBuf, String>,
+    config: ConfigService,
     state: Arc<Mutex<State>>,
 }
 
@@ -79,27 +80,22 @@ pub(super) fn now() -> u64 {
 }
 
 impl PairingService {
-    pub fn new(path: Result<PathBuf, String>) -> Self {
+    pub fn new(config: ConfigService) -> Self {
         Self {
-            path,
+            config,
             state: Arc::new(Mutex::new(State::default())),
         }
     }
 
     async fn load(&self, state: &mut State) -> Result<(), NetworkError> {
         if state.peers.is_none() {
-            let path = self
-                .path
-                .as_ref()
-                .map_err(|_| NetworkError::Storage)?
-                .clone();
-            state.peers = Some(
-                tokio::task::spawn_blocking(move || peers::load(&path))
-                    .await
-                    .map_err(|_| NetworkError::Storage)??,
-            );
+            state.peers = Some(peers::load(&self.config).await?);
         }
         Ok(())
+    }
+
+    pub(super) async fn initialize(&self) -> Result<(), NetworkError> {
+        self.load(&mut *self.state.lock().await).await
     }
 
     pub async fn create(
@@ -244,15 +240,7 @@ impl PairingService {
     }
 
     async fn save(&self, peers: &BTreeMap<String, StoredPeer>) -> Result<(), NetworkError> {
-        let path = self
-            .path
-            .as_ref()
-            .map_err(|_| NetworkError::Storage)?
-            .clone();
-        let peers = peers.values().cloned().collect();
-        tokio::task::spawn_blocking(move || peers::save(path, peers))
-            .await
-            .map_err(|_| NetworkError::Storage)?
+        peers::save(&self.config, peers.values().cloned().collect()).await
     }
 
     pub async fn bind(
@@ -359,8 +347,7 @@ mod expiry_tests {
     use super::*;
     #[tokio::test(start_paused = true)]
     async fn expired_invitation_is_removed_without_a_later_request() {
-        let path = std::env::temp_dir().join(format!("loki-expiry-{}.json", uuid::Uuid::new_v4()));
-        let manager = PairingService::new(Ok(path));
+        let manager = PairingService::new(ConfigService::from_registry());
         let created = manager
             .create(
                 SecretKey::generate().public().to_string(),

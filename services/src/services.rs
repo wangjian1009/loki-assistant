@@ -95,18 +95,15 @@ impl Services {
             Arc::clone(&notification),
         ));
         let service = service::Module::new(Arc::clone(&status));
-        let identity = config::service::ConfigService::storage_path()
-            .map(|path| network::IdentityStore::new(path.with_file_name("identity.json")))
-            .map_err(|error| error.to_string());
+        let password = password::Module::new(Arc::new(config.clone()));
+        let config = config.with_password_service(password.service());
         let network = Arc::new(network::NetworkService::new(
-            identity,
+            config.clone(),
             Arc::new(network::IrohRelayRegistrar::new()),
             Arc::clone(&notification),
             Arc::clone(&status),
             Duration::from_secs(10),
         ));
-        let password = password::Module::new(Arc::new(config.clone()));
-        let config = config.with_password_service(password.service());
         let base_config = Arc::new(config.clone());
         let emacs = emacs::Module::new(
             Arc::clone(&base_config),

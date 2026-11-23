@@ -144,17 +144,17 @@ Slack 模块通过只读配置 ~slack/watches~ 持久化全局主题聊天关注
 
 * 网络模块
 
-~network~ 的 ~relay_url~ （中转地址）和 ~relay_token~ （中转令牌）均为非必填字符串，默认空字符串。中转地址可通过 Emacs 配置界面或通用配置接口保存。中转令牌从权限为 ~0600~ 的 ~~/.assistant/config.yml~ 加载，在 Emacs 和配置 HTTP 接口中为只读。填写本机文件时使用中转服务器已有的共享访问令牌，重启 services 后加载。
+~network.relay_url~ 为配置文件中的中转地址。 ~network.relay_token~ 为 ~Password~ 类型，对应 pass 条目 ~loki-assistant/network/relay.gpg~ ，使用首行的共享访问令牌。配置 API 中令牌项为只读，只返回凭据是否可用。通过已配置的 pass 密码库保存或更新令牌后重启 services。地址和令牌都非空时注册中转。
 
 ** 本地身份
 
-服务启动及接收网络配置提交时检查 ~~/.assistant/identity.json~ 。文件不存在时，使用 iroh 的系统随机源生成私钥和 Endpoint ID，并以 ~0600~ 权限原子发布；新建目录权限为 ~0700~ 。并发创建不覆盖已发布的身份，符号链接和非普通文件被拒绝。身份文件包含 ~version: 1~ 、 ~secret_key~ 和 ~endpoint_id~ ，读取时验证公私钥匹配，损坏时通知并报错，不静默重新生成。
+本地身份通过 ~~/.assistant/config.yml~ 的 ~_system.network_identity~ 记录 Endpoint ID 和 ~Password~ 引用。私钥以 Base64 编码后由 pass 加密，条目路径为 ~loki-assistant/network/identity.gpg~ 。服务启动及接收网络配置提交时读取私钥，并核对公私钥是否匹配。首次使用时生成随机身份，已有身份缺失私钥或校验失败时会通知初始化失败。
 
-生成成功通过共享 ~NotificationService~ 发送“已生成本地身份”，正文只有保存位置和 Endpoint ID；复用已有身份不重复通知。私钥保存在独立文件中，不进入配置 API、发现元数据、日志或通知。身份不会因注册失败或清空中转配置而删除。
+升级时，服务将配置文件中的旧中转令牌、身份私钥和设备绑定令牌迁入已配置的 pass 密码库。旧版 ~~/.assistant/identity.json~ 和 ~~/.assistant/peers.json~ 仍可直接迁移。服务在凭据保存成功后原子更新配置文件，再移除已导入的旧文件。已有 Endpoint ID 和绑定凭据会一并保留。密码库不可用时保留待迁移的数据，可在恢复密码库后重试。内部凭据条目不通过密码查询 API 提供。
 
 ** 注册和生命周期
 
-地址和令牌均非空白时开始注册。未配齐时状态为未配置。修改中转地址时，配置处理器从候选配置快照读取地址及本机已加载的令牌。地址须为 HTTP(S) URL，且仅包含主机、端口和路径。连接启用 TLS 验证。
+地址和令牌均非空白时开始注册。未配齐时状态为未配置。修改中转地址时，配置处理器用候选地址和 pass 中的令牌尝试注册。地址须为 HTTP(S) URL，且仅包含主机、端口和路径。连接启用 TLS 验证。
 
 “注册”表示使用本地持久化身份与指定 iroh-relay 建立中转连接，确认 relay 已接受节点。端点同时声明绑定协议 ~loki-assistant/pair/1~ 、兼容设备状态协议 ~loki-assistant/device-status/1~ 和通用请求协议 ~loki-assistant/services/1~ ，由进程入口显式调度接收任务；当前接收绑定与已绑定设备的通用 HTTP 请求。HTTP listener 只监听 loopback。注册最多等待 10 秒，认证拒绝提前失败。地址或令牌变化均重新注册，成功后才允许落盘，并在 ~committed~ 中替换旧连接、作废未完成邀请并发送成功通知；失败发送失败通知，返回 ~config-change-rejected~ ，保留原配置、连接和邀请。相同配置已连接时不重复注册，失败后重新提交可以重试。
 
@@ -262,7 +262,7 @@ Emacs 打开管理页面仅调用 ~GET /network/peers~ ，不创建邀请。点�
 
 ~DELETE /network/peers/{endpoint_id}~ 先持久化删除，再关闭该设备当前被跟踪的连接，并取消该设备已经消费的邀请，防止旧请求恢复绑定。成功返回 ~{"api_version":"1","endpoint_id":"...","removed":true}~ ；设备不存在返回 404 ~peer-not-found~ 。解除绑定不撤销共享中继令牌，持有新邀请的设备可以再次绑定。设备状态 ALPN 查询同一份绑定关系并纳入连接撤销；后续业务协议同样必须遵守此边界。
 
-设备记录独立保存在 ~~/.assistant/peers.json~ ，包含 ~version: 1~ 和 ~peers~ 数组，最多 256 个设备。文件使用 ~0600~ 权限，通过同目录临时文件、文件同步和原子 rename 更新；目录创建权限为 ~0700~ 。读取拒绝符号链接、非普通文件、超过 1 MiB、重复身份或无效结构，损坏记录报错且不自动覆盖。重启会恢复绑定关系和每个手机的 ~binding_token~ ，不恢复邀请。设备列表及邀请查询不返回该凭据；Debug 隐藏原文。旧授权记录无凭据时须重新扫码，不能用身份本身 跳过凭据验证。
+设备记录保存在 ~~/.assistant/config.yml~ 的 ~_system.network_peers~ 中，最多 256 个设备。每个 ~binding_token~ 字段为 ~Password~ 引用，凭据由 pass 加密。重新绑定时先保存新凭据并提交配置，再清理旧条目。解绑先撤销设备授权，再清理对应的 pass 条目。导入和读取时均校验结构与身份唯一性。损坏记录须人工修复，服务会返回设备记录错误。邀请仅在内存中保留。设备列表和邀请查询只返回设备元数据。旧授权记录缺少绑定凭据时须重新扫码。
 
 *** 电脑状态查询与手机持久化
 

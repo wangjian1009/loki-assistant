@@ -617,11 +617,7 @@ impl ConfigService {
     }
 
     async fn persist_notifications(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
-        if let Some(storage) = &self.storage {
-            storage.write(values.clone()).await?;
-        }
-        *self.values.write().await = values;
-        Ok(())
+        self.persist_values(values).await
     }
 
     pub async fn migrate_pending_password_paths(&self) -> Result<(), ConfigServiceError> {

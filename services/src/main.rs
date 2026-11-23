@@ -35,7 +35,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let notification_retry = tokio::spawn(async move { notification.retry_pending().await });
     let network = Arc::clone(&services.network);
     let network_start = tokio::spawn(async move {
-        if let Err(error) = network.start(config).await {
+        if let Err(error) = network.start().await {
             eprintln!("网络初始化失败：{error}");
         }
         network.monitor().await;

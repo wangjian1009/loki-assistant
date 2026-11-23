@@ -4,7 +4,52 @@ use serde_json::Value;
 use crate::modules::config::{
     model::{ConfigDataType, ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata},
     registry::ConfigItemRegistration,
+    service::{ConfigService, ConfigServiceError, Password},
 };
+
+const RELAY_PASSWORD_PATH: &str = "loki-assistant/network/relay.gpg";
+const LEGACY_RELAY_TOKEN: &str = "network_relay_token";
+
+pub(super) fn relay_password() -> Password {
+    Password::new(RELAY_PASSWORD_PATH.into())
+}
+
+pub(super) async fn relay_token(config: &ConfigService) -> Result<String, ConfigServiceError> {
+    let password = relay_password();
+    config
+        .update_system_value(LEGACY_RELAY_TOKEN, None, async |legacy| {
+            if let Some(value) = legacy {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| ConfigServiceError::Storage("旧中转令牌格式无效。".into()))?;
+                if !value.trim().is_empty() {
+                    password.import(config, value).await?;
+                    return Ok((None, value.to_owned()));
+                }
+            }
+            Ok((
+                None,
+                password.read_optional(config).await?.unwrap_or_default(),
+            ))
+        })
+        .await
+}
+
+pub(super) async fn relay_token_is_set(config: &ConfigService) -> bool {
+    if let Some(legacy) = config.system_value(LEGACY_RELAY_TOKEN).await
+        && legacy
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+    relay_password()
+        .read_optional(config)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|value| !value.trim().is_empty())
+}
 
 #[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
 static RELAY_TOKEN_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
@@ -43,11 +88,15 @@ fn network_config_metadata() -> ConfigModuleMetadata {
             ConfigItemMetadata {
                 key: "relay_token".to_owned(),
                 name: "中转令牌".to_owned(),
-                description: "从本机配置文件读取的共享访问令牌，与中转地址一起生效。".to_owned(),
-                data_type: ConfigDataType::String,
+                description: "保存在本机 pass 密码库中的共享访问令牌，与中转地址一起生效。"
+                    .to_owned(),
+                data_type: ConfigDataType::Password {
+                    path: RELAY_PASSWORD_PATH.into(),
+                    key: None,
+                },
                 remote_access: crate::modules::config::model::ConfigRemoteAccess::Local,
                 required: false,
-                default: Some(Value::String(String::new())),
+                default: None,
                 dictionary: None,
                 list: None,
                 checker: None,
