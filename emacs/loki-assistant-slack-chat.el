@@ -14,6 +14,7 @@
 (declare-function consult--read "consult")
 (declare-function consult--tofu-append "consult")
 (declare-function consult--async-sink "consult")
+(defvar consult--completion-candidate-hook)
 (declare-function shell-maker-start-v2 "shell-maker")
 (declare-function make-shell-maker-config "shell-maker")
 (declare-function agent-shell-ui-make-fragment-model "agent-shell-ui")
@@ -95,6 +96,7 @@
 (defvar-local loki-assistant-slack--attachment-downloads nil)
 (defvar loki-assistant-slack--selection nil)
 (defvar loki-assistant-slack--completion-choices nil)
+(defvar loki-assistant-slack--pick-users-only nil)
 (defconst loki-assistant-slack--user-group 3)
 (defconst loki-assistant-slack--recent-users-limit 100)
 (defvar loki-assistant-slack--recent-users nil)
@@ -200,18 +202,18 @@
 
 (defun loki-assistant-slack--matches (input table pred)
   "按照分组和匹配程度返回 TABLE 中符合 INPUT 和 PRED 的候选。"
-  (let* ((users (string-prefix-p "@" input))
-         (query (downcase (string-trim (if users (substring input 1) input))))
+  (let* ((at-prefix (string-prefix-p "@" input))
+         (query (downcase (string-trim (if (and loki-assistant-slack--pick-users-only at-prefix)
+                                         (substring input 1) input))))
          (pattern (mapconcat (lambda (char) (regexp-quote (char-to-string char))) query ".*?"))
          matches)
     (dolist (candidate (all-completions "" table pred))
       (when-let ((choice (gethash candidate loki-assistant-slack--completion-choices)))
-        (let ((group (loki-assistant-slack--choice-group choice)))
-          (when (eq users (= group loki-assistant-slack--user-group))
-            (let* ((fields (loki-assistant-slack--choice-search choice))
-                   (exact (or (string-empty-p query) (equal candidate input) (member query fields))))
-              (when (or exact (seq-some (lambda (field) (string-match-p pattern field)) fields))
-                (push (list candidate group (if exact 0 1)) matches)))))))
+        (let* ((fields (loki-assistant-slack--choice-search choice))
+               (exact (or (string-empty-p query) (equal candidate input) (member query fields))))
+          (when (or exact (seq-some (lambda (field) (string-match-p pattern field)) fields))
+            (push (list candidate (loki-assistant-slack--choice-group choice) (if exact 0 1))
+                  matches)))))
     (mapcar #'car
             (cl-stable-sort (nreverse matches)
                             (lambda (left right)
@@ -413,25 +415,29 @@
            (message "%s" (or (plist-get response :error-message) "无法打开 Slack 私聊"))))))
    :room user))
 
-(defun loki-assistant-slack--choose (window selection rooms &optional status)
-  "在 WINDOW 选择当前请求 SELECTION 得到的 ROOMS。"
+(defun loki-assistant-slack--choose (window selection rooms &optional status on-user)
+  "在 WINDOW 选择当前请求 SELECTION 得到的 ROOMS。
+ON-USER 非空时只显示用户，并用选中的用户和打开私聊标记调用它。"
   (when (and (eq selection loki-assistant-slack--selection) (window-live-p window))
     (if (active-minibuffer-window)
         (message "请退出当前 minibuffer 后重新选择 Slack 聊天。")
-      (let* ((opened (loki-assistant-slack--open-rooms))
+      (let* ((opened (unless on-user (loki-assistant-slack--open-rooms)))
              (listed (mapcar (lambda (room) (alist-get 'id room)) rooms))
              (sink (consult--async-sink))
              (window-width (window-body-width (minibuffer-window (window-frame window))))
              (title-width (min 38 (max 14 (/ window-width 4))))
              (sender-width (min 18 (max 8 (/ window-width 8))))
              (choices-table (make-hash-table :test #'equal))
+             (keymap (when on-user (make-sparse-keymap)))
              (loki-assistant-slack--completion-choices choices-table)
+             (loki-assistant-slack--pick-users-only (and on-user t))
              (completion-styles-alist (cons '(loki-slack loki-assistant-slack--try-completion
                                                          loki-assistant-slack--all-completions "Slack 模糊匹配。") completion-styles-alist))
              (completion-category-overrides (cons '(loki-slack (styles loki-slack)) completion-category-overrides))
              (completion-ignore-case t)
-             minibuffer user-loading user-loaded user-status)
-        (maphash (lambda (id room) (unless (member id listed) (push room rooms))) opened)
+             minibuffer user-requested open-dm)
+        (when opened
+          (maphash (lambda (id room) (unless (member id listed) (push room rooms))) opened))
         (let ((keys (cl-loop for room in rooms for index from 0
                              for choice = (loki-assistant-slack--choice-for room (gethash (alist-get 'id room) opened))
                              for key = (consult--tofu-append
@@ -445,48 +451,55 @@
                                       (loki-assistant-slack--choice< (gethash left choices-table)
                                                                      (gethash right choices-table)))))))
         (cl-labels
-            ((show-status (input)
-               (let* ((users (string-prefix-p "@" input))
-                      (notice (if users
-                                  (if user-loading "正在读取 Slack 用户目录" user-status)
-                                status)))
-                 (cond (notice (minibuffer-message "%s" notice))
-                       ((not (loki-assistant-slack--matches input minibuffer-completion-table nil))
-                        (minibuffer-message "%s" (if users "未找到匹配的用户" "未找到匹配的聊天"))))))
+            ((open-selected-dm ()
+               (interactive)
+               (let ((key (run-hook-with-args-until-success 'consult--completion-candidate-hook)))
+                 (unless (and key (gethash key choices-table))
+                   (user-error "请选择 Slack 用户"))
+                 (setq open-dm t)
+                 (delete-minibuffer-contents)
+                 (insert key)
+                 (exit-minibuffer)))
+             (show-status (input)
+               (cond (status (minibuffer-message "%s" status))
+                     ((not (loki-assistant-slack--matches input minibuffer-completion-table nil))
+                      (minibuffer-message "%s" (if on-user "未找到匹配的用户" "未找到匹配的聊天")))))
              (receive-users (response)
                (when (and minibuffer (eq selection loki-assistant-slack--selection))
-                 (setq user-loading nil user-loaded t)
                  (if (plist-get response :ok)
                      (let ((data (plist-get response :data)))
-                       (unless (seq-empty-p (alist-get 'issues data))
-                         (setq user-status "部分 Slack 工作区的用户目录暂不可用"))
+                       (setq status (unless (seq-empty-p (alist-get 'issues data))
+                                      "部分 Slack 工作区的用户目录暂不可用"))
                        (when-let ((keys (loki-assistant-slack--user-choices
                                          (alist-get 'items data) choices-table title-width)))
                          (funcall sink keys)))
-                   (setq user-status (or (plist-get response :error-message) "Slack 用户目录暂不可用")))
+                   (setq status (or (plist-get response :error-message) "Slack 用户目录暂不可用")))
                  (when-let ((active (active-minibuffer-window)))
                    (when (eq (window-buffer active) minibuffer)
                      (with-selected-window active
-                       (let ((input (minibuffer-contents-no-properties)))
-                         (when (string-prefix-p "@" input)
-                           (funcall sink 'refresh)
-                           (show-status input))))))))
+                       (funcall sink 'refresh)
+                       (show-status (minibuffer-contents-no-properties)))))))
              (source (action)
                (pcase action
                  ('setup (setq minibuffer (current-buffer)) (funcall sink action))
                  ('destroy (setq minibuffer nil) (funcall sink action))
                  ((pred stringp)
                   (when (eq (current-buffer) minibuffer)
-                    (when (and (string-prefix-p "@" action) (not user-loading) (not user-loaded))
-                      (setq user-loading t)
+                    (when (and on-user (not user-requested))
+                      (setq user-requested t status "正在读取 Slack 用户目录")
                       (loki-assistant-slack--request "GET" "/slack/users" #'receive-users))
                     (show-status action)))
                  (_ (funcall sink action)))))
+          (when keymap
+            (define-key keymap (kbd "S-<return>") #'open-selected-dm)
+            (define-key keymap (kbd "S-RET") #'open-selected-dm))
           (when-let ((choice
                       (with-selected-window window
                         (consult--read
                          #'source
-                         :prompt "Slack 聊天（@ 选人）：" :category 'loki-slack
+                         :prompt (if on-user "Slack 用户（Shift+Enter 打开私聊）："
+                                   "Slack 聊天：")
+                         :category 'loki-slack :keymap keymap
                          :async-wrap nil :sort nil :require-match t
                          :lookup (lambda (key &rest _) (gethash key choices-table))
                          :group (lambda (key transform)
@@ -498,9 +511,38 @@
                                       key (gethash key choices-table)
                                       title-width sender-width window-width))))))
             (let ((target (loki-assistant-slack--choice-room choice)))
-              (if (= (loki-assistant-slack--choice-group choice) loki-assistant-slack--user-group)
-                  (loki-assistant-slack--open-user-chat target selection)
+              (if on-user
+                  (funcall on-user target open-dm)
                 (loki-assistant-slack--open target)))))))))
+
+(defun loki-assistant-slack--complete-user ()
+  "在聊天输入区的行首或空白后键入 @ 时选择用户。"
+  (when (and (eq last-command-event ?@) (eq (char-before) ?@)
+             (get-buffer-process (current-buffer))
+             (> (point) (loki-assistant-slack--draft-start))
+             (or (= (1- (point)) (loki-assistant-slack--draft-start))
+                 (memq (char-before (1- (point))) '(?\s ?\t ?\n)))
+             (not (active-minibuffer-window))
+             (require 'consult nil t))
+    (let ((trigger (copy-marker (1- (point)) t))
+          (selection (setq loki-assistant-slack--selection (list nil))))
+      (unwind-protect
+          (loki-assistant-slack--choose
+           (selected-window) selection nil nil
+           (lambda (user open-dm)
+             (when-let ((buffer (marker-buffer trigger)))
+               (with-current-buffer buffer
+                 (when (eq (char-after trigger) ?@)
+                   (goto-char (1+ trigger))
+                   (if open-dm
+                       (delete-region trigger (point))
+                     (insert (or (loki-assistant-slack--single-line (alist-get 'username user))
+                                 (loki-assistant-slack--single-line (alist-get 'name user))
+                                 (alist-get 'id user))
+                             " "))))
+               (when open-dm
+                 (loki-assistant-slack--open-user-chat user selection)))))
+        (set-marker trigger nil)))))
 
 ;;;###autoload
 (defun loki-assistant-slack-select-chat ()
@@ -2128,9 +2170,15 @@
 
 (define-minor-mode loki-assistant-slack-input-mode
   "在 shell-maker 缓冲区中编辑和发送 Slack 消息。"
-  :keymap loki-assistant-slack-input-mode-map)
+  :keymap loki-assistant-slack-input-mode-map
+  (if loki-assistant-slack-input-mode
+      (add-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user nil t)
+    (remove-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user t)))
 
 (dolist (buffer (buffer-list))
+  (with-current-buffer buffer
+    (when loki-assistant-slack-input-mode
+      (add-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user nil t)))
   (when (loki-assistant-slack--chat-buffer-p buffer)
     (with-current-buffer buffer (loki-assistant-slack--update-history))))
 
