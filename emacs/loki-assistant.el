@@ -306,10 +306,8 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
 (with-eval-after-load 'org-edna
   (require 'loki-assistant-edna))
 
-(if (featurep 'org-roam)
-    (require 'loki-assistant-capture)
-  (with-eval-after-load 'org-roam
-    (require 'loki-assistant-capture)))
+(autoload 'loki-assistant-doc-get "loki-assistant-doc")
+(autoload 'loki-assistant-doc-capture-full "loki-assistant-doc")
 
 (provide 'loki-assistant)
 ;;; loki-assistant.el ends here

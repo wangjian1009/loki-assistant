@@ -22,6 +22,8 @@
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 
+`modules/doc/` 在相同路径模板上提供 `GET /doc/{id}` 与 `POST /doc/{target}`。services 通过 Emacs gateway 转交文档 ID 或捕获目标与 Org 全文，返回标准 HTTP 结果。Emacs 文档模块决定模板、归档位置、查重与索引。
+
 `modules/password/` 提供只读查询协议。服务在加载用户配置前定位 `gpg`，并从进程环境的 `PASSWORD_STORE_DIR` 或 `$HOME/.password-store` 确定密码库。业务 HTTP 提供 `GET /password/entries` 和 `GET /password/entries/{*file}`。文件系统负责条目枚举、路径边界检查和密文的原子更新，GnuPG 命令经可注入的 `CommandRunner` 执行。密码主控通过 `gpg --show-only-session-key` 与 `gpg-agent` 交互，按密文摘要缓存会话密钥，rPGP 解密任务并行读取同一份密文快照。单项写入按路径排队。HTTP 不提供密码写入操作。明文与 GPG 原始错误不得进入日志、通知、状态或发现元数据。测试使用临时目录及进程替身。
 
 HTTP 错误统一返回 `api_version`、HTTP 数字 `status` 和 `error.source/code/message`；`source` 仅使用 `services`、`emacs`、`business`，`code`、`message` 必须为非空字符串，客户端按 `code` 判断并显示 `message`，不得新增模块专用错误外壳。

@@ -1,7 +1,7 @@
 #+TITLE: Chrome 插件、密码查询与全文捕获设计
 #+LANGUAGE: zh-CN
 
-本文记录 Chrome 插件、services 和 Emacs capture 模块的已确认设计与实现边界。
+本文记录 Chrome 插件、services 和 Emacs 文档模块的已确认设计与实现边界。
 第一版实现已落在对应目录；本文仍作为跨模块协议和行为基准。
 
 弹窗布局、Browserpass 操作承载与工具入口见
@@ -24,7 +24,7 @@ Chrome Manifest V3 插件的功能菜单包含全文保存和只读密码查询�
 
 - 浏览器解释当前页面并转换为 Org 文档。
 - services 提供唯一的对外 HTTP 接入点，并通过现有 Emacs gateway 调用 Emacs。
-- =loki-assistant-capture-full= 实现 Org 捕获、去重、窗口激活和保存后的索引处理。
+- =loki-assistant-doc-capture-full= 根据提交目标选模板、按来源去重并保存和索引文章。
 
 Emacs 不启动或依赖独立 HTTP 服务；插件不连接 Emacs 的 HTTP server、simple-httpd、
 =org-protocol= 或剪贴板。
@@ -35,10 +35,10 @@ Emacs 不启动或依赖独立 HTTP 服务；插件不连接 Emacs 的 HTTP serv
 Chrome 当前标签页
   -> activeTab + scripting 读取 DOM
   -> 浏览器内 HTML 转 Org
-  -> POST /emacs/capture/full 到本机 services
+  -> POST /doc/article 到本机 services
   -> services 校验请求并调用 emacsclient gateway
-  -> loki-assistant-capture-full 使用 org-roam capture API 建立捕获缓冲区
-  -> 用户在 Emacs 中 C-c C-c 保存或 C-c C-k 取消
+  -> loki-assistant-doc-capture-full 使用 org-roam 自动保存并更新索引
+  -> 插件显示保存结果或 services 的错误提示
 #+end_example
 
 浏览器只提交页面已经加载的内容，不在 services 或 Emacs 中重新下载网页，也不下载图片。
@@ -109,7 +109,7 @@ Shadow DOM 和 canvas；链接转为绝对 HTTP(S) 地址；图片只保留远�
 Chrome 扩展不读取 =~~/.assistant/service= pfile，直接在代码中固定 services 地址：
 
 #+begin_example
-http://127.0.0.1:47321/emacs/capture/full
+http://127.0.0.1:47321/doc/article
 #+end_example
 
 这是本功能的本机约定，不增加设置页、端口配置或 token。若 services 使用
@@ -118,99 +118,7 @@ http://127.0.0.1:47321/emacs/capture/full
 
 * services HTTP 接口
 
-在现有 =modules/emacs= 中增加业务接口，不新建独立的 HTTP 服务：
-
-#+begin_example
-POST /emacs/capture/full
-Content-Type: application/json
-#+end_example
-
-协议版本沿用 Emacs 模块的 =api_version: "1"= ，字段使用本项目已有的 snake_case 命名。
-
-** 请求
-
-#+begin_src json
-{
-  "title": "网页标题",
-  "url": "https://example.com/article/123",
-  "captured_at": "2026-11-18T12:30:00.000Z",
-  "body": "* 页面正文\n\n浏览器转换后的 Org 内容。\n"
-}
-#+end_src
-
-| 字段 | 类型 | 约束 |
-|------+------+------|
-| =title= | string | 必填、非空、不得含换行；由页面标题清理得到 |
-| =url= | string | 必填；绝对 HTTP 或 HTTPS URL，不含空白 |
-| =captured_at= | string | 必填；UTC RFC 3339，使用 =Z= 后缀 |
-| =body= | string | 必填、非空；浏览器生成的 Org 文本，保留换行 |
-
-未知字段、非法 JSON、字段类型错误和不符合格式的值返回 =400 invalid-request= ，服务不
-调用 Emacs。单次请求体上限建议为 16 MiB，按 UTF-8 字节计算；正文不进入 services
-日志。服务只负责校验和转发，不解释 Org 语法。
-
-** 成功响应
-
-新来源创建捕获缓冲区后返回 HTTP 202：
-
-#+begin_src json
-{
-  "api_version": "1",
-  "status": "pending",
-  "url": "https://example.com/article/123"
-}
-#+end_src
-
-202 只表示 Emacs 已建立捕获缓冲区，不表示文件已经保存。用户仍需在 Emacs 中确认或
-取消。
-
-已保存的来源 URL 返回 HTTP 200，并激活原文档：
-
-#+begin_src json
-{
-  "api_version": "1",
-  "status": "existing",
-  "url": "https://example.com/article/123",
-  "document": {
-    "id": "bf25ec0b-e09a-4994-8059-fefb78d18fa2",
-    "title": "已保存的网页标题",
-    "relative_path": "article/2026/20261118123000-网页标题.org"
-  }
-}
-#+end_src
-
-=relative_path= 只用于提示和日志，不作为浏览器后续查询地址；本版不增加捕获状态查询
-接口。
-
-** 错误
-
-错误响应沿用现有 Emacs 模块的 JSON 错误包装：
-
-#+begin_src json
-{
-  "api_version": "1",
-  "code": "capture-busy",
-  "message": "Emacs 中已有其他来源的未完成捕获，请先保存或取消。"
-}
-#+end_src
-
-| HTTP | code | 含义 |
-|------+------+------|
-| 400 | =invalid-request= | 请求 JSON、字段类型或字段值无效 |
-| 404 | =capture-not-installed= | Emacs 未加载 capture 模块或依赖不可用 |
-| 409 | =capture-busy= | 存在其他来源的未完成捕获 |
-| 422 | =capture-invalid= | capture 模块配置或模板无法使用 |
-| 502 | =emacsclient-failed= | emacsclient 调用失败 |
-| 503 | =emacs-unavailable= | 目标 Emacs server 不可连接 |
-| 503 | =emacs-ui-unavailable= | 没有可用图形 frame |
-| 504 | =emacs-timeout= | gateway 超时，结果可能已在 Emacs 中产生 |
-
-同一来源的重复请求应返回同一个 pending 结果，不创建第二个缓冲区；不同来源在存在
-未完成捕获时返回 =capture-busy= ，第一版不排队。
-
-接口用 =#[loki_api]= 注册到服务发现，使用现有的 =EmacsService= 、配置的
-=emacsclient_path=、=socket_name= 和串行 gateway。services 不把请求内容拼接进 shell，
-而是用 JSON 字符串参数传给固定的 Emacs Lisp 入口。
+Chrome 插件向 ~POST /doc/article~ 提交包含 ~title~ 、 ~url~ 、 ~captured_at~ 和 ~body~ 的 JSON。新文档保存并完成索引后返回 HTTP 201。命中已有来源时返回 HTTP 200 和原文档摘要。错误在原请求上返回，弹窗显示 ~error.message~ 。正文通过响应中的 ~document.id~ 请求 ~GET /doc/{id}~ 。 [[file:control-center-services.org::*全文捕获接入][文档模块全文捕获协议]]
 
 * browserpass 查询行为兼容
 
@@ -286,62 +194,9 @@ Chrome 扩展请求需要本机 loopback host permission。若 Chrome 对 JSON P
 services 只对 =chrome-extension://= Origin 提供必要的 =OPTIONS= 和 CORS 响应，不向普通
 网页开放跨域写入；其他本机 API 的行为保持不变。
 
-* Emacs capture 模块
+* Emacs 文档模块
 
-新增 =emacs/loki-assistant-capture.el= ，feature 名为
-=loki-assistant-capture=，由 =loki-assistant.el= 提供加载入口。它不启动 HTTP listener，
-不注册 simple-httpd 路由，也不修改用户的 =org-roam-capture-templates= 。
-
-对 services 暴露一个固定入口：
-
-#+begin_src emacs-lisp
-(loki-assistant-capture-full REQUEST-JSON)
-#+end_src
-
-入口解析并再次校验服务传入的字段，将结果编码成 services 可解析的 JSON。页面正文按
-字面插入捕获缓冲区，不执行其中的 =%=、=${}= 或 Lisp 表达式；标题也通过安全的模板
-占位替换传入，避免标题被当作模板代码求值。
-
-** 内置模板
-
-捕获模块调用 =org-roam-capture= 的参数 =:templates= 传入
-=loki-assistant-capture-templates= ，不要求用户预先配置
-=org-roam-capture-templates= 中的键，也不把该模板加入全局变量。这样手动执行
-=org-roam-capture= 时仍只看到用户自己的配置。
-
-=loki-assistant-capture-templates= 使用与 =org-roam-capture-templates= 相同的模板结构，
-由 Emacs 配置文件提供 key 为 =f= 的模板。=loki-assistant-capture-full= 固定选择 =f= ，
-不需要额外配置 =full= 或选择 key；模板的目录、文件名、头部和正文位置都可以在该变量中
-调整。浏览器请求协议不携带模板、路径或 Lisp 表达式。
-
-第一版内置模板的语义为：
-
-- 以 =org-roam-directory= 为根目录；目录不存在或不可写时返回配置错误。
-- 配置模板默认使用时间戳和安全 slug 生成新文件名；具体文件头和文件名格式集中在
-  =loki-assistant-capture-templates= 的 =f= 项，不由浏览器提交。
-- 文件标题来自请求的 =title= ，正文只插入浏览器转换后的 =body= 。
-- 将来源 =url= 写入 =ROAM_REFS=，将 =captured_at= 作为捕获元数据保留在请求状态，
-  不强制写进正文。
-- 保存完成后显式更新该文件的 org-roam 索引；取消只释放处理中来源，不创建第二份文档。
-
-模板变量只影响 Loki Assistant 发起的全文捕获，不改变服务请求协议，也不污染 org-roam
-的全局模板。
-
-** 去重和生命周期
-
-来源 URL 是唯一去重依据。模块在调用 capture 前：
-
-1. 规范化 URL 的 Unicode 和百分号编码，用 org-roam refs 查询已保存文档。
-2. 若找到文档，激活 Emacs 并打开原节点，不覆盖或追加正文，返回 =existing= 。
-3. 若同一 URL 正在捕获，激活已有捕获缓冲区，返回 =pending= 。
-4. 若其他 URL 正在捕获，返回 =capture-busy= ，不排队。
-5. 新来源占用 URL 后激活 Emacs 图形 frame，建立捕获缓冲区并返回 =pending= 。
-
-保存或取消由 =org-capture-after-finalize-hook= 清理处理中状态。保存成功后更新索引；
-索引失败时保留错误状态并在 Emacs 中提示，后续请求不能静默创建第二份文档。
-
-窗口激活沿用 services 现有 gateway 约定：优先选择显示目标的图形 frame，没有可用图形
-frame 时返回 =emacs-ui-unavailable= ；不因为捕获请求自动创建第二个 Emacs daemon。
+services 将目标 ~article~ 和网页全文信息转交给 ~loki-assistant-doc-capture-full~ 。Emacs 使用模块自有的模板 ~p~ 决定归档路径，默认保存到 ~article/YYYY/~ ，并用 ~ROAM_REFS~ 索引来源 URL。正文按字面写入。命中已有文档时直接返回其摘要。
 
 * 目录职责和实现边界
 
@@ -350,10 +205,10 @@ frame 时返回 =emacs-ui-unavailable= ；不因为捕获请求自动创建第�
 | =chrome-plugin/extension/features/org-capture/= | DOM 快照、HTML 到 Org 转换、功能状态 |
 | =chrome-plugin/extension/shared/services-client.js= | 使用固定地址调用 services、解析统一响应 |
 | =chrome-plugin/extension/popup/= | 密码查询、全文保存功能菜单和中文提示 |
-| =services/src/modules/emacs/protocol.rs= | 请求、成功响应和错误协议 DTO |
-| =services/src/modules/emacs/routes.rs= | =POST /emacs/capture/full= handler 和 API 元数据 |
-| =services/src/modules/emacs/service.rs= | 输入转发、gateway 调用、响应解析和错误映射 |
-| =emacs/loki-assistant-capture.el= | org-roam 查询、内置模板、捕获状态和索引钩子 |
+| =services/src/modules/doc/protocol.rs= | 请求、成功响应和错误协议 DTO |
+| =services/src/modules/doc/routes.rs= | =POST /doc/article= handler 和 API 元数据 |
+| =services/src/modules/doc/service.rs= | 输入转发、gateway 调用、响应解析和错误映射 |
+| =emacs/loki-assistant-doc.el= | org-roam 查询、模板选择、直接保存和索引 |
 | =docs/control-center-services.org= | 维护已实现 API 目录和 Emacs 模块协议 |
 | =chrome-plugin/README.org= | 插件构建、加载和排错 |
 
@@ -370,21 +225,10 @@ frame 时返回 =emacs-ui-unavailable= ；不因为捕获请求自动创建第�
 - services Rust 测试：请求校验、16 MiB 限制、API 发现、gateway 参数边界、响应状态和
   Emacs 错误映射；使用注入的 =CommandRunner= ，不连接用户 Emacs。
 - Emacs ERT：JSON 校验、内置模板不修改全局模板、正文按字面插入、URL 去重、重复提交、
-  保存、取消、索引失败和无图形 frame；通过 =emacsclient= 运行，不启动独立 HTTP 服务。
+  直接保存、重复提交、索引恢复和无需激活窗口；通过 =emacsclient= 运行，不启动独立 HTTP 服务。
 - 仅在相关源码修改后执行 =make emacs-test= 、services 测试和 Chrome 测试；纯文档变更不
   增加实现测试。
 
 * 已确认的决定
 
-当前已确认的实现决定如下：
-
-1. Chrome 使用代码中固定的 =http://127.0.0.1:47321= services 地址，不读取 pfile，不提供
-   设置页。
-2. services 通过 gateway 调用 =loki-assistant-capture-full= ；Emacs 不启动独立 HTTP 服务。
-3. =loki-assistant-capture-templates= 使用兼容 =org-roam-capture-templates= 的结构，由
-   Emacs 配置文件提供 key 为 =f= 的模板；Loki Assistant 固定使用 =f= ，不写入 org-roam
-   全局模板。
-4. 第一版继续使用 org-roam 的索引和文档模型，202 仅表示捕获缓冲区已经打开，最终保存
-   结果只在 Emacs 内反馈；本版不增加浏览器查询保存状态的接口。
-
-实施时同步修改 services API 文档、实现代码、测试、插件 README 和根目录 Makefile 入口。
+Chrome 插件通过固定的 loopback 地址调用 services。Emacs 文档模块负责用自己的 org-roam 模板自动保存和索引。浏览器根据同一次请求的结果显示保存状态或错误。

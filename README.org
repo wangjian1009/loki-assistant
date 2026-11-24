@@ -48,7 +48,7 @@ make chrome-build
 
 然后在 =chrome://extensions/= 开启开发者模式，加载
 =dist/chrome-plugin= 。插件使用固定的
-=http://127.0.0.1:47321/emacs/capture/full=，需要先启动 services。
+=http://127.0.0.1:47321/doc/article=，需要先启动 services。
 
 修改菜单栏 App 代码后使用 ~make restart-center~，该命令会退出旧进程并强制启动新构建的 App；只执行 ~make run~ 可能会复用旧实例。
 

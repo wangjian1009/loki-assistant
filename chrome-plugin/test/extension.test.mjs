@@ -2,13 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { captureFull, SERVICES_CAPTURE_URL } from "../extension/shared/services-client.js";
 
-test("services client 使用固定地址并解释 pending 响应", async () => {
+test("services client 使用固定地址并解释 saved 响应", async () => {
   const originalFetch = globalThis.fetch;
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
-    return new Response(JSON.stringify({ status: "pending" }), {
-      status: 202,
+    return new Response(JSON.stringify({ status: "saved", document: { id: "example-id" } }), {
+      status: 201,
       headers: { "Content-Type": "application/json" },
     });
   };
@@ -19,7 +19,8 @@ test("services client 使用固定地址并解释 pending 响应", async () => {
       captured_at: "2026-11-18T12:30:00.000Z",
       body: "* 正文\n",
     });
-    assert.equal(message, "已在 Emacs 打开捕获，请检查内容后使用 C-c C-c 保存。");
+    assert.equal(message, "网页全文已保存。");
+    assert.equal(SERVICES_CAPTURE_URL, "http://127.0.0.1:47321/doc/article");
     assert.equal(request.url, SERVICES_CAPTURE_URL);
     assert.equal(request.options.method, "POST");
     assert.equal(JSON.parse(request.options.body).title, "标题");
@@ -32,14 +33,14 @@ test("services client 将 Emacs 错误消息传递给插件界面", async () => 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({
     api_version: "1",
-    status: 409,
+    status: 404,
     error: {
       source: "business",
-      code: "capture-busy",
-      message: "Emacs capture 失败 [capture-busy]：请先完成当前捕获",
+      code: "capture-target-not-found",
+      message: "Emacs 不支持此全文捕获目标。",
     },
   }), {
-    status: 409,
+    status: 404,
     headers: { "Content-Type": "application/json" },
   });
   try {
@@ -50,7 +51,7 @@ test("services client 将 Emacs 错误消息传递给插件界面", async () => 
         captured_at: "2026-11-18T12:30:00.000Z",
         body: "* 正文\n",
       }),
-      { message: "Emacs capture 失败 [capture-busy]：请先完成当前捕获" },
+      { message: "Emacs 不支持此全文捕获目标。" },
     );
   } finally {
     globalThis.fetch = originalFetch;

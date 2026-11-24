@@ -6,15 +6,15 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use loki_services_macros::loki_api;
 
 use super::{
     protocol::{
         API_VERSION, ActivationRequest, ActivationResponse, BuffersResponse, EvalRequest,
-        EvalResponse, FullCaptureRequest, FullCaptureResponse, Notification, NotificationReceipt,
-        NotificationResponse, NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
+        EvalResponse, Notification, NotificationReceipt, NotificationResponse,
+        NotificationStatusResponse, OpenAppRequest, OpenAppResponse,
     },
     service::{EmacsError, EmacsService},
 };
@@ -95,41 +95,6 @@ async fn activate_slack(
         app: "slack".to_owned(),
         opened: true,
     }))
-}
-
-#[loki_api(
-    module = "emacs",
-    mount = "Arc<EmacsService>",
-    id = "capture-full",
-    method = "POST",
-    path = "/emacs/capture/full",
-    summary = "保存完整网页",
-    description = "协议版本 1：接收浏览器转换后的完整 Org 文本，通过 loki-assistant-capture-full 进入 Emacs 捕获流程。"
-)]
-async fn capture_full(
-    State(service): State<Arc<EmacsService>>,
-    request: Result<Json<FullCaptureRequest>, JsonRejection>,
-) -> Result<Response, Response> {
-    let Json(request) = request.map_err(json_error)?;
-    let result = service
-        .capture_full(request)
-        .await
-        .map_err(error_response)?;
-    let status = if result.status == "pending" {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
-    };
-    Ok((
-        status,
-        Json(FullCaptureResponse {
-            api_version: API_VERSION.to_owned(),
-            status: result.status,
-            url: result.url,
-            document: result.document,
-        }),
-    )
-        .into_response())
 }
 
 #[loki_api(
@@ -346,29 +311,6 @@ pub(crate) fn error_response(error: EmacsError) -> Response {
             ErrorSource::Business,
             "app-not-found",
         ),
-        EmacsError::Capture { code, .. } => match code.as_str() {
-            "capture-not-installed" => (
-                StatusCode::NOT_FOUND,
-                ErrorSource::Business,
-                "capture-not-installed",
-            ),
-            "capture-busy" => (StatusCode::CONFLICT, ErrorSource::Business, "capture-busy"),
-            "capture-invalid" => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                ErrorSource::Business,
-                "capture-invalid",
-            ),
-            "emacs-ui-unavailable" => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorSource::Emacs,
-                "emacs-ui-unavailable",
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorSource::Business,
-                "capture-failed",
-            ),
-        },
     };
     api_error_response(status, source, code, error.to_string())
 }

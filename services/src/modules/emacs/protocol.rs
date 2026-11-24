@@ -77,35 +77,3 @@ pub struct OpenAppResponse {
     pub app: String,
     pub opened: bool,
 }
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FullCaptureRequest {
-    pub title: String,
-    pub url: String,
-    pub captured_at: String,
-    pub body: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct FullCaptureDocument {
-    pub id: String,
-    pub title: String,
-    pub relative_path: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct FullCaptureResult {
-    pub status: String,
-    pub url: String,
-    pub document: Option<FullCaptureDocument>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct FullCaptureResponse {
-    pub api_version: String,
-    pub status: String,
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub document: Option<FullCaptureDocument>,
-}

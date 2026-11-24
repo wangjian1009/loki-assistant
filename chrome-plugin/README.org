@@ -10,7 +10,7 @@ Chrome 插件已实现全文保存和只读密码查询。跨模块协议和功�
 
 插件使用 Manifest V3，点击图标显示功能菜单。密码功能通过 services 的
 =GET /password/entries= 和 =GET /password/entries/{*file}= 查询条目，支持当前域名筛选、模糊搜索、条目详情、用户名/密码/OTP 复制、当前页面表单填充和条目 URL 打开。全文保存功能仍通过固定的
-=http://127.0.0.1:47321/emacs/capture/full= 提交浏览器内转换后的 Org 文本。
+=http://127.0.0.1:47321/doc/article= 提交浏览器内转换后的 Org 文本。
 
 弹窗导航固定为“工具、密码”。打开时检测当前页面可访问 frame 中的可见、可编辑密码框：
 有密码框则默认进入密码页，否则进入工具页。默认页与密码库是否存在匹配条目无关；
@@ -41,8 +41,7 @@ services 只提供密码查询；新增、编辑、删除和密码生成按钮�
 
 密码条目列表在进入密码页后按需查询，密码原文只在点击复制、详情或填充时按需读取，插件不持久化密码内容。OTP 在浏览器内按条目中的 =otpauth://= 或 Base32 secret 计算，填充带 OTP 的条目后会复制当前 token。
 
-Emacs 不需要启动 HTTP 服务；services 通过 =emacsclient= 调用
-=loki-assistant-capture-full= 。
+services 通过 =emacsclient= 调用 Emacs 文档模块直接保存网页全文。插件在原请求完成后显示结果。
 
 * 功能目录
 

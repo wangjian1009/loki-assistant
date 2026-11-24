@@ -16,7 +16,8 @@
 | ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
 | [[file:config-module.org][modules/config]] | 配置模型、数据读写和变更通知 | 已实现基础能力及元数据通知接入点 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
-| ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换、浏览器全文捕获 | 已实现 |
+| ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
+| ~modules/doc~ | 提交网页全文并按 Org ID 查询文档 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
 | ~modules/mail~ | 同步 Maildir、更新 mu 索引、通知新邮件及转交 Emacs 撰写草稿 | 已实现 |
@@ -39,7 +40,7 @@ services 启动后写入 ~~/.assistant/service~ JSON pfile，客户端通过该�
 所有 HTTP 错误统一返回 ~api_version~、HTTP 数字 ~status~ 和 ~error{source,code,message}~；~source~ 只能是 ~services~、~emacs~ 或 ~business~，~code~ 和 ~message~ 为非空字符串，客户端按 ~code~ 处理并显示 ~message~ 。
 
 #+begin_src json
-{"api_version":"1","status":409,"error":{"source":"business","code":"capture-busy","message":"Emacs 中已有未完成捕获，请先保存或取消。"}}
+{"api_version":"1","status":409,"error":{"source":"business","code":"capture-source-conflict","message":"该网页对应多篇文章，请在 Emacs 中确认它们的来源。"}}
 #+end_src
 
 * 目录
@@ -54,6 +55,7 @@ services/
     │   ├── config/         配置模型、路由、提交处理、存储和订阅
     │   ├── control_center/ 控制中心配置和登录启动处理器
     │   ├── discover/       模块/API 静态描述和发现路由
+    │   ├── doc/            网页全文提交与 Org 文档查询
     │   ├── emacs/          Lisp 求值、buffer 查询和激活、Emacs 通知转换
     │   ├── mail/           邮件同步、索引、通知与草稿
     │   ├── network/        本地身份、中转注册、配置处理与状态发布
@@ -106,7 +108,8 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | POST | ~/notification/retry-pending~ | 托盘就绪后调度未确认通知补发 |
 | POST | ~/emacs/eval~ | 执行 Lisp 并返回打印表示 |
 | POST | ~/emacs/apps/open~ | 按 app 查询参数打开 Emacs 应用 |
-| POST | ~/emacs/capture/full~ | 接收浏览器生成的 Org 全文并进入 Loki Assistant 捕获 |
+| POST | ~/doc/article~ | 保存浏览器生成的 Org 全文并返回文档摘要 |
+| GET | ~/doc/{id}~ | 按 Org ID 读取已保存的文档 |
 | GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
 | GET | ~/status~ | 读取全部模块发布的状态 |
 | GET | ~/status/{module_id}~ | 读取模块完整状态对象 |
@@ -341,6 +344,196 @@ network 将 iroh 已认证的 Endpoint ID 注入 Axum 请求扩展，配置中�
 
 除 HTTP 方法错误外，上表错误 ~source~ 为 ~business~ 。绑定令牌原文只出现在创建邀请响应与二维码，以及手机提交的加密绑定请求中，不进入状态中心、发现元数据、通知或日志；本机身份私钥始终不导出。
 
+* 文档模块
+
+本节记录 org-roam 文档资源、已实现的全文提交和按 ID 读取接口。
+
+** 知识库现状
+
+运行中的 Emacs 使用 =~/workspace/org-roam= 作为 ~org-roam-directory~ ，并启用了 ~org-roam-db-autosync-mode~ 。索引快照包含 1,046 个文件和 1,050 个节点，其中 994 个为文件级节点、56 个为标题级节点。10 个文件只有标题级节点。1,044 个节点有标签，共有 53 个不同标签。288 个节点有 HTTP(S) 来源引用，其中 269 个位于 ~article/~ 。索引中有 26 个加密文件，共含 29 个节点。 [[file:~/workspace/org-roam/AGENTS.md][知识库目录约定]]
+
+正文来自已保存的 Org 文件。org-roam 的 ~nodes~ 表提供 ~ID~ 、文件和位置、标题、层级、标题路径及带 ID 节点的任务状态。~tags~ 、 ~aliases~ 和 ~refs~ 提供标签、别名和 ~ROAM_REFS~ 来源。~links~ 提供有向链接，~id:~ 链接可以关联两个文档资源。~file:~ 、 ~attachment:~ 和普通网页链接各自保留其 Org 语义。索引包含位置和元数据，读取正文时由 Emacs 按 ID 核对已保存的文件。
+
+当前 Emacs 为 ~memo/~ 和 ~tasks/~ 配置了捕获模板，文档模块的网页全文模板写入 ~article/YYYY/~ 并记录 ~ROAM_REFS~ 。Dailies 按 ~daily/YYYY/MM/YYYY-MM-DD.org~ 写入，手动创建的历史日期文件也位于 ~daily/~ 下的其他层级。项目模板写入 ~todo~ 和 ~project~ 标签，Agenda 依据 ~todo~ 标签选择文件，再由 Org 解析其中的标题任务。索引快照仅有 5 个带 TODO 状态的节点，Agenda 的完整任务列表仍由 Org 管理。 [[file:~/workspace/org-roam/personal/emacs配置文件.org::*Org 文件管理 Roam][Emacs 的 org-roam 配置]]
+
+** 文档分类
+
+文档使用 ~kind~ 表示用途，使用 ~domain~ 表示内容领域。Emacs 的 ~loki-assistant-doc~ 根据节点文件相对于知识库根目录的位置推导这两个字段。标题级节点沿用所在文件的分类。标签作为独立的检索字段，保留 Org tag 的原始拼写与大小写。这套映射可直接用于现有文件，移动文件并重新索引后分类随目录更新，资源地址随 Org ID 保持稳定。
+
+| 目录 | kind | domain | 索引节点数 | 内容 |
+|------+--------+--------+------------+------|
+| ~article/~ | ~article~ | ~general~ | 324 | 文章、翻译和网页全文 |
+| ~literature/~ | ~literature~ | ~general~ | 67 | 文献和资料笔记 |
+| ~reading/~ | ~reading~ | ~general~ | 6 | 读书笔记 |
+| ~memo/~ | ~memo~ | ~general~ | 79 | 临时记录和资料摘录 |
+| ~zettle/~ | ~zettel~ | ~general~ | 35 | 原子化概念卡片 |
+| ~daily/~ | ~daily~ | ~general~ | 360 | 每日记录及其带 ID 的条目 |
+| ~tasks/~ | ~task~ | ~general~ | 24 | 任务文档和项目文档，可用 ~project~ 标签筛选项目 |
+| ~references/~ | ~reference~ | ~general~ | 0 | 带 ID 的参考资料，目前索引中只有文件记录 |
+| ~work/~ | ~note~ | ~work~ | 27 | 工作笔记和项目资料 |
+| ~personal/~ | ~note~ | ~personal~ | 38 | 个人笔记 |
+| ~finance/~ | ~note~ | ~finance~ | 30 | 财务笔记和学习资料 |
+| ~tony/~ | ~note~ | ~family~ | 41 | 家庭成员笔记 |
+| 根目录、 ~tools/~ 、 ~playground/~ 及其他目录 | ~note~ | ~general~ | 19 | 通用、工具与实验笔记 |
+
+文档集合从配置的知识库根目录内选取正文节点。~.setup.org~ 和 ~references/template.org~ 用于配置及模板，~build/~ 、 ~output/~ 、 ~tmp/~ 、 ~memo/data/~ 和 ~web-articles/~ 用于产物、暂存或网页素材。附件及导出文件通过各自的 Org 链接关联。
+
+** 资源结构
+
+一条文档资源对应一个 org-roam 节点。文件级节点和标题级节点共用 ~GET /doc/{id}~ 。同一文件可包含多个资源，也可以只有标题资源。日记和任务作为文档集合的筛选视图。日记日期取文件名的自然日，带 ID 的日记标题沿用同一天。
+
+| 资源 | HTTP 路径 | 表示 | 阶段 |
+|------+-----------+------+------|
+| 文档详情 | ~GET /doc/{id}~ | 文档摘要和已保存的 Org 正文 | 已实现 |
+| 文档集合 | ~GET /doc~ | 分页返回摘要，按 ~kind~ 、 ~domain~ 和 ~tag~ 过滤，按标题及别名搜索 | 后续 |
+| 文档链接 | ~GET /doc/{id}/links~ | ~outgoing~ 和 ~incoming~ 各返回去重后的可访问文档 ID，~references~ 提供 ~ROAM_REFS~ 中的 HTTP(S) 来源 URL | 后续 |
+| 网页文章 | ~POST /doc/article~ | 直接保存网页全文，返回文档摘要 | 已实现 |
+
+HTTP 方法决定路径段的含义。services 对 ~GET /doc/{id}~ 和 ~POST /doc/{target}~ 在同一路由模板上注册不同方法的处理器。~GET /doc/article~ 查询 ID 为 ~article~ 的文档，~POST /doc/article~ 将目标 ~article~ 交给 Emacs。新增提交目标由 Emacs 注册。
+
+稍后阅读可使用日记中带独立 Org ID 的条目，来源使用 ~ROAM_REFS~ ，阅读状态作为工作流字段。网页全文捕获也使用 ~ROAM_REFS~ ，因此来源引用只表示来源，队列成员由稍后阅读业务显式标记。
+
+** 全文捕获接入
+
+Chrome 插件读取活跃标签页的可见 HTML，并在浏览器内转换为 Org。链接和图片以 URL 写入正文。插件通过本机 services 的 ~POST /doc/article~ 提交全文。Emacs 保存文件并更新 org-roam 索引后，插件显示保存结果。
+
+*** 保存结果进入文档集合
+
+默认模板 ~p~ 将网页全文写入 ~article/YYYY/<时间戳>-<slug>.org~ 。已入索引的全文立即符合文档资源模型，使用原有 Org ID 查询 ~GET /doc/{id}~ ，分类为 ~kind=article~ 、 ~domain=general~ 和 ~node_type=file~ 。~ROAM_REFS~ 提供来源 URL，标题、标签和正文使用保存后的节点数据。既有已索引的全文使用原 Org ID 查询。
+
+Emacs 的 ~loki-assistant-doc~ 管理文档业务，包括解析提交目标、选择捕获模板、确定文件位置、按来源查重、保存与更新索引，以及按 ID 查询和分类。services 的 ~doc~ 模块通过既有 Emacs gateway 转交提交目标和全文信息，或转交待查询的 Org ID，再将 Emacs 的处理结果转换为 HTTP 响应。Chrome 插件通过该接口显示保存结果或原请求的错误说明。
+
+新全文捕获的来源去重以 ~ROAM_REFS~ 中的 URL 和文件级 ~article~ 节点为范围。同一 URL 的日记条目可以按需通过 ~id:~ 链接指向全文。URL 比对沿用现有的 Unicode 与百分号编码处理，保留查询和片段。若同一来源命中多个全文节点，返回 HTTP 409 ~capture-source-conflict~ 。当前索引已有一个 URL 命中多个文件级文章节点，既有节点保留各自的 Org ID。
+
+*** 直接提交
+
+~POST /doc/article~ 仅供本机调用，接收 ~title~ 、 ~url~ 、 ~captured_at~ 和 ~body~ 。services 从路径读取目标名，将 ~article~ 和这四个字段转交给 Emacs 的统一全文捕获入口 ~loki-assistant-doc-capture-full~ 。该入口接收 ~target~ 和 ~info~ 。
+
+#+begin_src emacs-lisp
+(loki-assistant-doc-capture-full
+ "article"
+ '(:title "网页标题"
+   :url "https://example.com/article/1"
+   :captured-at "2026-11-18T12:30:00Z"
+   :body "* 正文\n"))
+#+end_src
+
+Emacs 将已注册的目标 ~article~ 映射到模块自己的模板 ~p~ ，再用 ~:keys "p"~ 调用 ~org-roam-capture-~ 。~p~ 使用 ~file+head~ ，默认保存到 ~article/YYYY/<时间戳>-<slug>.org~ 。遇到未知目标时，Emacs 在选择模板或创建文件前返回 ~capture-target-not-found~ 。
+
+~p~ 模板启用 ~:immediate-finish t~ ，在同一次调用里完成保存。Emacs 使用 ~:before-finalize~ 写入字面的 Org 正文和 ~ROAM_REFS~ ，保存后更新索引。模板关闭跳转，整个操作由 Emacs 的 doc 入口完成。
+
+在临时 org-roam 库中已验证该流程。捕获完成后文件可按 Org ID 和来源 URL 查到，中文正文及其中的模板标记按字面保存，整个过程无需选择模板或确认保存。
+
+文件已保存且索引可通过 Org ID 读取时，HTTP 返回 ~201 Created~ ， ~Location~ 为 ~/doc/{id}~ 。命中唯一已保存全文时返回 HTTP 200，~status~ 为 ~existing~ ，复用原有文档摘要。两种响应都使用 ~Cache-Control: no-store~ ，浏览器可通过 ~document.id~ 读取正文。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "status": "saved",
+  "url": "https://example.com/article/1",
+  "document": {
+    "id": "note-42",
+    "title": "网页标题",
+    "kind": "article",
+    "domain": "general",
+    "node_type": "file",
+    "tags": ["article"],
+    "date": null
+  }
+}
+#+end_src
+
+同一来源的查重、保存和索引更新在 Emacs 中串行完成。文件名冲突时由 Emacs 选择不同路径。文件已写入但索引更新失败时，Emacs 在当前会话中保留来源与已写文件的关联，重试时补建索引后复用已保存的文件及 Org ID。
+
+*** 捕获错误
+
+Emacs 将捕获错误作为结构化结果返回给 services。services 在原 POST 请求上返回统一 HTTP 错误格式，并提供适合调用方显示的中文 ~error.message~ 。Chrome 插件在捕获结果区域显示该字段，连接失败或本地等待超时时显示对应的本地提示。
+
+| HTTP 状态 | 错误码 | 条件 |
+|-----------+--------+------|
+| 400 | ~invalid-request~ | 全文请求字段无效 |
+| 404 | ~capture-target-not-found~ | Emacs 未注册该提交目标 |
+| 409 | ~capture-source-conflict~ | 同一来源匹配多个全文节点 |
+| 500 | ~doc-transport-failed~ | services 无法暂存请求数据 |
+| 502 | ~capture-save-failed~ | Emacs 保存文件失败 |
+| 502 | ~capture-index-failed~ | 文件已写入，org-roam 索引更新失败 |
+| 502 | ~invalid-emacs-response~ | services 无法解析 Emacs 返回的结果 |
+| 503 | ~capture-template-unavailable~ | Emacs 已注册该目标，但对应模板缺失 |
+| 503 | ~doc-unavailable~ | 目标 Emacs 缺少文档模块或 org-roam |
+| 503 | ~emacs-unavailable~ | 目标 Emacs server 不可用 |
+| 504 | ~emacs-timeout~ | Emacs gateway 调用超时 |
+
+#+begin_src json
+{"api_version":"1","status":404,"error":{"source":"business","code":"capture-target-not-found","message":"Emacs 不支持此全文捕获目标。"}}
+#+end_src
+
+*** Gateway 传输
+
+services 将请求写入用户私有的临时 JSON 文件，Emacs doc 入口读取数据后按模板写入归档位置。临时文件随 gateway 请求结束清理。HTTP JSON 请求体限 16 MiB 加 4 KiB，解码后的 Org 正文限 16 MiB。Emacs 将 UTF-8 JSON 回执编码为 Base64，services 通过 gateway 解码后返回 HTTP JSON。
+
+** 请求
+
+~GET /doc/{id}~ 接收单个必填路径参数 ~id~ 。调用方将 Org ~ID~ 属性值按 UTF-8 编码为 URL 路径段。服务端解码一次，按原字符串区分大小写查询，支持 org-roam 已索引的自定义 ID。空白 ID、控制字符及无效编码视为无效参数。请求无需查询参数或请求体。
+
+接口归属 services 的 ~doc~ 模块，在发现目录中声明 ~access = "local"~ ，仅供本机调用。services 通过既有 Emacs gateway 将 Org ID 转交给 ~emacs/socket_name~ 指定的运行实例。Emacs 的 ~loki-assistant-doc~ 模块负责 org-roam 索引查询、确认已保存的节点 ID 和读取 Org 源码。
+
+加密文档使用当前 Emacs 会话可非交互读取的明文。需要交互解锁时返回 HTTP 403 ~document-locked~ 。
+
+** 成功响应
+
+HTTP 200 返回 UTF-8 JSON。响应使用 ~application/json~ 并携带 ~Cache-Control: no-store~ 。
+
+| 字段 | 类型 | 含义 |
+|------+------|------|
+| ~api_version~ | string | 协议版本，当前为 ~"1"~ |
+| ~document.id~ | string | 匹配的 Org ID |
+| ~document.title~ | string | org-roam 索引中的节点标题 |
+| ~document.kind~ | string | 文档用途，取文档分类表中的值 |
+| ~document.domain~ | string | 内容领域，取文档分类表中的值 |
+| ~document.node_type~ | string | ~file~ 表示文件级节点，~heading~ 表示标题级节点 |
+| ~document.tags~ | array<string> | org-roam 为该节点索引的标签，空集合返回 ~[]~ |
+| ~document.date~ | string 或 null | ~daily~ 文档文件名中的有效日期，格式为 ~YYYY-MM-DD~ 。其他情况为 ~null~ |
+| ~document.content~ | string | 已保存的 Org 源码。文件级节点返回整篇文件，标题级节点返回该标题、正文及其全部子标题 |
+
+文档摘要包含上述字段中除 ~content~ 外的文档字段。HTTP 以 Org ID 寻址，磁盘路径由 Emacs 内部解析。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "document": {
+    "id": "note-42",
+    "title": "示例文档",
+    "kind": "article",
+    "domain": "general",
+    "node_type": "file",
+    "tags": ["article"],
+    "date": null,
+    "content": ":PROPERTIES:\n:ID: note-42\n:END:\n#+title: 示例文档\n\n正文\n"
+  }
+}
+#+end_src
+
+** 错误响应
+
+错误沿用 services 的 ~api_version~ 、 ~status~ 和 ~error{source,code,message}~ 格式。文档模块返回的错误响应同样携带 ~Cache-Control: no-store~ 。
+
+| HTTP 状态 | source | code | 条件 |
+|-----------+--------+------+------|
+| 400 | ~business~ | ~invalid-request~ | 路径参数无效 |
+| 403 | ~business~ | ~document-locked~ | 加密文档需要在 Emacs 中交互解锁 |
+| 403 | ~services~ | ~remote-api-forbidden~ | 通过绑定设备请求通道调用，由网络模块返回 |
+| 404 | ~business~ | ~document-not-found~ | 索引无该节点、文件已删除或已保存的文件中已无该 ID |
+| 405 | ~services~ | ~method-not-allowed~ | 使用不受支持的 HTTP 方法 |
+| 502 | ~emacs~ | ~document-read-failed~ | Emacs 无法读取索引或文件 |
+| 502 | ~emacs~ | ~invalid-emacs-response~ | Emacs 返回的文档数据无法解析或与查询的 ID 不一致 |
+| 503 | ~emacs~ | ~emacs-unavailable~ | 目标 Emacs server 不可用 |
+| 503 | ~emacs~ | ~doc-unavailable~ | 目标 Emacs 缺少文档模块或 org-roam |
+| 504 | ~emacs~ | ~emacs-timeout~ | Emacs gateway 调用超时 |
+
+#+begin_src json
+{"api_version":"1","status":404,"error":{"source":"business","code":"document-not-found","message":"未找到该 ID 对应的 Org 文档。"}}
+#+end_src
+
 * 密码管理模块
 
 ** browserpass 源码分析与职责边界
@@ -559,58 +752,7 @@ Lisp 求值与 buffer 列表查询传入 ~--alternate-editor=~ 和 ~--eval~ 。s
 
 ** 浏览器全文捕获
 
-~POST /emacs/capture/full~ 是 Chrome 插件使用的唯一服务入口。services 只接收浏览器
-已经转换好的 Org 文本，不连接 Emacs HTTP 服务、不下载网页，也不执行正文中的 Lisp。
-请求字段为 ~title~、~url~、~captured_at~ 和 ~body~ ；标题不能含换行，来源必须是绝对
-HTTP(S) URL，时间使用 UTC RFC 3339 的 ~Z~ 后缀，正文按 UTF-8 字节限制为 16 MiB。
-未知字段、格式错误和超限请求返回 HTTP 400 ~invalid-request~ ，不会调用 Emacs。
-
-#+begin_src json
-{
-  "title": "网页标题",
-  "url": "https://example.com/article/1",
-  "captured_at": "2026-11-18T12:30:00.000Z",
-  "body": "* 正文\n"
-}
-#+end_src
-
-services 使用现有 Emacs gateway 调用固定的
-=loki-assistant-capture-full= ，并要求目标 Emacs 已加载
-=loki-assistant-capture= 。成功建立捕获缓冲区返回 HTTP 202：
-
-#+begin_src json
-{"api_version":"1","status":"pending","url":"https://example.com/article/1"}
-#+end_src
-
-同一来源已有已保存文档时返回 HTTP 200 ~existing~ ，同时激活原节点；不覆盖或追加正文。
-同一来源正在捕获时复用原捕获缓冲区并返回 ~pending~ ；其他来源存在未完成捕获时返回
-HTTP 409 ~capture-busy~ ，第一版不排队。202 只表示捕获缓冲区已打开，不表示文件已经
-保存；用户需要在 Emacs 中使用 =C-c C-c= 或 =C-c C-k= 。
-
-#+begin_src json
-{
-  "api_version": "1",
-  "status": "existing",
-  "url": "https://example.com/article/1",
-  "document": {"id":"...", "title":"网页标题", "relative_path":"article/1.org"}
-}
-#+end_src
-
-Emacs 端由 =emacs/loki-assistant-capture.el= 提供
-=loki-assistant-capture-full= 。它使用自有的
-=loki-assistant-capture-templates= （结构兼容 =org-roam-capture-templates= ）作为单次
-=org-roam-capture= 调用的模板，不要求用户预先把模板写入 org-roam 全局变量，也不改变
-手动 =org-roam-capture= 的模板列表。Emacs 配置中的 =f= 模板以 =org-roam-directory= 为
-根目录，使用时间戳和 slug 生成文件名，把来源写入 =ROAM_REFS= ，保存后显式更新 org-roam
-索引。
-正文按字面插入，不能通过页面内容执行模板或 Lisp 表达式。
-
-插件固定请求 =http://127.0.0.1:47321/emacs/capture/full=，不读取 services pfile，不提供
-端口设置或 token。services 若通过 =LOKI_ASSISTANT_HTTP_ADDR= 使用其他端口，需要同步修改
-插件源码后重新加载。Chrome 插件使用 loopback host permission；普通网页不获得该接口的
-跨域写入能力。Emacs 未加载 capture 模块、没有图形 frame、gateway 不可用或超时，分别
-返回 ~capture-not-installed~、~emacs-ui-unavailable~、~emacs-unavailable~ 或
-~emacs-timeout~ ，客户端显示服务端中文说明。
+网页全文入口及其请求、保存结果和错误见 [[*全文捕获接入][文档模块的全文捕获接口]]。Emacs gateway 使用当前配置的 socket 转交文档模块的请求。
 
 ** Emacs 主动状态上报
 

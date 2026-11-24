@@ -4,7 +4,7 @@ use axum::Router;
 
 use crate::{
     modules::{
-        alert::AlertService, config, control_center, discover, emacs, health, network,
+        alert::AlertService, config, control_center, discover, doc, emacs, health, network,
         notification::NotificationService, password, service, status::StatusService,
     },
     runtime::RuntimeState,
@@ -51,6 +51,7 @@ pub struct Services {
     pub status: Arc<StatusService>,
     pub alert: Arc<AlertService>,
     pub emacs: emacs::Module,
+    pub doc: doc::DocService,
     pub network: Arc<network::NetworkService>,
     pub password: password::Module,
     extensions: Vec<Arc<dyn ServiceExtension>>,
@@ -115,6 +116,7 @@ impl Services {
             Arc::clone(&notification),
             Arc::clone(&status),
         );
+        let doc = doc::DocService::new(emacs.service());
         let context = ExtensionContext {
             alert: &alert,
             config: &base_config,
@@ -153,6 +155,7 @@ impl Services {
             status,
             alert,
             emacs,
+            doc,
             network,
             password,
             extensions,
@@ -170,6 +173,7 @@ impl Services {
             .merge(self.alert.router())
             .merge(self.network.router())
             .merge(self.emacs.router())
+            .merge(self.doc.router())
             .merge(self.password.router());
         self.extensions
             .iter()

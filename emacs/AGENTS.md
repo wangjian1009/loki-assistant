@@ -12,7 +12,7 @@
 - `loki-assistant-config-tests.el` 覆盖配置界面和 HTTP 流程，纳入 `make emacs-test`。
 - `loki-assistant-devices.el` 提供 `loki-assistant-devices`，在 Hydra 菜单中使用 `d` 打开。首页仅展示已绑定设备和新增入口，点击后在当前 buffer 展开 services 返回的 PNG 与绑定信息，不生成二维码或显示令牌。仅可见且等待中的邀请查询进度；收起、关闭或卸载清理计时器并取消邀请，迟到的创建响应也须撤销。`loki-assistant-devices-tests.el` 使用临时 HTTP 服务验证列表、展开、图片、解绑、过期响应和清理，纳入 `make emacs-test`。
 - `loki-assistant-edna.el` 由包入口在 Org Edna 加载后加载，提供与 Org Tasks Core 一致的星期排程与后继兄弟创建；`loki-assistant-edna-tests.el` 验证星期推进、夏令时、已有任务链、事务回滚、重复完成创建和标题尾号递增，纳入 `make emacs-test`。Edna 动作入口遵循 `org-edna-action/loki-...!` 命名，其余定义使用模块前缀。
-- `loki-assistant-capture.el` 提供 `loki-assistant-capture-full`，接收 services gateway 转交的浏览器 Org 全文；固定使用 `loki-assistant-capture-templates` 中 key 为 `f` 的项调用 org-roam capture，不启动 HTTP 服务，也不修改 `org-roam-capture-templates`。
+- `loki-assistant-doc.el` 通过 org-roam 提供按 ID 查询与全文提交。`loki-assistant-doc-capture-full` 由 Emacs 按目标选择模板和归档路径，完成保存及索引后返回结果。目标 `article` 使用文档模块自己的模板 `p`。
 - 新增变量、函数和 feature 统一使用 `loki-assistant-` 前缀，文件启用 `lexical-binding`。
 - 注释、docstring 和面向用户的文本使用中文；按实际功能需要拆分文件。
 

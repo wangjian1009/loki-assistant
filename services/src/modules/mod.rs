@@ -4,6 +4,7 @@ pub mod alert;
 pub mod config;
 pub mod control_center;
 pub mod discover;
+pub mod doc;
 pub mod emacs;
 pub mod health;
 mod mail;
