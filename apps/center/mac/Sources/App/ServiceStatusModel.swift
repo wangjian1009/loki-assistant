@@ -91,11 +91,20 @@ struct SlackStatusModule: Decodable, Equatable, Sendable {
     }
 }
 
+struct MailStatusModule: Decodable, Equatable, Sendable {
+    let unreadCount: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case unreadCount = "unread_count"
+    }
+}
+
 struct ServiceStatusModules: Decodable, Equatable, Sendable {
     let service: SelfServiceStatusModule?
     let network: NetworkStatusModule?
     let alert: AlertStatusModule?
     let slack: SlackStatusModule?
+    let mail: MailStatusModule?
 }
 
 struct ServiceStatusSnapshot: Decodable, Equatable, Sendable {
@@ -139,6 +148,10 @@ final class ServiceStatusModel {
 
     var slackNewConversations: [SlackNewConversation] {
         snapshot?.status.slack?.newConversations ?? []
+    }
+
+    var unreadMailCount: UInt64? {
+        snapshot?.status.mail?.unreadCount
     }
 
     var indicator: ServiceIndicator {

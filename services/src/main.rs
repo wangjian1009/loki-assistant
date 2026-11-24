@@ -2,6 +2,7 @@ use std::{env, sync::Arc};
 
 use loki_services::{
     Services, http,
+    logging::LogWorker,
     runtime::{RuntimeConfig, RuntimeState, ServiceInstanceLock, ServicePfile},
 };
 
@@ -18,14 +19,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime_config = RuntimeConfig::from_env()?;
     let _instance_lock = ServiceInstanceLock::acquire()?;
+    let log_path = ServicePfile::path()?
+        .with_file_name("logs")
+        .join("services.log");
+    let _log_worker = LogWorker::start(log_path)?;
+    let result = serve().await;
+    if let Err(error) = &result {
+        log::error!("services 运行失败：{error}");
+    }
+    result
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_config = RuntimeConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(runtime_config.http_addr).await?;
     let service_pfile = ServicePfile::for_listener(listener.local_addr()?);
     let services = Arc::new(Services::load()?);
     let config = services.config.service();
     if let Err(error) = config.migrate_pending_password_paths().await {
-        eprintln!("迁移待确认配置的密码路径失败：{error}");
+        log::warn!("迁移待确认配置的密码路径失败：{error}");
     }
     let service_path = service_pfile.write()?;
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
@@ -36,14 +49,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let network = Arc::clone(&services.network);
     let network_start = tokio::spawn(async move {
         if let Err(error) = network.start().await {
-            eprintln!("网络初始化失败：{error}");
+            log::error!("网络初始化失败：{error}");
         }
     });
 
-    eprintln!(
-        "loki-services listening on http://{} (health: /healthz)",
-        listener.local_addr()?
-    );
+    log::info!("services 开始监听 http://{}", listener.local_addr()?);
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = tokio::select! {
@@ -59,7 +69,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     services.network.shutdown().await;
     service_pfile.remove_if_owner()?;
     result?;
-    eprintln!("services information removed: {}", service_path.display());
+    log::info!(
+        "services 已停止，已移除服务信息文件 {}",
+        service_path.display()
+    );
     Ok(())
 }
 

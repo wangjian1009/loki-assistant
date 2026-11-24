@@ -101,7 +101,7 @@ impl NotificationTracker {
             if let Some(content) = content {
                 records.pending.insert(id, Pending::new(content));
             } else {
-                eprintln!("无法恢复待确认通知 {id}");
+                log::warn!("无法恢复待确认通知 {id}");
             }
         }
         Ok(Self {

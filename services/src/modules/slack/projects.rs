@@ -333,7 +333,7 @@ impl Projects {
     async fn reload_nicknames(&self) {
         match self.nicknames().await {
             Ok(nicknames) => self.apply_nicknames(nicknames).await,
-            Err(error) => eprintln!("读取 Slack 昵称配置失败：{error:?}"),
+            Err(error) => log::warn!("读取 Slack 昵称配置失败：{error:?}"),
         }
     }
 

@@ -1,4 +1,5 @@
 mod routes;
+mod status;
 mod sync;
 
 use std::{path::PathBuf, sync::Arc};
@@ -10,7 +11,6 @@ use tokio::sync::Notify;
 
 use crate::{
     modules::{
-        alert::AlertService,
         config::{
             model::{ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata, ConfigRemoteAccess},
             service::{ConfigChangeHandler, ConfigService, ConfigServiceError},
@@ -18,6 +18,7 @@ use crate::{
         discover::registry::ModuleRegistration,
         emacs::service::EmacsService,
         notification::NotificationService,
+        status::StatusService,
     },
     services::{EXTENSIONS, ExtensionFuture, ExtensionRegistration, ServiceExtension},
 };
@@ -25,6 +26,7 @@ use crate::{
 const MODULE_ID: &str = "mail";
 const CONFIG_PATH: &str = "mbsync_config";
 const ENABLED: &str = "enabled";
+const UNREAD_QUERY: &str = "maildir:/inbox/ AND flag:unread AND NOT flag:trashed";
 
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]
 static MAIL_MODULE: ModuleRegistration = ModuleRegistration {
@@ -52,7 +54,7 @@ fn mail_configuration() -> ConfigModuleMetadata {
             (
                 CONFIG_PATH,
                 "mbsync 配置文件",
-                "指定绝对路径或 ~/ 开头的路径。同步告警会打开此文件。",
+                "指定绝对路径或 ~/ 开头的路径。同步失败通知会打开此文件。",
                 ConfigDataType::String,
                 json!("~/.mbsyncrc"),
             ),
@@ -87,9 +89,9 @@ fn mail_configuration() -> ConfigModuleMetadata {
 #[derive(Debug)]
 struct MailService {
     config: Arc<ConfigService>,
-    alert: Arc<AlertService>,
     notification: Arc<NotificationService>,
     emacs: Arc<EmacsService>,
+    status: Arc<StatusService>,
     stopping: Notify,
 }
 
@@ -101,9 +103,9 @@ static EXTENSION: ExtensionRegistration = ExtensionRegistration {
     build: |context| {
         Arc::new(MailModule(Arc::new(MailService {
             config: Arc::clone(context.config),
-            alert: Arc::clone(context.alert),
             notification: Arc::clone(context.notification),
             emacs: context.emacs.service(),
+            status: Arc::clone(context.status),
             stopping: Notify::new(),
         })))
     },

@@ -5,6 +5,7 @@
 extern crate self as loki_services;
 
 pub mod http;
+pub mod logging;
 pub mod modules;
 pub mod platform;
 mod process;

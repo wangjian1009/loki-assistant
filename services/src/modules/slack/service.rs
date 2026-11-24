@@ -545,12 +545,12 @@ impl SlackService {
                                 )
                                 .await;
                             if let Err(error) = result {
-                                eprintln!("无法发布 Slack 工作区 {id} 的重新授权告警：{error}");
+                                log::warn!("无法发布 Slack 工作区 {id} 的重新授权告警：{error}");
                             }
                         }
                         "authorized" => {
                             if let Err(error) = alert.clear(&alert_id).await {
-                                eprintln!("无法清理 Slack 工作区 {id} 的重新授权告警：{error}");
+                                log::warn!("无法清理 Slack 工作区 {id} 的重新授权告警：{error}");
                             }
                         }
                         _ => {}
@@ -562,7 +562,7 @@ impl SlackService {
 
     pub(super) async fn clear_reauthorization_alert(&self) {
         if let Err(error) = self.alert.clear(&self.reauthorization_alert_id()).await {
-            eprintln!(
+            log::warn!(
                 "无法清理 Slack 工作区 {} 的重新授权告警：{error}",
                 self.project.0
             );

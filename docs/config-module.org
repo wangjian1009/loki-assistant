@@ -75,7 +75,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 
 不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
 
-Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入；校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，“日志”调用 ~POST /emacs/apps/open?app=logs~ 并打开 ~~/.assistant/loki-assistant.log.org~ ，应用加载、日志文件打开和窗口聚焦由 services 的 Emacs 模块负责；登录启动由 services 的控制中心模块在配置提交前处理。
+Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入。校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，由 services 的 Emacs 模块打开并聚焦配置界面。登录启动由 services 的控制中心模块在配置提交前处理。
 
 * 现有提交前变化处理
 

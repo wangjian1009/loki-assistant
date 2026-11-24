@@ -3,18 +3,20 @@
 (require 'json)
 (require 'seq)
 
-(declare-function mu4e-search "mu4e-search")
 (declare-function mu4e--start "mu4e")
+(declare-function mu4e--server-view "mu4e-server")
 (declare-function mu4e-compose-mail "mu4e-compose")
+(declare-function mu4e-get-headers-buffer "mu4e-window")
+(declare-function mu4e-headers-mode "mu4e-headers")
 (declare-function mu4e-running-p "mu4e-server")
-(declare-function mu4e-update-index-nonlazy "mu4e-update")
+(declare-function mu4e-search "mu4e-search")
 (declare-function message-goto-body "message")
 (declare-function mml-quote-region "mml")
 (defvar mu4e--started)
-(defvar mu4e--server-indexing)
-(defvar mu4e-mu-home)
+(defvar mu4e-search-full)
 (defvar mu4e-search-include-related)
-(defvar mu4e-search-threads)
+(defvar mu4e-search-skip-duplicates)
+(defvar mu4e-view-auto-mark-as-read)
 
 (defun loki-assistant-mail--focus ()
   "选中可用于显示邮件的图形 frame。"
@@ -25,24 +27,6 @@
     (make-frame-visible frame)
     (select-frame-set-input-focus frame)
     frame))
-
-(defun loki-assistant-mail--index (payload)
-  "按 PAYLOAD 请求或查询当前 mu4e 进程的索引。"
-  (let ((home (alist-get 'home payload))
-        (phase (alist-get 'phase payload)))
-    (cond
-     ((not (and (featurep 'mu4e)
-                (mu4e-running-p)
-                (file-equal-p home
-                              (or mu4e-mu-home (getenv "MUHOME")
-                                  (expand-file-name "mu" (or (getenv "XDG_CACHE_HOME")
-                                                             "~/.cache"))))))
-      'unavailable)
-     (mu4e--server-indexing 'busy)
-     ((equal phase "start")
-      (mu4e-update-index-nonlazy)
-      'done)
-     (t 'done))))
 
 (defun loki-assistant-mail--compose (payload)
   "使用 PAYLOAD 打开 mu4e 草稿。"
@@ -70,13 +54,19 @@
                  (condition-case err
                      (when (frame-live-p frame)
                        (with-selected-frame frame
-                         (if (equal action "view")
-                             (let ((mu4e-search-include-related nil)
-                                   (mu4e-search-threads nil))
-                               ;; 先建立邮件列表，再由 mu4e 打开匹配的邮件。
-                               (mu4e-search (concat "msgid:" (json-serialize payload))
-                                            nil nil t payload t))
-                           (loki-assistant-mail--compose payload))))
+                         (pcase action
+                           ("view"
+                            ;; 首次打开正文时，mu4e 需要关联的邮件列表缓冲区。
+                            (with-current-buffer (mu4e-get-headers-buffer nil t)
+                              (unless (derived-mode-p 'mu4e-headers-mode)
+                                (mu4e-headers-mode)))
+                            (mu4e--server-view payload (eq mu4e-view-auto-mark-as-read t)))
+                           ("unread"
+                            (let ((mu4e-search-full t)
+                                  (mu4e-search-include-related nil)
+                                  (mu4e-search-skip-duplicates t))
+                              (mu4e-search payload)))
+                           ("compose" (loki-assistant-mail--compose payload)))))
                    (error (message "邮件操作失败：%s" (error-message-string err)))))))
     (if (and (mu4e-running-p) mu4e--started)
         (funcall open)
@@ -88,12 +78,11 @@
                   (decode-coding-string (base64-decode-string encoded-payload) 'utf-8)
                   :object-type 'alist)))
     (pcase action
-      ("index" (loki-assistant-mail--index payload))
       ("config"
        (loki-assistant-mail--focus)
        (find-file payload)
        t)
-      ((or "view" "compose")
+      ((or "view" "unread" "compose")
        (when (require 'mu4e nil t)
          ;; 账户选择可等待用户输入，先结束 emacsclient 的本次求值。
          (run-at-time 0 nil #'loki-assistant-mail--open action payload)

@@ -13,7 +13,7 @@ use loki_services_macros::loki_api;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::MailService;
+use super::{MailService, UNREAD_QUERY};
 use crate::{
     http::error::{API_VERSION, ErrorSource, response},
     modules::emacs::error_response,
@@ -45,6 +45,24 @@ async fn open(
     service
         .emacs
         .mail_action("view", json!(query.message_id))
+        .await
+        .map_err(error_response)?;
+    Ok(opened())
+}
+
+#[loki_api(
+    module = "mail",
+    mount = "Arc<MailService>",
+    id = "open-unread",
+    method = "POST",
+    path = "/mail/unread/open",
+    summary = "打开未读邮件列表",
+    description = "在 Emacs mu4e 中打开收件箱的未读邮件列表。"
+)]
+async fn open_unread(State(service): State<Arc<MailService>>) -> Result<Json<Value>, Response> {
+    service
+        .emacs
+        .mail_action("unread", json!(UNREAD_QUERY))
         .await
         .map_err(error_response)?;
     Ok(opened())

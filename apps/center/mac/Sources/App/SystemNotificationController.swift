@@ -1,7 +1,6 @@
 import AppKit
 import Darwin
 import Foundation
-import OSLog
 import UserNotifications
 
 struct SystemNotification: Codable, Equatable, Sendable {
@@ -131,10 +130,8 @@ private final class CenterInstanceLock {
 
 @MainActor
 final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
-    private let logger = Logger(subsystem: "cc.loki-assistant.center", category: "notification")
     private let receiptClient = NotificationReceiptClient()
     private var instanceLock: CenterInstanceLock?
-    private var settingDefaultMailApplication = false
     private lazy var delivery = NotificationDelivery(
         present: { [unowned self] in try await self.present($0) },
         report: { [receiptClient] in try await receiptClient.send($1, notificationID: $0) }
@@ -161,13 +158,20 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard instanceLock != nil else { return }
+        CenterLog.shared.record("托盘已启动")
         Task {
             do {
                 try await receiptClient.requestPendingRetry()
             } catch {
-                logger.debug("启动时请求补发通知失败：\(error.localizedDescription, privacy: .public)")
+                CenterLog.shared.record("启动时请求补发通知失败：\(error.localizedDescription)", level: "WARN")
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        guard instanceLock != nil else { return }
+        CenterLog.shared.record("托盘已退出")
+        CenterLog.shared.flush()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -188,7 +192,7 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                     }
                     try await delivery.handle(url)
                 } catch {
-                    logger.error("系统通知处理或回执失败：\(error.localizedDescription, privacy: .public)")
+                    CenterLog.shared.record("系统通知处理或回执失败：\(error.localizedDescription)", level: "ERROR")
                 }
             }
         }
@@ -217,7 +221,7 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 try FileManager.default.copyItem(at: source, to: copy)
                 content.attachments = [try UNNotificationAttachment(identifier: "app", url: copy)]
             } catch {
-                logger.error("应用图标无法显示：\(error.localizedDescription, privacy: .public)")
+                CenterLog.shared.record("应用图标无法显示：\(error.localizedDescription)", level: "WARN")
             }
         }
         try await center.add(UNNotificationRequest(identifier: notification.notificationID ?? UUID().uuidString, content: content, trigger: nil))
@@ -254,19 +258,15 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         }
     }
 
-    func setDefaultMailApplication() {
-        guard !settingDefaultMailApplication else { return }
-        settingDefaultMailApplication = true
+    func openUnreadMail() {
         Task {
-            defer { settingDefaultMailApplication = false }
-            let operation = CenterLog.shared.start("设为默认邮件应用")
+            let operation = CenterLog.shared.start("打开未读邮件列表")
             do {
-                try await NSWorkspace.shared.setDefaultApplication(
-                    at: Bundle.main.bundleURL, toOpenURLsWithScheme: "mailto")
+                try await receiptClient.openUnreadMail()
                 CenterLog.shared.finish(operation, result: "success")
             } catch {
                 CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
-                showError("无法设为默认邮件应用", error: error)
+                showError("无法打开未读邮件列表", error: error)
             }
         }
     }
@@ -274,9 +274,9 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private func followNotificationNavigation(_ navigation: URL, notificationID: String) async {
         do {
             try await receiptClient.activate(navigation)
-            logger.notice("通知点击已回调 services：\(notificationID, privacy: .public)")
+            CenterLog.shared.record("通知点击已回调 services：\(notificationID)")
         } catch {
-            logger.error("通知点击跳转失败：\(error.localizedDescription, privacy: .public)")
+            CenterLog.shared.record("通知点击跳转失败：\(error.localizedDescription)", level: "ERROR")
             showError("无法完成通知跳转", error: error)
         }
     }

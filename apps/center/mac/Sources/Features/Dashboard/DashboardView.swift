@@ -5,7 +5,7 @@ struct DashboardView: View {
     let status: ServiceStatusModel
     let idleSleep: IdleSleepController
     let openAlert: @MainActor (String, String) -> Void
-    let setDefaultMailApplication: @MainActor () -> Void
+    let openUnreadMail: @MainActor () -> Void
     @State private var openingSettings = false
     @State private var appOpenError: String?
 
@@ -64,11 +64,11 @@ struct DashboardView: View {
                     }
                 }
             }
-            Button(action: setDefaultMailApplication) {
-                Label("设为默认邮件应用", systemImage: "envelope")
+            if let count = status.unreadMailCount {
+                Button(action: openUnreadMail) {
+                    Label("收件箱 · \(count) 封未读", systemImage: "tray")
+                }
             }
-            .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: .leading)
             Button {
                 openingSettings = true
                 Task { @MainActor in

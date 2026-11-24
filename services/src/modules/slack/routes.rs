@@ -135,7 +135,7 @@ fn sync_after_confirmation(
             return;
         }
         if let Err(error) = projects.sync_projects(reload_team.as_deref()).await {
-            eprintln!("同步 Slack 工作区失败：{error}");
+            log::warn!("同步 Slack 工作区失败：{error}");
         }
         if let Some(team) = setup_team {
             open_team_setup(&projects, &team).await;
@@ -145,7 +145,7 @@ fn sync_after_confirmation(
 
 async fn open_team_setup(projects: &Projects, team: &str) {
     if let Err(error) = projects.open_team(team).await {
-        eprintln!("打开 Slack 工作区配置页失败：{error}");
+        log::warn!("打开 Slack 工作区配置页失败：{error}");
     }
 }
 

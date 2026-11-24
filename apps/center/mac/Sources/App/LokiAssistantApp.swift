@@ -65,7 +65,7 @@ struct LokiAssistantApp: App {
         MenuBarExtra {
             DashboardView(
                 status: status, idleSleep: idleSleep, openAlert: appDelegate.openAlert,
-                setDefaultMailApplication: appDelegate.setDefaultMailApplication
+                openUnreadMail: appDelegate.openUnreadMail
             )
         } label: {
             Image(nsImage: idleSleep.isEnabled ? Self.menuBarSleepIcon : Self.menuBarIcon)

@@ -107,7 +107,7 @@ impl NotificationService {
         let service = self.clone();
         tokio::spawn(async move {
             if let Err(error) = service.send(request).await {
-                eprintln!("提交后台通知失败：{error}");
+                log::warn!("提交后台通知失败：{error}");
             }
         });
     }
@@ -233,7 +233,7 @@ impl State {
                 timeout(deadline, launcher.launch(attempt.content)).await,
                 Ok(Ok(()))
             ) {
-                eprintln!("通知 {id} 暂未转交给菜单栏应用，稍后重试");
+                log::warn!("通知 {id} 暂未转交给菜单栏应用，稍后重试");
             }
         })
     }

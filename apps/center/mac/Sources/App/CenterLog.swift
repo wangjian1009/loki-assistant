@@ -1,14 +1,15 @@
 import Foundation
+import OSLog
 
-/// 托盘用户操作日志；文件使用 Org 结构，一级标题是用户操作，二级标题是本次操作中的调用。
-final class CenterLog: @unchecked Sendable {
+/// 在独立队列写入托盘日志，一次提交完整的操作及其调用。
+final class CenterLog: Sendable {
     static let shared = CenterLog()
-
     static let defaultFileURL = FileManager.default.homeDirectoryForCurrentUser
-        .appending(path: ".assistant/loki-assistant.log.org")
+        .appending(path: ".assistant/logs/center.log")
 
     private let fileURL: URL
-    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "cc.loki-assistant.center.log")
+    private let fallback = Logger(subsystem: "cc.loki-assistant.center", category: "file-log")
     private let maximumEntries = 500
 
     init(fileURL: URL = CenterLog.defaultFileURL) {
@@ -20,86 +21,88 @@ final class CenterLog: @unchecked Sendable {
     }
 
     func finish(_ operation: CenterLogOperation, result: String, details: [String: String] = [:], date: Date = Date()) {
-        let entry = operation.finish(result: result, details: details, endedAt: date)
-        guard let entry else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        do {
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let existing = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? Self.header
-            let retained = Array((Self.entries(in: existing) + [entry]).suffix(maximumEntries))
-            let content = Self.render(header: existing, entries: retained)
-            try content.write(to: fileURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        } catch {
-            // 日志不能阻断托盘操作；文件错误留给下一次写入重试。
-        }
+        guard let entry = operation.finish(result: result, details: details, endedAt: date) else { return }
+        enqueue(entry)
     }
 
-    private static let header = """
-#+TITLE: Loki Assistant 托盘日志
-#+STARTUP: overview
-#+OPTIONS: toc:nil
-
-"""
-
-    fileprivate struct Entry {
-        let text: String
+    func record(_ message: String, level: String = "INFO", date: Date = Date()) {
+        enqueue(Self.heading(message, level: level, date: date))
     }
 
-    private static func entries(in content: String) -> [Entry] {
-        var entries: [Entry] = []
-        var current: [String] = []
-        for line in content.components(separatedBy: .newlines) {
-            if line.hasPrefix("* ") {
-                if let entry = entry(from: current) { entries.append(entry) }
-                current = [line]
-            } else if !current.isEmpty {
-                current.append(line)
+    func flush() {
+        queue.sync {}
+    }
+
+    private func enqueue(_ entry: String) {
+        queue.async { [self] in
+            do {
+                try write(entry)
+            } catch {
+                fallback.error("写入托盘日志文件失败：\(error.localizedDescription, privacy: .public)")
             }
         }
-        if let entry = entry(from: current) { entries.append(entry) }
-        return entries
     }
 
-    private static func entry(from lines: [String]) -> Entry? {
-        guard !lines.isEmpty else {
-            return nil
+    private func write(_ entry: String) throws {
+        let manager = FileManager.default
+        let directory = fileURL.deletingLastPathComponent()
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: 0o700])
+        let existing: String
+        do {
+            existing = try String(contentsOf: fileURL, encoding: .utf8)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            existing = ""
         }
-        return Entry(text: lines.joined(separator: "\n"))
+        var entries: [String] = []
+        for line in existing.split(separator: "\n") {
+            if line.hasPrefix(" "), !entries.isEmpty {
+                entries[entries.count - 1] += "\n\(line)"
+            } else {
+                entries.append(String(line))
+            }
+        }
+        entries.append(entry)
+        let content = entries.suffix(maximumEntries).joined(separator: "\n") + "\n"
+        let temporary = directory.appending(path: ".center.\(UUID().uuidString).tmp")
+        let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { try? manager.removeItem(at: temporary) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        try handle.write(contentsOf: Data(content.utf8))
+        try handle.close()
+        guard Darwin.rename(temporary.path, fileURL.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
-    private static func render(header existing: String, entries: [Entry]) -> String {
-        let headerText = existing.range(of: "\n* ", options: .literal).map { String(existing[..<$0.lowerBound]) } ?? header
-        return headerText.trimmingCharacters(in: .whitespacesAndNewlines)
-            + "\n\n"
-            + entries.map(\.text).joined(separator: "\n\n")
-            + "\n"
+    fileprivate static func heading(_ message: String, level: String, date: Date) -> String {
+        return "\(timestamp(date)) [center] \(level) center - \(safe(message))"
     }
 
-    fileprivate static func isoString(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withColonSeparatorInTime]
-        return formatter.string(from: date)
-    }
-
-    fileprivate static func headingString(_ date: Date) -> String {
+    fileprivate static func timestamp(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd EEE HH:mm"
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         return formatter.string(from: date)
     }
 
     fileprivate static func safe(_ value: String) -> String {
-        value.replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        value.components(separatedBy: CharacterSet.newlines.union(.controlCharacters))
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    fileprivate static func fields(_ details: [String: String]) -> [String] {
+        details.keys.sorted().map { key in
+            "\(safe(key))=\(safe(details[key] ?? ""))"
+        }
     }
 }
 
 final class CenterLogOperation: @unchecked Sendable {
-    fileprivate struct Call: Sendable {
+    private struct Call {
         let action: String
         let result: String
         let details: [String: String]
@@ -121,37 +124,27 @@ final class CenterLogOperation: @unchecked Sendable {
 
     func call(_ action: String, result: String, details: [String: String] = [:], date: Date = Date()) {
         lock.lock()
+        defer { lock.unlock() }
+        guard !completed else { return }
         calls.append(Call(action: action, result: result, details: details, timestamp: date))
-        lock.unlock()
     }
 
-    fileprivate func finish(result: String, details: [String: String], endedAt: Date) -> CenterLog.Entry? {
+    fileprivate func finish(result: String, details: [String: String], endedAt: Date) -> String? {
         lock.lock()
         defer { lock.unlock() }
         guard !completed else { return nil }
         completed = true
-        let title = CenterLog.safe(action)
-        let timestamp = CenterLog.isoString(startedAt)
-        let heading = CenterLog.headingString(startedAt)
-        var lines = ["* [\(heading)] \(title)", ":PROPERTIES:", ":TIMESTAMP: \(timestamp)", ":ENDED_AT: \(CenterLog.isoString(endedAt))", ":RESULT: \(CenterLog.safe(result))"]
-        var allDetails = self.details
-        details.forEach { allDetails[$0.key] = $0.value }
-        lines.append(contentsOf: properties(allDetails))
-        lines.append(":END:")
-        lines.append(contentsOf: calls.map(renderCall))
-        return CenterLog.Entry(text: lines.joined(separator: "\n"))
-    }
-
-    private func properties(_ values: [String: String]) -> [String] {
-        values.keys.sorted().map { key in
-            ":\(CenterLog.safe(key).uppercased()): \(CenterLog.safe(values[key] ?? ""))"
+        let heading = CenterLog.heading(action, level: result == "failure" ? "ERROR" : "INFO", date: startedAt)
+        var metadata = self.details.merging(details) { _, new in new }
+        metadata["result"] = result
+        metadata["duration_ms"] = String(Int(max(0, endedAt.timeIntervalSince(startedAt)) * 1000))
+        var lines = [heading, "  " + CenterLog.fields(metadata).joined(separator: " ")]
+        for call in calls {
+            var fields = call.details
+            fields["result"] = call.result
+            let suffix = CenterLog.fields(fields).joined(separator: " ")
+            lines.append("  \(CenterLog.timestamp(call.timestamp)) \(CenterLog.safe(call.action))  \(suffix)")
         }
-    }
-
-    private func renderCall(_ call: Call) -> String {
-        var lines = ["** [\(CenterLog.headingString(call.timestamp))] \(CenterLog.safe(call.action))", ":PROPERTIES:", ":TIMESTAMP: \(CenterLog.isoString(call.timestamp))", ":RESULT: \(CenterLog.safe(call.result))"]
-        lines.append(contentsOf: properties(call.details))
-        lines.append(":END:")
         return lines.joined(separator: "\n")
     }
 }

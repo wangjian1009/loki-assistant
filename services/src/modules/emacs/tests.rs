@@ -1001,7 +1001,7 @@ async fn open_config_app_uses_gateway_and_latest_socket() {
 }
 
 #[tokio::test]
-async fn open_logs_app_opens_org_log_through_gateway() {
+async fn open_logs_app_calls_log_viewer_through_gateway() {
     let (service, runner, _) = service(vec![Ok(wire(json!({"result":"t"})))]);
     let (status, body) = request(service, "POST", "/emacs/apps/open?app=logs", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
@@ -1011,8 +1011,8 @@ async fn open_logs_app_opens_org_log_through_gateway() {
     );
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].1[3].contains("loki-assistant.log.org"));
-    assert!(calls[0].1[3].contains("find-file"));
+    assert!(calls[0].1[3].contains("loki-assistant-log"));
+    assert!(calls[0].1[3].contains("loki-assistant-log-open-app"));
 }
 
 #[tokio::test]

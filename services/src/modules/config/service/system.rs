@@ -131,7 +131,7 @@ impl StoredConfig {
             .await
             .map_err(task_error)?
         {
-            eprintln!("内部配置已迁移，清理旧文件失败：{error}");
+            log::warn!("内部配置已迁移，清理旧文件失败：{error}");
         }
         Ok(result)
     }

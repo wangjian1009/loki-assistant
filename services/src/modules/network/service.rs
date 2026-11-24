@@ -254,7 +254,7 @@ impl RelayContext {
         loop {
             changes.borrow_and_update();
             if let Err(error) = self.pairings.initialize().await {
-                eprintln!("加载设备绑定失败：{error}");
+                log::warn!("加载设备绑定失败：{error}");
             }
             let settings: Result<_, String> = async {
                 let url = self.relay_url().await?;
@@ -496,11 +496,11 @@ impl RelayContext {
             })
             .await
         {
-            Ok(receipt) => eprintln!(
+            Ok(receipt) => log::info!(
                 "{title}：通知已登记，notification_id={}",
                 receipt.notification_id
             ),
-            Err(error) => eprintln!("{title}，通知登记失败：{error}"),
+            Err(error) => log::warn!("{title}，通知登记失败：{error}"),
         }
     }
 
@@ -610,7 +610,7 @@ impl RelayContext {
         if let Some(old) = old
             && let Err(error) = old.session.close().await
         {
-            eprintln!("关闭中转连接失败：{error}");
+            log::warn!("关闭中转连接失败：{error}");
         }
         if let Some(notice) = notice {
             self.notify("中转注册成功", notice).await;

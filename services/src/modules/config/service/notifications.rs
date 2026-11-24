@@ -970,7 +970,7 @@ impl ConfigService {
                     None => Ok(()),
                 };
                 if let Err(error) = restored {
-                    eprintln!("恢复密码条目失败：{error}");
+                    log::warn!("恢复密码条目失败：{error}");
                 }
             }
         }
@@ -1235,7 +1235,7 @@ impl ConfigService {
                 && removed.insert(path)
                 && let Err(error) = store.remove(path).await
             {
-                eprintln!("清理配置凭据失败：{error}");
+                log::warn!("清理配置凭据失败：{error}");
             }
         }
     }

@@ -1316,7 +1316,7 @@ impl ConfigService {
         };
         let _ = self.changes.send(change.clone());
         if let Err(error) = handler.committed(change).await {
-            eprintln!("凭据已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
+            log::warn!("凭据已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
         }
         Ok(value)
     }
@@ -1593,7 +1593,7 @@ impl ConfigService {
         let _ = self.changes.send(change.clone());
         if let Some(handler) = handler {
             if let Err(error) = handler.committed(change).await {
-                eprintln!("配置已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
+                log::warn!("配置已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
             }
         }
         Ok(saved)

@@ -1,11 +1,7 @@
 use crate::process::Process;
 
 use std::{collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
-use std::{
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
+use std::{io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -333,33 +329,15 @@ impl EmacsService {
         action: &'static str,
         payload: Value,
     ) -> Result<(), EmacsError> {
-        match self.mail_dispatch(action, payload, true).await?.as_str() {
-            "t" => Ok(()),
-            "nil" => Err(EmacsError::AppNotFound("mail".into())),
-            _ => Err(EmacsError::InvalidResponse("邮件操作结果无效。".into())),
-        }
-    }
-
-    pub(crate) async fn mail_index(&self, home: &Path, phase: &str) -> Result<String, EmacsError> {
-        self.mail_dispatch(
-            "index",
-            serde_json::json!({"home": home, "phase": phase}),
-            false,
-        )
-        .await
-    }
-
-    async fn mail_dispatch(
-        &self,
-        action: &'static str,
-        payload: Value,
-        auto_start: bool,
-    ) -> Result<String, EmacsError> {
         let argument = STANDARD.encode(payload.to_string());
         let script = format!(
             "(when (require 'loki-assistant-mail nil t) (loki-assistant-mail-dispatch \"{action}\" \"{argument}\"))"
         );
-        self.eval_with_startup(&script, auto_start).await
+        match self.eval(&script).await?.as_str() {
+            "t" => Ok(()),
+            "nil" => Err(EmacsError::AppNotFound("mail".into())),
+            _ => Err(EmacsError::InvalidResponse("邮件操作结果无效。".into())),
+        }
     }
 
     pub(crate) async fn open_slack_conversation(
@@ -736,17 +714,8 @@ const OPEN_CONFIG_APP_SCRIPT: &str = r#"(progn
       t)))"#;
 
 const OPEN_LOG_APP_SCRIPT: &str = r#"(progn
-  (require 'seq)
-  (let* ((path (expand-file-name "~/.assistant/loki-assistant.log.org"))
-         (frame (or (and (display-graphic-p (selected-frame)) (selected-frame))
-                    (seq-find #'display-graphic-p (frame-list))
-                    (make-frame '((window-system . ns)))))
-         (buffer (find-file path)))
-    (select-frame frame)
-    (switch-to-buffer buffer)
-    (make-frame-visible frame)
-    (select-frame-set-input-focus frame)
-    t))"#;
+  (when (require 'loki-assistant-log nil t)
+    (loki-assistant-log-open-app)))"#;
 
 const BUFFERS_SCRIPT: &str = r#"(let ((json-encoding-pretty-print nil)
       (json-null nil)

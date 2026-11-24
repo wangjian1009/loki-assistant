@@ -83,7 +83,7 @@ make emacs-load
 make emacs-test
 #+end_src
 
-该命令通过 ~emacsclient --eval~ 将 ~emacs/~ 加入 ~load-path~，卸载已加载的包后执行 ~(require 'loki-assistant)~ 和 ~(require 'loki-assistant-config)~ ，用于首次加载和修改后的重新加载。
+~make emacs-load~ 先按 ~Package-Requires~ 安装缺失依赖，然后通过 ~emacsclient --eval~ 将 ~emacs/~ 加入 ~load-path~ ，卸载已加载的包并重新加载。
 
 ~make emacs-test~ 重新加载包并运行 ERT，使用临时 HTTP listener 验证请求、通知与配置界面，不改动用户配置或发送系统通知。测试失败时命令返回非零退出码；不会退出 Emacs。~make test~ 执行 Mac、services 和 Chrome 插件检查，Emacs 测试通过独立入口运行。
 
@@ -108,7 +108,8 @@ make emacs-test
 | make stop-service | 通过 brew services 停止 services |
 | make restart-service | 重建、更新并重启 services Homebrew 服务 |
 | make service-status | 查询 brew services 中的 services 状态 |
-| make emacs-load | 通过 emacsclient 重新加载 Emacs 包 |
+| make emacs-deps | 安装 Emacs 包声明的依赖 |
+| make emacs-load | 安装缺失依赖并重新加载 Emacs 包 |
 | make emacs-test | 通过 emacsclient 执行 Emacs ERT 测试 |
 | make harmony-deps | 检查 SDK 并安装 HarmonyOS 工程依赖 |
 | make harmony-check-sdk | 检查 HarmonyOS SDK 安装 |

@@ -245,7 +245,7 @@ pub(super) async fn save(
         .map_err(|_| NetworkError::Storage)?;
     for password in retired {
         if let Err(error) = password.remove(config).await {
-            eprintln!("清理旧设备绑定凭据失败：{error}");
+            log::warn!("清理旧设备绑定凭据失败：{error}");
         }
     }
     Ok(())

@@ -12,7 +12,7 @@ BREW ?= brew
 OPEN ?= open
 EMACSCLIENT ?= emacsclient
 
-.PHONY: emacs-load emacs-test emacs-config emacs-devices chrome-build chrome-test export-icons
+.PHONY: emacs-deps emacs-load emacs-test emacs-config emacs-devices chrome-build chrome-test export-icons
 .PHONY: relay-image harmony-test
 
 .PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
@@ -41,7 +41,8 @@ help:
 	  'make stop-service    通过 brew services 停止 services' \
 	  'make restart-service 重建、更新并重启 services Homebrew 服务' \
 	  'make service-status  查询 brew services 中的 services 状态' \
-	  'make emacs-load      通过 emacsclient 重新加载 Emacs 包' \
+	  'make emacs-deps      安装 Emacs 包声明的依赖' \
+	  'make emacs-load      安装缺失依赖并通过 emacsclient 重新加载 Emacs 包' \
 	  'make emacs-test      通过 emacsclient 执行 Emacs ERT 测试' \
 	  'make release         构建 Release Mac 菜单栏应用' \
 	  'make deploy          检查 HarmonyOS 真机，构建、安装并启动' \
@@ -58,7 +59,31 @@ help:
 	  '' \
 	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR TEST_BUILD_DIR CMAKE CTEST CARGO BREW OPEN EMACSCLIENT DEVECO_HOME HDC_TARGET'
 
-emacs-load:
+emacs-deps:
+	"$(EMACSCLIENT)" --eval "(progn \
+	  (require 'package) \
+	  (unless package--initialized (package-initialize)) \
+	  (let* ((requirements (with-temp-buffer \
+	                         (insert-file-contents \"$(PROJECT_ROOT)/emacs/loki-assistant.el\") \
+	                         (package-desc-reqs (package-buffer-info)))) \
+	         (missing (seq-remove (lambda (requirement) (apply #'package-installed-p requirement)) \
+	                              requirements))) \
+	    (when missing \
+	      (let ((package-archives (copy-tree package-archives))) \
+	        (unless (assoc \"nongnu\" package-archives) \
+	          (push '(\"nongnu\" . \"https://elpa.nongnu.org/nongnu/\") package-archives)) \
+	        (package-read-all-archive-contents) \
+	        (package-download-transaction \
+	         (or (ignore-errors (package-compute-transaction nil missing)) \
+	             (progn \
+	               (package-refresh-contents) \
+	               (package-compute-transaction nil missing)))) \
+	        (dolist (requirement missing) \
+	          (unless (apply #'package-installed-p requirement) \
+	            (error \"Emacs 依赖安装失败：%s\" (car requirement))))))) \
+	  t)"
+
+emacs-load: emacs-deps
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (let ((directory \"$(PROJECT_ROOT)/emacs\")) \
 	    (setq load-path (cons directory (delete directory load-path)))) \

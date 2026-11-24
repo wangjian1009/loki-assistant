@@ -1,7 +1,7 @@
 ;;; loki-assistant.el --- Loki Assistant 的 Emacs 入口 -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "27.1") (logview "0.19.3"))
 ;; Keywords: convenience
 
 ;;; Commentary:
@@ -24,6 +24,7 @@
   :group 'applications
   :prefix "loki-assistant-")
 
+(autoload 'loki-assistant-logs "loki-assistant-log" "浏览 Loki Assistant 日志。" t)
 (autoload 'loki-assistant-config "loki-assistant-config"
   "打开 services 配置管理界面。" t)
 (autoload 'loki-assistant-devices "loki-assistant-devices"
