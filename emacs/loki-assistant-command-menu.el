@@ -9,6 +9,7 @@
   "Loki Assistant"
   ("c" loki-assistant-config "服务配置")
   ("d" loki-assistant-devices "设备管理")
+  ("r" loki-assistant-read-later "稍后阅读")
   ("q" nil "退出"))
 
 (defalias 'loki-assistant-command-map #'loki-assistant-command-menu/body

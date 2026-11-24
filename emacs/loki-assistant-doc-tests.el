@@ -148,6 +148,51 @@
       (should (alist-get 'result (loki-assistant-read-later-mark-read "older-link")))
       (should (equal (loki-assistant-read-later-list) '((result (entries . []))))))))
 
+(ert-deftest loki-assistant-doc-test-read-later-mode-opens-and-marks-current-entry ()
+  (loki-assistant-doc-test--with-library
+    (let* ((org-roam-dailies-directory "journal/")
+           (file (expand-file-name "journal/2026-06-01.org" root))
+           (url "https://example.org/article")
+           opened-url)
+      (make-directory (file-name-directory file) t)
+      (with-temp-file file
+        (insert "* 旧条目 :稍后阅读:\n:PROPERTIES:\n:ID: first\n:END:\n"
+                "* " (org-link-make-string url "新条目") " :稍后阅读:\n"
+                ":PROPERTIES:\n:ID: second\n:CREATED: [2026-06-01 Mon 09:30]\n:END:\n"
+                "网页笔记\n"))
+      (org-roam-db-update-file file)
+      (save-window-excursion
+        (with-temp-buffer
+          (loki-assistant-read-later-mode)
+          (call-interactively (key-binding (kbd "g")))
+          (goto-char (point-min))
+          (should (equal (tabulated-list-get-id) "second"))
+          (should (string-match-p "新条目" (buffer-string)))
+          (cl-letf (((symbol-function 'browse-url)
+                     (lambda (address &rest _) (setq opened-url address))))
+            (call-interactively (key-binding (kbd "b"))))
+          (should (equal opened-url url))
+          (save-window-excursion
+            (save-current-buffer
+              (call-interactively (key-binding (kbd "RET")))
+              (should (file-equal-p buffer-file-name file))
+              (should (equal (org-entry-get nil "ID") "second"))
+              (should-not (org-entry-get nil "READED"))))
+          (let ((journal (find-buffer-visiting file)))
+            (with-current-buffer journal (set-buffer-modified-p t))
+            (unwind-protect
+                (should-error (call-interactively (key-binding (kbd "r"))) :type 'user-error)
+              (with-current-buffer journal (set-buffer-modified-p nil))))
+          (should (equal (tabulated-list-get-id) "second"))
+          (call-interactively (key-binding (kbd "r")))
+          (should (equal (tabulated-list-get-id) "first"))
+          (should-error (call-interactively (key-binding (kbd "b"))) :type 'user-error)
+          (call-interactively (key-binding (kbd "g")))
+          (should (equal (mapcar #'car tabulated-list-entries) '("first")))
+          (with-current-buffer (find-buffer-visiting file)
+            (goto-char (org-find-entry-with-id "second"))
+            (should (org-entry-get nil "READED"))))))))
+
 (ert-deftest loki-assistant-doc-test-capture-and-retry-without-confirmation ()
   (loki-assistant-doc-test--with-library
     (let* ((body "* 中文正文\n%? %(error \"不执行\") ${title}\n")

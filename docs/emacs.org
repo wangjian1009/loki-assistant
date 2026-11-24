@@ -25,6 +25,7 @@
 |--------+----------|
 | c      | 服务配置 |
 | d      | 设备管理 |
+| r      | 稍后阅读 |
 | q      | 退出     |
 
 * 本机服务发现
@@ -104,7 +105,17 @@
 
 ** 稍后阅读
 
-~loki-assistant-read-later~ 提供捕获、查询、标记已读和删除。要更换用于定位日记文件的模板，可在 Customize 中设置 ~loki-assistant-read-later-daily-template-key~ ，默认使用 ~org-roam-dailies-capture-templates~ 中的 ~d~ 模板。捕获通过 ~org-roam-dailies-capture-today~ 写入带 ID、 ~稍后阅读~ 标签和 ~CREATED~ 属性的链接标题。删除移除标题的 ~ID~ 并更新 org-roam 索引。 [[file:control-center-services.org::*稍后阅读][稍后阅读 HTTP 协议]]
+执行 ~M-x loki-assistant-read-later~ ，或在命令菜单按 ~r~ ，打开稍后阅读模式。列表从本地 org-roam 索引查询未读日记条目，默认按加入时间倒序显示。
+
+| 快捷键 | 操作 |
+|--------+------|
+| ~g~ | 刷新未读列表 |
+| ~RET~ | 打开当前条目的 Org 日记标题 |
+| ~b~ | 打开当前条目的网页链接 |
+| ~r~ | 保存已读时间并从未读列表移除当前条目 |
+| ~q~ | 退出列表 |
+
+要更换用于定位日记文件的模板，可在 Customize 中设置 ~loki-assistant-read-later-daily-template-key~ ，默认使用 ~org-roam-dailies-capture-templates~ 中的 ~d~ 模板。捕获通过 ~org-roam-dailies-capture-today~ 写入带 ID、 ~稍后阅读~ 标签和 ~CREATED~ 属性的链接标题。删除移除标题的 ~ID~ 并更新 org-roam 索引。 [[file:control-center-services.org::*稍后阅读][稍后阅读 HTTP 协议]]
 
 * 服务配置管理
 

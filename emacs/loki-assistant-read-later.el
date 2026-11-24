@@ -3,8 +3,10 @@
 ;;; Code:
 
 (require 'loki-assistant-doc)
+(require 'browse-url)
 (require 'org-capture)
 (require 'org-id)
+(require 'tabulated-list)
 
 (declare-function org-roam-dailies-capture-today "org-roam-dailies" (&optional goto keys))
 (declare-function org-roam-db-clear-file "org-roam-db" (&optional file))
@@ -221,8 +223,8 @@
     (loki-assistant-read-later--require-roam)
     `((result (entries . ,(vconcat (loki-assistant-read-later--list-entries)))))))
 
-(defun loki-assistant-read-later--update-entry (id update)
-  "在 ID 对应的稍后阅读标题上执行 UPDATE，保存并更新索引后返回其结果。"
+(defun loki-assistant-read-later--entry-file (id)
+  "返回 ID 对应的稍后阅读日记文件。"
   (unless (and (stringp id) (not (string-blank-p id))
                (not (string-match-p "[[:cntrl:]]" id)))
     (loki-assistant-doc--fail "invalid-request"))
@@ -230,11 +232,25 @@
   (let* ((node (condition-case nil
                    (org-roam-node-from-id id)
                  (error (loki-assistant-doc--fail "document-read-failed"))))
-         (file (and node (org-roam-node-file node)))
-         result)
+         (file (and node (org-roam-node-file node))))
     (unless (and file (file-in-directory-p file (loki-assistant-read-later--daily-root))
                  (file-regular-p file) (> (org-roam-node-level node) 0))
       (loki-assistant-doc--fail "read-later-not-found"))
+    file))
+
+(defun loki-assistant-read-later--goto-entry (id)
+  "定位当前日记中 ID 对应的稍后阅读标题。"
+  (let ((position (org-find-entry-with-id id)))
+    (unless position (loki-assistant-doc--fail "read-later-not-found"))
+    (goto-char position)
+    (unless (and (org-at-heading-p)
+                 (member loki-assistant-read-later--tag (org-get-tags nil t)))
+      (loki-assistant-doc--fail "read-later-not-found"))))
+
+(defun loki-assistant-read-later--update-entry (id update)
+  "在 ID 对应的稍后阅读标题上执行 UPDATE，保存并更新索引后返回其结果。"
+  (let ((file (loki-assistant-read-later--entry-file id))
+        result)
     (condition-case nil
         (let ((enable-local-variables nil)
               (enable-local-eval nil)
@@ -243,12 +259,7 @@
           (loki-assistant-read-later--check-buffer visiting)
           (with-current-buffer (or visiting (find-file-noselect file))
             (org-with-wide-buffer
-             (let ((pos (org-find-entry-with-id id)))
-               (unless pos (loki-assistant-doc--fail "read-later-not-found"))
-               (goto-char pos))
-             (unless (and (org-at-heading-p)
-                          (member loki-assistant-read-later--tag (org-get-tags nil t)))
-               (loki-assistant-doc--fail "read-later-not-found"))
+             (loki-assistant-read-later--goto-entry id)
              (atomic-change-group
                (setq result (funcall update))
                (when (buffer-modified-p) (save-buffer))))))
@@ -280,6 +291,107 @@
             (error (loki-assistant-doc--fail "read-later-index-failed")))
       (loki-assistant-doc--fail "read-later-index-failed"))
     `((result (id . ,id)))))
+
+(defun loki-assistant-read-later--result (reply)
+  "返回 REPLY 中的结果，交互操作失败时显示原因。"
+  (if-let* ((code (alist-get 'error reply)))
+      (user-error "%s"
+                  (pcase code
+                    ("doc-unavailable" "请先加载 org-roam 及日记模块")
+                    ("document-read-failed" "无法读取稍后阅读，请检查 org-roam 索引和日记文件")
+                    ("read-later-not-found" "找不到这条稍后阅读记录，请按 g 刷新")
+                    ("read-later-daily-conflict" "日记有未保存或未加载的更改，请处理后重试")
+                    ("read-later-save-failed" "无法保存稍后阅读记录，请检查日记文件")
+                    ("read-later-index-failed" "无法更新日记索引，请检查 org-roam 后重试")
+                    (_ (format "稍后阅读操作失败（%s）" code))))
+    (alist-get 'result reply)))
+
+(defun loki-assistant-read-later--load-rows ()
+  "将当前未读记录加载到列表。"
+  (let* ((result (loki-assistant-read-later--result (loki-assistant-read-later-list)))
+         (entries (alist-get 'entries result)))
+    (setq tabulated-list-entries
+          (mapcar (lambda (entry)
+                    (let ((captured-at (alist-get 'captured_at entry))
+                          (title (alist-get 'title entry))
+                          (url (alist-get 'url entry)))
+                      (list (alist-get 'id entry)
+                            (vector (if (stringp captured-at) captured-at "")
+                                    title
+                                    (if (stringp url) url "")))))
+                  entries))))
+
+(defun loki-assistant-read-later--id-at-point ()
+  "返回当前行的 Org ID。"
+  (or (tabulated-list-get-id) (user-error "请先选择一条未读记录")))
+
+(defun loki-assistant-read-later--entry-location (id)
+  "返回 ID 对应的日记缓冲区及标题位置，或文档错误。"
+  (catch 'loki-assistant-doc-error
+    (let* ((file (loki-assistant-read-later--entry-file id))
+           (buffer (find-file-noselect file)))
+      (with-current-buffer buffer
+        (org-with-wide-buffer
+         (loki-assistant-read-later--goto-entry id)
+         `((result . (,buffer . ,(point)))))))))
+
+(defun loki-assistant-read-later-open ()
+  "打开当前记录对应的 Org 日记条目。"
+  (interactive)
+  (let* ((id (loki-assistant-read-later--id-at-point))
+         (location
+          (loki-assistant-read-later--result (loki-assistant-read-later--entry-location id))))
+    (pop-to-buffer-same-window (car location))
+    (unless (<= (point-min) (cdr location) (point-max)) (widen))
+    (goto-char (cdr location))
+    (org-fold-show-context)
+    (org-fold-show-entry)))
+
+(defun loki-assistant-read-later-open-url ()
+  "打开当前记录的网页链接。"
+  (interactive)
+  (loki-assistant-read-later--id-at-point)
+  (let ((url (aref (tabulated-list-get-entry) 2)))
+    (unless (loki-assistant-read-later--web-url-p url)
+      (user-error "此条目没有网页链接，按 RET 可打开日记条目"))
+    (browse-url url)))
+
+(defun loki-assistant-read-later-mark-current-read ()
+  "标记当前记录为已读并从未读列表移除。"
+  (interactive)
+  (let ((id (loki-assistant-read-later--id-at-point)))
+    (loki-assistant-read-later--result (loki-assistant-read-later-mark-read id))
+    (setq tabulated-list-entries (assoc-delete-all id tabulated-list-entries))
+    (tabulated-list-delete-entry)
+    (when (and (eobp) (not (bobp))) (forward-line -1))
+    (message "已标记为已读")))
+
+(defvar loki-assistant-read-later-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'loki-assistant-read-later-open)
+    (define-key map (kbd "b") #'loki-assistant-read-later-open-url)
+    (define-key map (kbd "r") #'loki-assistant-read-later-mark-current-read)
+    map)
+  "稍后阅读列表的快捷键。")
+
+(define-derived-mode loki-assistant-read-later-mode tabulated-list-mode "稍后阅读"
+  "显示 org-roam 日记中的未读记录。"
+  (setq tabulated-list-format [("加入时间 (UTC)" 20 t) ("标题" 42 t) ("网页" 0 nil)]
+        tabulated-list-padding 2)
+  (setq-local mode-line-process '(:eval (unless tabulated-list-entries " · 没有未读记录")))
+  (add-hook 'tabulated-list-revert-hook #'loki-assistant-read-later--load-rows nil t)
+  (tabulated-list-init-header))
+
+;;;###autoload
+(defun loki-assistant-read-later ()
+  "打开并刷新稍后阅读未读列表。"
+  (interactive)
+  (let ((buffer (get-buffer-create "*稍后阅读*")))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'loki-assistant-read-later-mode)
+        (loki-assistant-read-later-mode))
+      (tabulated-list-revert))
+    (pop-to-buffer-same-window buffer)))
 
 (provide 'loki-assistant-read-later)
 ;;; loki-assistant-read-later.el ends here
