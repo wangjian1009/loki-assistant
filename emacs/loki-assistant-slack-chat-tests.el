@@ -564,6 +564,93 @@
           (loki-assistant-dispatch-slack-messages path))
       (delete-file path))))
 
+(ert-deftest loki-assistant-slack-chat-test-appends-without-redrawing-history ()
+  (skip-unless (require 'shell-maker nil t))
+  (let ((shell-maker-root-path (make-temp-file "loki-slack-append-test-" t))
+        (loki-assistant-slack--subscription-buffers (make-hash-table :test #'equal))
+        (room '((id . "TTEST.DCHAT") (session_id . "session") (team_id . "TTEST")
+                (title . "增量渲染测试")))
+        (id "append-test")
+        buffer thread-buffer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'loki-assistant-slack--request) #'ignore))
+          (setq buffer (loki-assistant-slack--make-chat-buffer " *Slack 追加测试*")
+                thread-buffer (loki-assistant-slack--make-chat-buffer " *Slack 线程测试*"))
+          (with-current-buffer buffer
+            (loki-assistant-slack--initialize-input)
+            (setq loki-assistant-slack--room room
+                  loki-assistant-slack--profiles (make-hash-table :test #'equal)
+                  loki-assistant-slack--pending-subscription
+                  (make-loki-assistant-slack--subscription :id id :room room))
+            (puthash id buffer loki-assistant-slack--subscription-buffers)
+            (should (eq 'applied
+                        (loki-assistant-slack-chat-test--deliver
+                         id "session" 1 "snapshot"
+                         '(snapshot .
+                           ((items . [((ts . "100.0") (text . "根消息") (reply_count . 1))
+                                      ((ts . "200.0") (text . "前一条消息")
+                                       (author . ((id . "TTEST.U1") (name . "发言者"))))]))))))
+            (setq loki-assistant-slack--thread-buffers (make-hash-table :test #'equal))
+            (puthash "100.0" thread-buffer loki-assistant-slack--thread-buffers)
+            (with-current-buffer thread-buffer
+              (setq loki-assistant-slack--thread-root "100.0"
+                    loki-assistant-slack--parent-buffer buffer)
+              (loki-assistant-slack--initialize-input))
+            (loki-assistant-slack--render-thread thread-buffer)
+            (goto-char (point-max))
+            (insert "未发送的草稿")
+            (goto-char (+ (loki-assistant-slack--draft-start) 2))
+            (let* ((old-position (loki-assistant-slack--message-position "200.0"))
+                   (old-label (car (overlays-at (1- old-position))))
+                   (thread-tick (with-current-buffer thread-buffer (buffer-chars-modified-tick))))
+              (should old-label)
+              (dotimes (_ 2)
+                (should (eq 'applied
+                            (loki-assistant-slack-chat-test--deliver
+                             id "session" 2 "changes"
+                             '(items . [((ts . "300.0") (text . "同一发送者的新消息")
+                                         (author . ((id . "TTEST.U1") (name . "发言者"))))
+                                        ((ts . "400.0") (text . "另一发送者的新消息")
+                                         (author . ((id . "TTEST.U2") (name . "另一位"))))])))))
+              (should (equal thread-tick
+                             (with-current-buffer thread-buffer (buffer-chars-modified-tick))))
+              (should (memq old-label (overlays-at (1- old-position))))
+              (should (= 1 (how-many "同一发送者的新消息" (point-min) (point-max))))
+              (should (= 2 (- (point) (loki-assistant-slack--draft-start))))
+              (should (equal (buffer-substring-no-properties
+                              (loki-assistant-slack--draft-start) (point-max))
+                             "未发送的草稿"))
+              (should (equal (get-char-property loki-assistant-slack--history-end 'display) "  ❯ "))
+              (let ((same (loki-assistant-slack--message-position "300.0"))
+                    (other (loki-assistant-slack--message-position "400.0")))
+                (should (get-text-property same 'read-only))
+                (should-not (get-char-property (1- same) 'before-string))
+                (should (equal (get-char-property (1- other) 'before-string) " 另一位 \n"))
+                (cl-letf (((symbol-function 'window-start) (lambda (_) (point-min)))
+                          ((symbol-function 'window-end) (lambda (&rest _) (1+ other)))
+                          ((symbol-function 'pos-visible-in-window-p) (lambda (&rest _) t)))
+                  (should (equal (gethash nil (loki-assistant-slack--visible-read-positions nil))
+                                 "300.0"))))
+              (should (eq 'applied
+                          (loki-assistant-slack-chat-test--deliver
+                           id "session" 3 "changes"
+                           '(thread_items . [((ts . "110.0") (thread_ts . "100.0")
+                                              (text . "线程新回复"))]))))
+              (should (loki-assistant-slack--message-position "110.0"))
+              (with-current-buffer thread-buffer
+                (should (loki-assistant-slack--message-position "110.0")))
+              (should (eq 'applied
+                          (loki-assistant-slack-chat-test--deliver
+                           id "session" 4 "changes"
+                           '(items . [((ts . "200.0") (text . "编辑后的前一条消息")
+                                       (author . ((id . "TTEST.U1") (name . "发言者"))))]))))
+              (goto-char (loki-assistant-slack--message-position "200.0"))
+              (should (looking-at-p "编辑后的前一条消息"))
+              (should (loki-assistant-slack--message-position "400.0")))))
+      (dolist (candidate (list thread-buffer buffer))
+        (when (buffer-live-p candidate) (kill-buffer candidate)))
+      (delete-directory shell-maker-root-path t))))
+
 (ert-deftest loki-assistant-slack-chat-test-top-level-timeline-and-send ()
   (skip-unless (require 'shell-maker nil t))
   (let ((shell-maker-root-path (make-temp-file "loki-slack-chat-test-" t))

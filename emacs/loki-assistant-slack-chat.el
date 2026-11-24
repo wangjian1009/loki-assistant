@@ -80,6 +80,8 @@
 (defvar-local loki-assistant-slack--thread-root nil)
 (defvar-local loki-assistant-slack--thread-message nil)
 (defvar-local loki-assistant-slack--history-end nil)
+(defvar-local loki-assistant-slack--rendered-timeline nil
+  "已渲染的主时间线，car 为末尾发送者，cdr 为消息列表。")
 (defvar-local loki-assistant-slack--reply nil
   "当前输入区的线程回复目标。")
 (defvar-local loki-assistant-slack--send-request nil)
@@ -1177,12 +1179,12 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                (loki-assistant-slack--load-profiles)))))
        :room loki-assistant-slack--room :params (list (cons 'cursor cursor))))))
 
-(defun loki-assistant-slack--update-history ()
-  "为有回复的消息初始化折叠状态并重绘聊天。"
+(defun loki-assistant-slack--update-history (&optional changes)
+  "为有回复的消息初始化折叠状态，按 CHANGES 更新界面。"
   (dolist (message (loki-assistant-slack--page-items loki-assistant-slack--timeline))
     (when (> (or (loki-assistant-slack--non-null (alist-get 'reply_count message)) 0) 0)
       (loki-assistant-slack--thread-page (alist-get 'ts message))))
-  (loki-assistant-slack--render))
+  (loki-assistant-slack--render changes))
 
 (defun loki-assistant-slack--subscription-path (subscription)
   "返回 SUBSCRIPTION 的本机接口路径。"
@@ -1430,7 +1432,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                        (with-current-buffer child (setq loki-assistant-slack--thread-message nil)))
                      (remhash root loki-assistant-slack--threads)))
                  (loki-assistant-slack--apply-thread-push data)
-                 (loki-assistant-slack--update-history)))
+                 (loki-assistant-slack--update-history data)))
               (_ (error "未知的 Slack 消息投递类型")))
             (setf (loki-assistant-slack--subscription-sequence subscription) sequence)
             (run-at-time 0 nil
@@ -2039,51 +2041,60 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                 (setq position end))))))
       expanded)))
 
-(defun loki-assistant-slack--insert-messages (items room profiles &optional inline-threads)
-  "显示 ITEMS，按发送者分组。INLINE-THREADS 非空时内嵌回复。"
-  (let (sender)
-    (dolist (message (seq-remove #'loki-assistant-slack--thinking-placeholder-p items))
-      (let* ((author (loki-assistant-slack--non-null (alist-get 'author message)))
+(defun loki-assistant-slack--insert-messages (items room profiles &optional inline-threads sender)
+  "显示 ITEMS 并返回末尾发送者，SENDER 为之前的发送者。
+INLINE-THREADS 非空时内嵌回复。"
+  (dolist (message (seq-remove #'loki-assistant-slack--thinking-placeholder-p items))
+    (let* ((author (loki-assistant-slack--non-null (alist-get 'author message)))
            (id (alist-get 'id author)))
-        (unless (and (stringp id) (not (string-empty-p id)) (equal sender id))
-          (loki-assistant-slack--insert-author-label author profiles))
-        (let ((start (point)))
-          (loki-assistant-slack--message message room profiles)
-          (setq sender (unless (and inline-threads
-                                    (loki-assistant-slack--thread-block message room profiles start))
-                         id)))
-        (insert "\n")))))
+      (unless (and (stringp id) (not (string-empty-p id)) (equal sender id))
+        (loki-assistant-slack--insert-author-label author profiles))
+      (let ((start (point)))
+        (loki-assistant-slack--message message room profiles)
+        (setq sender (unless (and inline-threads
+                                  (loki-assistant-slack--thread-block message room profiles start))
+                       id)))
+      (insert "\n")))
+  sender)
 
 (defun loki-assistant-slack--history (timeline room profiles &optional thread root)
-  "显示 TIMELINE 或 THREAD 中 ROOT 消息及其回复，再显示输入区。"
+  "显示 TIMELINE 或 THREAD 中 ROOT 消息及其回复，再显示输入区。
+返回最后一组消息的发送者。"
   (let ((inhibit-read-only t))
-    (cond
-     ((not thread)
-      (loki-assistant-slack--pagination timeline)
-      (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items timeline)
-                                             room profiles t))
-     (root
-      (loki-assistant-slack--insert-messages (list root) room profiles)
-      (when-let ((page (gethash thread loki-assistant-slack--threads)))
-        (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items page) room profiles)))
-     (t (insert (propertize "线程已不可用\n\n" 'face 'shadow))))
-    (loki-assistant-slack--insert-label (if loki-assistant-slack--reply "我 · 线程回复" "我")
-                                       'loki-assistant-slack-self-label
-                                       (gethash loki-assistant-slack--self-id profiles))))
+    (prog1
+        (cond
+         ((not thread)
+          (loki-assistant-slack--pagination timeline)
+          (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items timeline)
+                                                 room profiles t))
+         (root
+          (loki-assistant-slack--insert-messages (list root) room profiles)
+          (when-let ((page (gethash thread loki-assistant-slack--threads)))
+            (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items page) room profiles)))
+         (t (insert (propertize "线程已不可用\n\n" 'face 'shadow))))
+      (loki-assistant-slack--insert-label (if loki-assistant-slack--reply "我 · 线程回复" "我")
+                                         'loki-assistant-slack-self-label
+                                         (gethash loki-assistant-slack--self-id profiles)))))
+
+(defun loki-assistant-slack--decorate-labels (start end)
+  "为 START 到 END 之间可见的身份色块添加 overlay。"
+  (save-excursion
+    (save-restriction
+      (narrow-to-region start end)
+      (goto-char (point-min))
+      ;; 色块锚定在正文前的换行，避免光标落在显示字符串里。
+      (while-let ((label (text-property-search-forward 'loki-slack-label)))
+        (unless (invisible-p (prop-match-beginning label))
+          (let ((overlay (make-overlay (prop-match-beginning label) (prop-match-end label))))
+            (overlay-put overlay 'loki-slack-chat-display t)
+            (overlay-put overlay 'before-string (concat (prop-match-value label) "\n"))))))))
 
 (defun loki-assistant-slack--decorate (prompt input)
   "用 overlay 显示身份色块和 PROMPT 到 INPUT 之间的输入提示符。"
-  (save-excursion
-    (goto-char (point-min))
-    ;; 色块锚定在正文前的换行，避免光标落在显示字符串里。
-    (while-let ((label (text-property-search-forward 'loki-slack-label)))
-      (unless (invisible-p (prop-match-beginning label))
-        (let ((overlay (make-overlay (prop-match-beginning label) (prop-match-end label))))
-          (overlay-put overlay 'loki-slack-chat-display t)
-          (overlay-put overlay 'before-string (concat (prop-match-value label) "\n")))))
-    (let ((overlay (make-overlay prompt input)))
-      (overlay-put overlay 'loki-slack-chat-display t)
-      (overlay-put overlay 'display (propertize "  ❯ " 'face 'default))))
+  (loki-assistant-slack--decorate-labels (point-min) prompt)
+  (let ((overlay (make-overlay prompt input)))
+    (overlay-put overlay 'loki-slack-chat-display t)
+    (overlay-put overlay 'display (propertize "  ❯ " 'face 'default)))
   (loki-assistant-slack--update-send-prompt (current-buffer)))
 
 (defun loki-assistant-slack--stop-send-timer ()
@@ -2114,14 +2125,34 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                          (concat (propertize frame 'face 'shadow)
                                  (propertize " ❯ " 'face 'default)))))))))
 
-(defun loki-assistant-slack--render ()
-  "更新当前聊天和关联线程的界面。"
-  (loki-assistant-slack--render-buffer)
-  (when loki-assistant-slack--thread-buffers
-    (maphash (lambda (_ buffer)
-               (when (and (buffer-live-p buffer) (comint-check-proc buffer))
-                 (loki-assistant-slack--render-thread buffer)))
-             loki-assistant-slack--thread-buffers)))
+(defun loki-assistant-slack--changed-roots (changes)
+  "按时间戳收集 CHANGES 影响的顶层消息。"
+  (let ((roots (make-hash-table :test #'equal)))
+    (seq-doseq (ts (alist-get 'deleted_ts changes))
+      (puthash ts t roots))
+    (seq-doseq (item (alist-get 'items changes))
+      (puthash (alist-get 'ts item) t roots))
+    (dolist (key '(thread_items deleted_thread_messages))
+      (seq-doseq (item (alist-get key changes))
+        (puthash (alist-get 'thread_ts item) t roots)))
+    roots))
+
+(defun loki-assistant-slack--render (&optional changes)
+  "更新当前聊天，CHANGES 非空时只刷新受影响的独立线程。"
+  (let ((roots (when (and changes (not (or (assq 'nicknames changes) (assq 'title changes))))
+                 (loki-assistant-slack--changed-roots changes))))
+    (unless (and roots (loki-assistant-slack--append-history roots))
+      (loki-assistant-slack--render-buffer))
+    (when loki-assistant-slack--thread-buffers
+      (if roots
+          (maphash (lambda (root _)
+                     (when-let ((buffer (loki-assistant-slack--thread-buffer root)))
+                       (loki-assistant-slack--render-thread buffer)))
+                   roots)
+        (maphash (lambda (_ buffer)
+                   (when (and (buffer-live-p buffer) (comint-check-proc buffer))
+                     (loki-assistant-slack--render-thread buffer)))
+                 loki-assistant-slack--thread-buffers)))))
 
 (defun loki-assistant-slack--render-thread (buffer)
   "用主聊天的数据更新线程 BUFFER。"
@@ -2140,6 +2171,56 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
             loki-assistant-slack--threads threads
             loki-assistant-slack--thread-message (or root loki-assistant-slack--thread-message))
       (loki-assistant-slack--render-buffer))))
+
+(defun loki-assistant-slack--append-history (roots)
+  "主时间线仅增加末尾消息时追加正文，返回非空。
+ROOTS 含本批次影响的顶层消息。"
+  (when-let* ((rendered loki-assistant-slack--rendered-timeline)
+              (prompt (loki-assistant-slack--prompt-start))
+              ((and (> prompt (point-min))
+                    (markerp loki-assistant-slack--history-end)
+                    (= prompt loki-assistant-slack--history-end)))
+              (start (1- prompt))
+              ((get-text-property start 'loki-slack-label)))
+    (let* ((items (loki-assistant-slack--page-items loki-assistant-slack--timeline))
+           (previous (cdr rendered))
+           (remaining items)
+           (sender (car rendered)))
+      ;; 合并会保留未变消息的对象。只要其中一条或其线程有更新，
+      ;; 或有新消息插入旧区间，完整重绘路径就会重新生成分组。
+      (while (and previous (eq (car previous) (car remaining))
+                  (not (gethash (alist-get 'ts (car previous)) roots)))
+        (setq previous (cdr previous)
+              remaining (cdr remaining)))
+      (unless previous
+        (when remaining
+          (let* ((room loki-assistant-slack--room)
+                 (profiles loki-assistant-slack--profiles)
+                 (self-id loki-assistant-slack--self-id)
+                 (nicknames loki-assistant-slack--nicknames)
+                 (threads loki-assistant-slack--threads)
+                 (text (with-temp-buffer
+                         (let ((loki-assistant-slack--self-id self-id)
+                               (loki-assistant-slack--nicknames nicknames)
+                               (loki-assistant-slack--threads threads))
+                           (setq sender (loki-assistant-slack--insert-messages
+                                         remaining room profiles t sender))
+                           (buffer-string)))))
+            (unless (string-empty-p text)
+              (setq loki-assistant-slack--rendered-timeline nil)
+              (let ((inhibit-read-only t)
+                    (buffer-undo-list t)
+                    (modified (buffer-modified-p)))
+                (save-excursion
+                  (goto-char start)
+                  ;; 移动输入区色块的 overlay，保留提示符和草稿的标记。
+                  (insert-before-markers text)
+                  (add-text-properties start (point)
+                                       '(read-only t front-sticky (read-only) rear-nonsticky t))
+                  (loki-assistant-slack--decorate-labels start (point)))
+                (restore-buffer-modified-p modified)))))
+        (setq loki-assistant-slack--rendered-timeline (cons sender items))
+        t))))
 
 (defun loki-assistant-slack--render-buffer ()
   "更新提示符上方的历史，保留当前输入和编辑位置。"
@@ -2160,16 +2241,19 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
          (threads loki-assistant-slack--threads)
          (profiles loki-assistant-slack--profiles)
          (nicknames loki-assistant-slack--nicknames)
+         sender
          (history (with-temp-buffer
                     (let ((loki-assistant-slack--self-id self-id)
                           (loki-assistant-slack--nicknames nicknames)
                           (loki-assistant-slack--reply reply)
                           (loki-assistant-slack--threads threads))
-                      (loki-assistant-slack--history timeline room profiles thread thread-message))
+                      (setq sender (loki-assistant-slack--history
+                                    timeline room profiles thread thread-message)))
                     (buffer-string)))
          (modified (buffer-modified-p))
          (inhibit-read-only t)
          (buffer-undo-list t))
+    (setq loki-assistant-slack--rendered-timeline nil)
     (loki-assistant-slack--update-title)
     (save-excursion
       (remove-overlays (point-min) (point-max) 'loki-slack-chat-display t)
@@ -2196,7 +2280,10 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
           (goto-char (max (prop-match-beginning anchor) (- (prop-match-end anchor) offset)))
         (when-let ((position (loki-assistant-slack--message-position root)))
           (goto-char position))))
-    (restore-buffer-modified-p modified)))
+    (restore-buffer-modified-p modified)
+    (unless thread
+      (setq loki-assistant-slack--rendered-timeline
+            (cons sender (loki-assistant-slack--page-items timeline))))))
 
 (defun loki-assistant-slack--submit ()
   "激活按钮、切换线程折叠状态或发送当前输入。"
