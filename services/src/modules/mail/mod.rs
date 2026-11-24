@@ -95,6 +95,7 @@ struct MailService {
     notification: Arc<NotificationService>,
     emacs: Arc<EmacsService>,
     status: Arc<StatusService>,
+    refresh_requested: Notify,
     stopping: Notify,
 }
 
@@ -110,6 +111,7 @@ static EXTENSION: ExtensionRegistration = ExtensionRegistration {
             notification: Arc::clone(context.notification),
             emacs: context.emacs.service(),
             status: Arc::clone(context.status),
+            refresh_requested: Notify::new(),
             stopping: Notify::new(),
         })))
     },

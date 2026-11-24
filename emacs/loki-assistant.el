@@ -306,6 +306,9 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
 (with-eval-after-load 'org-edna
   (require 'loki-assistant-edna))
 
+(with-eval-after-load 'mu4e
+  (require 'loki-assistant-mail))
+
 (autoload 'loki-assistant-doc-get "loki-assistant-doc")
 (autoload 'loki-assistant-doc-capture-full "loki-assistant-doc")
 

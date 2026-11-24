@@ -4,6 +4,8 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function loki-assistant-request "loki-assistant")
+(declare-function mu4e--init-handlers "mu4e")
 (declare-function mu4e--start "mu4e")
 (declare-function mu4e--server-view "mu4e-server")
 (declare-function mu4e-bookmarks "mu4e-bookmarks")
@@ -20,7 +22,10 @@
 (defvar mu4e--server-indexing)
 (defvar mu4e--server-process)
 (defvar mu4e-index-update-status)
+(defvar mu4e-remove-func)
+(defvar mu4e-update-func)
 (defvar mu4e-view-auto-mark-as-read)
+(defvar mu4e-view-func)
 
 (defcustom loki-assistant-mail-inbox-bookmark-key ?i
   "托盘打开收件箱时使用的 mu4e 书签快捷键。"
@@ -29,6 +34,52 @@
 
 (defvar loki-assistant-mail--index-request nil
   "最近一次 services 索引请求的标识、mu 进程及发起前的完成状态。")
+
+(defvar loki-assistant-mail--refresh-timer nil
+  "合并连续邮件变更回执的定时器。")
+
+(defun loki-assistant-mail-database ()
+  "返回当前 mu4e 数据库位置和 mu 可执行文件的 JSON。"
+  (let ((database (mu4e-database-path)))
+    (json-serialize `((program . ,(car (process-command mu4e--server-process)))
+                      (home . ,(directory-file-name (file-name-directory database)))))))
+
+(defun loki-assistant-mail--request-refresh ()
+  "异步通知 services 刷新本机邮件状态。"
+  (setq loki-assistant-mail--refresh-timer nil)
+  (require 'loki-assistant)
+  (loki-assistant-request
+   "POST" "/mail/status/refresh"
+   :callback (lambda (response)
+               (unless (plist-get response :ok)
+                 (message "请求刷新邮件状态失败：%s"
+                          (plist-get response :error-message))))))
+
+(defun loki-assistant-mail--schedule-refresh (&rest _)
+  "将 mu4e 的成功回执合并为一次邮件状态刷新。"
+  (unless loki-assistant-mail--refresh-timer
+    (setq loki-assistant-mail--refresh-timer
+          (run-at-time 0.2 nil #'loki-assistant-mail--request-refresh))))
+
+(defun loki-assistant-mail--index-updated ()
+  "在 mu4e 索引有变更时请求刷新邮件状态。"
+  (when (> (+ (plist-get mu4e-index-update-status :updated)
+              (plist-get mu4e-index-update-status :cleaned-up))
+           0)
+    (loki-assistant-mail--schedule-refresh)))
+
+(defun loki-assistant-mail--observe-replies ()
+  "在 mu4e 的邮件操作回执处理完成后安排刷新。"
+  ;; 打开邮件的回执也可能包含打开时自动标记已读的结果。
+  (dolist (handler '(mu4e-update-func mu4e-remove-func mu4e-view-func))
+    (when (default-value handler)
+      (add-function :after (default-value handler)
+                    #'loki-assistant-mail--schedule-refresh))))
+
+(with-eval-after-load 'mu4e
+  (advice-add 'mu4e--init-handlers :after #'loki-assistant-mail--observe-replies)
+  (loki-assistant-mail--observe-replies)
+  (add-hook 'mu4e-index-updated-hook #'loki-assistant-mail--index-updated))
 
 (defun loki-assistant-mail-index (request-id check-only)
   "在已有的 mu4e 进程中发起或查询 REQUEST-ID 对应的索引更新。
@@ -40,9 +91,7 @@ CHECK-ONLY 非空时只查询已发起的索引。"
         (error "mu4e 进程已退出，无法确认索引结果"))
       (if (eq previous-status mu4e-index-update-status)
           'running
-        (let ((database (mu4e-database-path)))
-          (json-serialize `((program . ,(car (process-command process)))
-                            (home . ,(directory-file-name (file-name-directory database))))))))
+        (loki-assistant-mail-database)))
      (check-only (error "找不到此前发起的 mu4e 索引请求"))
      (mu4e--server-indexing 'busy)
      (t
@@ -104,6 +153,7 @@ CHECK-ONLY 非空时只查询已发起的索引。"
                    (error (message "邮件操作失败：%s" (error-message-string err)))))))
     (if (and (mu4e-running-p) mu4e--started)
         (funcall open)
+      (mu4e--init-handlers)
       (mu4e--start open))))
 
 (defun loki-assistant-mail--view-message (message-id)

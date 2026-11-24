@@ -19,6 +19,23 @@ use crate::{
 #[loki_api(
     module = "mail",
     mount = "Arc<MailService>",
+    id = "refresh-status",
+    method = "POST",
+    path = "/mail/status/refresh",
+    summary = "请求刷新邮件状态",
+    description = "Emacs 邮件操作完成后，安排从当前 mu4e 数据库重查未读数。"
+)]
+async fn refresh_status(State(service): State<Arc<MailService>>) -> (StatusCode, Json<Value>) {
+    service.refresh_requested.notify_one();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"api_version": API_VERSION})),
+    )
+}
+
+#[loki_api(
+    module = "mail",
+    mount = "Arc<MailService>",
     id = "open-config",
     method = "POST",
     path = "/mail/config/open",
