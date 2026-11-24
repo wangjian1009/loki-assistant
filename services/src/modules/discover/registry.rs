@@ -38,6 +38,10 @@ pub static MODULE_DESCRIPTORS: [ModuleRegistration];
 pub static API_DESCRIPTORS: [ApiDescriptor];
 
 pub fn metadata() -> Vec<ModuleMetadata> {
+    metadata_for(false)
+}
+
+pub(super) fn metadata_for(remote: bool) -> Vec<ModuleMetadata> {
     let mut modules: Vec<_> = MODULE_DESCRIPTORS
         .iter()
         .map(|module| ModuleMetadata {
@@ -49,7 +53,10 @@ pub fn metadata() -> Vec<ModuleMetadata> {
         })
         .collect();
 
-    for api in API_DESCRIPTORS.iter() {
+    for api in API_DESCRIPTORS
+        .iter()
+        .filter(|api| !remote || api.access == "paired")
+    {
         if let Some(module) = modules.iter_mut().find(|module| module.id == api.module_id) {
             module.apis.push(
                 ApiMetadata::new(api.id, api.method, api.path, api.summary, api.description)
@@ -68,6 +75,9 @@ pub fn metadata() -> Vec<ModuleMetadata> {
                     ),
             );
         }
+    }
+    if remote {
+        modules.retain(|module| !module.apis.is_empty());
     }
     for module in &mut modules {
         module.apis.sort_by(|left, right| {

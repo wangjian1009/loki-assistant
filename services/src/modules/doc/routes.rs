@@ -142,7 +142,7 @@ async fn capture_read_later(
     id = "list-read-later",
     method = "GET",
     path = "/doc/read-later/entries",
-    access = "local",
+    access = "paired",
     summary = "查询稍后阅读列表",
     description = "协议版本 1，从 Emacs 获取尚未标记已读的节点。"
 )]

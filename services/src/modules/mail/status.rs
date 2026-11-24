@@ -28,17 +28,14 @@ fn mail_status() -> StatusModuleMetadata {
     StatusModuleMetadata {
         id: MODULE_ID.into(),
         name: "邮件".into(),
-        description: "收件箱的本机未读邮件状态。".into(),
+        description: "收件箱的未读邮件状态。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        items: vec![
-            StatusItemMetadata::new(
-                UNREAD_COUNT,
-                "未读邮件数",
-                "收件箱中未读且未标记删除的邮件数量。",
-                StatusSchema::Integer,
-            )
-            .local_only(),
-        ],
+        items: vec![StatusItemMetadata::new(
+            UNREAD_COUNT,
+            "未读邮件数",
+            "收件箱中未读且未标记删除的邮件数量。",
+            StatusSchema::Integer,
+        )],
     }
 }
 

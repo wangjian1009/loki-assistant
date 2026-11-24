@@ -321,9 +321,9 @@ query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体
 
 电脑 network 模块统一完成通用请求到 HTTP request 的转换，通过进程内 Axum Router 调用现有 handler；业务模块不另写远程分发逻辑。Services 组合根调用 ~attach_remote~ 注入共享业务路由工厂，仅持有 Weak 引用。每次请求都校验当前会话、已认证手机的绑定记录以及 ~binding_token~ ，凭据使用常量时间比较，解绑关闭被跟踪连接及其 stream。
 
-~#[loki_api]~ 的 ~access~ 默认 ~local~ ，显式声明 ~paired~ 后允许绑定设备调用。discover 返回同一份声明，network 检查请求方法与实际匹配的 Axum 路由模板。绑定管理、Emacs、密码、Slack 和通知接口仅供本机调用。绑定设备可查询会话、健康、发现目录、配置和状态。配置项与状态项的读取按各自的 ~remote_access~ 检查，配置写入默认仅限本机。[[file:config-module.org][配置中心协议]]
+~#[loki_api]~ 的 ~access~ 默认 ~local~ ，显式声明 ~paired~ 后允许绑定设备调用。network 按请求方法与实际匹配的 Axum 路由模板检查同一份声明。远端 ~GET /discover~ 和 ~GET /discover/modules~ 只列出含 ~paired~ API 的模块，模块详情也只返回这些 API。远端查询没有开放 API 的模块详情时返回 404 ~module-not-found~ 。配置元数据和状态元数据依据各项的 ~remote_access~ 裁剪，只保留可读项及其所属模块。配置写入默认仅限本机。[[file:config-module.org][配置中心协议]]
 
-network 将 iroh 已认证的 Endpoint ID 注入 Axum 请求扩展，配置中心和状态中心通过该扩展判断请求来源。转发请求也携带 ~x-loki-device~ 和 ~x-loki-remote-devices~ ，loopback HTTP 入口移除这两个请求头。~GET /network/session~ 返回当前电脑的身份、在线状态、名称、设备类型和请求方的绑定时间。本机调用该接口返回 401 ~peer-authentication-required~ 。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
+network 将 iroh 已认证的 Endpoint ID 写入转发请求的 ~x-loki-device~ 和 ~x-loki-remote-devices~ 请求头，并注入 Axum 请求扩展。发现、配置和状态接口通过该扩展判断请求来源。loopback HTTP 入口移除这两个请求头。~GET /network/session~ 返回当前电脑的身份、在线状态、名称、设备类型和请求方的绑定时间。本机调用该接口返回 401 ~peer-authentication-required~ 。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
 
 请求最大 1 MiB，响应最大 4 MiB；每个手机最多 8 个正在执行请求，服务总上限 64，超限返回 429。服务端 stream 处理上限 30 秒；手机请求默认 10 秒，允许 1 至 30 秒，覆盖连接、发送与读取。手机显式取消 reset 当前 stream，超时和取消不保证已经执行的写操作回滚。网络层不自动重发请求。
 
@@ -541,7 +541,7 @@ HTTP 200 返回 UTF-8 JSON。响应使用 ~application/json~ 并携带 ~Cache-Co
 
 ** 稍后阅读
 
-四个接口均为本机协议版本 1，复用 Emacs gateway 和标准错误响应，并返回 ~Cache-Control: no-store~ 。services 负责 HTTP 参数解码和结果转发。Emacs 负责捕获、索引查询、标记已读和删除。
+四个接口均使用协议版本 1，复用 Emacs gateway 和标准错误响应，并返回 ~Cache-Control: no-store~ 。本机和已绑定设备均可查询未读列表。捕获、标记已读和删除仅供本机调用。services 负责 HTTP 参数解码和结果转发。Emacs 负责捕获、索引查询、标记已读和删除。
 
 | 接口 | 请求 | HTTP 200 响应中的业务字段 |
 |------+------|------------------------------|
@@ -666,7 +666,7 @@ GET /password/entries/example.com/alice.gpg
 
 ~GET /stats/meta~ 返回 ~api_version~ 和 ~modules~ 列表。模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 、 ~remote_access~ 和递归 ~schema~ 。数据路径为 ~/status/{模块 id}/{状态项 key}~ ，嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~ 。本次 services 启动时间可通过 ~GET /status/service~ 查询。
 
-通过 ~StatusItemMetadata::new~ 声明的状态项默认可由绑定设备读取，调用 ~local_only()~ 可将 ~remote_access~ 设为 ~false~ 。目前开放 ~service~ 的所有状态项和 ~network/my~ ，Emacs、Slack 与未声明状态项仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。状态上报接口仅供本机调用。
+通过 ~StatusItemMetadata::new~ 声明的状态项默认可由绑定设备读取，调用 ~local_only()~ 可将 ~remote_access~ 设为 ~false~ 。目前开放 ~service~ 的所有状态项、 ~network/my~ 和 ~mail/unread_count~ 。Emacs、Slack 与未声明状态项仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。状态上报接口仅供本机调用。
 
 ~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未配置、未连接、连接成功、连接失败和连接中的五个值及说明。
 
@@ -735,7 +735,7 @@ services 汇总同轮的同步、索引和未读查询错误，通过告警模�
 
 定时同步完成索引后，和 Emacs 请求刷新时，services 都通过同一刷新操作查询全局收件箱中未读且未标记删除的邮件，按 Message-ID 去重。首次成功查询建立基线，随后每封新匹配的邮件发送一条包含主题的系统通知，同一进程对每个 Message-ID 只通知一次。点击通知后由 services 通过 Emacs gateway 打开对应邮件。新邮件和同步失败通知使用应用标识 ~mail~ 。
 
-同一次查询通过共享状态模块发布 ~mail/unread_count~ 。可通过 ~GET /status/mail/unread_count~ 或本机 ~GET /status~ 读取。索引暂不可用时，状态保留最近一次成功值，首次成功前该状态项缺省。
+同一次查询通过共享状态模块发布 ~mail/unread_count~ 。本机和已绑定设备可通过 ~GET /status/mail/unread_count~ 读取该整数，也可从 ~GET /status~ 的快照读取。索引暂不可用时，状态保留最近一次成功值，首次成功前该状态项缺省。
 
 mu4e 在查看邮件、更新标记、移动或删除邮件完成后，异步调用本机 ~POST /mail/status/refresh~ 。索引有变更时也会调用该接口。连续回执合并发送，请求体为空。services 接受请求后返回 ~202~ 和 ~{"api_version":"1"}~ 。邮件处理循环串行执行同步和刷新，同步期间收到的请求可由同步结束后的查询处理。mu4e 正在索引、暂不可用或查询失败时，待处理的刷新请求合并为一次，每隔五秒重试，也可由下一轮同步后的成功查询处理。查询开始后到达的请求留待下一次查询。关闭自动同步时，此接口仍可刷新当前 mu4e 数据库。
 

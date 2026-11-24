@@ -528,6 +528,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     let remote_config_service = remote_config.service();
     let routes = remote_config
         .router()
+        .merge(crate::modules::discover::Module::new().router())
         .merge(fixture.status.router())
         .merge(crate::modules::password::Module::new(None).router())
         .merge(
@@ -921,7 +922,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
             "{method} {path}"
         );
     }
-    check_remote_config_and_status(network.clone(), &fixture, &remote_config_service).await;
+    check_remote_metadata_and_permissions(network.clone(), &fixture, &remote_config_service).await;
     let missing = channel_request(network.clone(), ServiceRequest::get("/missing"))
         .await
         .unwrap_err();
@@ -973,7 +974,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     relay.shutdown().await.unwrap();
 }
 
-async fn check_remote_config_and_status(
+async fn check_remote_metadata_and_permissions(
     network: Arc<loki_mobile_network::network::Network>,
     fixture: &Fixture,
     config: &crate::modules::config::service::ConfigService,
@@ -1004,7 +1005,36 @@ async fn check_remote_config_and_status(
         .publish("service", "name", json!("测试电脑"))
         .await
         .unwrap();
+    fixture
+        .status
+        .publish("mail", "unread_count", json!(3))
+        .await
+        .unwrap();
     let get = |path: &'static str| channel_request(network.clone(), ServiceRequest::get(path));
+    let catalog = get("/discover").await.unwrap().data;
+    let modules = catalog["modules"].as_array().unwrap();
+    for module in modules {
+        let apis = module["apis"].as_array().unwrap();
+        assert!(!apis.is_empty());
+        assert!(apis.iter().all(|api| api["access"] == "paired"));
+    }
+    let summaries = get("/discover/modules").await.unwrap().data;
+    let summaries = summaries["modules"].as_array().unwrap();
+    assert!(
+        summaries
+            .iter()
+            .map(|module| &module["id"])
+            .eq(modules.iter().map(|module| &module["id"]))
+    );
+    let doc = get("/discover/modules/doc").await.unwrap().data;
+    let apis = doc["apis"].as_array().unwrap();
+    assert_eq!(apis.len(), 1);
+    assert_eq!(apis[0]["method"], "GET");
+    assert_eq!(apis[0]["path"], "/doc/read-later/entries");
+    let error = get("/discover/modules/password").await.unwrap_err();
+    assert!(
+        matches!(error, ResponsError::Services(error) if error.status == 404 && error.code == "module-not-found")
+    );
     assert_eq!(
         get("/data/network").await.unwrap().data["values"],
         json!({"relay_url":{"value":"","source":"default"}})
@@ -1028,7 +1058,12 @@ async fn check_remote_config_and_status(
         get("/status/network/my/status").await.unwrap().data["value"],
         "connected"
     );
+    assert_eq!(
+        get("/status/mail/unread_count").await.unwrap().data["value"],
+        3
+    );
     let snapshot = get("/status").await.unwrap().data;
+    assert_eq!(snapshot["status"]["mail"], json!({"unread_count": 3}));
     assert!(snapshot["status"].get("emacs").is_none());
     assert!(snapshot["status"].get("custom").is_none());
     assert!(snapshot["status"].get("slack").is_none());

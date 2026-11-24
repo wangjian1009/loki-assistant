@@ -1,5 +1,8 @@
-use crate::http::error::{ErrorSource, response as error_response};
-use axum::{Json, Router, extract::Path, http::StatusCode, response::Response};
+use crate::{
+    http::error::{ErrorSource, response as error_response},
+    modules::network::remote::AuthenticatedPeer,
+};
+use axum::{Extension, Json, Router, extract::Path, http::StatusCode, response::Response};
 
 use super::{
     model::ModuleMetadata,
@@ -21,14 +24,13 @@ pub fn router() -> Router {
     path = "/discover",
     access = "paired",
     summary = "获取完整服务描述",
-    description = "返回所有模块及其 HTTP API 的完整元数据。"
+    description = "返回当前请求方可访问的模块及其 HTTP API 元数据。"
 )]
-async fn discover() -> Json<DiscoverResponse> {
-    let catalog = registry::metadata();
+async fn discover(peer: Option<Extension<AuthenticatedPeer>>) -> Json<DiscoverResponse> {
     Json(DiscoverResponse {
         service: "loki-services".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        modules: catalog,
+        modules: registry::metadata_for(peer.is_some()),
     })
 }
 
@@ -40,10 +42,10 @@ async fn discover() -> Json<DiscoverResponse> {
     path = "/discover/modules",
     access = "paired",
     summary = "获取模块列表",
-    description = "返回模块名称、版本和简要描述。"
+    description = "返回当前请求方可访问的模块名称、版本和简要描述。"
 )]
-async fn list_modules() -> Json<ModuleListResponse> {
-    let catalog = registry::metadata();
+async fn list_modules(peer: Option<Extension<AuthenticatedPeer>>) -> Json<ModuleListResponse> {
+    let catalog = registry::metadata_for(peer.is_some());
     Json(ModuleListResponse {
         modules: catalog.iter().map(ModuleMetadata::summary).collect(),
     })
@@ -57,13 +59,15 @@ async fn list_modules() -> Json<ModuleListResponse> {
     path = "/discover/modules/{module_id}",
     access = "paired",
     summary = "获取模块描述",
-    description = "根据模块标识返回单个模块的完整元数据。"
+    description = "根据模块标识返回当前请求方可访问的 API 元数据。"
 )]
-async fn get_module(Path(module_id): Path<String>) -> Result<Json<ModuleMetadata>, Response> {
-    registry::metadata()
-        .iter()
+async fn get_module(
+    Path(module_id): Path<String>,
+    peer: Option<Extension<AuthenticatedPeer>>,
+) -> Result<Json<ModuleMetadata>, Response> {
+    registry::metadata_for(peer.is_some())
+        .into_iter()
         .find(|module| module.id == module_id)
-        .cloned()
         .map(Json)
         .ok_or_else(|| {
             error_response(

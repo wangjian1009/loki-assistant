@@ -250,13 +250,17 @@ async fn read_later_routes_forward_requests_and_replies_to_emacs() {
 }
 
 #[tokio::test]
-async fn discovery_mounts_the_doc_module_with_local_access() {
+async fn discovery_exposes_only_the_read_later_list_to_paired_devices() {
     let app = crate::http::router(Arc::new(RuntimeState::default()));
     let (status, _, body) = request(app, "GET", "/discover/modules/doc", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let apis = body["apis"].as_array().unwrap();
     assert_eq!(apis.len(), 6);
-    assert!(apis.iter().all(|api| api["access"] == "local"));
+    let remote_apis: Vec<_> = apis.iter().filter(|api| api["access"] != "local").collect();
+    assert_eq!(remote_apis.len(), 1);
+    assert_eq!(remote_apis[0]["access"], "paired");
+    assert_eq!(remote_apis[0]["method"], "GET");
+    assert_eq!(remote_apis[0]["path"], "/doc/read-later/entries");
     assert!(
         apis.iter().any(|api| {
             api["path"] == "/doc/read-later/entries/{id}" && api["method"] == "DELETE"
