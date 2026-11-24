@@ -8,15 +8,16 @@ use std::{
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, process::Command, time};
 
-use super::{ENABLED, MODULE_ID, MailService};
-use crate::modules::notification::protocol::NotificationRequest;
+use super::{ENABLED, MODULE_ID, MailService, diagnostic};
+use crate::modules::alert::{AlertInput, AlertLevel};
 
 const INTERVAL: Duration = Duration::from_secs(300);
 const SYNC_DEADLINE: Duration = Duration::from_secs(120);
 const INDEX_DEADLINE: Duration = Duration::from_secs(60);
 const INDEX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MU_LOCK_BACKOFF: [u64; 4] = [250, 500, 1000, 2000];
-pub(super) const CONFIG_CALLBACK: &str = "/mail/config/open";
+const SYNC_ALERT: &str = "mail.sync";
+const CONFIG_CALLBACK: &str = "/mail/config/open";
 
 #[derive(Deserialize)]
 pub(super) struct MuDatabase {
@@ -35,6 +36,7 @@ impl MailService {
                 .await
                 .is_ok_and(|value| value.value.as_bool() == Some(true));
             if !enabled {
+                self.clear_sync_alert().await;
                 if changes.recv().await.is_none() {
                     return;
                 }
@@ -51,9 +53,13 @@ impl MailService {
     }
 
     async fn sync_cycle(&self, seen: &mut Option<HashSet<String>>) {
-        let Ok(path) = self.config_path().await else {
-            self.notify_failure("无法读取 mbsync 配置路径。".into());
-            return;
+        let path = match self.config_path().await {
+            Ok(path) => path,
+            Err(error) => {
+                self.report_failure(format!("无法读取 mbsync 配置路径。{error}"))
+                    .await;
+                return;
+            }
         };
         let sync_error = match run(
             Command::new("mbsync")
@@ -78,8 +84,9 @@ impl MailService {
 
         let errors: Vec<_> = [sync_error, index_error].into_iter().flatten().collect();
         if !errors.is_empty() {
-            self.notify_failure(errors.join(" "));
+            self.report_failure(errors.join("\n")).await;
         } else {
+            self.clear_sync_alert().await;
             log::info!("邮件同步和索引已完成，未读数已刷新");
         }
     }
@@ -141,14 +148,30 @@ impl MailService {
         .map_err(|_| "等待 mu4e 索引完成超时。".to_owned())?
     }
 
-    fn notify_failure(&self, body: String) {
-        log::warn!("邮箱同步失败：{body}");
-        self.notification.trigger(NotificationRequest {
-            app: Some(MODULE_ID.into()),
-            title: "邮箱同步失败".into(),
-            body: Some(body),
-            callback_url: Some(CONFIG_CALLBACK.into()),
-        });
+    async fn report_failure(&self, body: String) {
+        log::warn!("邮箱同步失败：{}", body.replace('\n', " "));
+        if let Err(error) = self
+            .alert
+            .publish(
+                SYNC_ALERT,
+                AlertInput {
+                    app: Some(MODULE_ID.into()),
+                    title: "邮箱同步失败".into(),
+                    body: Some(body),
+                    callback_url: Some(CONFIG_CALLBACK.into()),
+                    level: AlertLevel::Error,
+                },
+            )
+            .await
+        {
+            log::warn!("发布邮件同步告警失败：{error}");
+        }
+    }
+
+    async fn clear_sync_alert(&self) {
+        if let Err(error) = self.alert.clear(SYNC_ALERT).await {
+            log::warn!("清理邮件同步告警失败：{error}");
+        }
     }
 }
 
@@ -192,7 +215,15 @@ async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Ou
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("无法启动 {name}（{}）。", error.kind()))?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("无法启动 {name}。请检查可执行文件及 services 的 PATH。")
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                format!("无法启动 {name}。可执行文件的权限不足。")
+            }
+            _ => format!("无法启动 {name}（{}）。", error.kind()),
+        })?;
     let mut stdout_pipe = child.stdout.take().expect("已配置标准输出管道");
     let mut stderr_pipe = child.stderr.take().expect("已配置标准错误管道");
     let mut stdout = Vec::new();
@@ -203,17 +234,25 @@ async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Ou
             stdout_pipe.read_to_end(&mut stdout),
             stderr_pipe.read_to_end(&mut stderr),
         )?;
-        Ok::<_, std::io::Error>(Output {
-            status,
-            stdout,
-            stderr,
-        })
+        Ok::<_, std::io::Error>(status)
     })
     .await;
     let message = match result {
-        Ok(Ok(output)) => return Ok(output),
-        Ok(Err(error)) => format!("读取 {name} 执行结果失败（{}）。", error.kind()),
-        Err(_) => format!("{name} 执行超时。"),
+        Ok(Ok(status)) => {
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(Err(error)) => {
+            let message = format!("读取 {name} 执行结果失败（{}）。", error.kind());
+            diagnostic::with_detail(message, name, &stderr)
+        }
+        Err(_) => {
+            let message = format!("{name} 执行超过 {} 秒。", deadline.as_secs());
+            diagnostic::with_detail(message, name, &stderr)
+        }
     };
     let _ = child.kill().await;
     Err(message)
@@ -223,8 +262,30 @@ pub(super) fn exit_message(name: &str, output: &Output) -> String {
     if database_locked(output) {
         return format!("{name} 重试后仍无法打开已锁定的数据库。");
     }
-    match output.status.code() {
+    let message = match output.status.code() {
         Some(code) => format!("{name} 执行失败（退出码 {code}）。"),
         None => format!("{name} 已中断。"),
+    };
+    diagnostic::with_detail(message, name, &output.stderr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retains_mbsync_diagnostics_when_services_times_out() {
+        let error = run(
+            Command::new("/bin/sh").args([
+                "-c",
+                "printf '%s\n' 'Cannot connect to imap.example.org (192.0.2.1:993): Connection refused' >&2; exec /bin/sleep 30",
+            ]),
+            "mbsync",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("mbsync 执行超过 1 秒"));
+        assert!(error.contains("连接 imap.example.org:993 被拒绝"));
     }
 }

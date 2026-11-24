@@ -1,3 +1,4 @@
+mod diagnostic;
 mod routes;
 mod status;
 mod sync;
@@ -11,6 +12,7 @@ use tokio::sync::Notify;
 
 use crate::{
     modules::{
+        alert::AlertService,
         config::{
             model::{ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata, ConfigRemoteAccess},
             service::{ConfigChangeHandler, ConfigService, ConfigServiceError},
@@ -54,7 +56,7 @@ fn mail_configuration() -> ConfigModuleMetadata {
             (
                 CONFIG_PATH,
                 "mbsync 配置文件",
-                "指定绝对路径或 ~/ 开头的路径。同步失败通知会打开此文件。",
+                "指定绝对路径或 ~/ 开头的路径。同步失败告警会打开此文件。",
                 ConfigDataType::String,
                 json!("~/.mbsyncrc"),
             ),
@@ -89,6 +91,7 @@ fn mail_configuration() -> ConfigModuleMetadata {
 #[derive(Debug)]
 struct MailService {
     config: Arc<ConfigService>,
+    alert: Arc<AlertService>,
     notification: Arc<NotificationService>,
     emacs: Arc<EmacsService>,
     status: Arc<StatusService>,
@@ -103,6 +106,7 @@ static EXTENSION: ExtensionRegistration = ExtensionRegistration {
     build: |context| {
         Arc::new(MailModule(Arc::new(MailService {
             config: Arc::clone(context.config),
+            alert: Arc::clone(context.alert),
             notification: Arc::clone(context.notification),
             emacs: context.emacs.service(),
             status: Arc::clone(context.status),

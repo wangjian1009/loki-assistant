@@ -202,7 +202,7 @@ Channels personal-inbox work-inbox
 
 在 Emacs 的 services 设置中打开“邮件 → 自动同步”。默认使用 ~~/.mbsyncrc~ ，也可在同一界面指定配置路径。若在 Emacs 中使用 ~mu4e~ ，请在该实例启用 ~server-start~ ，并在 services 的 Emacs 设置中选择对应的 server socket。services 会复用正在运行的 ~mu4e~ 更新索引。没有可用的 ~mu4e~ 时，services 直接运行 ~mu index~ 。
 
-每轮同步完成索引后刷新未读数。点击同步失败通知会打开配置，点击新邮件通知会打开 mu4e 中的邮件。 [[file:../docs/control-center-services.org::*邮件模块][邮件模块协议]]
+每轮同步完成索引后刷新未读数。同步失败时可从告警查看具体阶段和原因，点击告警通知可打开配置。整轮成功后自动清理告警。点击新邮件通知会打开 mu4e 中的邮件。 [[file:../docs/control-center-services.org::*邮件模块][邮件模块协议]]
 
 * 系统通知代码接口
 
