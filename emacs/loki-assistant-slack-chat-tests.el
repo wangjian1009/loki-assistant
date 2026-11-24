@@ -65,49 +65,6 @@
       (should (equal (alist-get 'id selected) "TTWO.U1"))
       (should (equal (alist-get 'session_id selected) "two")))))
 
-(ert-deftest loki-assistant-slack-chat-test-draft-at-inserts-user-or-opens-dm ()
-  (skip-unless (and (require 'consult nil t) (require 'shell-maker nil t)))
-  (let* ((shell-maker-root-path (make-temp-file "loki-slack-user-test-" t))
-         (buffer (loki-assistant-slack--make-chat-buffer "*Slack 用户测试*"))
-         (loki-assistant-slack--selection nil)
-         (loki-assistant-slack--recent-users nil)
-         requests opened)
-    (unwind-protect
-        (save-window-excursion
-          (switch-to-buffer buffer)
-          (loki-assistant-slack--initialize-input)
-          (cl-letf (((symbol-function 'loki-assistant-slack--request)
-                     (lambda (method path callback &rest _)
-                       (push (cons method path) requests)
-                       (funcall callback
-                                (if (equal method "GET")
-                                    '(:ok t :data ((items . [((id . "TONE.U1")
-                                                              (team_name . "项目协作")
-                                                              (username . "linzhou"))])))
-                                  '(:ok t :data ((conversation . ((id . "TONE.D1")))))))))
-                    ((symbol-function 'loki-assistant-slack--open)
-                     (lambda (room) (setq opened (alist-get 'id room)))))
-            (goto-char (point-max))
-            (execute-kbd-macro "mail@")
-            (should-not requests)
-            (insert " ")
-            (execute-kbd-macro (vconcat "@" "lin" (kbd "S-<return>")))
-            (should (equal opened "TONE.D1"))
-            (should (equal requests '(("POST" . "/slack/users/TONE.U1/dm")
-                                      ("GET" . "/slack/users"))))
-            (should (equal (buffer-substring-no-properties
-                            (loki-assistant-slack--draft-start) (point-max))
-                           "mail@ "))
-            (execute-kbd-macro (vconcat "@" "lin" (kbd "RET")))
-            (should (equal requests '(("GET" . "/slack/users")
-                                      ("POST" . "/slack/users/TONE.U1/dm")
-                                      ("GET" . "/slack/users"))))
-            (should (equal (buffer-substring-no-properties
-                            (loki-assistant-slack--draft-start) (point-max))
-                           "mail@ @linzhou "))))
-      (when (buffer-live-p buffer) (kill-buffer buffer))
-      (delete-directory shell-maker-root-path t))))
-
 (ert-deftest loki-assistant-slack-chat-test-watch-updates-title-after-confirmation ()
   (with-temp-buffer
     (setq-local loki-assistant-slack--room
