@@ -6,17 +6,46 @@
 (declare-function mu4e--start "mu4e")
 (declare-function mu4e--server-view "mu4e-server")
 (declare-function mu4e-compose-mail "mu4e-compose")
+(declare-function mu4e-database-path "mu4e-server")
 (declare-function mu4e-get-headers-buffer "mu4e-window")
 (declare-function mu4e-headers-mode "mu4e-headers")
 (declare-function mu4e-running-p "mu4e-server")
 (declare-function mu4e-search "mu4e-search")
+(declare-function mu4e-update-index-nonlazy "mu4e-update")
 (declare-function message-goto-body "message")
 (declare-function mml-quote-region "mml")
 (defvar mu4e--started)
+(defvar mu4e--server-indexing)
+(defvar mu4e--server-process)
+(defvar mu4e-index-update-status)
 (defvar mu4e-search-full)
 (defvar mu4e-search-include-related)
 (defvar mu4e-search-skip-duplicates)
 (defvar mu4e-view-auto-mark-as-read)
+
+(defvar loki-assistant-mail--index-request nil
+  "最近一次 services 索引请求的标识、mu 进程及发起前的完成状态。")
+
+(defun loki-assistant-mail-index (request-id check-only)
+  "在已有的 mu4e 进程中发起或查询 REQUEST-ID 对应的索引更新。
+CHECK-ONLY 非空时只查询已发起的索引。"
+  (pcase-let ((`(,id ,process ,previous-status) loki-assistant-mail--index-request))
+    (cond
+     ((equal request-id id)
+      (unless (and (eq process mu4e--server-process) (mu4e-running-p))
+        (error "mu4e 进程已退出，无法确认索引结果"))
+      (if (eq previous-status mu4e-index-update-status)
+          'running
+        (let ((database (mu4e-database-path)))
+          (json-serialize `((program . ,(car (process-command process)))
+                            (home . ,(directory-file-name (file-name-directory database))))))))
+     (check-only (error "找不到此前发起的 mu4e 索引请求"))
+     (mu4e--server-indexing 'busy)
+     (t
+      (let ((status mu4e-index-update-status))
+        (mu4e-update-index-nonlazy)
+        (setq loki-assistant-mail--index-request (list request-id mu4e--server-process status))
+        'running)))))
 
 (defun loki-assistant-mail--focus ()
   "选中可用于显示邮件的图形 frame。"

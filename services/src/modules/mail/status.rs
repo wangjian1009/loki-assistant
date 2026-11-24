@@ -4,7 +4,10 @@ use loki_services_macros::loki_status;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{MODULE_ID, MailService, UNREAD_QUERY, sync};
+use super::{
+    MODULE_ID, MailService, UNREAD_QUERY,
+    sync::{self, MuDatabase},
+};
 use crate::modules::{
     notification::protocol::NotificationRequest,
     status::model::{StatusItemMetadata, StatusModuleMetadata, StatusSchema},
@@ -43,8 +46,9 @@ impl MailService {
     pub(super) async fn refresh_unread(
         &self,
         seen: &mut Option<HashSet<String>>,
+        database: Option<&MuDatabase>,
     ) -> Result<(), String> {
-        let messages = unread_mail().await?;
+        let messages = unread_mail(database).await?;
         self.status
             .publish(MODULE_ID, UNREAD_COUNT, json!(messages.len()))
             .await
@@ -78,11 +82,12 @@ impl MailService {
     }
 }
 
-async fn unread_mail() -> Result<Vec<IndexedMail>, String> {
+async fn unread_mail(database: Option<&MuDatabase>) -> Result<Vec<IndexedMail>, String> {
     let output = sync::run_mu(
         "find",
         ["--nocolor", "--format=json2", "--skip-dups", UNREAD_QUERY],
         QUERY_DEADLINE,
+        database,
     )
     .await?;
     if output.status.code() == Some(2)

@@ -1,9 +1,11 @@
 use std::{
     collections::HashSet,
+    path::PathBuf,
     process::{Output, Stdio},
     time::Duration,
 };
 
+use serde::Deserialize;
 use tokio::{io::AsyncReadExt, process::Command, time};
 
 use super::{ENABLED, MODULE_ID, MailService};
@@ -12,8 +14,15 @@ use crate::modules::notification::protocol::NotificationRequest;
 const INTERVAL: Duration = Duration::from_secs(300);
 const SYNC_DEADLINE: Duration = Duration::from_secs(120);
 const INDEX_DEADLINE: Duration = Duration::from_secs(60);
+const INDEX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MU_LOCK_BACKOFF: [u64; 4] = [250, 500, 1000, 2000];
 pub(super) const CONFIG_CALLBACK: &str = "/mail/config/open";
+
+#[derive(Deserialize)]
+pub(super) struct MuDatabase {
+    pub(super) program: PathBuf,
+    pub(super) home: PathBuf,
+}
 
 impl MailService {
     pub(super) async fn sync_loop(&self) {
@@ -62,9 +71,8 @@ impl MailService {
         };
 
         // 某个邮箱同步失败时，其他邮箱可能已经写入 Maildir。
-        let index_error = match run_mu("index", ["--quiet", "--nocolor"], INDEX_DEADLINE).await {
-            Ok(output) if output.status.success() => self.refresh_unread(seen).await.err(),
-            Ok(output) => Some(exit_message("mu index", &output)),
+        let index_error = match self.update_index().await {
+            Ok(database) => self.refresh_unread(seen, database.as_ref()).await.err(),
             Err(error) => Some(error),
         };
 
@@ -74,6 +82,63 @@ impl MailService {
         } else {
             log::info!("邮件同步和索引已完成，未读数已刷新");
         }
+    }
+
+    async fn update_index(&self) -> Result<Option<MuDatabase>, String> {
+        if let Some(database) = self.index_in_emacs().await? {
+            return Ok(Some(database));
+        }
+        let output = run_mu("index", ["--quiet", "--nocolor"], INDEX_DEADLINE, None).await?;
+        if output.status.success() {
+            return Ok(None);
+        }
+        // mu4e 可能在首次检查之后启动并取得数据库锁。
+        if database_locked(&output)
+            && let Some(database) = self.index_in_emacs().await?
+        {
+            return Ok(Some(database));
+        }
+        Err(exit_message("mu index", &output))
+    }
+
+    async fn index_in_emacs(&self) -> Result<Option<MuDatabase>, String> {
+        let request = uuid::Uuid::new_v4();
+        time::timeout(INDEX_DEADLINE, async {
+            let mut started = false;
+            loop {
+                let check_only = if started { "t" } else { "nil" };
+                let script = format!(
+                    r#"(if (and (fboundp 'mu4e-running-p) (mu4e-running-p))
+    (progn
+      (require 'loki-assistant-mail)
+      (loki-assistant-mail-index "{request}" {check_only}))
+  'unavailable)"#
+                );
+                let result = self
+                    .emacs
+                    .eval_running(&script)
+                    .await
+                    .map_err(|error| format!("mu4e 索引失败：{error}"))?;
+                match result.as_deref() {
+                    None | Some("unavailable") if !started => return Ok(None),
+                    None | Some("unavailable") => {
+                        return Err("mu4e 已退出，无法确认索引结果。".into());
+                    }
+                    Some("busy") if !started => {}
+                    Some("running") => started = true,
+                    Some(result) if started => {
+                        let database = serde_json::from_str::<String>(result)
+                            .and_then(|json| serde_json::from_str::<MuDatabase>(&json))
+                            .map_err(|_| "无法读取 mu4e 返回的索引位置。".to_owned())?;
+                        return Ok(Some(database));
+                    }
+                    _ => return Err("mu4e 返回的索引状态无效。".into()),
+                }
+                time::sleep(INDEX_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .map_err(|_| "等待 mu4e 索引完成超时。".to_owned())?
     }
 
     fn notify_failure(&self, body: String) {
@@ -91,26 +156,33 @@ pub(super) async fn run_mu<const N: usize>(
     subcommand: &str,
     args: [&str; N],
     deadline: Duration,
+    database: Option<&MuDatabase>,
 ) -> Result<Output, String> {
     let name = format!("mu {subcommand}");
     let mut backoff = MU_LOCK_BACKOFF.into_iter();
     loop {
-        let output = run(
-            Command::new("mu").arg(subcommand).args(args),
-            &name,
-            deadline,
-        )
-        .await?;
-        if output.status.code() != Some(19)
-            || !String::from_utf8_lossy(&output.stderr).contains("database locked")
-        {
+        let mut command = match database {
+            Some(database) => Command::new(&database.program),
+            None => Command::new("mu"),
+        };
+        command.arg(subcommand);
+        if let Some(database) = database {
+            command.arg("--muhome").arg(&database.home);
+        }
+        let output = run(command.args(args), &name, deadline).await?;
+        if !database_locked(&output) {
             return Ok(output);
         }
         let Some(delay) = backoff.next() else {
-            return Err(format!("{name} 重试后仍无法打开已锁定的数据库。"));
+            return Ok(output);
         };
         time::sleep(Duration::from_millis(delay)).await;
     }
+}
+
+fn database_locked(output: &Output) -> bool {
+    output.status.code() == Some(19)
+        && String::from_utf8_lossy(&output.stderr).contains("database locked")
 }
 
 async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Output, String> {
@@ -148,6 +220,9 @@ async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Ou
 }
 
 pub(super) fn exit_message(name: &str, output: &Output) -> String {
+    if database_locked(output) {
+        return format!("{name} 重试后仍无法打开已锁定的数据库。");
+    }
     match output.status.code() {
         Some(code) => format!("{name} 执行失败（退出码 {code}）。"),
         None => format!("{name} 已中断。"),

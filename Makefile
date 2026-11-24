@@ -92,6 +92,8 @@ emacs-load: emacs-deps
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config) \
 	  (require 'loki-assistant-devices) \
+	  (when (featurep 'loki-assistant-mail) \
+	    (load \"$(PROJECT_ROOT)/emacs/loki-assistant-mail.el\" nil t)) \
 	  (if (featurep 'loki-assistant-slack-chat) \
 	      (load \"$(PROJECT_ROOT)/emacs/loki-assistant-slack-chat.el\" nil t) \
 	    (require 'loki-assistant-slack-chat)))"

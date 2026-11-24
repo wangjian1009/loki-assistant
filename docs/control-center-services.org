@@ -501,7 +501,9 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 
 ~mail/enabled~ 默认为 ~false~ 。开启后立即执行首次同步，每轮结束五分钟后再次执行。关闭后当前轮次结束即停止定时任务。~mail/mbsync_config~ 默认为 ~~/.mbsyncrc~ ，其中的 ~loki-auto~ 组决定要同步的邮箱和文件夹。
 
-services 在同一轮内依次运行 ~mbsync~ 、 ~mu index~ 和未读查询。部分邮箱同步失败时，仍索引已下载的邮件。~mu~ 命令遇到数据库锁冲突时异步退避，最多重试四次。各项处理结束后，services 汇总最终失败并发送一条系统通知。点击失败通知可打开 ~mbsync~ 配置。
+services 每轮先运行 ~mbsync~ 。部分邮箱同步失败时，仍索引已下载的邮件。services 通过 ~emacsclient~ 连接 ~emacs/socket_name~ 指定的已有 Emacs server。若该实例的 ~mu4e~ 正在运行，则复用它持有数据库的 ~mu server~ 更新索引。若已有索引任务在运行，则等待该任务结束后再发起更新。索引完成后，对同一数据库执行只读的 ~mu find~ 来刷新未读数。
+
+目标 Emacs server 不可连接或 ~mu4e~ 未运行时，services 直接运行 ~mu index~ 。自动同步只连接已有 Emacs server。若 Emacs 已接手但无法确认索引完成，本轮保留最近一次的未读状态。命令行 ~mu~ 遇到数据库锁冲突时异步退避，最多重试四次。各项处理结束后，services 汇总最终失败并发送一条系统通知。点击失败通知可打开 ~mbsync~ 配置。
 
 索引更新成功后，services 查询全局收件箱中未读且未标记删除的邮件，按 Message-ID 去重。首次成功查询建立基线，随后每封新匹配的邮件发送一条包含主题的系统通知，同一进程对每个 Message-ID 只通知一次。点击通知后由 services 通过 Emacs gateway 打开对应邮件。新邮件和同步失败通知使用应用标识 ~mail~ 。
 

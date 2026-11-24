@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::{process::Command, time::timeout};
 
+use crate::modules::config::service::ConfigServiceError;
 use crate::modules::status::{
     StatusService,
     protocol::{StatusResponse, StatusValues},
@@ -24,6 +25,8 @@ use super::{
         NotificationStatusResponse,
     },
 };
+
+const OPTIONAL_SERVER_EDITOR: &str = "--alternate-editor=/usr/bin/true";
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EmacsError>> + Send + 'a>>;
 
@@ -184,6 +187,26 @@ impl EmacsService {
         script: &str,
         auto_start: bool,
     ) -> Result<String, EmacsError> {
+        let alternate_editor = if auto_start {
+            "--alternate-editor="
+        } else {
+            "--alternate-editor=/usr/bin/false"
+        };
+        self.eval_with_alternate_editor(script, alternate_editor)
+            .await?
+            .ok_or_else(|| EmacsError::InvalidResponse("未收到 Emacs 求值结果".into()))
+    }
+
+    pub(crate) async fn eval_running(&self, script: &str) -> Result<Option<String>, EmacsError> {
+        self.eval_with_alternate_editor(script, OPTIONAL_SERVER_EDITOR)
+            .await
+    }
+
+    async fn eval_with_alternate_editor(
+        &self,
+        script: &str,
+        alternate_editor: &'static str,
+    ) -> Result<Option<String>, EmacsError> {
         if script.trim().is_empty() {
             return Err(EmacsError::InvalidRequest("script 不能为空".to_owned()));
         }
@@ -203,6 +226,11 @@ impl EmacsService {
                             EmacsError::Config("emacsclient_path 必须是非空路径".to_owned())
                         })?
                         .to_owned(),
+                    Err(ConfigServiceError::ValueNotSet { .. })
+                        if alternate_editor == OPTIONAL_SERVER_EDITOR =>
+                    {
+                        return Ok(None);
+                    }
                     Err(error) => return Err(EmacsError::Config(error.to_string())),
                 };
                 let socket = config
@@ -217,12 +245,7 @@ impl EmacsService {
                         EmacsError::Config("socket_name 必须是非空 socket 名称或路径".to_owned())
                     })?;
                 let args = vec![
-                    if auto_start {
-                        "--alternate-editor="
-                    } else {
-                        "--alternate-editor=/usr/bin/false"
-                    }
-                    .to_owned(),
+                    alternate_editor.to_owned(),
                     // 显式指定 socket，禁止 emacsclient 在连接失败后尝试 TCP server 文件。
                     format!("--socket-name={socket}"),
                     "--eval".to_owned(),
@@ -241,7 +264,11 @@ impl EmacsService {
                         },
                     });
                 }
-                decode_response(&output.stdout)
+                // 连接失败时由 true 返回空输出。Emacs 成功求值时始终有 JSON 响应。
+                if alternate_editor == OPTIONAL_SERVER_EDITOR && output.stdout.is_empty() {
+                    return Ok(None);
+                }
+                decode_response(&output.stdout).map(Some)
             })
             .await
     }

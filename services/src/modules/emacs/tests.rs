@@ -112,6 +112,36 @@ fn test_metadata() -> crate::modules::config::model::ConfigModuleMetadata {
     metadata
 }
 
+#[tokio::test]
+async fn optional_eval_detects_missing_server_without_starting_emacs() {
+    let (emacs, runner, _) = service(vec![
+        Ok(CommandOutput {
+            success: true,
+            status: Some(0),
+            stdout: String::new(),
+            stderr: "emacsclient: can't find socket".into(),
+        }),
+        Ok(wire(json!({"result": "running"}))),
+        Ok(wire(json!({"error": "索引失败"}))),
+    ]);
+
+    assert_eq!(emacs.eval_running("t").await.unwrap(), None);
+    assert_eq!(
+        emacs.eval_running("t").await.unwrap().as_deref(),
+        Some("running")
+    );
+    assert!(matches!(
+        emacs.eval_running("t").await,
+        Err(EmacsError::Lisp(_))
+    ));
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    for (_, args) in calls.iter() {
+        assert_eq!(args[0], "--alternate-editor=/usr/bin/true");
+        assert_eq!(args[1], "--socket-name=server");
+    }
+}
+
 fn notification(module_id: &str) -> Notification {
     Notification {
         module_id: module_id.to_owned(),

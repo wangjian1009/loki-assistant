@@ -200,7 +200,9 @@ Channels personal-inbox work-inbox
 
 把示例中的 Channel 名替换为配置中要自动同步的 Channel。迁移现有定时任务时，停止旧的 ~brew services~ isync 任务，将 Emacs 的 ~mu4e-update-interval~ 设为 ~nil~ 并重启 mu4e 后，可继续使用 mu4e 的手动同步命令。
 
-在 Emacs 的 services 设置中打开“邮件 → 自动同步”。默认使用 ~~/.mbsyncrc~ ，也可在同一界面指定配置路径。每轮同步完成索引后刷新未读数。点击同步失败通知会打开配置，点击新邮件通知会打开 mu4e 中的邮件。 [[file:../docs/control-center-services.org::*邮件模块][邮件模块协议]]
+在 Emacs 的 services 设置中打开“邮件 → 自动同步”。默认使用 ~~/.mbsyncrc~ ，也可在同一界面指定配置路径。若在 Emacs 中使用 ~mu4e~ ，请在该实例启用 ~server-start~ ，并在 services 的 Emacs 设置中选择对应的 server socket。services 会复用正在运行的 ~mu4e~ 更新索引。没有可用的 ~mu4e~ 时，services 直接运行 ~mu index~ 。
+
+每轮同步完成索引后刷新未读数。点击同步失败通知会打开配置，点击新邮件通知会打开 mu4e 中的邮件。 [[file:../docs/control-center-services.org::*邮件模块][邮件模块协议]]
 
 * 系统通知代码接口
 
