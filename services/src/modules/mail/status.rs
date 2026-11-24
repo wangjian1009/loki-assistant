@@ -74,7 +74,7 @@ impl MailService {
                             .take(200)
                             .collect(),
                     ),
-                    callback_url: Some(format!("/mail/open?{query}")),
+                    callback_url: Some(format!("/emacs/mail/open?{query}")),
                 });
             }
         }

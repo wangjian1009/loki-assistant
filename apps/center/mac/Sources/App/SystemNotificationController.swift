@@ -258,15 +258,15 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         }
     }
 
-    func openUnreadMail() {
+    func openMailInbox() {
         Task {
-            let operation = CenterLog.shared.start("打开未读邮件列表")
+            let operation = CenterLog.shared.start("打开收件箱")
             do {
-                try await receiptClient.openUnreadMail()
+                try await receiptClient.openMailInbox()
                 CenterLog.shared.finish(operation, result: "success")
             } catch {
                 CenterLog.shared.finish(operation, result: "failure", details: ["error": error.localizedDescription])
-                showError("无法打开未读邮件列表", error: error)
+                showError("无法打开收件箱", error: error)
             }
         }
     }

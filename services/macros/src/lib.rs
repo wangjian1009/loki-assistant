@@ -200,8 +200,13 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
     let method_name = method.value().to_ascii_lowercase();
-    if !matches!(method_name.as_str(), "get" | "post" | "put" | "patch" | "delete" | "head" | "options") {
-        return syn::Error::new(method.span(), "不支持自动挂载此 HTTP 方法").to_compile_error().into();
+    if !matches!(
+        method_name.as_str(),
+        "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+    ) {
+        return syn::Error::new(method.span(), "不支持自动挂载此 HTTP 方法")
+            .to_compile_error()
+            .into();
     }
     let method_name = format_ident!("{method_name}");
     let group = mount_group.unwrap_or_else(|| module.clone());

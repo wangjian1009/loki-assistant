@@ -515,8 +515,6 @@ services 汇总同轮的同步、索引和未读查询错误，通过告警模�
 
 | 方法 | 路径 | 用途 |
 |------+------|------|
-| POST | ~/mail/open?message_id=...~ | 在 mu4e 打开通知对应的邮件 |
-| POST | ~/mail/unread/open~ | 在 mu4e 打开全局收件箱的未读邮件列表，沿用未读计数的查询 |
 | POST | ~/mail/config/open~ | 在 Emacs 打开同步失败告警关联的 mbsync 配置 |
 | POST | ~/mail/compose~ | 开启 mu4e 草稿 |
 
@@ -531,6 +529,19 @@ services 与托盘各自将 UTF-8 文本写入 ~~/.assistant/logs/services.log~ 
 * Emacs 模块
 
 Emacs 模块的协议版本为 ~1~，成功和错误响应均包含 ~api_version: "1"~。HTTP handler 只依赖 ~EmacsService~；外部进程通过可注入的 ~CommandRunner~ 调用，不经过 shell。连接配置指定的本机 Emacs server，不为每个请求另建会话。
+
+** 邮件跳转
+
+托盘和新邮件通知通过本机接口请求 Emacs 打开收件箱或邮件。Emacs 接受操作后返回 ~200~ 和 ~{"api_version":"1","opened":true}~ 。
+
+| 方法 | 路径 | 用途 |
+|------+------|------|
+| POST | ~/emacs/mail/open?message_id=...~ | 按 Message-ID 在 mu4e 打开通知对应的邮件 |
+| POST | ~/emacs/mail/inbox/open~ | 打开 mu4e 中配置的收件箱书签 |
+
+收件箱书签来自目标 Emacs 的 ~mu4e-bookmarks~ 。~loki-assistant-mail-inbox-bookmark-key~ 默认选择快捷键 ~i~ 。Emacs 执行该书签的查询，结果范围由书签配置决定。旧通知中的 ~/mail/open~ 和旧托盘的 ~/mail/unread/open~ 仍可转发相同操作。
+
+在 Emacs 中，~M-x loki-assistant-mail-open-inbox~ 打开同一收件箱，~M-x loki-assistant-mail-open-message~ 输入 Message-ID 后打开指定邮件。
 
 ** 配置和连接
 

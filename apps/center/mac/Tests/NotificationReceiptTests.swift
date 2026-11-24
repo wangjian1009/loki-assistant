@@ -30,6 +30,16 @@ final class NotificationReceiptTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: body), ["url": url.absoluteString])
     }
 
+    func testOpenMailInboxUsesEmacsMailEndpoint() async throws {
+        let stub = ReceiptStub(statuses: [200])
+        let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })
+        try await client.openMailInbox()
+        let requests = stub.requests
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/healthz", "/emacs/mail/inbox/open"])
+        XCTAssertEqual(requests.last?.httpMethod, "POST")
+        XCTAssertNil(requests.last?.httpBody)
+    }
+
     func testStartupSkipsPendingRetryWhenServiceIsUnavailable() async throws {
         let stub = ReceiptStub(statuses: [], healthBody: "{}")
         let client = NotificationReceiptClient(discover: { stub.discover() }, transport: { try stub.respond($0) })

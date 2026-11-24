@@ -8,6 +8,21 @@
 
 (require 'ert)
 (require 'loki-assistant)
+(require 'loki-assistant-mail)
+
+(ert-deftest loki-assistant-test-mail-inbox-opens-configured-bookmark ()
+  (let ((loki-assistant-mail-inbox-bookmark-key ?g)
+        opened)
+    (cl-letf (((symbol-function 'loki-assistant-mail--open) #'funcall)
+              ((symbol-function 'mu4e-bookmarks)
+               (lambda () '((:key ?i :query "maildir:/other")
+                            (:key ?g :query (lambda () "maildir:/configured-inbox")))))
+              ((symbol-function 'mu4e-search-bookmark)
+               (lambda (query) (setq opened query))))
+      (loki-assistant-mail-open-inbox)
+      (should (equal opened "maildir:/configured-inbox"))
+      (let ((loki-assistant-mail-inbox-bookmark-key ?x))
+        (should-error (loki-assistant-mail-open-inbox) :type 'user-error)))))
 
 (defvar hydra-curr-body-fn)
 

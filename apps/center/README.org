@@ -24,7 +24,7 @@
 
 在 macOS 自带的「邮件」中打开「邮件 → 设置 → 通用 → 默认电子邮件阅读器」，选择「Loki的助理」。系统邮件链接经 services 转为 Emacs mu4e 草稿。 [[file:../../docs/control-center-services.org::*邮件模块][邮件模块协议]]
 
-展开托盘菜单可查看全局收件箱的未读邮件数量，点击「收件箱」可在 mu4e 中查看对应的未读邮件列表。 [[file:../../docs/control-center-services.org::*邮件模块][邮件模块协议]]
+点击托盘菜单中的「收件箱」，即可打开 mu4e 中快捷键 ~i~ 对应的收件箱书签。同步完成后，菜单项也会显示未读邮件数量。 [[file:../../docs/control-center-services.org::*邮件跳转][邮件跳转协议]]
 
 * 应用图标
 

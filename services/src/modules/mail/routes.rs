@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{
-        Query, State,
-        rejection::{JsonRejection, QueryRejection},
-    },
+    extract::{State, rejection::JsonRejection},
     http::StatusCode,
     response::Response,
 };
@@ -13,60 +10,11 @@ use loki_services_macros::loki_api;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{MailService, UNREAD_QUERY};
+use super::MailService;
 use crate::{
     http::error::{API_VERSION, ErrorSource, response},
     modules::emacs::error_response,
 };
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MessageQuery {
-    message_id: String,
-}
-
-#[loki_api(
-    module = "mail",
-    mount = "Arc<MailService>",
-    id = "open",
-    method = "POST",
-    path = "/mail/open",
-    summary = "打开邮件",
-    description = "在 Emacs mu4e 中打开指定 Message-ID 的邮件。"
-)]
-async fn open(
-    State(service): State<Arc<MailService>>,
-    query: Result<Query<MessageQuery>, QueryRejection>,
-) -> Result<Json<Value>, Response> {
-    let Query(query) = query.map_err(|_| invalid("需要提供有效的 message_id。"))?;
-    if query.message_id.trim().is_empty() || query.message_id.chars().any(char::is_control) {
-        return Err(invalid("需要提供有效的 message_id。"));
-    }
-    service
-        .emacs
-        .mail_action("view", json!(query.message_id))
-        .await
-        .map_err(error_response)?;
-    Ok(opened())
-}
-
-#[loki_api(
-    module = "mail",
-    mount = "Arc<MailService>",
-    id = "open-unread",
-    method = "POST",
-    path = "/mail/unread/open",
-    summary = "打开未读邮件列表",
-    description = "在 Emacs mu4e 中打开收件箱的未读邮件列表。"
-)]
-async fn open_unread(State(service): State<Arc<MailService>>) -> Result<Json<Value>, Response> {
-    service
-        .emacs
-        .mail_action("unread", json!(UNREAD_QUERY))
-        .await
-        .map_err(error_response)?;
-    Ok(opened())
-}
 
 #[loki_api(
     module = "mail",

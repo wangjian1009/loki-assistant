@@ -1,4 +1,5 @@
 pub mod config;
+mod mail;
 pub mod protocol;
 mod routes;
 pub mod service;

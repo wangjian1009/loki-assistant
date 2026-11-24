@@ -152,8 +152,8 @@ struct NotificationReceiptClient: Sendable {
         try await activate(callback: conversation.callback, slackSessionID: conversation.sessionID)
     }
 
-    func openUnreadMail() async throws {
-        try await activate(callback: "/mail/unread/open")
+    func openMailInbox() async throws {
+        try await activate(callback: "/emacs/mail/inbox/open")
     }
 
     private func activate(callback: String, slackSessionID: UUID? = nil) async throws {

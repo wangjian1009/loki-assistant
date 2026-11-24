@@ -518,7 +518,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 10);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 12);
             let capture = body["apis"]
                 .as_array()
                 .unwrap()
@@ -544,6 +544,20 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
                 .unwrap();
             assert_eq!(slack["path"], "/emacs/slack/activate");
             assert_eq!(slack["access"], "local");
+            for (id, path) in [
+                ("open-mail", "/emacs/mail/open"),
+                ("open-mail-inbox", "/emacs/mail/inbox/open"),
+            ] {
+                let api = body["apis"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|api| api["id"] == id)
+                    .unwrap();
+                assert_eq!(api["path"], path);
+                assert_eq!(api["method"], "POST");
+                assert_eq!(api["access"], "local");
+            }
             let notification = body["apis"]
                 .as_array()
                 .unwrap()
@@ -1057,6 +1071,45 @@ async fn activates_slack_through_emacs_dispatch() {
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert!(calls[0].1[3].contains("loki-assistant-dispatch-activate-slack"));
+}
+
+#[tokio::test]
+async fn opens_mail_and_configured_inbox_through_emacs() {
+    let (service, runner, _) = service(vec![
+        Ok(wire(json!({"result":"t"}))),
+        Ok(wire(json!({"result":"t"}))),
+        Ok(wire(json!({"result":"t"}))),
+        Ok(wire(json!({"result":"t"}))),
+    ]);
+    for path in [
+        "/emacs/mail/open?message_id=a%2Bb%40example.org",
+        "/emacs/mail/inbox/open",
+        "/mail/open?message_id=a%2Bb%40example.org",
+        "/mail/unread/open",
+    ] {
+        let (status, body) = request(service.clone(), "POST", path, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(body, json!({"api_version":"1", "opened":true}));
+    }
+    let (status, body) = request(
+        service,
+        "POST",
+        "/emacs/mail/open?message_id=%0A",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid-request");
+
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 4);
+    for pair in calls.chunks_exact(2) {
+        assert!(
+            pair[0].1[3]
+                .contains(r#"loki-assistant-mail-dispatch \"view\" \"ImErYkBleGFtcGxlLm9yZyI=\""#)
+        );
+        assert!(pair[1].1[3].contains(r#"loki-assistant-mail-dispatch \"inbox\" \"bnVsbA==\""#));
+    }
 }
 
 #[tokio::test]

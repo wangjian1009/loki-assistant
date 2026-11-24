@@ -5,7 +5,7 @@ struct DashboardView: View {
     let status: ServiceStatusModel
     let idleSleep: IdleSleepController
     let openAlert: @MainActor (String, String) -> Void
-    let openUnreadMail: @MainActor () -> Void
+    let openMailInbox: @MainActor () -> Void
     @State private var openingSettings = false
     @State private var appOpenError: String?
 
@@ -64,9 +64,13 @@ struct DashboardView: View {
                     }
                 }
             }
-            if let count = status.unreadMailCount {
-                Button(action: openUnreadMail) {
-                    Label("收件箱 · \(count) 封未读", systemImage: "tray")
+            if case .healthy = status.status {
+                Button(action: openMailInbox) {
+                    if let count = status.unreadMailCount {
+                        Label("收件箱 · \(count) 封未读", systemImage: "tray")
+                    } else {
+                        Label("收件箱", systemImage: "tray")
+                    }
                 }
             }
             Button {
