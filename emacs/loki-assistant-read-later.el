@@ -366,19 +366,33 @@
     (when (and (eobp) (not (bobp))) (forward-line -1))
     (message "已标记为已读")))
 
+(defun loki-assistant-read-later-help ()
+  "显示稍后阅读模式的操作说明。"
+  (interactive)
+  (describe-function 'loki-assistant-read-later-mode))
+
 (defvar loki-assistant-read-later-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'loki-assistant-read-later-open)
     (define-key map (kbd "b") #'loki-assistant-read-later-open-url)
     (define-key map (kbd "r") #'loki-assistant-read-later-mark-current-read)
+    (define-key map (kbd "?") #'loki-assistant-read-later-help)
     map)
   "稍后阅读列表的快捷键。")
 
 (define-derived-mode loki-assistant-read-later-mode tabulated-list-mode "稍后阅读"
-  "显示 org-roam 日记中的未读记录。"
+  "查看 org-roam 日记中的未读记录，默认按加入时间倒序排列。
+
+\\<loki-assistant-read-later-mode-map>\\[next-line] / \\[previous-line]  移到下一条或上一条记录。
+\\[loki-assistant-read-later-open]  打开当前记录对应的 Org 日记条目。
+\\[loki-assistant-read-later-open-url]  打开当前记录的网页链接。
+\\[loki-assistant-read-later-mark-current-read]  保存已读时间，并从列表移除当前记录。
+\\[revert-buffer]  重新查询未读列表。
+\\[quit-window]  退出列表。"
   (setq tabulated-list-format [("加入时间 (UTC)" 20 t) ("标题" 42 t) ("网页" 0 nil)]
         tabulated-list-padding 2)
-  (setq-local mode-line-process '(:eval (unless tabulated-list-entries " · 没有未读记录")))
+  (setq-local mode-line-process
+              '(" · ? 帮助" (:eval (unless tabulated-list-entries " · 没有未读记录"))))
   (add-hook 'tabulated-list-revert-hook #'loki-assistant-read-later--load-rows nil t)
   (tabulated-list-init-header))
 
