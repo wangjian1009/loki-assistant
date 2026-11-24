@@ -18,6 +18,7 @@ use super::{
 };
 use crate::{
     modules::{
+        alert::AlertService,
         config::{
             self,
             service::{ConfigService, ConfigServiceError},
@@ -171,15 +172,25 @@ esac
             .with_password_service(passwords)
     }
     pub(super) fn service(&self) -> Arc<NetworkService> {
+        self.service_with(self.registrar.clone(), Duration::from_millis(30))
+    }
+    fn service_with(
+        &self,
+        registrar: Arc<dyn RelayRegistrar>,
+        timeout: Duration,
+    ) -> Arc<NetworkService> {
+        let notification = Arc::new(NotificationService::with_launcher(
+            self.launcher.clone(),
+            Duration::from_secs(1),
+        ));
+        let alert = Arc::new(AlertService::new(self.status.clone(), notification.clone()));
         Arc::new(NetworkService::new(
             self.stored_config(),
-            self.registrar.clone(),
-            Arc::new(NotificationService::with_launcher(
-                self.launcher.clone(),
-                Duration::from_secs(1),
-            )),
+            registrar,
+            notification,
+            alert,
             self.status.clone(),
-            Duration::from_millis(30),
+            timeout,
         ))
     }
     pub(super) fn config(&self, service: Arc<NetworkService>) -> Arc<ConfigService> {
@@ -187,6 +198,9 @@ esac
     }
     async fn phase(&self) -> Value {
         self.status.value("network", "my").await.unwrap().value["status"].clone()
+    }
+    async fn alerts(&self) -> Value {
+        self.status.value("alert", "active").await.unwrap().value
     }
     fn titles(&self) -> Vec<String> {
         self.launcher
@@ -265,7 +279,7 @@ async fn startup_without_relay_generates_identity_once_and_never_connects() {
 }
 
 #[tokio::test]
-async fn saving_relay_creates_identity_notifies_and_keeps_connection_until_replaced() {
+async fn saving_relay_creates_identity_and_keeps_connection_until_replaced() {
     let fixture = Fixture::new();
     let service = fixture.service();
     let config = fixture.config(service.clone());
@@ -278,7 +292,8 @@ async fn saving_relay_creates_identity_notifies_and_keeps_connection_until_repla
         .await
         .unwrap();
     service.start().await.unwrap();
-    assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册成功"]);
+    assert_eq!(fixture.titles(), ["已生成本地身份"]);
+    assert_eq!(fixture.alerts().await, json!([]));
     config
         .replace("network", "relay_url", json!("https://first.example"))
         .await
@@ -315,8 +330,14 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
     let service = fixture.service();
     let config = fixture.config(service.clone());
     fixture.registrar.fail.store(true, Ordering::SeqCst);
+    *fixture.registrar.failure_message.lock().unwrap() = Some("中转拒绝注册 saved-token".into());
     assert!(service.start().await.is_err());
-    assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册失败"]);
+    let alerts = fixture.alerts().await;
+    assert_eq!(alerts.as_array().unwrap().len(), 1);
+    assert_eq!(alerts[0]["id"], "network.relay-registration");
+    assert_eq!(alerts[0]["title"], "中转注册失败");
+    assert_eq!(alerts[0]["level"], "error");
+    assert_eq!(alerts[0]["body"], "中转拒绝注册 [已隐藏]");
     assert_eq!(
         config.value("network", "relay_url").await.unwrap().value,
         json!("https://saved.example")
@@ -328,6 +349,8 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
         .await
         .unwrap();
     service.start().await.unwrap();
+    assert_eq!(fixture.alerts().await, json!([]));
+    assert!(!fixture.titles().iter().any(|title| title == "中转注册成功"));
     service.shutdown().await;
     let restarted = fixture.service();
     restarted.start().await.unwrap();
@@ -401,7 +424,7 @@ async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
             .load(Ordering::SeqCst)
     );
     assert_eq!(changes.try_recv().unwrap().key, "relay_url");
-    assert_eq!(fixture.titles().last().unwrap(), "中转注册失败");
+    assert_eq!(fixture.alerts().await[0]["title"], "中转注册失败");
     service.shutdown().await;
 }
 
@@ -431,8 +454,7 @@ async fn storage_failure_does_not_start_registration() {
 }
 
 #[tokio::test]
-async fn timeout_and_identity_failure_are_notified_and_notification_failure_does_not_change_registration_result()
- {
+async fn timeout_and_identity_failure_publish_alerts_even_when_notification_fails() {
     let fixture = Fixture::new();
     let service = fixture.service();
     let config = fixture.config(service.clone());
@@ -446,21 +468,35 @@ async fn timeout_and_identity_failure_are_notified_and_notification_failure_does
         .await
         .unwrap();
     assert!(service.start().await.unwrap_err().contains("超时"));
-    assert_eq!(fixture.titles().last().unwrap(), "中转注册失败");
+    assert!(
+        fixture.alerts().await[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("超时")
+    );
     fixture.registrar.hang.store(false, Ordering::SeqCst);
     fixture.launcher.fail.store(true, Ordering::SeqCst);
+    fixture.registrar.fail.store(true, Ordering::SeqCst);
+    config
+        .replace("network", "relay_url", json!("https://reject.example"))
+        .await
+        .unwrap();
+    assert!(service.start().await.is_err());
+    assert_eq!(fixture.alerts().await[0]["body"], "中转拒绝注册");
+    fixture.registrar.fail.store(false, Ordering::SeqCst);
     config
         .replace("network", "relay_url", json!("https://ok.example"))
         .await
         .unwrap();
     service.start().await.unwrap();
+    assert_eq!(fixture.alerts().await, json!([]));
     service.shutdown().await;
     config
         .set_system_value("network_identity", "损坏")
         .await
         .unwrap();
     assert!(fixture.service().start().await.is_err());
-    assert_eq!(fixture.titles().last().unwrap(), "网络身份初始化失败");
+    assert_eq!(fixture.alerts().await[0]["title"], "中转注册失败");
 }
 
 #[tokio::test]
@@ -490,16 +526,8 @@ async fn real_iroh_registration_uses_only_the_configured_ephemeral_relay() {
     let relay = Server::spawn(server_config).await.unwrap();
     let address = format!("http://{}", relay.http_addr().unwrap());
     let fixture = Fixture::new();
-    let service = Arc::new(NetworkService::new(
-        fixture.stored_config(),
-        Arc::new(IrohRelayRegistrar::new()),
-        Arc::new(NotificationService::with_launcher(
-            fixture.launcher.clone(),
-            Duration::from_secs(1),
-        )),
-        fixture.status.clone(),
-        Duration::from_secs(10),
-    ));
+    let service =
+        fixture.service_with(Arc::new(IrohRelayRegistrar::new()), Duration::from_secs(10));
     let config = fixture.config(service.clone());
     config
         .replace("network", "relay_token", json!(token.clone()))
@@ -510,7 +538,7 @@ async fn real_iroh_registration_uses_only_the_configured_ephemeral_relay() {
         .await
         .unwrap();
     service.start().await.unwrap();
-    assert_eq!(fixture.titles(), ["已生成本地身份", "中转注册成功"]);
+    assert_eq!(fixture.titles(), ["已生成本地身份"]);
     assert_eq!(fixture.phase().await, "connected");
     let denied = IrohRelayRegistrar::new();
     let error = tokio::time::timeout(
@@ -664,16 +692,7 @@ async fn configuration_remains_available_during_background_registration() {
     };
     use tower::ServiceExt;
     let fixture = Fixture::new();
-    let service = Arc::new(NetworkService::new(
-        fixture.stored_config(),
-        fixture.registrar.clone(),
-        Arc::new(NotificationService::with_launcher(
-            fixture.launcher.clone(),
-            Duration::from_secs(1),
-        )),
-        fixture.status.clone(),
-        Duration::from_secs(2),
-    ));
+    let service = fixture.service_with(fixture.registrar.clone(), Duration::from_secs(2));
     let config = fixture.config(service.clone());
     config
         .replace("network", "relay_token", json!("valid-token"))

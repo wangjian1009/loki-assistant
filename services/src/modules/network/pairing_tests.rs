@@ -510,6 +510,10 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         fixture.stored_config(),
         Arc::new(IrohRelayRegistrar::new()),
         notification.clone(),
+        Arc::new(crate::modules::alert::AlertService::new(
+            fixture.status.clone(),
+            notification.clone(),
+        )),
         fixture.status.clone(),
         Duration::from_secs(10),
     ));

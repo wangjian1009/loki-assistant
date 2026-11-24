@@ -105,6 +105,7 @@ impl Services {
             config.clone(),
             Arc::new(network::IrohRelayRegistrar::new()),
             Arc::clone(&notification),
+            Arc::clone(&alert),
             Arc::clone(&status),
             Duration::from_secs(10),
         ));

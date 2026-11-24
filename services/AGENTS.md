@@ -6,7 +6,7 @@
 
 当前实现控制中心服务框架、配置中心、控制中心登录启动、系统通知模块、只读密码查询、Emacs gateway 与浏览器全文捕获。菜单栏状态界面属于 `apps/center/`，根目录 `emacs/` 提供 HTTP 客户端、通知发送、全文捕获和 Customize 风格的服务配置管理界面。不得在此目录复制 SwiftUI 界面或提前建立旧版会话引擎。
 
-`modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和通知。配置成功落盘后，提交回调通过 channel 通知中转任务读取最新设置。中转任务管理候选注册、连接监控和远程请求分发。注册等待期间仍可查询和使用当前活动连接，其他配置可以继续提交。注册失败保留当前连接与邀请，并通过通知服务报告失败。入口发出初始化请求，失败不影响本机 HTTP。没有固定对端或备用 relay。网络模块通过 `StatusService` 的请求队列发布 `network/my`，状态 HTTP 接口属于 `modules/status`。
+`modules/network/` 维护 `relay_url`、`relay_token` 配置、本地身份、中转注册和告警。配置成功落盘后，提交回调通过 channel 通知中转任务读取最新设置。中转任务管理候选注册、连接监控和远程请求分发。注册等待期间仍可查询和使用当前活动连接，其他配置可以继续提交。注册失败保留当前连接与邀请，并通过共享 `AlertService` 发布告警 `network.relay-registration`。注册恢复或关闭中转时清理对应告警。入口发出初始化请求，失败不影响本机 HTTP。没有固定对端或备用 relay。网络模块通过 `StatusService` 的请求队列发布 `network/my`，状态 HTTP 接口属于 `modules/status`。
 
 扫码绑定同样归属 `modules/network/`：`routes.rs` 提供五个邀请与设备管理接口，`pairing.rs` 管理单次邀请和绑定事务，`peers.rs` 通过配置模块读写设备绑定。绑定 ALPN 为 `loki-assistant/pair/1`，复用当前 relay Endpoint，由中转任务接收连接并分发。对端身份只取自 iroh 已认证连接；持久化成功后才消费邀请，接受的磁盘事务不因请求取消而中断。配置成功切换取消旧邀请，失败与撤销保留邀请。令牌不进入日志、通知、状态与发现元数据，HTTP 响应禁止缓存；测试使用临时文件、临时身份和本机随机端口 relay。
 
@@ -143,7 +143,7 @@ src/modules/<module>/
 | `modules/notification` | 系统通知发送、通用跳转封装和回执状态                           | 本模块 `protocol`、`NotificationLauncher` trait |
 | `modules/voice`         | 录音、识别、待确认、取消和失败状态机                             | 本模块 `protocol`、平台音频/识别 trait     |
 | `modules/status` | 由业务方设置的通用状态存储与查询 | JSON、进程内 channel |
-| `modules/network` | 身份持久化、中转注册和通知 | 配置处理器 trait、注入的通知服务、iroh 适配 |
+| `modules/network` | 身份持久化、中转注册和告警 | 配置处理器 trait、注入的告警和通知服务、iroh 适配 |
 | `modules/control_center` | 控制中心配置、菜单栏登录启动与失败撤销 | 配置处理器 trait、平台 LaunchAgent 管理器 |
 | `modules/password` | 本地 pass 目录配置、条目列表与只读解密 | 本模块 `CommandRunner` trait、配置服务、文件元数据检查 |
 | `modules/config`      | 配置模型、配置数据读写和变化订阅                               | 本模块 `model`、`service`、平台存储 trait   |
@@ -197,7 +197,7 @@ Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `
 
 在 `services/` 目录执行 `cargo fmt --check` 和 `cargo test --workspace`。修改跨模块协议时，同时检查 `docs/control-center-services.org` 及调用方；纯文档变更不增加实现测试。
 
-网络身份只在缺失时通过系统随机源生成，以 `0600` 权限原子保存；损坏或公私钥不匹配时禁止覆盖。生成身份与注册结果均通过注入的共享通知服务发送，私钥和令牌不得进入通知、日志或 HTTP 元数据。旧的固定测试身份、验证 CLI 和手机验证桥接已删除；真实 relay 测试仅使用本机随机端口与临时身份。
+网络身份只在缺失时通过系统随机源生成，以 `0600` 权限原子保存；损坏或公私钥不匹配时禁止覆盖。生成身份通过共享通知服务发送，注册失败通过共享告警服务报告。私钥和令牌不得进入告警、通知、日志或 HTTP 元数据。旧的固定测试身份、验证 CLI 和手机验证桥接已删除；真实 relay 测试仅使用本机随机端口与临时身份。
 
 `StatusService` 由 `Services` 创建并共享；状态值由业务模块通过 Rust 接口发布，不在 status 模块内拉取业务值。Emacs 通过业务入口 `POST /emacs/receiver/status` 上报，由 EmacsService 使用注入的共享 StatusService 发布 `emacs/runtime`，网络模块发布 `network/my`；禁止恢复 Emacs 模块私有的状态存储。`/status` HTTP 仅提供 GET 查询，不提供 POST/PUT 发布路由。网络令牌从配置中心读取，地址与令牌都非空才注册；任意一项缺失视为未配置，不读取环境令牌，不创建 Homebrew 服务环境文件。
 

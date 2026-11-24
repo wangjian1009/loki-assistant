@@ -13,11 +13,14 @@ use super::{
     relay::{RelayRegistrar, RelaySession},
 };
 use crate::modules::{
+    alert::{AlertInput, AlertLevel, AlertService},
     config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService},
     notification::{NotificationService, protocol::NotificationRequest},
     status::StatusService,
 };
 use crate::process::Process;
+
+const RELAY_REGISTRATION_ALERT: &str = "network.relay-registration";
 
 #[derive(Clone, PartialEq, Eq)]
 struct RelaySettings {
@@ -80,6 +83,7 @@ pub(super) struct RelayContext {
     config: ConfigService,
     registrar: Arc<dyn RelayRegistrar>,
     notification: Arc<NotificationService>,
+    alert: Arc<AlertService>,
     state: Process<State>,
     registration_timeout: Duration,
     status: Arc<StatusService>,
@@ -150,6 +154,7 @@ impl NetworkService {
         config: ConfigService,
         registrar: Arc<dyn RelayRegistrar>,
         notification: Arc<NotificationService>,
+        alert: Arc<AlertService>,
         status: Arc<StatusService>,
         registration_timeout: Duration,
     ) -> Self {
@@ -167,6 +172,7 @@ impl NetworkService {
             config,
             registrar,
             notification,
+            alert,
             state,
             registration_timeout,
             status,
@@ -273,7 +279,10 @@ impl RelayContext {
                             Self::restore_active_phase(&status, state, ConnectionStatus::Failed);
                         })
                         .await;
-                    self.notify("读取中转配置失败", error.clone()).await;
+                    if !changes.has_changed().unwrap_or(false) {
+                        self.report_registration_failure(format!("读取中转配置失败：{error}"))
+                            .await;
+                    }
                     Err(error)
                 }
             };
@@ -505,25 +514,36 @@ impl RelayContext {
     }
 
     async fn identity(&self) -> Result<iroh::SecretKey, String> {
-        let result = identity::ensure(&self.config).await;
-        match result {
-            Ok((identity, created)) => {
-                if created {
-                    self.notify(
-                        "已生成本地身份",
-                        format!(
-                            "身份私钥已保存到 GPG 密码库。\nEndpoint ID：{}",
-                            identity.public()
-                        ),
-                    )
-                    .await;
-                }
-                Ok(identity)
-            }
-            Err(error) => {
-                self.notify("网络身份初始化失败", error.clone()).await;
-                Err(error)
-            }
+        let (identity, created) = identity::ensure(&self.config).await?;
+        if created {
+            self.notify(
+                "已生成本地身份",
+                format!(
+                    "身份私钥已保存到 GPG 密码库。\nEndpoint ID：{}",
+                    identity.public()
+                ),
+            )
+            .await;
+        }
+        Ok(identity)
+    }
+
+    async fn report_registration_failure(&self, error: String) {
+        if let Err(error) = self
+            .alert
+            .publish(
+                RELAY_REGISTRATION_ALERT,
+                AlertInput {
+                    app: None,
+                    title: "中转注册失败".into(),
+                    body: Some(error),
+                    level: AlertLevel::Error,
+                    callback_url: None,
+                },
+            )
+            .await
+        {
+            log::warn!("发布中转注册告警失败：{error}");
         }
     }
 
@@ -561,36 +581,30 @@ impl RelayContext {
         let candidate = self.register_candidate(settings).await;
         let status = self.status.clone();
         let pairings = self.pairings.clone();
-        let changes = changes.clone();
-        let (old, notice, outcome) = self
+        let pending_changes = changes.clone();
+        let (old, outcome) = self
             .state
             .with(move |state| {
                 Box::pin(async move {
                     state.registering = false;
-                    if changes.has_changed().unwrap_or(false) {
+                    if pending_changes.has_changed().unwrap_or(false) {
                         Self::restore_active_phase(&status, state, ConnectionStatus::Offline);
                         let stale = match candidate {
                             Ok(Candidate::Replace(value)) => value,
                             _ => None,
                         };
-                        return (stale, None, Ok(()));
+                        return (stale, None);
                     }
                     match candidate {
                         Ok(Candidate::Replace(current)) => {
                             pairings.invalidate().await;
                             let old = std::mem::replace(&mut state.active, current);
                             Self::restore_active_phase(&status, state, ConnectionStatus::Offline);
-                            let notice = state.active.as_ref().map(|active| {
-                                format!(
-                                    "中转地址：{}\nEndpoint ID：{}",
-                                    active.settings.url, active.endpoint_id
-                                )
-                            });
-                            (old, notice, Ok(()))
+                            (old, Some(Ok(())))
                         }
                         Ok(Candidate::Keep) => {
                             Self::restore_active_phase(&status, state, ConnectionStatus::Connected);
-                            (None, None, Ok(()))
+                            (None, Some(Ok(())))
                         }
                         Err(error) => {
                             let fallback = if configured {
@@ -599,7 +613,7 @@ impl RelayContext {
                                 ConnectionStatus::Offline
                             };
                             Self::restore_active_phase(&status, state, fallback);
-                            (None, None, Err(error))
+                            (None, Some(Err(error)))
                         }
                     }
                 })
@@ -612,10 +626,20 @@ impl RelayContext {
         {
             log::warn!("关闭中转连接失败：{error}");
         }
-        if let Some(notice) = notice {
-            self.notify("中转注册成功", notice).await;
+        if let Some(outcome) = &outcome
+            && !changes.has_changed().unwrap_or(false)
+        {
+            match outcome {
+                Ok(()) => {
+                    if let Err(error) = self.alert.clear(RELAY_REGISTRATION_ALERT).await {
+                        log::warn!("清理中转注册告警失败：{error}");
+                    }
+                }
+                Err(error) if configured => self.report_registration_failure(error.clone()).await,
+                Err(error) => self.notify("网络身份初始化失败", error.clone()).await,
+            }
         }
-        outcome
+        outcome.unwrap_or(Ok(()))
     }
 
     // 外部 I/O 在中转任务中执行，状态请求仍可查询当前连接。
@@ -659,11 +683,7 @@ impl RelayContext {
                 endpoint_id,
                 session,
             }))),
-            Err(error) => {
-                let error = error.replace(&settings.token, "[已隐藏]");
-                self.notify("中转注册失败", error.clone()).await;
-                Err(error)
-            }
+            Err(error) => Err(error.replace(&settings.token, "[已隐藏]")),
         }
     }
 

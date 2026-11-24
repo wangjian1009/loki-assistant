@@ -152,7 +152,7 @@ Slack 模块通过只读配置 ~slack/watches~ 持久化全局主题聊天关注
 
 ** 本地身份
 
-本地身份通过 ~~/.assistant/config.yml~ 的 ~_system.network_identity~ 记录 Endpoint ID 和 ~Password~ 引用。私钥以 Base64 编码后由 GPG 加密，条目路径为 ~loki-assistant/network/identity.gpg~ 。服务启动及接收网络配置提交时读取私钥，并核对公私钥是否匹配。首次使用时生成随机身份，已有身份缺失私钥或校验失败时会通知初始化失败。
+本地身份通过 ~~/.assistant/config.yml~ 的 ~_system.network_identity~ 记录 Endpoint ID 和 ~Password~ 引用。私钥以 Base64 编码后由 GPG 加密，条目路径为 ~loki-assistant/network/identity.gpg~ 。服务启动及接收网络配置提交时读取私钥，并核对公私钥是否匹配。首次使用时生成随机身份。已有身份缺失私钥或校验失败时，已配置中转的实例发布注册告警，未配置中转的实例发送身份初始化失败通知。
 
 升级时，服务将配置文件中的旧中转令牌、身份私钥和设备绑定令牌迁入已配置的 GPG 密码库。旧版 ~~/.assistant/identity.json~ 和 ~~/.assistant/peers.json~ 仍可直接迁移。服务在凭据保存成功后原子更新配置文件，再移除已导入的旧文件。已有 Endpoint ID 和绑定凭据会一并保留。密码库不可用时保留待迁移的数据，可在恢复密码库后重试。内部凭据条目不通过密码查询 API 提供。
 
@@ -160,9 +160,9 @@ Slack 模块通过只读配置 ~slack/watches~ 持久化全局主题聊天关注
 
 地址和令牌均非空白时开始注册。未配齐时状态为未配置。地址为 HTTP(S) URL，包含主机、端口和路径。连接启用 TLS 验证。
 
-配置成功落盘后，提交回调通知中转任务读取最新的地址和令牌。配置请求与其他模块的写入可以继续完成。中转任务用持久化身份注册候选连接，注册最多等待 10 秒，认证拒绝会提前结束。成功时切换活动连接、作废未完成邀请并发送通知。注册失败时保留已保存的设置、当前活动连接和邀请，并发送失败通知。相同配置已连接时复用连接，失败后重新提交可重试。
+配置成功落盘后，提交回调通知中转任务读取最新的地址和令牌。配置请求与其他模块的写入可以继续完成。中转任务用持久化身份注册候选连接，注册最多等待 10 秒，认证拒绝会提前结束。注册失败时保留已保存的设置、当前活动连接和邀请，并通过告警模块发布 ~network.relay-registration~ 。注册成功时切换活动连接、作废未完成邀请并清理该告警。相同配置已连接时复用连接并清理告警，失败后重新提交可重试。
 
-同一中转任务监控连接，接收 ~loki-assistant/pair/1~ 、 ~loki-assistant/device-status/1~ 和 ~loki-assistant/services/1~ 并按协议分发请求。入口发送初始化请求，退出时通知中转任务释放连接。清空地址或令牌后关闭活动连接并保留身份。HTTP listener 只监听 loopback。
+同一中转任务监控连接，接收 ~loki-assistant/pair/1~ 、 ~loki-assistant/device-status/1~ 和 ~loki-assistant/services/1~ 并按协议分发请求。入口发送初始化请求，退出时通知中转任务释放连接。清空地址或令牌后关闭活动连接、保留身份并清理注册告警。HTTP listener 只监听 loopback。
 
 ** 本机网络状态
 
