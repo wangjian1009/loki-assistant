@@ -15,7 +15,8 @@ use super::{
     DocService,
     protocol::{
         CaptureInfo, CaptureResponse, CaptureResult, CaptureStatus, Document, DocumentResponse,
-        Failure, Request,
+        Failure, ReadLaterCapture, ReadLaterDelete, ReadLaterInfo, ReadLaterList, ReadLaterRead,
+        ReadLaterResponse, Request,
     },
     service::{DocError, invalid_reply},
 };
@@ -109,6 +110,105 @@ async fn capture(
     Ok(response)
 }
 
+#[loki_api(
+    module = "doc",
+    mount = "DocService",
+    id = "capture-read-later",
+    method = "POST",
+    path = "/doc/read-later/entries",
+    access = "local",
+    summary = "捕获稍后阅读链接",
+    description = "协议版本 1，将网页标题和链接交给 Emacs 写入当天日记。"
+)]
+async fn capture_read_later(
+    State(service): State<DocService>,
+    info: Result<Json<ReadLaterInfo>, JsonRejection>,
+) -> Result<Json<ReadLaterResponse<ReadLaterCapture>>, Response> {
+    let Json(info) =
+        info.map_err(|_| error_response(DocError::Business(Failure::InvalidReadLaterLink)))?;
+    let result = service
+        .call(Request::CaptureReadLater { info })
+        .await
+        .map_err(error_response)?;
+    Ok(Json(ReadLaterResponse {
+        api_version: API_VERSION,
+        result,
+    }))
+}
+
+#[loki_api(
+    module = "doc",
+    mount = "DocService",
+    id = "list-read-later",
+    method = "GET",
+    path = "/doc/read-later/entries",
+    access = "local",
+    summary = "查询稍后阅读列表",
+    description = "协议版本 1，从 Emacs 获取尚未标记已读的节点。"
+)]
+async fn list_read_later(
+    State(service): State<DocService>,
+) -> Result<Json<ReadLaterResponse<ReadLaterList>>, Response> {
+    let result = service
+        .call(Request::ListReadLater)
+        .await
+        .map_err(error_response)?;
+    Ok(Json(ReadLaterResponse {
+        api_version: API_VERSION,
+        result,
+    }))
+}
+
+#[loki_api(
+    module = "doc",
+    mount = "DocService",
+    id = "mark-read-later-read",
+    method = "POST",
+    path = "/doc/read-later/entries/{id}/read",
+    access = "local",
+    summary = "标记稍后阅读为已读",
+    description = "协议版本 1，将 Org ID 交给 Emacs 保存已读状态。"
+)]
+async fn mark_read_later_read(
+    State(service): State<DocService>,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Json<ReadLaterResponse<ReadLaterRead>>, Response> {
+    let id = path_segment(id)?;
+    let result = service
+        .call(Request::MarkReadLaterRead { id })
+        .await
+        .map_err(error_response)?;
+    Ok(Json(ReadLaterResponse {
+        api_version: API_VERSION,
+        result,
+    }))
+}
+
+#[loki_api(
+    module = "doc",
+    mount = "DocService",
+    id = "delete-read-later",
+    method = "DELETE",
+    path = "/doc/read-later/entries/{id}",
+    access = "local",
+    summary = "删除稍后阅读索引节点",
+    description = "协议版本 1，将 Org ID 交给 Emacs 移除该标题的 ID 属性并更新索引。"
+)]
+async fn delete_read_later(
+    State(service): State<DocService>,
+    id: Result<Path<String>, PathRejection>,
+) -> Result<Json<ReadLaterResponse<ReadLaterDelete>>, Response> {
+    let id = path_segment(id)?;
+    let result = service
+        .call(Request::DeleteReadLater { id })
+        .await
+        .map_err(error_response)?;
+    Ok(Json(ReadLaterResponse {
+        api_version: API_VERSION,
+        result,
+    }))
+}
+
 fn valid_segment(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
@@ -137,7 +237,7 @@ async fn method_not_allowed() -> Response {
         StatusCode::METHOD_NOT_ALLOWED,
         ErrorSource::Services,
         "method-not-allowed",
-        "文档接口支持 GET 查询和 POST 提交。",
+        "此文档接口不支持当前 HTTP 方法。",
     )
 }
 
@@ -213,6 +313,42 @@ fn error_response(error: DocError) -> Response {
                 Emacs,
                 "capture-index-failed",
                 "Emacs 无法更新网页全文的索引，请检查 org-roam 后重试。",
+            ),
+            InvalidReadLaterLink => (
+                StatusCode::BAD_REQUEST,
+                Business,
+                "invalid-read-later-link",
+                "请提供有效的网页标题和 HTTP(S) URL。",
+            ),
+            ReadLaterNotFound => (
+                StatusCode::NOT_FOUND,
+                Business,
+                "read-later-not-found",
+                "未找到该 ID 对应的稍后阅读节点。",
+            ),
+            ReadLaterTemplateUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Emacs,
+                "read-later-template-unavailable",
+                "请在 Emacs 中为稍后阅读配置指向日记目录的捕获模板。",
+            ),
+            ReadLaterDailyConflict => (
+                StatusCode::CONFLICT,
+                Business,
+                "read-later-daily-conflict",
+                "日记有尚未保存或加载的更改，请在 Emacs 中处理后重试。",
+            ),
+            ReadLaterSaveFailed => (
+                StatusCode::BAD_GATEWAY,
+                Emacs,
+                "read-later-save-failed",
+                "Emacs 无法保存稍后阅读记录，请检查日记模板和文件。",
+            ),
+            ReadLaterIndexFailed => (
+                StatusCode::BAD_GATEWAY,
+                Emacs,
+                "read-later-index-failed",
+                "Emacs 无法更新稍后阅读的索引，请检查 org-roam 后重试。",
             ),
         },
     };

@@ -17,7 +17,7 @@
 | [[file:config-module.org][modules/config]] | 配置模型、数据读写和变更通知 | 已实现基础能力及元数据通知接入点 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
-| ~modules/doc~ | 提交网页全文并按 Org ID 查询文档 | 已实现 |
+| ~modules/doc~ | 提交网页全文、按 Org ID 查询文档和管理稍后阅读 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
 | ~modules/mail~ | 同步 Maildir、更新 mu 索引、通知新邮件及转交 Emacs 撰写草稿 | 已实现 |
@@ -110,6 +110,10 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | POST | ~/emacs/apps/open~ | 按 app 查询参数打开 Emacs 应用 |
 | POST | ~/doc/article~ | 保存浏览器生成的 Org 全文并返回文档摘要 |
 | GET | ~/doc/{id}~ | 按 Org ID 读取已保存的文档 |
+| POST | ~/doc/read-later/entries~ | 把网页链接保存到当天日记 |
+| GET | ~/doc/read-later/entries~ | 查询未读网页链接 |
+| POST | ~/doc/read-later/entries/{id}/read~ | 按 Org ID 标记已读 |
+| DELETE | ~/doc/read-later/entries/{id}~ | 移除日记标题的 Org ID |
 | GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
 | GET | ~/status~ | 读取全部模块发布的状态 |
 | GET | ~/status/{module_id}~ | 读取模块完整状态对象 |
@@ -388,10 +392,11 @@ network 将 iroh 已认证的 Endpoint ID 注入 Axum 请求扩展，配置中�
 | 文档集合 | ~GET /doc~ | 分页返回摘要，按 ~kind~ 、 ~domain~ 和 ~tag~ 过滤，按标题及别名搜索 | 后续 |
 | 文档链接 | ~GET /doc/{id}/links~ | ~outgoing~ 和 ~incoming~ 各返回去重后的可访问文档 ID，~references~ 提供 ~ROAM_REFS~ 中的 HTTP(S) 来源 URL | 后续 |
 | 网页文章 | ~POST /doc/article~ | 直接保存网页全文，返回文档摘要 | 已实现 |
+| 稍后阅读 | ~/doc/read-later/entries~ | 捕获网页链接、查询未读节点、标记已读及移除节点 ID | 已实现 |
 
 HTTP 方法决定路径段的含义。services 对 ~GET /doc/{id}~ 和 ~POST /doc/{target}~ 在同一路由模板上注册不同方法的处理器。~GET /doc/article~ 查询 ID 为 ~article~ 的文档，~POST /doc/article~ 将目标 ~article~ 交给 Emacs。新增提交目标由 Emacs 注册。
 
-稍后阅读可使用日记中带独立 Org ID 的条目，来源使用 ~ROAM_REFS~ ，阅读状态作为工作流字段。网页全文捕获也使用 ~ROAM_REFS~ ，因此来源引用只表示来源，队列成员由稍后阅读业务显式标记。
+稍后阅读使用日记中带独立 Org ID 和 ~稍后阅读~ 标签的条目，来源写入标题链接，阅读状态作为工作流字段。
 
 ** 全文捕获接入
 
@@ -533,6 +538,34 @@ HTTP 200 返回 UTF-8 JSON。响应使用 ~application/json~ 并携带 ~Cache-Co
 #+begin_src json
 {"api_version":"1","status":404,"error":{"source":"business","code":"document-not-found","message":"未找到该 ID 对应的 Org 文档。"}}
 #+end_src
+
+** 稍后阅读
+
+四个接口均为本机协议版本 1，复用 Emacs gateway 和标准错误响应，并返回 ~Cache-Control: no-store~ 。services 负责 HTTP 参数解码和结果转发。Emacs 负责捕获、索引查询、标记已读和删除。
+
+| 接口 | 请求 | HTTP 200 响应中的业务字段 |
+|------+------|------------------------------|
+| ~POST /doc/read-later/entries~ | JSON 对象，含 ~title~ 和绝对 HTTP(S) ~url~ | ~entry~ 为保存的节点摘要。同一链接已有未读节点时返回该节点 |
+| ~GET /doc/read-later/entries~ | 无请求体 | ~entries~ 为未读节点摘要数组，按捕获时间倒序，空列表为 ~[]~ |
+| ~POST /doc/read-later/entries/{id}/read~ | ~id~ 为 URL 路径段编码后的 Org ID，无请求体 | ~id~ 和首次标记的 ~read_at~ ，采用 UTC ISO 8601。重复标记返回相同时间 |
+| ~DELETE /doc/read-later/entries/{id}~ | ~id~ 为 URL 路径段编码后的 Org ID，无请求体 | ~id~ 为已移除的 Org ID |
+
+节点摘要含 ~id~ 、 ~title~ 、 ~url~ 和 ~captured_at~ 。新捕获以标题中的 Org 链接保存来源，以本地 Org 非激活时间戳写入 ~CREATED~ 。列表从标题提取 HTTP(S) 链接，标题无此类链接时 ~url~ 为 ~null~ 。~captured_at~ 由 ~CREATED~ 转为 UTC ISO 8601，旧记录兼容 ~LOKI_READ_LATER_CAPTURED_AT~ ，无时间返回 ~null~ 。
+
+标记已读会将首次已读时间以本地 Org 非激活时间戳写入 ~READED~ ，如 ~[2026-11-24 Tue 17:33]~ 。删除只移除目标标题的 ~ID~ ，日记中的标题、属性和内容照常保留。保存并更新索引后，原 ID 从列表和 ~GET /doc/{id}~ 查询结果中消失。
+
+捕获使用目标 Emacs 会话的本地日期，调用 ~org-roam-dailies-capture-today~ 。日记位置继承 ~org-roam-dailies-capture-templates~ 中指定模板的 ~:target~ ，由 ~loki-assistant-read-later-daily-template-key~ 选择，默认为 ~d~ 。 [[file:emacs.org::*稍后阅读][Emacs 稍后阅读]]
+
+| HTTP | 错误码 | 含义 |
+|------+--------+------|
+| 400 | ~invalid-read-later-link~ | 网页标题、链接或提交格式无效 |
+| 404 | ~read-later-not-found~ | Org ID 无对应的稍后阅读节点 |
+| 409 | ~read-later-daily-conflict~ | 日记有尚未保存或加载的更改 |
+| 502 | ~document-read-failed~ | Emacs 无法查询索引 |
+| 502 | ~read-later-save-failed~ | Emacs 无法保存日记 |
+| 502 | ~read-later-index-failed~ | 日记索引更新失败 |
+| 503 | ~read-later-template-unavailable~ | 日记模板缺失或目标超出日记目录 |
+| 503 | ~doc-unavailable~ | 目标 Emacs 缺少文档模块、org-roam 或 Dailies |
 
 * 密码管理模块
 

@@ -5,8 +5,13 @@ import { rankEntries } from "../features/password-search/search.js";
 import { clearAfter, copyText } from "../features/password-copy/copy.js";
 import { generateTotp } from "../features/password-otp/otp.js";
 import { loadEntry, copyableValue } from "../features/password-manager/manager.js";
+import { installReadLater } from "../features/read-later/view.js";
 
 const $ = (id) => document.getElementById(id);
+const readLater = installReadLater({
+  save: $("read-later-save"), saveStatus: $("tool-status"), list: $("read-later-entries"),
+  listStatus: $("read-later-status"), refreshButton: $("read-later-refresh"), sendMessage,
+});
 const state = {
   tab: null, files: [], domainOnly: true, view: null, manualView: false,
   loaded: false, loading: false, contextReady: false, loadError: "", listRequest: 0, selectedFile: null,
@@ -78,7 +83,7 @@ function showView(view, { manual = false, focus = true } = {}) {
   if (state.view === "password" && view !== "password") state.listScroll = $("content").scrollTop;
   if (state.view === "details" && view !== "details") clearDetails();
   state.view = view;
-  const passwordMode = view !== "tools";
+  const passwordMode = view === "password" || view === "details";
   $("connection").hidden = !passwordMode;
   $("page-context").hidden = !passwordMode;
   $("password-footer").hidden = !passwordMode;
@@ -88,7 +93,7 @@ function showView(view, { manual = false, focus = true } = {}) {
     $("connection").setAttribute("aria-expanded", "false");
   }
   $("initial-loading").hidden = true;
-  for (const name of ["tools", "password", "details"]) $(name + "-view").hidden = name !== view;
+  for (const name of ["tools", "password", "details", "read-later"]) $(name + "-view").hidden = name !== view;
   for (const tab of document.querySelectorAll(".tab")) {
     const active = tab.dataset.view === (view === "details" ? "password" : view);
     tab.classList.toggle("active", active);
@@ -97,10 +102,13 @@ function showView(view, { manual = false, focus = true } = {}) {
   $("shortcut-hint").hidden = view !== "password";
   $("content").scrollTop = view === "password" ? state.listScroll : 0;
   if (focus) {
-    const target = view === "tools" ? document.querySelector("#tools-view .tool-tile:not(:disabled)") || document.querySelector('.tab[data-view="tools"]') : view === "password" ? $("search") : $("details-back");
+    const defaultTarget = { password: $("search"), details: $("details-back") };
+    const tool = view === "tools" && document.querySelector("#tools-view .tool-tile:not(:disabled)");
+    const target = tool || defaultTarget[view] || document.querySelector(`.tab[data-view="${view}"]`);
     target.focus({ preventScroll: true });
   }
   if (view === "password" && state.contextReady && !state.loaded && !state.loading) void loadFiles();
+  if (view === "read-later") void readLater.refresh();
 }
 
 function renderEntries() {
@@ -112,7 +120,7 @@ function renderEntries() {
   $("domain-toggle").hidden = !currentOrigin();
   const matches = currentOrigin() ? rankedEntries("", true).length : null;
   $("match-count").textContent = state.loaded && matches !== null ? String(matches) : "—";
-  $("match-count").hidden = state.view === "tools" || !state.loaded;
+  $("match-count").hidden = !["password", "details"].includes(state.view) || !state.loaded;
   $("result-count").textContent = state.loaded ? `${$("search").value.trim() ? "搜索结果" : state.domainOnly && currentOrigin() ? "当前网站" : "全部条目"} · ${ranked.length} 项` : state.loadError ? "密码条目未加载" : "正在读取密码条目…";
   if (!state.loaded || !ranked.length) {
     const empty = element("div", "empty");
@@ -401,6 +409,7 @@ async function initialize() {
     state.tab = context.tab;
     state.contextReady = true;
     const origin = currentOrigin();
+    readLater.setPage(state.tab?.url);
     $("hostname").textContent = origin?.hostname || "当前页面不支持填充或全文保存";
     $("hostname").title = origin?.hostname || "仍可搜索和复制密码";
     $("org-capture").disabled = !origin;
@@ -409,6 +418,7 @@ async function initialize() {
     if (context.detectionError) setStatus(context.detectionError, true);
   } catch (error) {
     state.contextReady = true;
+    readLater.setPage(null);
     $("hostname").textContent = "无法读取当前页面";
     $("org-capture").disabled = true;
     if (!state.manualView) showView("tools");

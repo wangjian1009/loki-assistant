@@ -102,6 +102,10 @@
 
 模块的 ~loki-assistant-doc-capture-templates~ 使用 org-roam 模板结构。目标 ~article~ 对应模板 ~p~ ，默认保存到 ~org-roam-directory~ 下的 ~article/YYYY/~ 。Emacs 按 ~ROAM_REFS~ 去重，并在同一次调用中完成保存和索引。Chrome 根据原请求的结果显示成功提示或错误说明。 [[file:control-center-services.org::*文档模块][文档接口与分类]]
 
+** 稍后阅读
+
+~loki-assistant-read-later~ 提供捕获、查询、标记已读和删除。要更换用于定位日记文件的模板，可在 Customize 中设置 ~loki-assistant-read-later-daily-template-key~ ，默认使用 ~org-roam-dailies-capture-templates~ 中的 ~d~ 模板。捕获通过 ~org-roam-dailies-capture-today~ 写入带 ID、 ~稍后阅读~ 标签和 ~CREATED~ 属性的链接标题。删除移除标题的 ~ID~ 并更新 org-roam 索引。 [[file:control-center-services.org::*稍后阅读][稍后阅读 HTTP 协议]]
+
 * 服务配置管理
 
 加载包后执行 ~M-x loki-assistant-config~ ，或从仓库根目录执行 ~make emacs-config~ 。菜单栏“设置”调用 services 的 ~POST /emacs/apps/open?app=config~ ，由服务打开该界面并聚焦图形 frame；目标 Emacs 需要已将本包加入 ~load-path~ 。首次连接尚未运行的 server 时，启动行为沿用 [[file:control-center-services.org::*配置和连接][Emacs gateway 的连接约定]]。

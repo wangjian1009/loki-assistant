@@ -184,9 +184,11 @@ Lisp 求值和 buffer 列表查询在 server 不可用时，仍通过 ~emacsclie
 
 完整请求、响应、错误码和 Rust 处理器接入方式见 [[file:../docs/control-center-services.org::*Emacs 模块][Emacs 模块协议]]。
 
-* 文档查询与全文保存
+* 文档查询、全文保存与稍后阅读
 
 Chrome 通过 ~POST /doc/article~ 发送 Org 全文，services 转交给目标 Emacs 的文档模块自动保存。客户端通过 ~GET /doc/{id}~ 查询已索引的 Org 文档。目标 Emacs server 需能加载 ~loki-assistant-doc~ 和 ~org-roam~ 。从仓库开发时可用 ~make emacs-load~ 加载。 [[file:../docs/control-center-services.org::*文档模块][文档接口]]
+
+稍后阅读的捕获和列表共用 ~/doc/read-later/entries~ 。客户端以 ~POST /doc/read-later/entries/{id}/read~ 标记已读，以 ~DELETE /doc/read-later/entries/{id}~ 移除节点 ID。services 将操作交给目标 Emacs 的 ~loki-assistant-read-later~ 模块。 [[file:../docs/control-center-services.org::*稍后阅读][稍后阅读协议]]
 
 * 邮件自动同步
 

@@ -12,6 +12,11 @@
 (require 'url-parse)
 (require 'url-util)
 
+(autoload 'loki-assistant-read-later-capture "loki-assistant-read-later")
+(autoload 'loki-assistant-read-later-list "loki-assistant-read-later")
+(autoload 'loki-assistant-read-later-mark-read "loki-assistant-read-later")
+(autoload 'loki-assistant-read-later-delete "loki-assistant-read-later")
+
 (declare-function org-roam-capture- "org-roam-capture")
 (declare-function org-roam-capture--fill-template "org-roam-capture" (template &optional ensure-newline))
 (declare-function org-roam-capture--target-truepath "org-roam-capture" (path))
@@ -337,6 +342,13 @@
                              :url (plist-get info :url)
                              :captured-at (plist-get info :captured_at)
                              :body (plist-get info :body)))))
+                   ("capture_read_later"
+                    (loki-assistant-read-later-capture (plist-get request :info)))
+                   ("list_read_later" (loki-assistant-read-later-list))
+                   ("mark_read_later_read"
+                    (loki-assistant-read-later-mark-read (plist-get request :id)))
+                   ("delete_read_later"
+                    (loki-assistant-read-later-delete (plist-get request :id)))
                    (_ '((error . "invalid-request"))))))
            (error '((error . "invalid-request"))))))
     (base64-encode-string (encode-coding-string (json-serialize reply) 'utf-8) t)))

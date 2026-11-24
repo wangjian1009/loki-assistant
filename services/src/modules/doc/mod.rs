@@ -13,6 +13,6 @@ use crate::modules::discover::registry::ModuleRegistration;
 static DOC_MODULE: ModuleRegistration = ModuleRegistration {
     id: "doc",
     name: "文档",
-    description: "通过 Emacs 和 org-roam 按 ID 读取文档，按目标提交网页全文。",
+    description: "通过 Emacs 和 org-roam 读取文档、保存网页全文和管理稍后阅读。",
     version: env!("CARGO_PKG_VERSION"),
 };

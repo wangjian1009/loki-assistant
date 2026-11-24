@@ -19,6 +19,7 @@
     <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
     <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
     <symbol id="icon-page" viewBox="0 0 24 24"><path d="M14 2H5v20h14V7l-5-5Zm0 0v6h5M8 12h8m-8 4h6"/></symbol>
+    <symbol id="icon-bookmark" viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z"/></symbol>
     <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-1 8M20 4v6h-6"/></symbol>
   </defs></svg>
   <main id="app">
@@ -30,6 +31,7 @@
     <nav class="tabs" aria-label="功能">
       <button class="tab" data-view="tools" aria-pressed="false">工具</button>
       <button class="tab" data-view="password" aria-pressed="false">密码 <span id="match-count" class="count" aria-label="当前网站匹配数量" hidden>—</span></button>
+      <button class="tab" data-view="read-later" aria-pressed="false">稍后阅读</button>
     </nav>
     <div id="content" class="content">
       <aside id="diagnostics" class="notice" hidden><p id="connection-detail">正在连接本机服务…</p><button id="refresh" class="text-button">重试连接</button></aside>
@@ -37,8 +39,14 @@
       <section id="tools-view" aria-label="工具" hidden>
         <div class="tool-grid" aria-label="页面工具">
           <button id="org-capture" class="tool-tile" title="将完整网页保存到 Emacs，确认后存为 Org 笔记" disabled><span class="tool-icon"><svg class="icon" aria-hidden="true"><use href="#icon-page"/></svg></span><span>全文保存</span></button>
+          <button id="read-later-save" class="tool-tile" disabled><span class="tool-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bookmark"/></svg></span><span>保存链接</span></button>
         </div>
         <p id="tool-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+      <section id="read-later-view" aria-label="稍后阅读" hidden>
+        <div class="read-later-actions"><button id="read-later-refresh" class="text-button" type="button">刷新列表</button></div>
+        <div id="read-later-status" class="status" role="status"></div>
+        <ul id="read-later-entries" class="entries"></ul>
       </section>
       <section id="password-view" aria-label="密码列表" hidden>
         <div class="search-box"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><button id="domain-scope" class="scope" title="移除网站过滤" aria-label="移除当前网站过滤">当前网站 ×</button><input id="search" type="search" autocomplete="off" placeholder="搜索密码条目…" aria-label="搜索密码条目" aria-controls="entries"></div>

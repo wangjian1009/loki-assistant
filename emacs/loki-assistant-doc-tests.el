@@ -4,7 +4,9 @@
 
 (require 'ert)
 (require 'loki-assistant-doc)
+(require 'loki-assistant-read-later)
 (require 'org-roam-capture)
+(require 'org-roam-dailies)
 
 (defmacro loki-assistant-doc-test--with-library (&rest body)
   "在临时 org-roam 知识库中执行 BODY。"
@@ -18,7 +20,8 @@
           (org-id-files nil)
           (org-capture-plist nil)
           (org-capture-last-stored-marker (make-marker))
-          (loki-assistant-doc--unindexed (make-hash-table :test 'equal)))
+          (loki-assistant-doc--unindexed (make-hash-table :test 'equal))
+          (loki-assistant-read-later--pending-index (make-hash-table :test 'equal)))
      (unwind-protect
          (progn ,@body)
        (org-roam-db--close-all)
@@ -28,6 +31,122 @@
              (with-current-buffer buffer (set-buffer-modified-p nil))
              (kill-buffer buffer))))
        (delete-directory root t))))
+
+(ert-deftest loki-assistant-doc-test-read-later-daily-roundtrip ()
+  (loki-assistant-doc-test--with-library
+    (let* ((org-roam-dailies-directory "journal/")
+           (org-roam-dailies-capture-templates
+            '(("d" "日记" entry "* %?"
+               :target (file+head "%<%Y>/%<%m>/%<%Y-%m-%d>.org" "#+TITLE: 日记\n")
+               :jump-to-captured t)))
+           (url "https://example.com/文章?x=%5B1%5D#位置")
+           (info (list :title "网页 %(error \"不执行\") ${title}" :url url))
+           (file (expand-file-name (format-time-string "journal/%Y/%m/%F.org") root))
+           entry id)
+      (should (equal (loki-assistant-read-later-list) '((result (entries . [])))))
+      (should (equal (alist-get 'error
+                                (loki-assistant-read-later-capture
+                                 '(:title "内部页面" :url "chrome://settings")))
+                     "invalid-read-later-link"))
+      (cl-letf (((symbol-function 'save-buffer)
+                 (lambda (&rest _) (error "日记暂不可写"))))
+        (should (equal (alist-get 'error (loki-assistant-read-later-capture info))
+                       "read-later-save-failed")))
+      (should-not (file-exists-p file))
+      (should-not (find-buffer-visiting file))
+      (cl-letf (((symbol-function 'org-roam-db-update-file)
+                 (lambda (&rest _) (error "索引暂不可用"))))
+        (should (equal (alist-get 'error (loki-assistant-read-later-capture info))
+                       "read-later-index-failed")))
+      (should (file-regular-p file))
+      (setq entry (alist-get 'entry (alist-get 'result (loki-assistant-read-later-capture info)))
+            id (alist-get 'id entry))
+      (should (stringp id))
+      (should (equal (alist-get 'title entry) (plist-get info :title)))
+      (should (equal (alist-get 'url entry) url))
+      (should (equal (alist-get 'entries (alist-get 'result (loki-assistant-read-later-list)))
+                     (vector entry)))
+      (with-current-buffer (find-buffer-visiting file)
+        (set-buffer-modified-p t)
+        (unwind-protect
+            (should (equal (alist-get 'error (loki-assistant-read-later-mark-read id))
+                           "read-later-daily-conflict"))
+          (set-buffer-modified-p nil)))
+      (cl-letf (((symbol-function 'org-roam-db-update-file)
+                 (lambda (&rest _) (error "索引暂不可用"))))
+        (should (equal (alist-get 'error (loki-assistant-read-later-mark-read id))
+                       "read-later-index-failed")))
+      (let ((read (loki-assistant-read-later-mark-read id)))
+        (should (equal (alist-get 'id (alist-get 'result read)) id))
+        (with-current-buffer (find-buffer-visiting file)
+          (org-with-wide-buffer
+           (goto-char (org-find-entry-with-id id))
+           (let ((stamp (org-entry-get nil "READED")))
+             (should (string-match-p (rx string-start "[" (= 4 digit) "-" (= 2 digit) "-" (= 2 digit)
+                                         " " (= 3 alpha) " " (= 2 digit) ":" (= 2 digit) "]" string-end)
+                                     stamp))
+             (should (equal (alist-get 'read_at (alist-get 'result read))
+                            (format-time-string "%FT%TZ" (org-time-string-to-time stamp) t))))))
+        (should (equal read (loki-assistant-read-later-mark-read id))))
+      (should (equal (loki-assistant-read-later-list) '((result (entries . [])))))
+      (let ((content (alist-get 'content (alist-get 'result (loki-assistant-doc-get id)))))
+        (should (string-match-p ":稍后阅读:" content))
+        (should (string-prefix-p (concat "* " (org-link-make-string url (plist-get info :title))) content))
+        (should (= 1 (with-temp-buffer
+                       (insert content)
+                       (how-many (regexp-quote url) (point-min) (point-max)))))
+        (should (string-match-p ":CREATED: +\\[[0-9-]+ [A-Za-z]+ [0-9:]+\\]" content))
+        (should-not (string-match-p ":ROAM_REFS:\\|:LOKI_READ_LATER_CAPTURED_AT:" content))
+        (should (string-match-p "^:READED:" content))))))
+
+(ert-deftest loki-assistant-doc-test-read-later-delete-only-removes-id ()
+  (loki-assistant-doc-test--with-library
+    (let* ((org-roam-dailies-directory "journal/")
+           (file (expand-file-name "journal/2026-06-01.org" root))
+           (before (concat "* 网页标题 :稍后阅读:\n"
+                           ":PROPERTIES:\n:ID: deletable\n:CREATED: [2026-06-01 Mon 08:30]\n:END:\n"
+                           "网页笔记\n"
+                           "** 子标题\n:PROPERTIES:\n:ID: child-id\n:END:\n"))
+           (after (string-replace ":ID: deletable\n" "" before)))
+      (make-directory (file-name-directory file) t)
+      (with-temp-file file (insert before))
+      (org-roam-db-update-file file)
+      (should (= 1 (length (alist-get 'entries (alist-get 'result (loki-assistant-read-later-list))))))
+      (should (equal (alist-get 'error (loki-assistant-read-later-delete "child-id"))
+                     "read-later-not-found"))
+      (should (equal (loki-assistant-read-later-delete "deletable") '((result (id . "deletable")))))
+      (should (equal (loki-assistant-read-later-list) '((result (entries . [])))))
+      (should-not (org-roam-node-from-id "deletable"))
+      (should (equal (loki-assistant-doc-get "deletable") '((error . "document-not-found"))))
+      (should (org-roam-node-from-id "child-id"))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (should (equal (buffer-string) after))))))
+
+(ert-deftest loki-assistant-doc-test-read-later-keeps-entries-without-heading-links ()
+  (loki-assistant-doc-test--with-library
+    (let* ((org-roam-dailies-directory "journal/")
+           (file (expand-file-name "journal/2026-06-01.org" root))
+           (url "https://example.org/guide#daily"))
+      (make-directory (file-name-directory file) t)
+      (with-temp-file file
+        (insert "* 日记中的网页 :稍后阅读:\n:PROPERTIES:\n:ID: older-link\n"
+                ":ROAM_REFS: https://example.org/reference\n:END:\n"
+                (org-link-make-string url "网页") "\n"
+                "** 子节点\n:PROPERTIES:\n:ID: child-link\n:END:\n"
+                "[[https://example.org/child]]\n"))
+      (org-roam-db-update-file file)
+      (should (equal (loki-assistant-read-later-list)
+                     '((result (entries . [((id . "older-link") (title . "日记中的网页")
+                                            (url . :null) (captured_at . :null))])))))
+      (let* ((reply (loki-assistant-read-later-capture (list :title "新标题" :url url)))
+             (entry (alist-get 'entry (alist-get 'result reply)))
+             (id (alist-get 'id entry)))
+        (should (stringp id))
+        (should-not (equal id "older-link"))
+        (should (alist-get 'result (loki-assistant-read-later-delete id))))
+      (should (alist-get 'result (loki-assistant-read-later-mark-read "older-link")))
+      (should (equal (loki-assistant-read-later-list) '((result (entries . []))))))))
 
 (ert-deftest loki-assistant-doc-test-capture-and-retry-without-confirmation ()
   (loki-assistant-doc-test--with-library

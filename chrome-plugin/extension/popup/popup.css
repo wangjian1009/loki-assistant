@@ -60,8 +60,15 @@ kbd { display: inline-block; min-width: 19px; padding: 2px 4px; border: 1px soli
 .tool-tile { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 9px; min-width: 0; min-height: 94px; padding: 10px 2px; border-radius: 10px; font-size: 12px; line-height: 1.4; text-align: center; }
 .tool-icon { display: grid; place-items: center; width: 50px; height: 50px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px #00000008; }
 .tool-icon .icon { width: 25px; height: 25px; }
-#org-capture .tool-icon { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+#org-capture .tool-icon, #read-later-save .tool-icon { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 #tools-view .status { padding: 8px 4px 0; }
+.read-later-actions { display: flex; justify-content: flex-end; margin: -8px 0 8px; }
+#read-later-entries { list-style: none; margin: 0; padding: 0; }
+#read-later-status { margin: 0 0 8px; }
+.read-later-link { display: block; color: inherit; text-decoration: none; }
+a.read-later-link:hover .entry-name { text-decoration: underline; }
+.read-later-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.read-later-link .entry-name, .read-later-link .entry-path { display: block; }
 h1 { margin: 0 0 5px; font-size: 14px; font-weight: 600; }
 .primary { display: flex; justify-content: center; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 10px 14px; border-radius: 7px; color: var(--accent-ink); background: var(--accent); font-size: 12px; }
 .primary:hover:not(:disabled) { background: var(--accent); filter: brightness(.93); }

@@ -10,11 +10,12 @@
 
 * 目标与范围
 
-Chrome Manifest V3 插件的功能菜单包含全文保存和只读密码查询：
+Chrome Manifest V3 插件的功能菜单包含全文保存、稍后阅读和只读密码查询。
 
 | 显示名称 | 功能标识 | 行为 |
 |----------+----------+------|
 | 全文保存 | =org-capture= | 读取当前完整网页，转换为 Org 文本并提交到 Loki Assistant |
+| 稍后阅读 | =read-later= | 保存当前网页链接，查询未读列表，标记已读或删除 |
 | 密码 | =password-query= | 查询 pass 条目，复制字段并填充当前网页 |
 
 功能菜单保留按功能扩展的边界，每个能力使用独立功能目录；后续能力不得把协议和实现堆回
@@ -82,8 +83,8 @@ chrome-plugin/
 #+end_src
 
 popup 只负责显示功能菜单、启动功能和显示结果。密码列表仅在首次进入密码页时发起，详情在操作时按需读取；工具页使用四列图标网格，无搜索框、
-无密码查询及其状态展示，目前仅提供全文保存入口，其他工具后续另行设计。
-当前标签页读取、密码框检测、密码填充和全文保存通过 service worker 调度。
+提供全文保存和保存链接入口。
+当前标签页读取、密码框检测、密码填充、全文保存和稍后阅读通过 service worker 调度。
 popup 使用 =page-context= 请求当前页面信息，使用 =capture-snapshot= 请求后台读取页面快照，
 在具备 DOM 的 popup 中转换为 Org，再以 =capture-full= 交给后台提交；service worker 不执行 DOM 转换。
 每个功能由自己的目录导出入口，目录之间不共享
@@ -92,7 +93,7 @@ popup 使用 =page-context= 请求当前页面信息，使用 =capture-snapshot=
 插件使用 =activeTab=、=scripting=、=tabs= 权限，以及访问
 =http://127.0.0.1/*= 的 =host_permissions= 。不申请 cookies、下载、剪贴板或全部网页
 访问权限；复制使用扩展页面的 Clipboard API，不声明 =clipboardRead= 或 =clipboardWrite= 。
-Chrome 内部页面、Web Store、PDF 查看器和没有 HTML body 的页面直接显示不支持提示。
+全文保存遇到 Chrome 内部页面、Web Store、PDF 查看器或缺少 HTML body 的页面时会提示。稍后阅读读取标签页的标题和 HTTP(S) URL。
 
 =tabs= 用于用户点击插件前读取当前标签页 URL 并刷新密码匹配角标，不用于读取页面 DOM。
 角标在后台按当前 hostname 和端口匹配条目名称，不解密密码；扩展加载、安装、浏览器启动、
@@ -120,6 +121,10 @@ http://127.0.0.1:47321/doc/article
 
 Chrome 插件向 ~POST /doc/article~ 提交包含 ~title~ 、 ~url~ 、 ~captured_at~ 和 ~body~ 的 JSON。新文档保存并完成索引后返回 HTTP 201。命中已有来源时返回 HTTP 200 和原文档摘要。错误在原请求上返回，弹窗显示 ~error.message~ 。正文通过响应中的 ~document.id~ 请求 ~GET /doc/{id}~ 。 [[file:control-center-services.org::*全文捕获接入][文档模块全文捕获协议]]
 
+** 稍后阅读
+
+在工具页点击「保存链接」后，service worker 读取当前标签页的标题和 HTTP(S) URL，经本机 services 交给 Emacs 写入当天日记。每次激活弹窗的「稍后阅读」标签页时重新请求未读列表。点击标题在浏览器新标签页打开网址，标记已读或删除后刷新列表。 [[file:control-center-services.org::*稍后阅读][稍后阅读协议]]
+
 * browserpass 查询行为兼容
 
 本插件参考 browserpass-extension 3.13.0 和 browserpass-native 3.x 的查询行为。原版
@@ -136,9 +141,9 @@ native host 的 =configure=、=list=、=fetch= 分别对应本插件的配置中
 
 插件保留以下可见行为：
 
-- 工具页采用“图标 + 短名称”网格，目前只展示全文保存；其他功能后续设计，无工具搜索，
+- 工具页采用“图标 + 短名称”网格，展示全文保存和保存链接，无工具搜索，
   不加载或显示密码条目信息。密码查询在进入密码页后才触发，迟到结果不会改变工具页。
-- 弹窗按“工具、密码”排列；可访问 frame 中有可见、可编辑密码框时默认进入密码页，否则进入工具页。
+- 弹窗依次展示「工具」「密码」「稍后阅读」。可访问 frame 中有可见、可编辑密码框时默认进入密码页，否则进入工具页。
   不读取密码框内容，不因匹配条目数量选择默认页；手动切换后，迟到的页面检测不改变当前页。
 - 条目列表默认按当前标签页 hostname 过滤，输入搜索词时按第一词模糊匹配、其余词做字面子串过滤；“全部条目”按钮取消域名过滤，Backspace 在搜索框为空时也会取消过滤。
 - 密码入口数字只统计当前网站匹配条目，不随搜索词改变；列表结果单独计数，查询失败显示未知，不能显示成零匹配。

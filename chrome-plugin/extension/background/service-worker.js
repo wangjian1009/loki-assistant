@@ -1,5 +1,5 @@
 import { captureFull } from "../shared/services-client.js";
-import { CAPTURE_FULL, CAPTURE_SNAPSHOT } from "../shared/messages.js";
+import { CAPTURE_FULL, CAPTURE_SNAPSHOT, READ_LATER_CAPTURE, READ_LATER_DELETE, READ_LATER_LIST, READ_LATER_MARK_READ } from "../shared/messages.js";
 import { PASSWORD_FILL, PASSWORD_FILL_BEST } from "../shared/messages.js";
 import { fetchEntry, listEntries } from "../features/password-query/api.js";
 import { parsePasswordEntry } from "../features/password-query/entry.js";
@@ -9,10 +9,24 @@ import { readPageContext } from "../features/password-fill/context.js";
 import { PAGE_CONTEXT, PASSWORD_BADGE_REFRESH } from "../shared/messages.js";
 import { collectCurrentPage } from "../features/org-capture/current-page.js";
 import { installPasswordBadge } from "../features/password-manager/badge.js";
+import { captureCurrentLink, deleteReadLater, listReadLater, markReadLaterRead } from "../features/read-later/api.js";
 
 const passwordBadge = installPasswordBadge();
+const readLaterActions = new Map([
+  [READ_LATER_CAPTURE, async () => { await captureCurrentLink(); }],
+  [READ_LATER_LIST, async () => ({ entries: await listReadLater() })],
+  [READ_LATER_MARK_READ, (message) => markReadLaterRead(message.id)],
+  [READ_LATER_DELETE, (message) => deleteReadLater(message.id)],
+]);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  const readLaterAction = readLaterActions.get(message?.type);
+  if (readLaterAction) {
+    readLaterAction(message)
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (message?.type === PASSWORD_BADGE_REFRESH) {
     passwordBadge.refreshActive()
       .then(() => sendResponse({ ok: true }))

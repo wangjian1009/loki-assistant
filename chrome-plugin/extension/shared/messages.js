@@ -1,5 +1,9 @@
 export const CAPTURE_FULL = "capture-full";
 export const CAPTURE_SNAPSHOT = "capture-snapshot";
+export const READ_LATER_CAPTURE = "read-later-capture";
+export const READ_LATER_LIST = "read-later-list";
+export const READ_LATER_MARK_READ = "read-later-mark-read";
+export const READ_LATER_DELETE = "read-later-delete";
 export const PASSWORD_FILL = "password-fill";
 export const PASSWORD_FILL_BEST = "password-fill-best";
 export const PAGE_CONTEXT = "page-context";
