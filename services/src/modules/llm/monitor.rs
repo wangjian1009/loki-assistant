@@ -7,14 +7,25 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use serde::Serialize;
+use axum::http::HeaderMap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::protocol::{Client, Phase, Protocol, RequestStatus, Usage, UsageRow, UsageTotal};
+use super::protocol::{
+    Client, Phase, Protocol, RequestStatus, SessionUsageRow, Usage, UsageRow, UsageTotal,
+};
 use crate::{http::error::API_VERSION, process::Process};
 
 const RECENT_REQUESTS: usize = 100;
-type Totals = BTreeMap<Uuid, BTreeMap<String, UsageTotal>>;
+type Totals = BTreeMap<Uuid, BTreeMap<String, UpstreamUsage>>;
+
+#[derive(Default, Deserialize, Serialize)]
+struct UpstreamUsage {
+    #[serde(flatten)]
+    total: UsageTotal,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sessions: BTreeMap<String, UsageTotal>,
+}
 
 #[derive(Debug)]
 pub(crate) struct Monitor(Process<State>);
@@ -35,10 +46,10 @@ pub(super) struct Requests {
 }
 
 #[derive(Serialize)]
-pub(super) struct UsageReport {
+pub(super) struct UsageReport<Row> {
     api_version: &'static str,
     storage_error: bool,
-    usage: Vec<UsageRow>,
+    usage: Vec<Row>,
 }
 
 impl Monitor {
@@ -69,6 +80,7 @@ impl Monitor {
         &self,
         client: Client,
         protocol: Protocol,
+        headers: &HeaderMap,
         endpoint: String,
         track_usage: bool,
     ) -> RequestGuard {
@@ -76,6 +88,7 @@ impl Monitor {
         let request = RequestStatus {
             id,
             client_id: client.id,
+            session_id: session_id(headers, protocol),
             upstream: client.binding.upstream,
             protocol,
             endpoint,
@@ -111,7 +124,7 @@ impl Monitor {
             .await
     }
 
-    pub(super) async fn usage(&self) -> UsageReport {
+    pub(super) async fn usage(&self) -> UsageReport<UsageRow> {
         self.0
             .call(|state| UsageReport {
                 api_version: API_VERSION,
@@ -123,13 +136,60 @@ impl Monitor {
                         upstreams.iter().map(move |(upstream, total)| UsageRow {
                             client_id,
                             upstream: upstream.clone(),
-                            total: total.clone(),
+                            total: total.total.clone(),
                         })
                     })
                     .collect(),
             })
             .await
     }
+
+    pub(super) async fn session_usage(&self) -> UsageReport<SessionUsageRow> {
+        self.0
+            .call(|state| UsageReport {
+                api_version: API_VERSION,
+                storage_error: state.storage_error,
+                usage: state
+                    .totals
+                    .iter()
+                    .flat_map(|(&client_id, upstreams)| {
+                        upstreams.iter().flat_map(move |(upstream, totals)| {
+                            totals
+                                .sessions
+                                .iter()
+                                .map(move |(session_id, total)| SessionUsageRow {
+                                    session_id: session_id.clone(),
+                                    usage: UsageRow {
+                                        client_id,
+                                        upstream: upstream.clone(),
+                                        total: total.clone(),
+                                    },
+                                })
+                        })
+                    })
+                    .collect(),
+            })
+            .await
+    }
+}
+
+fn session_id(headers: &HeaderMap, protocol: Protocol) -> Option<String> {
+    let candidates: &[&str] = match protocol {
+        Protocol::Codex => &["x-loki-session-id", "thread-id", "session-id", "session_id"],
+        Protocol::Claude => &["x-loki-session-id"],
+    };
+    candidates.iter().find_map(|&name| {
+        let values = headers.get_all(name);
+        let mut values = values.iter();
+        let value = values.next()?.to_str().ok()?;
+        (values.next().is_none()
+            && !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b','))
+        .then(|| value.to_owned())
+    })
 }
 
 pub(super) struct RequestGuard {
@@ -194,22 +254,20 @@ async fn finish(
     request.duration_ms = Some(duration_ms);
     request.usage = usage;
     if let Some(usage) = usage {
-        let total = state
+        let totals = state
             .totals
             .entry(request.client_id)
             .or_default()
             .entry(request.upstream.clone())
             .or_default();
-        total.input_tokens = total
-            .input_tokens
-            .saturating_add(usage.input_tokens.unwrap_or(0));
-        total.output_tokens = total
-            .output_tokens
-            .saturating_add(usage.output_tokens.unwrap_or(0));
-        total.requests = total.requests.saturating_add(1);
-        total.incomplete_requests = total
-            .incomplete_requests
-            .saturating_add(u64::from(!usage.complete));
+        totals.total.record(usage);
+        if let Some(session_id) = &request.session_id {
+            totals
+                .sessions
+                .entry(session_id.clone())
+                .or_default()
+                .record(usage);
+        }
     }
     state.recent.push_front(request);
     state.recent.truncate(RECENT_REQUESTS);

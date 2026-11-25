@@ -8,7 +8,7 @@
 
 | 事件 | 发送时机 | 字段 |
 |------+----------+------|
-| ~Started~ | 选定上游后 | Loki 请求 ID、客户端 ID、实际上游 ID、协议、开始时间、请求方法及路径后缀 |
+| ~Started~ | 选定上游后 | Loki 请求 ID、客户端 ID、可选会话标识、实际上游 ID、协议、开始时间、请求方法及路径后缀 |
 | ~Headers~ | 收到上游响应头 | 请求 ID、HTTP 状态及观察所需的 ~Content-Type~ 和 ~Content-Encoding~ |
 | ~BodyBytes~ | 转交响应正文数据块时 | 请求 ID、原始数据块 |
 | ~Finished~ | 正文读完、上游失败或客户端断开 | 请求 ID、结束时间、结果、首包及总耗时、观测是否缺段 |
@@ -30,6 +30,7 @@ CREATE TABLE usage_event (
     seq INTEGER PRIMARY KEY,
     request_id TEXT NOT NULL UNIQUE,
     client_id TEXT NOT NULL,
+    session_id TEXT,
     upstream_id TEXT NOT NULL,
     protocol TEXT NOT NULL,
     model TEXT NOT NULL,
@@ -55,6 +56,10 @@ CREATE INDEX usage_event_time
 
 CREATE INDEX usage_event_client_upstream_time
     ON usage_event (client_id, upstream_id, finished_at_ms DESC, seq DESC);
+
+CREATE INDEX usage_event_client_session_time
+    ON usage_event (client_id, session_id, finished_at_ms DESC, seq DESC)
+    WHERE session_id IS NOT NULL;
 
 CREATE TABLE usage_daily (
     report_day TEXT NOT NULL,
@@ -110,6 +115,7 @@ CREATE TABLE usage_legacy_total (
 * 查询与兼容
 
 - 明细查询按 ~finished_at_ms DESC, seq DESC~ 排序，游标为上一页最后一行的这两个字段，避免 ~OFFSET~ 随页数增长。首版索引覆盖全局最近请求以及客户端加上游的时间区间查询。按实际查询频率再评估单独的上游索引。
+- 会话查询按 ~client_id~ 和 ~session_id~ 过滤明细，再按实际上游汇总。迁移时将现有 JSON 中的会话累计导入独立期初余额，沿用客户端、会话和上游的组合键。按会话查询只加该会话的期初余额。客户端总量继续使用 ~usage_legacy_total~ 。
 - 日报和月报扫描 ~usage_daily~ 的日期区间。实时结果在同一个只读快照里合并 ~seq > through_seq~ 的明细尾部，因此最近已提交的记录在下一次聚合前即可查询。月报在日报结果上按月聚合。聚合水位滞后时，报表暴露待合并行数，查询成本由日报行数和尾部长度决定。
 - 保留 ~GET /llm/usage~ 的累计查询语义。首次迁移把旧 ~llm-usage.json~ 按客户端和上游导入 ~usage_legacy_total~ ，与推进数据库结构版本同事务提交。旧数据能计入原字段的累计查询。按日期、模型、缓存分项的历史从第一条新明细开始。兼容的 ~input_tokens~ 对应 ~input_reported_tokens~ 的累计值，日报使用三个输入分项。
 - SQLite 查询最多只占用短时只读事务。返回聚合水位、最近成功落盘时间、队列积压与观测缺口，便于解释统计延迟。~unobserved_requests~ 至少在进程内更新，恢复写入后再与落盘记录一起持久化。长时间写入故障期间异常退出可能丢失尚未持久化的缺口计数。
@@ -129,6 +135,6 @@ CREATE TABLE usage_legacy_total (
 
 * 本机样本验证
 
-用 SQLite 3.54.1 写入 100 万条模拟明细，包含 16 个客户端、8 个上游和 5 个模型。完成日报合并并截断 WAL 后数据库约 343 MiB。热缓存下，按客户端和上游读取 50 条明细平均约 0.036 ms，单月汇总查询平均约 3.9 ms。这些是直接执行 SQL 的本机样本结果。
+用 SQLite 3.54.1 写入 100 万条模拟明细，包含 16 个客户端、8 个上游和 5 个模型。完成日报合并并截断 WAL 后数据库约 343 MiB。热缓存下，按客户端和上游读取 50 条明细平均约 0.036 ms，单月汇总查询平均约 3.9 ms。这些是直接执行 SQL 的本机样本结果，样本采用加入会话列和会话索引前的表结构。
 
 查询计划确认明细经复合索引定位，日报和尾部明细分别经日期主键和 ~seq~ 主键查找。样本中重复插入同一请求、合并回滚、重复合并，以及读取尚未合并的明细，均得到相同总量。

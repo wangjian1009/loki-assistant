@@ -76,6 +76,7 @@ pub(super) struct Usage {
 pub(super) struct RequestStatus {
     pub id: Uuid,
     pub client_id: Uuid,
+    pub session_id: Option<String>,
     pub upstream: String,
     pub protocol: Protocol,
     pub endpoint: String,
@@ -95,12 +96,34 @@ pub(super) struct UsageTotal {
     pub incomplete_requests: u64,
 }
 
+impl UsageTotal {
+    pub(super) fn record(&mut self, usage: Usage) {
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(usage.input_tokens.unwrap_or(0));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(usage.output_tokens.unwrap_or(0));
+        self.requests = self.requests.saturating_add(1);
+        self.incomplete_requests = self
+            .incomplete_requests
+            .saturating_add(u64::from(!usage.complete));
+    }
+}
+
 #[derive(Serialize)]
 pub(super) struct UsageRow {
     pub client_id: Uuid,
     pub upstream: String,
     #[serde(flatten)]
     pub total: UsageTotal,
+}
+
+#[derive(Serialize)]
+pub(super) struct SessionUsageRow {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub usage: UsageRow,
 }
 
 pub(super) fn error(

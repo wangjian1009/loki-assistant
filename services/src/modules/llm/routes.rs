@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{
     monitor::{Requests, UsageReport},
-    protocol::{Binding, Client, Protocol, error},
+    protocol::{Binding, Client, Protocol, SessionUsageRow, UsageRow, error},
     service::LlmService,
 };
 use crate::http::error::API_VERSION;
@@ -153,8 +153,23 @@ async fn requests(State(service): State<Arc<LlmService>>) -> Json<Requests> {
     summary = "查询代理用量",
     description = "按客户端令牌对应的公开 ID 和供应商汇总输入、输出 token 及用量不完整的请求数。"
 )]
-async fn usage(State(service): State<Arc<LlmService>>) -> Json<UsageReport> {
+async fn usage(State(service): State<Arc<LlmService>>) -> Json<UsageReport<UsageRow>> {
     Json(service.monitor.usage().await)
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "session-usage",
+    method = "GET",
+    path = "/llm/usage/sessions",
+    summary = "查询会话用量",
+    description = "按客户端 ID、会话标识和供应商汇总输入、输出 token 及用量不完整的请求数。"
+)]
+async fn session_usage(
+    State(service): State<Arc<LlmService>>,
+) -> Json<UsageReport<SessionUsageRow>> {
+    Json(service.monitor.session_usage().await)
 }
 
 fn binding(body: Result<Json<Binding>, JsonRejection>) -> Result<Binding, Response> {

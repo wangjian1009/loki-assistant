@@ -755,12 +755,19 @@ Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_
 | DELETE | ~/llm/clients/{id}~ | 撤销令牌，已累计的用量仍可通过客户端 ID 查询 |
 | GET | ~/llm/requests~ | 查询正在等待或流式输出的请求，以及最近 100 条终态记录 |
 | GET | ~/llm/usage~ | 按客户端 ID 和供应商读取累计用量 |
+| GET | ~/llm/usage/sessions~ | 按客户端 ID、供应商和会话标识读取累计用量 |
 
 每个客户端令牌对应一个供应商。明文令牌只在签发响应中交付，配置保存其摘要。切换写入成功后，新请求使用新绑定，已发出的请求及其用量归原供应商。
 
 用量观察独立于转发。统计从 ~POST~ 响应中旁路读取 ~input_tokens~ 和 ~output_tokens~ 。Codex 流读取终态事件的 ~response.usage~ ，Claude 流读取 ~message_start~ 和 ~message_delta~ 中的累计值。模型列表和输入 token 估算只计入请求监控。响应缺字段、流在报告终态前中断，或压缩及大小限制使字段无法读取时，记录中将 ~usage.complete~ 置为 ~false~ ，同时保留能读取的计数。用量读取上限为单条 SSE 事件 1 MiB 和非流式正文 16 MiB。
 
 ~GET /llm/usage~ 每行返回 ~client_id~ 、 ~upstream~ 、 ~input_tokens~ 、 ~output_tokens~ 、 ~requests~ 和 ~incomplete_requests~ 。汇总累计已报告的用量，~incomplete_requests~ 表示其中有多少请求缺少完整用量。汇总保存到配置目录的 ~llm-usage.json~ 。~storage_error~ 表示最近一次持久化失败。
+
+** 会话标识
+
+客户端可以在同一会话的请求上发送相同的 ~X-Loki-Session-Id~ 。Codex 入口依次读取 ~X-Loki-Session-Id~ 、 ~thread-id~ 、 ~session-id~ 和 ~session_id~ ，以第一个有效值为准。Claude 入口读取 ~X-Loki-Session-Id~ 。每种头只接受一个非空值，最多 128 个可见 ASCII 字符，逗号除外。会话头随请求透传，统计只用于归集。
+
+~GET /llm/requests~ 返回可空的 ~session_id~ 。~GET /llm/usage/sessions~ 的每行比累计用量多一个 ~session_id~ ，同一客户端的会话切换供应商后按实际供应商分别显示。带标识的请求同时计入客户端和供应商的总量。缺少标识的请求和旧版累计数据只计入总量。会话累计与总量一起写入 ~llm-usage.json~ 。
 
 * 邮件模块
 

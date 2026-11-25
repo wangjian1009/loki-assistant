@@ -277,9 +277,13 @@ impl LlmService {
 
         let head = parts.method == Method::HEAD;
         let track_usage = UsageReader::tracks(&parts.method, endpoint);
-        let mut guard = self
-            .monitor
-            .start(client, protocol, endpoint.to_owned(), track_usage);
+        let mut guard = self.monitor.start(
+            client,
+            protocol,
+            &parts.headers,
+            endpoint.to_owned(),
+            track_usage,
+        );
         let mut upstream = self.http.request(parts.method, uri).headers(headers);
         if !body.is_end_stream() {
             upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
