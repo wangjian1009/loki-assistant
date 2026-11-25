@@ -743,7 +743,7 @@ Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_
 
 通过 ~GET /meta/llm~ 读取供应商字段。用 ~PUT /data/llm/providers/{id}~ 添加供应商，用 ~PATCH~ 更新所需字段。~codex_uri~ 和 ~claude_uri~ 都填写对应协议的版本化基础 URI，例如 =https://api.openai.com/v1= 和 =https://api.anthropic.com/v1= 。同一供应商可以配置两个 URI。省略某个 URI 或将其清空表示该供应商不支持对应协议。
 
-~codex_api_key~ 和 ~claude_api_key~ 是可选的配置密码字段，经配置中心保存到本机 pass 密码库。配置值只保存其引用。代理向 Codex 上游发送 ~Authorization: Bearer~ ，向 Claude 上游发送 ~x-api-key~ 。上游收到的是供应商凭据。
+每个供应商有一个可选的 ~token~ 密码字段，供其配置的协议共用。密码库路径使用 ~loki-assistant/llm/{id}.gpg~ ，~llm.providers~ 记录保存密码引用。代理向 Codex 上游发送 ~Authorization: Bearer <token>~ ，向 Claude 上游发送 ~x-api-key: <token>~ 。
 
 ** 管理客户端和查看用量
 

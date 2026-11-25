@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{
     archive::{self, Archive, Settings, SettingsPatch, Update, Writer},
-    config::{CLIENTS, MODULE, PROVIDERS, provider_uri},
+    config::{CLIENTS, MODULE, PROVIDER_TOKEN, PROVIDERS, provider_uri},
     instructions::Format,
     monitor::{Monitor, RequestGuard},
     protocol::{Binding, Client, IssuedClient, Phase, Protocol, error},
@@ -146,14 +146,9 @@ impl LlmService {
                         .expect("供应商配置应为列表")
                     {
                         let id = record["id"].as_str().expect("供应商记录应有标识");
-                        let mut resolved = [Ok(None), Ok(None)];
-                        for (protocol, result) in [Protocol::Codex, Protocol::Claude]
-                            .into_iter()
-                            .zip(&mut resolved)
-                        {
-                            *result = read_upstream(&config, id, record, protocol).await;
-                        }
-                        let [codex, claude] = resolved;
+                        let token = read_provider_token(&config, id, record).await;
+                        let codex = read_upstream(record, Protocol::Codex, &token);
+                        let claude = read_upstream(record, Protocol::Claude, &token);
                         providers.insert(id.to_owned(), Provider { codex, claude });
                     }
                     *state = Authorization { clients, providers };
@@ -317,7 +312,7 @@ impl LlmService {
                     Protocol::Claude => &provider.claude,
                 }
                 .as_ref()
-                .map_err(|code| error(StatusCode::BAD_GATEWAY, code, "供应商的 API Key 不可用。"))?
+                .map_err(|code| error(StatusCode::BAD_GATEWAY, code, "供应商的 Token 不可用。"))?
                 .clone()
                 .ok_or_else(|| {
                     error(
@@ -634,27 +629,36 @@ fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
     result
 }
 
-async fn read_upstream(
+async fn read_provider_token(
     config: &ConfigService,
     id: &str,
     record: &Value,
+) -> Result<Option<String>, &'static str> {
+    if !record[PROVIDER_TOKEN].is_string() {
+        return Ok(None);
+    }
+    let [token] = config
+        .read_record_passwords(MODULE, PROVIDERS, id, [PROVIDER_TOKEN])
+        .await
+        .map_err(|_| "llm-provider-key-missing")?;
+    token.map(Some).ok_or("llm-provider-key-missing")
+}
+
+fn read_upstream(
+    record: &Value,
     protocol: Protocol,
+    token: &Result<Option<String>, &'static str>,
 ) -> Result<Option<Upstream>, &'static str> {
     let Some(uri) = provider_uri(record, protocol.uri_field()).map_err(|_| "llm-provider-uri")?
     else {
         return Ok(None);
     };
-    let credential = if record[protocol.key_field()].is_string() {
-        let [key] = config
-            .read_record_passwords(MODULE, PROVIDERS, id, [protocol.key_field()])
-            .await
-            .map_err(|_| "llm-provider-key-missing")?;
-        let key = key.ok_or("llm-provider-key-missing")?;
+    let credential = if let Some(token) = token.as_ref().map_err(|&code| code)? {
         let value = match protocol {
-            Protocol::Codex => format!("Bearer {key}"),
-            Protocol::Claude => key,
+            Protocol::Codex => HeaderValue::from_str(&format!("Bearer {token}")),
+            Protocol::Claude => HeaderValue::from_str(token),
         };
-        let mut header = HeaderValue::from_str(&value).map_err(|_| "llm-provider-key-invalid")?;
+        let mut header = value.map_err(|_| "llm-provider-key-invalid")?;
         header.set_sensitive(true);
         Some(header)
     } else {

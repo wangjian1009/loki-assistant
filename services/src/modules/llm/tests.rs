@@ -525,7 +525,10 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
                 "/v1/models",
                 get(
                     |headers: HeaderMap, OriginalUri(uri): OriginalUri| async move {
-                        assert_eq!(headers[header::AUTHORIZATION], "Bearer codex-upstream-key");
+                        assert_eq!(
+                            headers[header::AUTHORIZATION],
+                            "Bearer shared-upstream-token"
+                        );
                         assert!(!headers.contains_key("x-api-key"));
                         assert_eq!(uri.query(), Some("client_version=1"));
                         Json(json!({"data":[]}))
@@ -535,14 +538,17 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
             .route(
                 "/v1/responses/compact",
                 post(|headers: HeaderMap| async move {
-                    assert_eq!(headers[header::AUTHORIZATION], "Bearer codex-upstream-key");
+                    assert_eq!(
+                        headers[header::AUTHORIZATION],
+                        "Bearer shared-upstream-token"
+                    );
                     Json(json!({"usage":{"input_tokens":4}}))
                 }),
             )
             .route(
                 "/v1/messages",
                 post(|headers: HeaderMap| async move {
-                    assert_eq!(headers["x-api-key"], "claude-upstream-key");
+                    assert_eq!(headers["x-api-key"], "shared-upstream-token");
                     assert!(!headers.contains_key(header::AUTHORIZATION));
                     Json(json!({"usage":{"input_tokens":31,"output_tokens":0}}))
                 }),
@@ -557,7 +563,7 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
         "shared",
         json!({
             "codex_uri":root,"claude_uri":root,
-            "codex_api_key":"codex-upstream-key","claude_api_key":"claude-upstream-key",
+            "token":"shared-upstream-token",
         }),
     )
     .await;
@@ -565,12 +571,13 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
     let listed = json_body(invoke(&app, Method::GET, "/llm/clients", None, None).await).await;
     assert_eq!(listed["clients"], json!([{"id":id,"upstream":"shared"}]));
     let stored = fs::read_to_string(directory.0.join("config.yml")).unwrap();
-    for secret in [
-        &"codex-upstream-key".to_owned(),
-        &"claude-upstream-key".to_owned(),
-    ] {
-        assert!(!stored.contains(secret));
-    }
+    assert!(!stored.contains("shared-upstream-token"));
+    let stored: Value = serde_yaml_ng::from_str(&stored).unwrap();
+    assert_eq!(
+        stored["llm"]["providers"][0]["token"],
+        "loki-assistant/llm/shared.gpg"
+    );
+    assert!(directory.0.join("loki-assistant/llm/shared.gpg").is_file());
     let updated = invoke(
         &app,
         Method::PATCH,

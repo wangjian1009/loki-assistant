@@ -27,13 +27,6 @@ impl Protocol {
             Self::Claude => "claude_uri",
         }
     }
-
-    pub(super) fn key_field(self) -> &'static str {
-        match self {
-            Self::Codex => "codex_api_key",
-            Self::Claude => "claude_api_key",
-        }
-    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]

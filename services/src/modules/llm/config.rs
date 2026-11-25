@@ -23,6 +23,7 @@ use crate::modules::config::{
 pub(super) const MODULE: &str = "llm";
 pub(super) const PROVIDERS: &str = "providers";
 pub(super) const CLIENTS: &str = "clients";
+pub(super) const PROVIDER_TOKEN: &str = "token";
 const CLIENT_NOTIFICATION: &str = "/llm/config/clients";
 use super::archive::Settings;
 use super::service::LlmService;
@@ -40,7 +41,7 @@ fn metadata() -> ConfigModuleMetadata {
             collection(
                 PROVIDERS,
                 "供应商",
-                "为每个协议填写版本化基础 URI 和可选凭据。",
+                "分别填写协议的版本化基础 URI，并为供应商设置一个可选 Token。",
             ),
             collection(
                 CLIENTS,
@@ -147,18 +148,10 @@ static PROVIDER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
                 field("codex_uri", "Codex 基础 URI", ConfigDataType::String),
                 field("claude_uri", "Claude 基础 URI", ConfigDataType::String),
                 field(
-                    "codex_api_key",
-                    "Codex API Key",
+                    PROVIDER_TOKEN,
+                    "供应商 Token",
                     ConfigDataType::Password {
-                        path: "loki-assistant/llm/{key}/codex.gpg".into(),
-                        key: None,
-                    },
-                ),
-                field(
-                    "claude_api_key",
-                    "Claude API Key",
-                    ConfigDataType::Password {
-                        path: "loki-assistant/llm/{key}/claude.gpg".into(),
+                        path: "loki-assistant/llm/{key}.gpg".into(),
                         key: None,
                     },
                 ),
