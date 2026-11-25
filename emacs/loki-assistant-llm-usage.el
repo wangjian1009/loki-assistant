@@ -4,6 +4,7 @@
 (require 'calendar)
 (require 'json)
 (require 'subr-x)
+(require 'svg)
 (require 'tabulated-list)
 (require 'parse-time)
 (require 'loki-assistant)
@@ -22,6 +23,14 @@
     (to_date . "排除的结束日期") (from . "起始时间") (to . "排除的结束时间")
     (group_by . "分组") (bucket . "周期")))
 
+(defconst loki-assistant-llm-usage--chart-series
+  '((input_uncached_tokens "未缓存输入" ?█ font-lock-function-name-face "#73b8ff")
+    (cache_read_tokens "读缓存" ?▓ font-lock-type-face "#75d6b8")
+    (cache_write_tokens "写缓存" ?▒ font-lock-constant-face "#ffbd75")
+    (output_tokens "输出" ?░ font-lock-keyword-face "#cda8fa")))
+
+(defconst loki-assistant-llm-usage--chart-width 32)
+
 (cl-defstruct loki-assistant-llm-usage--view
   filters items data cursor selected loading error)
 
@@ -29,6 +38,7 @@
 (defvar-local loki-assistant-llm-usage--current 'overview)
 (defvar-local loki-assistant-llm-usage--zone "Asia/Shanghai")
 (defvar-local loki-assistant-llm-usage--context nil)
+(defvar-local loki-assistant-llm-usage--chart nil)
 
 (defun loki-assistant-llm-usage--state ()
   (or (gethash loki-assistant-llm-usage--current loki-assistant-llm-usage--views-state)
@@ -44,6 +54,10 @@
   (if-let ((value (loki-assistant-llm-usage--value key row)))
       (format "%s" value)
     (or missing "—")))
+
+(defun loki-assistant-llm-usage--client-name (id data)
+  (when (stringp id)
+    (cdr (assoc-string id (alist-get 'client_names data)))))
 
 (defun loki-assistant-llm-usage--phase (value)
   (or (cdr (assoc value '(("waiting" . "等待响应") ("responding" . "接收响应")
@@ -66,12 +80,49 @@
           "—"))
     (error (format "%s" value))))
 
-(defconst loki-assistant-llm-usage--token-fields
-  '(input_uncached_tokens cache_read_tokens cache_write_tokens output_tokens))
+(defun loki-assistant-llm-usage--format-count (count)
+  (if count
+      (reverse (string-remove-suffix
+                "," (replace-regexp-in-string "[0-9]\\{3\\}" "\\&,"
+                                              (reverse (number-to-string count)))))
+    "—"))
 
-(defun loki-assistant-llm-usage--sum (row)
-  (cl-loop for field in loki-assistant-llm-usage--token-fields
-           sum (or (loki-assistant-llm-usage--value field row) 0)))
+(defun loki-assistant-llm-usage--count (key row)
+  (loki-assistant-llm-usage--format-count (loki-assistant-llm-usage--value key row)))
+
+(defun loki-assistant-llm-usage--chart-total (item)
+  (cl-loop for (key) in loki-assistant-llm-usage--chart-series
+           sum (or (loki-assistant-llm-usage--value key item) 0)))
+
+(defun loki-assistant-llm-usage--chart-maximum (items)
+  (cl-loop for item in items maximize (loki-assistant-llm-usage--chart-total item)))
+
+(defun loki-assistant-llm-usage--chart-widths (item maximum width)
+  (let ((cumulative 0) (previous 0))
+    (cl-loop for (key) in loki-assistant-llm-usage--chart-series
+             do (cl-incf cumulative (or (loki-assistant-llm-usage--value key item) 0))
+             for end = (round (* cumulative width) (max 1 maximum))
+             collect (- end previous)
+             do (setq previous end))))
+
+(defun loki-assistant-llm-usage--chart-bar (item maximum)
+  (cl-loop for (key label glyph face) in loki-assistant-llm-usage--chart-series
+           for width in (loki-assistant-llm-usage--chart-widths
+                         item maximum loki-assistant-llm-usage--chart-width)
+           concat (propertize (make-string width glyph)
+                              'face face
+                              'help-echo (format "%s %s token" label
+                                                 (loki-assistant-llm-usage--count key item)))))
+
+(defun loki-assistant-llm-usage--group-label (group-by)
+  (cdr (assoc group-by '(("client_id" . "客户端") ("upstream" . "供应商")
+                         ("protocol" . "协议") ("model" . "模型")))))
+
+(defun loki-assistant-llm-usage--group-value (item data label)
+  (if (equal (alist-get 'group_by data) "client_id")
+      (or (loki-assistant-llm-usage--client-name (alist-get 'group item) data)
+          (loki-assistant-llm-usage--cell 'group item "未知客户端"))
+    (loki-assistant-llm-usage--cell 'group item (concat "未知" label))))
 
 (defun loki-assistant-llm-usage--result-items (view data)
   (append (pcase view
@@ -117,16 +168,25 @@
              (when (eq view loki-assistant-llm-usage--current)
                (loki-assistant-llm-usage--render)))))))))
 
-(defun loki-assistant-llm-usage--row (item max-token)
+(defun loki-assistant-llm-usage--row (item data chart-maximum)
   (cl-labels ((cell (key &optional missing) (loki-assistant-llm-usage--cell key item missing)))
     (pcase loki-assistant-llm-usage--current
       ('overview
-       (vconcat (vector (cell 'period_start) (cell 'group "全部"))
-                (mapcar #'cell loki-assistant-llm-usage--token-fields)
-                (vector (cell 'requests) (cell 'incomplete_requests)
-                        (make-string (if (zerop max-token) 0
-                                       (/ (* 16 (loki-assistant-llm-usage--sum item)) max-token))
-                                     ?▰))))
+       (let ((group-by (alist-get 'group_by data)))
+         (vconcat
+          (vector (if (equal (alist-get 'bucket data) "month")
+                      (substring (cell 'period_start) 0 7)
+                    (cell 'period_start)))
+          (when-let ((label (loki-assistant-llm-usage--group-label group-by)))
+            (vector (loki-assistant-llm-usage--group-value item data label)))
+          (if chart-maximum
+              (vector (loki-assistant-llm-usage--chart-bar item chart-maximum)
+                      (loki-assistant-llm-usage--format-count
+                       (loki-assistant-llm-usage--chart-total item))
+                      (loki-assistant-llm-usage--count 'incomplete_requests item))
+            (mapcar (lambda (key) (loki-assistant-llm-usage--count key item))
+                    '(requests incomplete_requests input_uncached_tokens
+                      cache_read_tokens cache_write_tokens output_tokens))))))
       ('history
        (vector (loki-assistant-llm-usage--time (alist-get 'finished_at item))
                (cell 'upstream) (cell 'model)
@@ -154,20 +214,97 @@
                   '(period_start group)
                 '(client_id session_id upstream)))))
 
+(defun loki-assistant-llm-usage--insert-filters (filters data)
+  (when filters
+    (insert "筛选  "
+            (mapconcat
+             (lambda (pair)
+               (format "%s %s" (alist-get (car pair) loki-assistant-llm-usage--fields)
+                       (if (eq (car pair) 'client_id)
+                           (or (loki-assistant-llm-usage--client-name (cdr pair) data)
+                               (cdr pair))
+                         (cdr pair))))
+             filters " · ")
+            "\n")))
+
+(defun loki-assistant-llm-usage--report-range (data)
+  (let* ((from (loki-assistant-llm-usage--value 'from_date data))
+         (to (loki-assistant-llm-usage--value 'to_date data)))
+    (when (and from to)
+      (let ((last (format-time-string
+                   "%Y-%m-%d"
+                   (date-to-time (loki-assistant-llm-usage--date-time to -1))
+                   loki-assistant-llm-usage--zone)))
+        (if (equal from last) from (concat from " 至 " last "（含首尾）"))))))
+
+(defun loki-assistant-llm-usage--insert-overview (data filters has-rows chart-maximum)
+  (let ((start (loki-assistant-llm-usage--value 'data_from data))
+        (totals (alist-get 'totals data)))
+    (when-let ((range (loki-assistant-llm-usage--report-range data)))
+        (insert (propertize "统计范围  " 'face 'bold)
+                range "  ·  " loki-assistant-llm-usage--zone "\n")
+      (when (and start (time-less-p (date-to-time (loki-assistant-llm-usage--date-time
+                                                  (alist-get 'from_date data)))
+                                   (date-to-time start)))
+        (insert (propertize (concat "明细采集开始于 "
+                                    (loki-assistant-llm-usage--time start) "\n")
+                            'face 'shadow))))
+    (loki-assistant-llm-usage--insert-filters
+     (cl-remove-if (lambda (pair) (memq (car pair) '(from_date to_date bucket group_by))) filters)
+     data)
+    (when totals
+      (insert "\n" (propertize "区间汇总" 'face 'bold) "\n"
+              (format "  请求 %s 次  ·  用量不完整 %s 次\n"
+                      (loki-assistant-llm-usage--count 'requests totals)
+                      (loki-assistant-llm-usage--count 'incomplete_requests totals))
+              (format "  输入 token  未缓存 %s  ·  读缓存 %s  ·  写缓存 %s\n"
+                      (loki-assistant-llm-usage--count 'input_uncached_tokens totals)
+                      (loki-assistant-llm-usage--count 'cache_read_tokens totals)
+                      (loki-assistant-llm-usage--count 'cache_write_tokens totals))
+              (format "  输出 token  %s\n"
+                      (loki-assistant-llm-usage--count 'output_tokens totals)))
+      (when (> (or (alist-get 'incomplete_requests totals) 0) 0)
+        (insert (propertize "  汇总只计入已上报的 token。\n" 'face 'shadow))))
+    (when (and has-rows chart-maximum)
+      (insert "\n" (propertize (if (equal (alist-get 'bucket data) "month")
+                                   "按月用量图" "按日用量图") 'face 'bold)
+              "  ·  满格 " (loki-assistant-llm-usage--format-count chart-maximum) " token\n  ")
+      (cl-loop for (_ label glyph face) in loki-assistant-llm-usage--chart-series
+               do (insert (propertize (string glyph) 'face face) " " label "  "))
+      (insert "\n"))
+    (when (and has-rows (not chart-maximum))
+      (insert "\n" (propertize (if (equal (alist-get 'bucket data) "month")
+                                     "按月明细" "按日明细")
+                                 'face 'bold)
+              "  ·  用量单位为 token\n"))))
+
 (defun loki-assistant-llm-usage--render ()
   (let* ((state (loki-assistant-llm-usage--state))
+         (title (nth 1 (assq loki-assistant-llm-usage--current loki-assistant-llm-usage--views)))
          (data (loki-assistant-llm-usage--view-data state))
          (items (loki-assistant-llm-usage--view-items state))
          (selected (or (tabulated-list-get-id)
                        (loki-assistant-llm-usage--view-selected state)))
-         (max-token (if (eq loki-assistant-llm-usage--current 'overview)
-                        (apply #'max 0 (mapcar #'loki-assistant-llm-usage--sum items))
-                      0)))
+         (overview (eq loki-assistant-llm-usage--current 'overview))
+         (chart-maximum (when (and overview loki-assistant-llm-usage--chart)
+                          (loki-assistant-llm-usage--chart-maximum items)))
+         (filters (loki-assistant-llm-usage--view-filters state)))
+    (setq-local tabulated-list-use-header-line (not overview))
+    (setq-local header-line-format nil)
     (setq tabulated-list-format
           (pcase loki-assistant-llm-usage--current
-            ('overview [("日期" 12 nil) ("分组" 17 nil) ("未缓存输入" 14 nil)
-                        ("缓存读取" 13 nil) ("缓存写入" 13 nil) ("输出" 12 nil)
-                        ("请求" 8 nil) ("不完整" 8 nil) ("趋势" 16 nil)])
+            ('overview
+             (vconcat
+              (vector (list (if (equal (alist-get 'bucket data) "month") "月份" "日期") 10 nil))
+              (when-let ((label (loki-assistant-llm-usage--group-label (alist-get 'group_by data))))
+                (vector (list label 14 nil)))
+              (if chart-maximum
+                  (vector (list "用量" loki-assistant-llm-usage--chart-width nil)
+                          '("合计 token" 16 nil :right-align t)
+                          '("用量不完整" 10 nil :right-align t))
+                [("请求数" 8 nil :right-align t) ("用量不完整" 10 nil :right-align t)
+                 ("未缓存输入" 12 nil :right-align t) ("读缓存" 11 nil :right-align t)
+                 ("写缓存" 11 nil :right-align t) ("输出" 11 nil :right-align t)])))
             ('history [("完成时间" 20 nil) ("供应商" 15 nil) ("模型" 20 nil)
                        ("结果" 8 nil) ("耗时 ms" 10 nil) ("输出" 12 nil) ("用量" 8 nil)])
             ('live [("开始时间" 20 nil) ("供应商" 15 nil) ("模型" 20 nil)
@@ -180,19 +317,35 @@
           tabulated-list-entries
           (mapcar (lambda (item)
                     (list (loki-assistant-llm-usage--id item)
-                          (loki-assistant-llm-usage--row item max-token))) items))
-    (tabulated-list-init-header)
+                          (loki-assistant-llm-usage--row item data chart-maximum))) items))
+    (when (or (not overview) items)
+      (tabulated-list-init-header))
+    (when (and overview (not items))
+      (setq-local tabulated-list--header-string nil))
     (tabulated-list-print t)
+    (when overview
+      (let ((inhibit-read-only t)
+            (header (tabulated-list-header-overlay-p)))
+        (save-excursion
+          (goto-char (point-min))
+          (loki-assistant-llm-usage--insert-overview data filters items chart-maximum)
+          (when header
+            (move-overlay header (point) (overlay-end header))))))
     (when selected
       (goto-char (point-min))
       (while (and (not (eobp)) (not (equal selected (tabulated-list-get-id))))
         (forward-line 1))
       (when (eobp) (goto-char (point-min))))
+    (setq-local frame-title-format (concat "LLM 用量 · " title))
     (setq-local mode-line-process
-                (list " · " (nth 1 (assq loki-assistant-llm-usage--current loki-assistant-llm-usage--views))
-                      " · 1-5 切换  g 刷新  RET 打开"
+                (list " · " title
+                      " · C-c C-q 退出  ? 帮助  1-5 切换  g 刷新"
+                      (unless (eq loki-assistant-llm-usage--current 'totals) "  RET 打开")
                       (when (memq loki-assistant-llm-usage--current '(overview history sessions))
-                        "  f 筛选")
+                        "  f 筛选  F 清除")
+                      (when overview (if loki-assistant-llm-usage--chart "  t 表格" "  t 图表"))
+                      (when (and overview items) "  e 导出 PNG")
+                      (when loki-assistant-llm-usage--context "  b 返回")
                       (when (loki-assistant-llm-usage--view-cursor state) "  l 下一页")
                       (when (loki-assistant-llm-usage--view-loading state) " · 查询中…")
                       (when (loki-assistant-llm-usage--view-error state)
@@ -206,20 +359,9 @@
           (insert (propertize "最近一次落盘失败，用量可能滞后\n" 'face 'warning)))
         (when (eq loki-assistant-llm-usage--current 'totals)
           (insert "全量累计含导入的旧数据；输入按上游原始口径。\n"))
-        (when-let ((totals (alist-get 'totals data)))
-          (insert (format "%s 至 %s（不含）  %s\n"
-                          (alist-get 'from_date data) (alist-get 'to_date data)
-                          loki-assistant-llm-usage--zone))
-          (insert (format "区间总量  未缓存输入 %s  缓存读取 %s  缓存写入 %s  输出 %s  请求 %s  不完整 %s\n"
-                          (alist-get 'input_uncached_tokens totals) (alist-get 'cache_read_tokens totals)
-                          (alist-get 'cache_write_tokens totals) (alist-get 'output_tokens totals)
-                          (alist-get 'requests totals) (alist-get 'incomplete_requests totals)))
-          (when-let ((start (loki-assistant-llm-usage--value 'data_from data)))
-            (insert (format "历史明细自 %s 起\n" (loki-assistant-llm-usage--time start)))))
-        (when-let ((filters (loki-assistant-llm-usage--view-filters state)))
-          (insert "筛选  " (mapconcat
-                           (lambda (pair) (format "%s %s" (alist-get (car pair) loki-assistant-llm-usage--fields)
-                                                  (cdr pair))) filters " · ") "\n"))))))
+        (unless overview
+          (loki-assistant-llm-usage--insert-filters filters data))))
+    (set-buffer-modified-p nil)))
 
 (defun loki-assistant-llm-usage--switch (view)
   (setf (loki-assistant-llm-usage--view-selected (loki-assistant-llm-usage--state))
@@ -230,6 +372,109 @@
   (loki-assistant-llm-usage--load))
 
 (defun loki-assistant-llm-usage-overview () "打开用量概览。" (interactive) (loki-assistant-llm-usage--switch 'overview))
+(defun loki-assistant-llm-usage-toggle-chart ()
+  "在用量概览中切换表格和图表。"
+  (interactive)
+  (unless (eq loki-assistant-llm-usage--current 'overview)
+    (user-error "请在概览中切换图表"))
+  (setq loki-assistant-llm-usage--chart (not loki-assistant-llm-usage--chart))
+  (loki-assistant-llm-usage--render))
+
+(defun loki-assistant-llm-usage--chart-svg (data items filters)
+  (let* ((maximum (loki-assistant-llm-usage--chart-maximum items))
+         (monthly (equal (alist-get 'bucket data) "month"))
+         (group (loki-assistant-llm-usage--group-label (alist-get 'group_by data)))
+         (filter-label (with-temp-buffer
+                         (loki-assistant-llm-usage--insert-filters
+                          (cl-remove-if (lambda (pair)
+                                          (memq (car pair) '(from_date to_date bucket group_by)))
+                                        filters)
+                          data)
+                         (string-trim (buffer-string))))
+         (legend-y (if (string-empty-p filter-label) 87 108))
+         (first-row-y (+ legend-y 55))
+         (height (+ first-row-y (* 28 (length items))))
+         (bar-start (if group 316 130))
+         (bar-width (- 782 bar-start))
+         (svg (svg-create 1040 height)))
+    (cl-labels ((label (value x y &optional size anchor)
+                  (svg-text svg value :x x :y y :fill "#e6edf3"
+                            :font-family "Noto Sans SC, sans-serif"
+                            :font-size (or size 14) :text-anchor (or anchor "start"))))
+      (svg-rectangle svg 0 0 1040 height :fill "#161b22")
+      (label (if monthly "LLM 每月用量" "LLM 每日用量") 24 34 22)
+      (label (concat (loki-assistant-llm-usage--report-range data)
+                     "  ·  " loki-assistant-llm-usage--zone) 24 60)
+      (unless (string-empty-p filter-label)
+        (label (truncate-string-to-width filter-label 118 nil nil "…") 24 81))
+      (cl-loop for (_ name _glyph _face color) in loki-assistant-llm-usage--chart-series
+               for x from 24 by 132
+               do (svg-rectangle svg x (- legend-y 11) 12 12 :fill color)
+               do (label name (+ x 20) legend-y))
+      (label (format "满格 %s token" (loki-assistant-llm-usage--format-count maximum))
+             1016 legend-y 14 "end")
+      (let ((header-y (- first-row-y 28)))
+        (label (if monthly "月份" "日期") 24 header-y)
+        (when group (label group 130 header-y))
+        (label "合计 token" 912 header-y 14 "end")
+        (label "用量不完整" 1016 header-y 14 "end"))
+      (cl-loop for item in items
+               for y from first-row-y by 28
+               for period = (loki-assistant-llm-usage--cell 'period_start item)
+               do (label (if monthly (substring period 0 7) period) 24 y)
+               do (when group
+                    (label (truncate-string-to-width
+                            (loki-assistant-llm-usage--group-value item data group) 23 nil nil "…")
+                           130 y))
+               do (let ((x bar-start))
+                    (cl-loop for (_key _label _glyph _face color) in loki-assistant-llm-usage--chart-series
+                             for width in (loki-assistant-llm-usage--chart-widths item maximum bar-width)
+                             when (> width 0)
+                             do (svg-rectangle svg x (- y 12) width 14 :fill color)
+                             do (cl-incf x width)))
+               do (label (loki-assistant-llm-usage--format-count
+                          (loki-assistant-llm-usage--chart-total item)) 912 y 14 "end")
+               do (label (loki-assistant-llm-usage--count 'incomplete_requests item)
+                         1016 y 14 "end")))
+    svg))
+
+(defun loki-assistant-llm-usage-export-png (&optional file)
+  "将当前用量概览绘制为 PNG。交互调用时选择输出文件。"
+  (interactive)
+  (unless (eq loki-assistant-llm-usage--current 'overview)
+    (user-error "请在用量概览中导出 PNG"))
+  (let* ((state (loki-assistant-llm-usage--state))
+         (items (loki-assistant-llm-usage--view-items state))
+         (data (loki-assistant-llm-usage--view-data state))
+         (filters (loki-assistant-llm-usage--view-filters state))
+         (converter (executable-find "rsvg-convert")))
+    (unless items (user-error "当前概览没有可导出的用量记录"))
+    (unless converter (user-error "导出 PNG 需要 rsvg-convert"))
+    (let* ((local-directory (if (file-remote-p default-directory) "~/" default-directory))
+           (name (expand-file-name (or file (read-file-name "导出 PNG 到文件：" local-directory
+                                                         nil nil "llm-usage.png"))
+                                   local-directory))
+           (target (if (string-suffix-p ".png" name t) name (concat name ".png"))))
+      (when (or (file-remote-p target) (directory-name-p name) (file-directory-p name))
+        (user-error "请选择本机 PNG 文件路径"))
+      (let ((temporary (make-nearby-temp-file
+                        (expand-file-name ".llm-usage-" (file-name-directory target)) nil ".png"))
+            (default-directory local-directory))
+        (unwind-protect
+            (progn
+              (with-temp-buffer
+                (let ((coding-system-for-write 'utf-8-unix))
+                  (svg-print (loki-assistant-llm-usage--chart-svg data items filters))
+                  (let ((start (point-max)))
+                    (unless (eq 0 (call-process-region (point-min) start converter
+                                                       nil (list t t) nil "-o" temporary))
+                      (user-error "PNG 转换失败：%s"
+                                  (string-trim (buffer-substring-no-properties start (point-max))))))))
+              (rename-file temporary target (and (called-interactively-p 'interactive) 1))
+              (message "已导出 PNG 到 %s" target)
+              target)
+          (when (file-exists-p temporary) (delete-file temporary)))))))
+
 (defun loki-assistant-llm-usage-history () "打开请求历史。" (interactive) (loki-assistant-llm-usage--switch 'history))
 (defun loki-assistant-llm-usage-sessions () "打开会话用量。" (interactive) (loki-assistant-llm-usage--switch 'sessions))
 (defun loki-assistant-llm-usage-totals () "打开全量累计用量。" (interactive) (loki-assistant-llm-usage--switch 'totals))
@@ -475,15 +720,24 @@
     (define-key map (kbd "4") #'loki-assistant-llm-usage-totals)
     (define-key map (kbd "5") #'loki-assistant-llm-usage-live)
     (define-key map (kbd "g") #'loki-assistant-llm-usage-refresh)
+    (define-key map (kbd "t") #'loki-assistant-llm-usage-toggle-chart)
+    (define-key map (kbd "e") #'loki-assistant-llm-usage-export-png)
     (define-key map (kbd "f") #'loki-assistant-llm-usage-filter)
     (define-key map (kbd "F") #'loki-assistant-llm-usage-clear-filters)
     (define-key map (kbd "l") #'loki-assistant-llm-usage-more)
     (define-key map (kbd "b") #'loki-assistant-llm-usage-back)
     (define-key map (kbd "RET") #'loki-assistant-llm-usage-open)
+    (define-key map (kbd "C-c C-q") #'quit-window)
+    (define-key map (kbd "?") #'describe-mode)
     map))
 
 (define-derived-mode loki-assistant-llm-usage-mode tabulated-list-mode "LLM 用量"
-  "查看用量概览、请求历史、会话、累计用量和实时请求。"
+  "查看用量概览、请求历史、会话、累计用量和实时请求。
+
+按 1 至 5 切换视图，g 刷新。按 RET 查看选中行的请求或详情。
+在概览中按 t 切换表格和用量图，按 e 导出 PNG。
+概览、历史和会话支持 f 筛选和 F 清除筛选。列表有下一页时按 l。
+下钻后按 b 返回上一视图。按 C-c C-q 退出，按 ? 查看模式帮助。"
   (setq-local loki-assistant-llm-usage--views-state (make-hash-table :test #'eq))
   (setq-local tabulated-list-padding 2))
 
