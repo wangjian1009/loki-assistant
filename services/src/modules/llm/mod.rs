@@ -1,9 +1,11 @@
 mod config;
 mod history;
+mod instructions;
 mod monitor;
 mod protocol;
 mod routes;
 mod service;
+mod transcript;
 mod usage;
 
 #[cfg(test)]

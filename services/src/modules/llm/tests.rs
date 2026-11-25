@@ -3,7 +3,7 @@ use std::{convert::Infallible, fs, path::PathBuf, sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::OriginalUri,
+    extract::{DefaultBodyLimit, OriginalUri},
     http::{HeaderMap, Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -28,8 +28,12 @@ use crate::{
     runtime::RuntimeState,
 };
 
-const CODEX_FIRST: &str =
-    "event: response.created\r\ndata: {\"type\":\"response.created\"}\r\n\r\n";
+const CODEX_FIRST: &str = concat!(
+    "event: response.created\r\ndata: {\"type\":\"response.created\"}\r\n\r\n",
+    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"正在查看\"}\r\n\r\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"read_file\",\"call_id\":\"call-2\",\"arguments\":\"\"}}\r\n\r\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"README.org\\\"}\"}\r\n\r\n",
+);
 const CODEX_LAST: &str = "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}}\r\n\r\n";
 const CLAUDE_STREAM: &str = concat!(
     "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":23,\"output_tokens\":1,\"cache_read_input_tokens\":8}}}\n\n",
@@ -125,10 +129,7 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
                     let gate = response_gate.clone();
                     async move {
                         assert!(!headers.contains_key(header::AUTHORIZATION));
-                        assert_eq!(
-                            request,
-                            json!({"model":"codex-model","input":"测试","stream":true})
-                        );
+                        assert_eq!(request, native_responses_request());
                         let first = stream::once(async {
                             Ok::<_, Infallible>(Bytes::from_static(CODEX_FIRST.as_bytes()))
                         });
@@ -149,7 +150,7 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
                         assert!(!headers.contains_key("x-api-key"));
                         assert_eq!(uri.query(), Some("beta=true"));
                         assert_eq!(headers["anthropic-version"], "2023-06-01");
-                        assert_eq!(request, json!({"model":"claude-model","stream":true}));
+                        assert_eq!(request, native_messages_request());
                         sse(Body::from(CLAUDE_STREAM))
                     },
                 ),
@@ -160,7 +161,8 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
                     assert_eq!(request, json!({}));
                     Json(json!({"input_tokens":99}))
                 }),
-            ),
+            )
+            .layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
     )
     .await;
 
@@ -184,7 +186,7 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
         Method::POST,
         "/llm/codex/v1/responses",
         Some(("authorization", &bearer)),
-        Some(json!({"model":"codex-model","input":"测试","stream":true})),
+        Some(native_responses_request()),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -206,7 +208,46 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     assert_eq!(active[0]["phase"], "responding");
     assert!(active[0]["first_byte_ms"].is_u64());
     assert!(active[0]["usage"].is_null());
+    assert_eq!(
+        active[0]["instructions"],
+        json!({"status":"captured","count":3})
+    );
     assert_eq!(snapshot["recent"], json!([]));
+    let codex_path = format!("/llm/requests/{}", codex_id.as_str().unwrap());
+    let detail = invoke(&app, Method::GET, &codex_path, None, None).await;
+    assert_eq!(detail.headers()[header::CACHE_CONTROL], "no-store");
+    let detail = json_body(detail).await;
+    assert_eq!(detail["item"]["phase"], "responding");
+    assert_eq!(
+        detail["item"]["request_content"]["settings"]["tool_choice"],
+        "auto"
+    );
+    assert_eq!(
+        detail["item"]["request_content"]["tools"][0]["name"],
+        "read_file"
+    );
+    assert_eq!(
+        detail["item"]["request_content"]["blocks"][0]["kind"],
+        "tool_result"
+    );
+    assert_eq!(
+        detail["item"]["response_content"],
+        json!({
+            "complete":false,"truncated":false,
+            "blocks":[
+                {"kind":"message","role":"assistant","text":"正在查看"},
+                {"kind":"tool_call","name":"read_file","id":"call-2","text":"{\"path\":\"README.org\"}"}
+            ]
+        })
+    );
+    assert_eq!(
+        detail["item"]["instructions"]["blocks"],
+        json!([
+            {"source":"instructions","role":null,"text":"顶层示例"},
+            {"source":"input[0]","role":"system","text":"系统示例"},
+            {"source":"input[1].content[0].text","role":"developer","text":"开发者示例"}
+        ])
+    );
     let response = invoke(
         &app,
         Method::PUT,
@@ -237,7 +278,7 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
                 .header("x-api-key", &token)
                 .header("anthropic-version", "2023-06-01")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"model":"claude-model","stream":true}"#))
+                .body(Body::from(native_messages_request().to_string()))
                 .unwrap(),
         )
         .await
@@ -252,6 +293,19 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     assert_eq!(snapshot["active"][0]["upstream"], "a");
     assert_eq!(snapshot["recent"][0]["model"], "claude-model");
     assert_eq!(snapshot["recent"][0]["phase"], "completed");
+    assert_eq!(
+        snapshot["recent"][0]["instructions"],
+        json!({"status":"captured","count":1})
+    );
+    let claude_path = format!(
+        "/llm/requests/{}",
+        snapshot["recent"][0]["id"].as_str().unwrap()
+    );
+    let claude_detail = json_body(invoke(&app, Method::GET, &claude_path, None, None).await).await;
+    assert_eq!(
+        claude_detail["item"]["instructions"]["blocks"],
+        json!([{"source":"system[0].text","role":"system","text":"Claude 示例"}])
+    );
     gate.add_permits(1);
     assert_eq!(old_stream.next().await.unwrap().unwrap(), CODEX_LAST);
     assert!(old_stream.next().await.is_none());
@@ -284,7 +338,44 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     );
     let persisted = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
     assert_eq!(persisted, snapshot);
+    let codex_recent = json_body(invoke(&app, Method::GET, &codex_path, None, None).await).await;
+    assert_eq!(
+        codex_recent["item"]["instructions"]["blocks"],
+        detail["item"]["instructions"]["blocks"]
+    );
+    assert_eq!(codex_recent["item"]["response_content"]["complete"], true);
+    assert_eq!(
+        codex_recent["item"]["response_content"]["blocks"],
+        detail["item"]["response_content"]["blocks"]
+    );
+    let history_path = format!("/llm/usage/requests/{}", codex_id.as_str().unwrap());
+    let history = json_body(invoke(&app, Method::GET, &history_path, None, None).await).await;
+    assert!(history["item"].get("instructions").is_none());
     server.abort();
+}
+
+fn native_responses_request() -> Value {
+    json!({
+        "model":"codex-model",
+        "instructions":"顶层示例",
+        "input":[
+            {"role":"system","content":"系统示例"},
+            {"role":"developer","content":[{"type":"input_text","text":"开发者示例"}]},
+            {"type":"function_call_output","call_id":"call-1","output":"工具结果示例"},
+            {"role":"user","content":"a".repeat(2_300_000)}
+        ],
+        "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}],
+        "tool_choice":"auto",
+        "stream":true
+    })
+}
+
+fn native_messages_request() -> Value {
+    json!({
+        "model":"claude-model",
+        "system":[{"type":"text","text":"Claude 示例"}],
+        "stream":true
+    })
 }
 
 #[derive(Debug)]
@@ -810,7 +901,18 @@ async fn queries_persisted_usage_by_model_session_and_stable_page() {
     let directory = Directory::new();
     let (app, _notifications) = persistent_router(&directory).await;
     provider(&app, "work", json!({"codex_uri":format!("{upstream}/v1")})).await;
-    let (client, token) = issue(&app, "work").await;
+    let created = invoke(
+        &app,
+        Method::POST,
+        "/llm/clients",
+        None,
+        Some(json!({"name":"editor","upstream":"work"})),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    let client = created["client"]["id"].as_str().unwrap();
+    let token = created["client"]["token"].as_str().unwrap();
     for _ in 0..2 {
         let request = Request::post("/llm/codex/v1/responses")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -825,6 +927,8 @@ async fn queries_persisted_usage_by_model_session_and_stable_page() {
     assert_eq!(response.status(), StatusCode::OK);
     let data = json_body(response).await;
     let row = &data["items"][0];
+    assert_eq!(row["client_name"], "editor");
+    assert_eq!(data["client_names"][client], "editor");
     assert_eq!(row["model"], "test-model");
     assert_eq!(row["usage"]["input_uncached_tokens"], 40);
     assert_eq!(row["usage"]["cache_read_tokens"], 80);
@@ -866,6 +970,7 @@ async fn queries_persisted_usage_by_model_session_and_stable_page() {
         detail["raw_usage"]["input_tokens_details"]["cached_tokens"],
         80
     );
+    assert_eq!(detail["item"]["client_name"], "editor");
 
     let summary = json_body(
         invoke(
@@ -906,12 +1011,34 @@ async fn queries_persisted_usage_by_model_session_and_stable_page() {
     .await;
     assert_eq!(sessions["usage"][0]["requests"], 2);
     assert_eq!(sessions["next_cursor"], Value::Null);
+    assert_eq!(sessions["client_names"][client], "editor");
+    for path in [
+        "/llm/usage",
+        "/llm/requests",
+        "/llm/usage/summary?group_by=client_id",
+        "/llm/usage/options?dimension=client_id",
+    ] {
+        let report = json_body(invoke(&app, Method::GET, path, None, None).await).await;
+        assert_eq!(report["client_names"][client], "editor", "{path}");
+    }
 
     let (restarted, _notifications) = persistent_router(&directory).await;
     let report =
         json_body(invoke(&restarted, Method::GET, "/llm/usage/summary", None, None).await).await;
     assert_eq!(report["totals"]["requests"], 2);
     assert_eq!(report["totals"]["output_tokens"], 20);
+    let response = invoke(
+        &restarted,
+        Method::DELETE,
+        &format!("/llm/clients/{client}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let history = json_body(invoke(&restarted, Method::GET, &path, None, None).await).await;
+    assert_eq!(history["items"][0]["client_id"], client);
+    assert_eq!(history["items"][0]["client_name"], Value::Null);
     server.abort();
 }
 
@@ -1029,7 +1156,14 @@ async fn chat_completions_records_the_model_with_or_without_upstream_metadata() 
             Method::POST,
             "/llm/codex/v1/chat/completions",
             Some(("authorization", &bearer)),
-            Some(json!({"model":"requested-model","stream":stream})),
+            Some(json!({
+                "model":"requested-model",
+                "messages":[
+                    {"role":"system","content":[{"type":"text","text":"聊天系统示例"}]},
+                    {"role":"user","content":"用户消息"}
+                ],
+                "stream":stream
+            })),
         )
         .await;
         assert_eq!(response.status(), status);
@@ -1047,6 +1181,16 @@ async fn chat_completions_records_the_model_with_or_without_upstream_metadata() 
         .await;
         let item = &history["items"][0];
         assert_eq!(item["model"], model);
+        let path = format!("/llm/requests/{}", item["id"].as_str().unwrap());
+        let detail = json_body(invoke(&app, Method::GET, &path, None, None).await).await;
+        assert_eq!(
+            detail["item"]["instructions"]["blocks"],
+            json!([{
+                "source":"messages[0].content[0].text",
+                "role":"system",
+                "text":"聊天系统示例"
+            }])
+        );
         if stream {
             assert_eq!(item["outcome"], "completed");
             assert_eq!(item["usage"]["input_uncached_tokens"], 8);

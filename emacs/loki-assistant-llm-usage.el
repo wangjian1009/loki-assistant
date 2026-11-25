@@ -3,11 +3,20 @@
 (require 'cl-lib)
 (require 'calendar)
 (require 'json)
+(require 'rx)
 (require 'subr-x)
 (require 'svg)
 (require 'tabulated-list)
 (require 'parse-time)
 (require 'loki-assistant)
+
+(declare-function agent-shell-markdown-replace-markup "agent-shell-markdown")
+(declare-function agent-shell-chat-boxed-label "agent-shell-chat-mode")
+(declare-function org-mode "org")
+(defvar agent-shell-markdown-render-functions)
+(defvar org-inhibit-startup)
+(defvar org-hide-emphasis-markers)
+(defvar org-src-fontify-natively)
 
 (defconst loki-assistant-llm-usage--views
   '((overview "概览" "/llm/usage/summary")
@@ -39,6 +48,9 @@
 (defvar-local loki-assistant-llm-usage--zone "Asia/Shanghai")
 (defvar-local loki-assistant-llm-usage--context nil)
 (defvar-local loki-assistant-llm-usage--chart nil)
+(defvar-local loki-assistant-llm-usage--detail-request nil)
+(defvar-local loki-assistant-llm-usage--detail-windows nil)
+(defvar-local loki-assistant-llm-usage--detail-id nil)
 
 (defun loki-assistant-llm-usage--state ()
   (or (gethash loki-assistant-llm-usage--current loki-assistant-llm-usage--views-state)
@@ -59,6 +71,11 @@
   (when (stringp id)
     (cdr (assoc-string id (alist-get 'client_names data)))))
 
+(defun loki-assistant-llm-usage--client-label (item data)
+  (or (loki-assistant-llm-usage--value 'client_name item)
+      (loki-assistant-llm-usage--client-name (alist-get 'client_id item) data)
+      "未知客户端"))
+
 (defun loki-assistant-llm-usage--phase (value)
   (or (cdr (assoc value '(("waiting" . "等待响应") ("responding" . "接收响应")
                           ("completed" . "完成") ("failed" . "失败")
@@ -69,6 +86,13 @@
   (cond ((not (consp usage)) "—")
         ((eq (alist-get 'complete usage) t) "完整")
         (t "不完整")))
+
+(defun loki-assistant-llm-usage--instruction-label (capture)
+  (pcase (alist-get 'status capture)
+    ("captured" (format "%s 段" (alist-get 'count capture)))
+    ("reading" "读取中")
+    ("absent" "未携带")
+    (_ "未采集")))
 
 (defun loki-assistant-llm-usage--time (value)
   (condition-case nil
@@ -121,7 +145,7 @@
 (defun loki-assistant-llm-usage--group-value (item data label)
   (if (equal (alist-get 'group_by data) "client_id")
       (or (loki-assistant-llm-usage--client-name (alist-get 'group item) data)
-          (loki-assistant-llm-usage--cell 'group item "未知客户端"))
+          "未知客户端")
     (loki-assistant-llm-usage--cell 'group item (concat "未知" label))))
 
 (defun loki-assistant-llm-usage--result-items (view data)
@@ -189,23 +213,31 @@
                       cache_read_tokens cache_write_tokens output_tokens))))))
       ('history
        (vector (loki-assistant-llm-usage--time (alist-get 'finished_at item))
+               (loki-assistant-llm-usage--client-label item data)
                (cell 'upstream) (cell 'model)
                (loki-assistant-llm-usage--phase (alist-get 'outcome item))
                (cell 'duration_ms)
                (loki-assistant-llm-usage--cell 'output_tokens (alist-get 'usage item) "未上报")
                (loki-assistant-llm-usage--usage-label (alist-get 'usage item))))
       ('live
-       (let ((usage (loki-assistant-llm-usage--value 'usage item)))
-         (vector (loki-assistant-llm-usage--time (alist-get 'started_at item))
-                 (cell 'upstream) (cell 'model)
+       (let ((usage (loki-assistant-llm-usage--value 'usage item))
+             (started (loki-assistant-llm-usage--time (alist-get 'started_at item))))
+         (vector (if (string-match-p "^[0-9-]\\{10\\} " started)
+                     (propertize (substring started 11) 'help-echo started)
+                   started)
+                 (loki-assistant-llm-usage--client-label item data)
                  (loki-assistant-llm-usage--phase (alist-get 'phase item))
+                 (loki-assistant-llm-usage--instruction-label
+                  (loki-assistant-llm-usage--value 'instructions item))
+                 (cell 'upstream) (cell 'model)
                  (cell 'first_byte_ms) (cell 'duration_ms)
                  (loki-assistant-llm-usage--cell 'output_tokens usage)
                  (loki-assistant-llm-usage--usage-label usage))))
       (_
        (vconcat (when (eq loki-assistant-llm-usage--current 'sessions)
                   (vector (cell 'session_id)))
-                (mapcar #'cell '(client_id upstream input_tokens output_tokens requests incomplete_requests)))))))
+                (vector (loki-assistant-llm-usage--client-label item data))
+                (mapcar #'cell '(upstream input_tokens output_tokens requests incomplete_requests)))))))
 
 (defun loki-assistant-llm-usage--id (item)
   (or (alist-get 'id item)
@@ -221,8 +253,7 @@
              (lambda (pair)
                (format "%s %s" (alist-get (car pair) loki-assistant-llm-usage--fields)
                        (if (eq (car pair) 'client_id)
-                           (or (loki-assistant-llm-usage--client-name (cdr pair) data)
-                               (cdr pair))
+                           (loki-assistant-llm-usage--client-label (list pair) data)
                          (cdr pair))))
              filters " · ")
             "\n")))
@@ -305,14 +336,14 @@
                 [("请求数" 8 nil :right-align t) ("用量不完整" 10 nil :right-align t)
                  ("未缓存输入" 12 nil :right-align t) ("读缓存" 11 nil :right-align t)
                  ("写缓存" 11 nil :right-align t) ("输出" 11 nil :right-align t)])))
-            ('history [("完成时间" 20 nil) ("供应商" 15 nil) ("模型" 20 nil)
+            ('history [("完成时间" 20 nil) ("客户端" 18 nil) ("供应商" 15 nil) ("模型" 20 nil)
                        ("结果" 8 nil) ("耗时 ms" 10 nil) ("输出" 12 nil) ("用量" 8 nil)])
-            ('live [("开始时间" 20 nil) ("供应商" 15 nil) ("模型" 20 nil)
-                    ("状态" 12 nil) ("首包 ms" 10 nil) ("耗时 ms" 10 nil)
+            ('live [("开始时间" 9 nil) ("客户端" 14 nil) ("状态" 10 nil) ("系统指令" 9 nil)
+                    ("供应商" 15 nil) ("模型" 20 nil) ("首包 ms" 10 nil) ("耗时 ms" 10 nil)
                     ("输出" 12 nil) ("用量" 8 nil)])
             (_ (vconcat (when (eq loki-assistant-llm-usage--current 'sessions)
                           [("会话" 26 nil)])
-                        [("客户端" 38 nil) ("供应商" 17 nil) ("上游输入" 16 nil)
+                        [("客户端" 18 nil) ("供应商" 17 nil) ("上游输入" 16 nil)
                          ("输出" 12 nil) ("请求" 8 nil) ("不完整" 8 nil)])))
           tabulated-list-entries
           (mapcar (lambda (item)
@@ -339,13 +370,16 @@
     (setq-local frame-title-format (concat "LLM 用量 · " title))
     (setq-local mode-line-process
                 (list " · " title
-                      " · C-c C-q 退出  ? 帮助  1-5 切换  g 刷新"
-                      (unless (eq loki-assistant-llm-usage--current 'totals) "  RET 打开")
-                      (when (memq loki-assistant-llm-usage--current '(overview history sessions))
-                        "  f 筛选  F 清除")
-                      (when overview (if loki-assistant-llm-usage--chart "  t 表格" "  t 图表"))
-                      (when (and overview items) "  e 导出 PNG")
-                      (when loki-assistant-llm-usage--context "  b 返回")
+                      (loki-assistant--mode-line-keys
+                       (concat "1-5 切换  g 刷新"
+                               (unless (eq loki-assistant-llm-usage--current 'totals)
+                                 "  RET 打开")
+                               (when (memq loki-assistant-llm-usage--current '(overview history sessions))
+                                 "  f 筛选  F 清除")
+                               (when overview (if loki-assistant-llm-usage--chart
+                                                  "  t 表格" "  t 图表"))
+                               (when (and overview items) "  e 导出 PNG")
+                               (when loki-assistant-llm-usage--context "  b 返回")))
                       (when (loki-assistant-llm-usage--view-cursor state) "  l 下一页")
                       (when (loki-assistant-llm-usage--view-loading state) " · 查询中…")
                       (when (loki-assistant-llm-usage--view-error state)
@@ -366,7 +400,8 @@
 (defun loki-assistant-llm-usage--switch (view)
   (setf (loki-assistant-llm-usage--view-selected (loki-assistant-llm-usage--state))
         (tabulated-list-get-id))
-  (setq loki-assistant-llm-usage--current view)
+  (setq loki-assistant-llm-usage--current view
+        loki-assistant-llm-usage--detail-request nil)
   (let ((inhibit-read-only t)) (erase-buffer))
   (loki-assistant-llm-usage--render)
   (loki-assistant-llm-usage--load))
@@ -573,13 +608,34 @@
   (loki-assistant-llm-usage--set-filters state filters)
   (loki-assistant-llm-usage--load))
 
+(defun loki-assistant-llm-usage--choose-client (items data selected)
+  (let* ((partial (eq (alist-get 'has_more data) t))
+         (ids (mapcar (lambda (item) (alist-get 'value item)) items))
+         (unknown 0))
+    (when partial
+      (setq ids (delete-dups
+                 (append ids (mapcar (lambda (entry) (format "%s" (car entry)))
+                                     (alist-get 'client_names data))))))
+    (when selected (cl-pushnew selected ids :test #'equal))
+    (let* ((choices (mapcar (lambda (id)
+                              (cons (or (loki-assistant-llm-usage--client-name id data)
+                                        (format "未知客户端（%d）" (cl-incf unknown)))
+                                    id))
+                            ids))
+           (choice (completing-read "客户端（留空清除）：" (cons '("" . "") choices)
+                                    nil (not partial) nil nil (car (rassoc selected choices)))))
+      (or (cdr (assoc choice choices)) choice))))
+
 (defun loki-assistant-llm-usage--choose-candidate (state key filters)
   (let* ((buffer (current-buffer))
          (view loki-assistant-llm-usage--current)
-         (prefix (read-string "候选前缀（留空列出全部候选）："))
+         (client-filter (eq key 'client_id))
          (context (loki-assistant-llm-usage--history-filters
                    (assq-delete-all 'session_id (assq-delete-all key (copy-tree filters)))))
-         (params (append (list (cons 'dimension (symbol-name key)) (cons 'q prefix))
+         (params (append (list (cons 'dimension (symbol-name key))
+                               (if client-filter
+                                   '(limit . "100")
+                                 (cons 'q (read-string "候选前缀（留空列出全部候选）："))))
                          (if (eq view 'sessions)
                              (cons '(source . "sessions") context) context))))
     (loki-assistant-request
@@ -594,11 +650,14 @@
                   (hint (cond ((not (plist-get reply :ok)) "候选不可用，可直接输入")
                               ((eq (alist-get 'has_more data) t) "可直接输入完整值")
                               (t "留空清除")))
-                  (value (completing-read
-                          (format "%s（%s）："
-                                  (alist-get key loki-assistant-llm-usage--fields) hint)
-                          (mapcar (lambda (item) (alist-get 'value item)) items)
-                          nil nil nil nil (alist-get key filters))))
+                  (value (if client-filter
+                             (if (plist-get reply :ok)
+                                 (loki-assistant-llm-usage--choose-client items data (alist-get key filters))
+                               (user-error "%s" (or (plist-get reply :error-message) "读取客户端候选失败")))
+                           (completing-read
+                            (format "%s（%s）：" (alist-get key loki-assistant-llm-usage--fields) hint)
+                            (mapcar (lambda (item) (alist-get 'value item)) items)
+                            nil nil nil nil (alist-get key filters)))))
              (loki-assistant-llm-usage--apply-filter state filters key value))))))))
 
 (defun loki-assistant-llm-usage-clear-filters ()
@@ -630,6 +689,30 @@
           (puthash 'history (cdr context) loki-assistant-llm-usage--views-state))
         (loki-assistant-llm-usage--switch (car context)))
     (quit-window)))
+
+(defun loki-assistant-llm-usage--open-request (row state live)
+  (let* ((origin (current-buffer))
+         (window (selected-window))
+         (request (list nil))
+         (path (concat (if live "/llm/requests/" "/llm/usage/requests/")
+                       (url-hexify-string (alist-get 'id row)))))
+    (setq loki-assistant-llm-usage--detail-request request)
+    (loki-assistant-request
+     "GET" path
+     :callback
+     (lambda (reply)
+       (when (and (buffer-live-p origin) (eq (selected-window) window)
+                  (eq (window-buffer window) origin)
+                  (eq request (buffer-local-value 'loki-assistant-llm-usage--detail-request origin)))
+         (if (plist-get reply :ok)
+             (loki-assistant-llm-usage--detail (plist-get reply :data) live)
+           (when live
+             (loki-assistant-llm-usage--detail
+              (list (cons 'item (cons '(instructions (status . "unavailable")) row))
+                    (cons 'client_names (alist-get 'client_names
+                                                   (loki-assistant-llm-usage--view-data state))))
+              t))
+           (message "%s" (or (plist-get reply :error-message) "读取请求详情失败"))))))))
 
 (defun loki-assistant-llm-usage-open ()
   "查看日期、会话或单条请求的详情。"
@@ -664,34 +747,470 @@
       ('sessions
        (loki-assistant-llm-usage--drill
         (mapcar (lambda (key) (assq key row)) '(client_id session_id upstream))))
-      ('history
-       (let ((origin (current-buffer))
-             (id (alist-get 'id row)))
-         (loki-assistant-request
-          "GET" (concat "/llm/usage/requests/" (url-hexify-string id))
-          :callback (lambda (reply)
-                      (when (buffer-live-p origin)
-                        (if (plist-get reply :ok)
-                            (loki-assistant-llm-usage--detail (plist-get reply :data))
-                          (message "%s" (or (plist-get reply :error-message) "读取请求详情失败"))))))))
-      ('live (loki-assistant-llm-usage--detail (list (cons 'item row))))
+      ('history (loki-assistant-llm-usage--open-request row state nil))
+      ('live (loki-assistant-llm-usage--open-request row state t))
       (_ (user-error "请从会话或请求历史查看明细")))))
 
-(defun loki-assistant-llm-usage--detail (data)
-  (let ((buffer (get-buffer-create "*LLM 请求详情*"))
-        (item (alist-get 'item data)))
+(defvar loki-assistant-llm-usage-detail-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-q") #'loki-assistant-llm-usage-close-detail)
+    (define-key map (kbd "q") #'loki-assistant-llm-usage-close-detail)
+    (define-key map (kbd "g") #'loki-assistant-llm-usage-refresh-detail)
+    (define-key map (kbd "j") #'loki-assistant-llm-usage-jump-detail)
+    (define-key map (kbd "?") #'describe-mode)
+    (define-key map (kbd "TAB") #'loki-assistant-llm-usage-next-item)
+    (define-key map (kbd "<tab>") #'loki-assistant-llm-usage-next-item)
+    (define-key map (kbd "n") #'loki-assistant-llm-usage-next-item)
+    (define-key map (kbd "<backtab>") #'loki-assistant-llm-usage-previous-item)
+    (define-key map (kbd "S-<tab>") #'loki-assistant-llm-usage-previous-item)
+    (define-key map (kbd "p") #'loki-assistant-llm-usage-previous-item)
+    (define-key map (kbd "C-M-u") #'loki-assistant-llm-usage-parent-item)
+    (define-key map (kbd "RET") #'loki-assistant-llm-usage-fold-instruction)
+    (define-key map (kbd "<return>") #'loki-assistant-llm-usage-fold-instruction)
+    (define-key map (kbd "w") #'loki-assistant-llm-usage-copy-instruction)
+    map))
+
+(define-derived-mode loki-assistant-llm-usage-detail-mode special-mode "LLM 请求详情"
+  "查看实时请求的对话、请求上下文和工具定义。
+Tab/n 和 Shift-Tab/p 跳到相邻可见项目，C-M-u 回到上一级。
+RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
+实时请求可按 j 跳到章节，按 g 刷新。
+按 q 或 C-c C-q 返回，按 ? 查看模式帮助。"
+  (require 'agent-shell-faces nil t)
+  (require 'agent-shell-chat-mode nil t)
+  (require 'agent-shell-markdown nil t)
+  (setq-local truncate-lines nil)
+  (add-to-invisibility-spec 'loki-assistant-llm-usage-instruction)
+  (add-to-invisibility-spec 'org-link)
+  (setq-local mode-line-process (loki-assistant--mode-line-keys nil)))
+
+(defun loki-assistant-llm-usage--detail-face (face fallback)
+  (if (facep face) face fallback))
+
+(defun loki-assistant-llm-usage--speaker-label (title role)
+  (if (fboundp 'agent-shell-chat-boxed-label)
+      (agent-shell-chat-boxed-label (list (cons :text title) (cons :role role)))
+    (propertize (format " %s " title)
+                'face (list :inherit
+                            (if (eq role 'user)
+                                '(bold font-lock-keyword-face)
+                              '(bold font-lock-function-name-face))
+                            :inverse-video t :box t))))
+
+(defun loki-assistant-llm-usage--fold-instruction (body hide)
+  (overlay-put body 'invisible (when hide 'loki-assistant-llm-usage-instruction))
+  (let ((indicator (+ (overlay-start (overlay-get body 'heading))
+                      (length (overlay-get body 'indent)))))
+    (with-silent-modifications
+      (put-text-property indicator (1+ indicator) 'display (if hide "▶" "▼")))))
+
+(defun loki-assistant-llm-usage--reveal-instruction (body)
+  (while body
+    (loki-assistant-llm-usage--fold-instruction body nil)
+    (setq body (overlay-get body 'parent-fold))))
+
+(defun loki-assistant-llm-usage--instruction-at-point ()
+  (or (get-text-property (point) 'loki-assistant-llm-usage-instruction)
+      (user-error "请把光标移到一段内容上")))
+
+(defun loki-assistant-llm-usage-fold-instruction ()
+  "折叠或展开当前段内容。"
+  (interactive)
+  (let* ((body (loki-assistant-llm-usage--instruction-at-point))
+         (hide (not (overlay-get body 'invisible))))
+    (when hide (goto-char (overlay-start (overlay-get body 'heading))))
+    (loki-assistant-llm-usage--fold-instruction body hide)))
+
+(defun loki-assistant-llm-usage-copy-instruction ()
+  "复制当前项目的正文。"
+  (interactive)
+  (let ((body (loki-assistant-llm-usage--instruction-at-point)))
+    (kill-new (or (overlay-get body 'text)
+                  (buffer-substring-no-properties (overlay-start body) (overlay-end body)))))
+  (message "已复制当前内容"))
+
+(defun loki-assistant-llm-usage--move-item (forward)
+  (let ((target
+         (save-excursion
+           (let ((property 'loki-assistant-llm-item-heading)
+                 (search (if forward #'text-property-search-forward
+                           #'text-property-search-backward))
+                 match)
+             (when-let ((body (get-text-property (point) property)))
+               (let ((heading (overlay-get body 'heading)))
+                 (goto-char (if forward (overlay-end heading) (overlay-start heading)))))
+             (while (and (setq match (funcall search property nil (lambda (_ value) value)))
+                         (invisible-p (prop-match-beginning match))))
+             (and match (prop-match-beginning match))))))
+    (if target (goto-char target) (user-error "没有更多可见项目"))))
+
+(defun loki-assistant-llm-usage-next-item ()
+  "跳到下一个可见项目。"
+  (interactive)
+  (loki-assistant-llm-usage--move-item t))
+
+(defun loki-assistant-llm-usage-previous-item ()
+  "跳到上一个可见项目。"
+  (interactive)
+  (loki-assistant-llm-usage--move-item nil))
+
+(defun loki-assistant-llm-usage-parent-item ()
+  "跳到当前项目的上一级。"
+  (interactive)
+  (if-let ((parent (overlay-get (loki-assistant-llm-usage--instruction-at-point) 'parent-fold)))
+      (goto-char (overlay-start (overlay-get parent 'heading)))
+    (user-error "当前项目已经在顶层")))
+
+(defun loki-assistant-llm-usage-close-detail ()
+  "返回请求列表并恢复原窗口布局。"
+  (interactive)
+  (if-let ((windows loki-assistant-llm-usage--detail-windows))
+      (progn
+        (setq loki-assistant-llm-usage--detail-windows nil
+              loki-assistant-llm-usage--detail-request nil)
+        (set-window-configuration windows))
+    (quit-window)))
+
+(defun loki-assistant-llm-usage-refresh-detail ()
+  "读取当前实时请求的最新响应。"
+  (interactive)
+  (unless loki-assistant-llm-usage--detail-id
+    (user-error "请在实时请求详情中刷新"))
+  (let ((buffer (current-buffer))
+        (window (selected-window))
+        (id loki-assistant-llm-usage--detail-id)
+        (request (list nil)))
+    (setq loki-assistant-llm-usage--detail-request request)
+    (loki-assistant-request
+     "GET" (concat "/llm/requests/" (url-hexify-string id))
+     :callback (lambda (reply)
+                 (when (and (eq window (selected-window))
+                            (eq (window-buffer window) buffer)
+                            (eq request (buffer-local-value
+                                         'loki-assistant-llm-usage--detail-request buffer)))
+                   (if (plist-get reply :ok)
+                       (let ((line (with-current-buffer buffer (line-number-at-pos))))
+                         (loki-assistant-llm-usage--detail (plist-get reply :data) t)
+                         (forward-line (1- line)))
+                     (message "%s" (or (plist-get reply :error-message) "刷新请求失败"))))))))
+
+(defvar loki-assistant-llm-usage--enclosing-fold nil
+  "渲染嵌套项目时包含它的折叠区。")
+
+(defun loki-assistant-llm-usage--insert-fold (title hide render &optional face)
+  (let* ((start (point))
+         (parent loki-assistant-llm-usage--enclosing-fold)
+         (indent (if parent (concat (overlay-get parent 'indent) "  ") ""))
+         (label (copy-sequence title)))
+    (add-face-text-property 0 (length label)
+                            (or face (loki-assistant-llm-usage--detail-face 'agent-shell-secondary 'shadow))
+                            t label)
+    (insert indent (propertize "▶" 'face 'default) " " label "\n")
+    (let* ((body-start (point))
+           (body (make-overlay body-start body-start))
+           (heading (make-overlay start body-start)))
+      (overlay-put body 'indent indent)
+      (overlay-put body 'heading heading)
+      (overlay-put body 'parent-fold parent)
+      (overlay-put body 'isearch-open-invisible #'loki-assistant-llm-usage--reveal-instruction)
+      (add-text-properties start body-start
+                           (list 'loki-assistant-llm-item-heading body
+                                 'loki-assistant-llm-usage-instruction body))
+      (let ((loki-assistant-llm-usage--enclosing-fold body))
+        (funcall render))
+      (move-overlay body body-start (point))
+      (loki-assistant-llm-usage--fold-instruction body hide)
+      body)))
+
+(defun loki-assistant-llm-usage--insert-block (title text hide &optional face rendered)
+  (let ((body (loki-assistant-llm-usage--insert-fold
+               title hide
+               (lambda ()
+                 (let ((start (point))
+                       (indent (concat (overlay-get loki-assistant-llm-usage--enclosing-fold
+                                                   'indent)
+                                       "  ")))
+                   (insert (or rendered text))
+                   (unless (bolp) (insert "\n"))
+                   ;; 行首的显示前缀会在隐藏正文后作用到下一条可见标题。
+                   (remove-text-properties start (point) '(line-prefix nil wrap-prefix nil))
+                   (let ((end (copy-marker (point) t)))
+                     (save-excursion
+                       (goto-char start)
+                       (while (< (point) end)
+                         (unless (eolp) (insert indent))
+                         (forward-line 1)))
+                     (set-marker end nil)))
+                 (insert "\n"))
+               face)))
+    (overlay-put body 'text text)
+    (put-text-property (overlay-start body) (overlay-end body)
+                       'loki-assistant-llm-usage-instruction body)))
+
+(defun loki-assistant-llm-usage--render-markdown (text)
+  (when (fboundp 'agent-shell-markdown-replace-markup)
+    (with-temp-buffer
+      (let ((agent-shell-markdown-render-functions nil))
+        (insert text)
+        (condition-case nil
+            (progn
+              (agent-shell-markdown-replace-markup :force t :render-images nil :highlight-blocks nil)
+              (buffer-string))
+          (error nil))))))
+
+(defun loki-assistant-llm-usage--org-output (text)
+  (let* ((case-fold-search t)
+         (fence (make-string 3 #x60))
+         (start (when (string-match (concat (rx string-start (* (any " \t\n")))
+                                           fence (rx "org" (* (any " \t")) "\n"))
+                                    text)
+                  (match-end 0)))
+         (end (and start (string-match (concat "^" fence (rx (* (any " \t\n")) string-end))
+                                       text start))))
+    (cond ((and start end) (substring text start end))
+          ((and (not (string-match-p fence text))
+                (string-match-p
+                 (rx (or (seq line-start "#+" (+ (any alnum "_-")))
+                         (seq line-start "**" (* "*") " " (+ (not (any "*\n"))) line-end)
+                         (seq "[[" (+ (not (any "]\n"))) "][")))
+                 text))
+           text))))
+
+(defun loki-assistant-llm-usage--render-assistant (text)
+  (let ((org-text (loki-assistant-llm-usage--org-output text)))
+    (or (when (and org-text (require 'org nil t))
+          (with-temp-buffer
+            (let ((org-inhibit-startup t)
+                  (org-hide-emphasis-markers t)
+                  (org-src-fontify-natively nil))
+              (delay-mode-hooks (org-mode))
+              (insert org-text)
+              (font-lock-ensure)
+              (buffer-string))))
+        (loki-assistant-llm-usage--render-markdown text))))
+
+(defun loki-assistant-llm-usage--insert-instructions (capture)
+  (let ((blocks (vconcat (loki-assistant-llm-usage--value 'blocks capture))))
+    (if (seq-empty-p blocks)
+        (insert "  系统指令 · " (loki-assistant-llm-usage--instruction-label capture) "\n")
+      (loki-assistant-llm-usage--insert-fold
+       (format "系统指令 · %d 段" (length blocks)) t
+       (lambda ()
+         (cl-loop for block across blocks
+                  for source = (alist-get 'source block)
+                  for role = (loki-assistant-llm-usage--value 'role block)
+                  do (loki-assistant-llm-usage--insert-block
+                      (if role (concat source " · " role) source)
+                      (alist-get 'text block) t)))))))
+
+(defun loki-assistant-llm-usage--pretty-json (text)
+  (with-temp-buffer
+    (insert text)
+    (condition-case nil
+        (progn (json-pretty-print-buffer) (buffer-string))
+      (error text))))
+
+(defun loki-assistant-llm-usage--insert-transcript-block (block &optional hide-message)
+  (let* ((kind (alist-get 'kind block))
+         (name (loki-assistant-llm-usage--value 'name block))
+         (id (loki-assistant-llm-usage--value 'id block))
+         (text (or (alist-get 'text block) ""))
+         (role (alist-get 'role block))
+         (title (pcase kind
+                  ("message" (pcase role
+                               ("user" (loki-assistant-llm-usage--speaker-label "用户" 'user))
+                               ("assistant" (loki-assistant-llm-usage--speaker-label "助手" 'agent))
+                               (role (or role "消息"))))
+                  ("tool_call" "工具调用")
+                  ("tool_result" "工具结果")
+                  ("error" "上游错误")
+                  (_ "内容"))))
+    (loki-assistant-llm-usage--insert-block
+     (string-join (delq nil (list title name id
+                                 (pcase kind
+                                   ("tool_call" (if (string-empty-p text) "无参数" "参数"))
+                                   ("tool_result" "结果正文"))))
+                  " · ")
+     (if (string-empty-p text) "无已采集正文" text)
+     (or (member kind '("tool_call" "tool_result"))
+         (and hide-message (equal kind "message")))
+     (when (equal kind "error")
+       (loki-assistant-llm-usage--detail-face 'agent-shell-error 'error))
+     (cond ((and (equal kind "tool_call") (not (string-empty-p text)))
+            (loki-assistant-llm-usage--pretty-json text))
+           ((and (equal role "assistant") (not (string-empty-p text)))
+            (loki-assistant-llm-usage--render-assistant text))))))
+
+(defun loki-assistant-llm-usage--tool-activity-p (block)
+  (member (alist-get 'kind block) '("tool_call" "tool_result")))
+
+(defun loki-assistant-llm-usage--transcript-counts (blocks)
+  (let ((users 0) (assistants 0) (calls 0) (results 0))
+    (dolist (block blocks)
+      (pcase (alist-get 'kind block)
+        ("message" (pcase (alist-get 'role block)
+                     ("user" (cl-incf users))
+                     ("assistant" (cl-incf assistants))))
+        ("tool_call" (cl-incf calls))
+        ("tool_result" (cl-incf results))))
+    (delq nil (list (when (> users 0) (format "%d 条用户消息" users))
+                    (when (> assistants 0) (format "%d 条助手消息" assistants))
+                    (when (> calls 0) (format "%d 次工具调用" calls))
+                    (when (> results 0) (format "%d 条工具结果" results))))))
+
+(defun loki-assistant-llm-usage--insert-dialogue (blocks &optional history)
+  (while blocks
+    (if (loki-assistant-llm-usage--tool-activity-p (car blocks))
+        (let* ((end (cl-position-if-not #'loki-assistant-llm-usage--tool-activity-p blocks))
+               (activity (if end (seq-take blocks end) blocks))
+               (names (delete-dups (delq nil (mapcar (lambda (block) (alist-get 'name block))
+                                                    activity))))
+               (summary (append (loki-assistant-llm-usage--transcript-counts activity)
+                                (when names
+                                  (list (concat (string-join (seq-take names 3) "、")
+                                                (when (> (length names) 3) "等")))))))
+          (loki-assistant-llm-usage--insert-fold
+           (string-join (cons "工具活动" summary) " · ") t
+           (lambda ()
+             (dolist (block activity)
+               (loki-assistant-llm-usage--insert-transcript-block block))))
+          (setq blocks (and end (nthcdr end blocks))))
+      (loki-assistant-llm-usage--insert-transcript-block (pop blocks) history))))
+
+(defun loki-assistant-llm-usage--user-message-p (block)
+  (and (equal (alist-get 'kind block) "message")
+       (equal (alist-get 'role block) "user")))
+
+(defun loki-assistant-llm-usage--insert-section (name &optional summary)
+  (insert "\n" (propertize name 'face 'bold 'loki-assistant-llm-section name))
+  (when summary
+    (insert " · " (propertize summary 'face (loki-assistant-llm-usage--detail-face
+                                            'agent-shell-secondary 'shadow))))
+  (insert "\n"))
+
+(defun loki-assistant-llm-usage-jump-detail ()
+  "跳到当前请求详情的某一节。"
+  (interactive)
+  (let ((position (point-min)) sections)
+    (while (< position (point-max))
+      (when-let ((section (get-text-property position 'loki-assistant-llm-section)))
+        (push (cons section position) sections))
+      (setq position (next-single-property-change
+                      position 'loki-assistant-llm-section nil (point-max))))
+    (unless sections (user-error "当前详情没有可跳转的章节"))
+    (setq sections (nreverse sections))
+    (goto-char (cdr (assoc (completing-read "跳到：" sections nil t) sections)))))
+
+(defun loki-assistant-llm-usage--insert-transcript (item)
+  (let* ((input (loki-assistant-llm-usage--value 'request_content item))
+         (response (loki-assistant-llm-usage--value 'response_content item))
+         (tools (vconcat (alist-get 'tools input)))
+         (incoming (append (alist-get 'blocks input) nil))
+         (outgoing (append (alist-get 'blocks response) nil))
+         (settings (loki-assistant-llm-usage--value 'settings input)))
+    (loki-assistant-llm-usage--insert-section "对话")
+    (if (null incoming)
+        (insert (if input "请求中无文本或工具消息\n" "请求输入未采集\n"))
+      (let ((latest (or (cl-position-if #'loki-assistant-llm-usage--user-message-p incoming :from-end t)
+                        (1- (length incoming)))))
+        (while (and (> latest 0)
+                    (loki-assistant-llm-usage--user-message-p (nth (1- latest) incoming)))
+          (cl-decf latest))
+        (let ((history (seq-take incoming latest)))
+          (when history
+            (loki-assistant-llm-usage--insert-fold
+             (string-join (cons "历史对话" (or (loki-assistant-llm-usage--transcript-counts history)
+                                                (list (format "%d 项" (length history)))))
+                          " · ") t
+             (lambda () (loki-assistant-llm-usage--insert-dialogue history t)))))
+        (loki-assistant-llm-usage--insert-dialogue (seq-drop incoming latest))))
+    (when (eq t (alist-get 'truncated input))
+      (insert (propertize "请求内容已截取\n" 'face 'shadow)))
+    (let ((counts (loki-assistant-llm-usage--transcript-counts outgoing))
+          (active (member (alist-get 'phase item) '("waiting" "responding"))))
+      (loki-assistant-llm-usage--insert-section
+       "本次响应" (when counts (string-join counts " · ")))
+      (cond (outgoing
+             (dolist (block outgoing)
+               (loki-assistant-llm-usage--insert-transcript-block block))
+             (unless (eq t (alist-get 'complete response))
+               (insert (propertize "当前仅显示已取得的响应\n" 'face 'shadow))))
+            ((eq t (alist-get 'complete response))
+             (insert "响应中无可显示内容\n"))
+            (active (insert "等待响应内容\n"))
+            (t (insert "响应内容未采集\n"))))
+    (when (eq t (alist-get 'truncated response))
+      (insert (propertize "响应内容已截取\n" 'face 'shadow)))
+    (insert "\n")
+    (let* ((start (point))
+           (capture (loki-assistant-llm-usage--value 'instructions item))
+           (instruction-summary (concat "系统指令 " (loki-assistant-llm-usage--instruction-label capture)))
+           (tool-summary (format "工具定义 %d 项" (length tools))))
+      (loki-assistant-llm-usage--insert-fold
+       (string-join (delq nil (list "请求上下文" instruction-summary
+                                   (when input tool-summary)
+                                   (when settings (format "请求设置 %d 项" (length settings)))))
+                    " · ") t
+       (lambda ()
+         (loki-assistant-llm-usage--insert-instructions capture)
+         (when settings
+           (loki-assistant-llm-usage--insert-fold
+            (format "请求设置 · %d 项" (length settings)) t
+            (lambda ()
+              (dolist (setting settings)
+                (loki-assistant-llm-usage--insert-block
+                 (symbol-name (car setting))
+                 (loki-assistant-llm-usage--pretty-json (json-encode (cdr setting))) t)))))
+         (unless (seq-empty-p tools)
+           (loki-assistant-llm-usage--insert-fold
+            (format "工具定义 · %d 项" (length tools)) t
+            (lambda ()
+              (cl-loop for tool across tools
+                       do (loki-assistant-llm-usage--insert-block
+                           (or (alist-get 'name tool) "工具")
+                           (loki-assistant-llm-usage--pretty-json (alist-get 'text tool)) t)))))))
+      (put-text-property start (1+ start) 'loki-assistant-llm-section "请求上下文"))))
+
+(defun loki-assistant-llm-usage--detail (data &optional live)
+  (let* ((buffer (get-buffer-create "*LLM 请求详情*"))
+         (item (alist-get 'item data))
+         (windows (when live
+                    (or (and (eq (window-buffer) buffer)
+                             (buffer-local-value 'loki-assistant-llm-usage--detail-windows buffer))
+                        (current-window-configuration)))))
     (with-current-buffer buffer
-      (special-mode)
+      (loki-assistant-llm-usage-detail-mode)
+      (setq loki-assistant-llm-usage--detail-windows windows
+            loki-assistant-llm-usage--detail-id (when live (alist-get 'id item)))
       (let ((inhibit-read-only t)
             (json-null :null)
             (json-false :false))
+        (remove-overlays)
         (erase-buffer)
-        (insert (format "请求 %s\n\n" (loki-assistant-llm-usage--cell 'id item)))
-        (cl-loop for (key . label) in '((client_id . "客户端") (session_id . "会话")
+        (if live
+            (insert (propertize (format "%s  ·  %s"
+                                       (loki-assistant-llm-usage--cell 'model item "未知模型")
+                                       (loki-assistant-llm-usage--phase (alist-get 'phase item)))
+                                'face 'bold)
+                    "\n"
+                    (format "%s  ·  %s  ·  %s\n"
+                            (loki-assistant-llm-usage--client-label item data)
+                            (loki-assistant-llm-usage--cell 'upstream item)
+                            (loki-assistant-llm-usage--cell 'protocol item))
+                    (format "HTTP %s  ·  首包 %s ms  ·  耗时 %s ms\n"
+                            (loki-assistant-llm-usage--cell 'upstream_status item)
+                            (loki-assistant-llm-usage--cell 'first_byte_ms item)
+                            (loki-assistant-llm-usage--cell 'duration_ms item))
+                    (format "请求 %s  ·  %s\n"
+                            (loki-assistant-llm-usage--cell 'id item)
+                            (loki-assistant-llm-usage--time (alist-get 'started_at item))))
+          (insert (format "请求 %s\n\n" (loki-assistant-llm-usage--cell 'id item)))
+          (insert (format "客户端  %s\n" (loki-assistant-llm-usage--client-label item data)))
+          (cl-loop for (key . label) in '((session_id . "会话")
                                       (upstream . "供应商") (protocol . "协议") (model . "模型")
                                       (upstream_status . "HTTP 状态") (first_byte_ms . "首包 ms")
                                       (duration_ms . "耗时 ms"))
-                 do (insert (format "%s  %s\n" label (loki-assistant-llm-usage--cell key item))))
+                   do (insert (format "%s  %s\n" label (loki-assistant-llm-usage--cell key item)))))
         (when-let ((usage (loki-assistant-llm-usage--value 'usage item)))
           (insert "\n用量  " (loki-assistant-llm-usage--usage-label usage) "\n")
           (cl-loop for (key . label) in '((input_reported_tokens . "上游输入")
@@ -701,6 +1220,13 @@
                    when (assq key usage)
                    do (insert (format "%s  %s\n" label
                                       (loki-assistant-llm-usage--cell key usage "未上报")))))
+        (when live
+          (unless (loki-assistant-llm-usage--value 'usage item)
+            (insert "用量  待上报\n"))
+          (loki-assistant-llm-usage--insert-transcript item)
+          (setq mode-line-process
+                (loki-assistant--mode-line-keys
+                 "q 返回  g 刷新  j 章节  Tab/n 下项  S-Tab/p 上项  RET 展开或折叠  C-M-u 上一级  C-s 搜索  w 复制")))
         (when (assq 'raw_usage data)
           (insert "\n原始用量\n")
           (if-let ((raw (loki-assistant-llm-usage--value 'raw_usage data)))
@@ -708,9 +1234,15 @@
             (insert "未上报"))
           (insert "\n"))
         (goto-char (point-min))))
-    (if (>= (window-total-width) 110)
-        (select-window (display-buffer-in-side-window buffer '((side . right) (window-width . 0.42))))
-      (pop-to-buffer buffer))))
+    (cond (live
+           (when-let ((side (get-buffer-window buffer)))
+             (when (and (not (eq side (selected-window))) (window-parameter side 'window-side))
+               (delete-window side)))
+           (delete-other-windows)
+           (switch-to-buffer buffer))
+          ((>= (window-total-width) 110)
+           (select-window (display-buffer-in-side-window buffer '((side . right) (window-width . 0.42)))))
+          (t (pop-to-buffer buffer)))))
 
 (defvar loki-assistant-llm-usage-mode-map
   (let ((map (make-sparse-keymap)))

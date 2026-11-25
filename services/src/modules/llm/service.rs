@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use super::{
     config::{CLIENTS, MODULE, PROVIDERS, provider_uri},
+    instructions::Format,
     monitor::{Monitor, RequestGuard},
     protocol::{Binding, Client, IssuedClient, Phase, Protocol, error},
     usage::UsageReader,
@@ -185,6 +186,18 @@ impl LlmService {
             .await
     }
 
+    pub(super) async fn client_names(&self) -> BTreeMap<String, String> {
+        self.authorization
+            .call(|state| {
+                state
+                    .clients
+                    .iter()
+                    .map(|(id, client)| (id.to_string(), client.name.clone()))
+                    .collect()
+            })
+            .await
+    }
+
     pub(super) async fn issue(
         &self,
         name: Option<String>,
@@ -344,18 +357,53 @@ impl LlmService {
 
         let head = parts.method == Method::HEAD;
         let track_usage = UsageReader::tracks(&parts.method, endpoint);
-        let mut guard = self
-            .monitor
-            .start(client, protocol, &parts.headers, track_usage);
+        let observe_request = track_usage && identity_encoding(&parts.headers);
+        let instruction_format = track_usage
+            .then(|| Format::for_endpoint(protocol, endpoint))
+            .flatten();
+        let mut guard = self.monitor.start(
+            client,
+            protocol,
+            &parts.headers,
+            track_usage,
+            instruction_format,
+        );
         let mut upstream = self.http.request(parts.method, uri).headers(headers);
         if !body.is_end_stream() {
-            let mut observation = track_usage.then(|| guard.request_body_observer());
-            let body = body.into_data_stream().inspect(move |item| {
-                if let (Some(observer), Ok(chunk)) = (&mut observation, item) {
-                    observer.push(chunk);
-                }
-            });
-            upstream = upstream.body(reqwest::Body::wrap_stream(body));
+            let length = body.size_hint().exact();
+            let body = body.into_data_stream();
+            let body = if observe_request {
+                let observed = stream::unfold(
+                    (body, guard.request_body_observer(), length),
+                    |(mut body, mut observer, mut remaining)| async move {
+                        match body.next().await {
+                            Some(item) => {
+                                if let Ok(chunk) = &item {
+                                    observer.push(chunk);
+                                    remaining = remaining
+                                        .and_then(|size| size.checked_sub(chunk.len() as u64));
+                                    if remaining == Some(0) {
+                                        observer.complete();
+                                    }
+                                } else {
+                                    observer.abort();
+                                }
+                                Some((item, (body, observer, remaining)))
+                            }
+                            None => {
+                                if matches!(remaining, None | Some(0)) {
+                                    observer.complete();
+                                }
+                                None
+                            }
+                        }
+                    },
+                );
+                reqwest::Body::wrap_stream(observed)
+            } else {
+                reqwest::Body::wrap_stream(body)
+            };
+            upstream = upstream.body(body);
         }
         let upstream = match upstream.send().await {
             Ok(response) => response,
@@ -383,17 +431,7 @@ impl LlmService {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-        let identity = upstream
-            .headers()
-            .get_all(header::CONTENT_ENCODING)
-            .iter()
-            .all(|value| {
-                value.to_str().is_ok_and(|codings| {
-                    codings
-                        .split(',')
-                        .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
-                })
-            });
+        let identity = identity_encoding(upstream.headers());
         guard.response_headers(status.as_u16(), protocol, stream, identity);
         let mut response_headers = forwarded_headers(upstream.headers());
         // 由 Axum 重新生成流式传输的消息边界。
@@ -473,6 +511,19 @@ impl ForwardBody {
             .expect("请求尚未结束")
             .finish(phase, body_complete);
     }
+}
+
+fn identity_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|codings| {
+                codings
+                    .split(',')
+                    .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+            })
+        })
 }
 
 fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {

@@ -1,7 +1,11 @@
 use axum::http::Method;
 use serde_json::Value;
 
-use super::protocol::{Protocol, Usage};
+use super::{
+    instructions::Format,
+    protocol::{Protocol, Usage},
+    transcript::Output,
+};
 
 const MAX_SSE_EVENT: usize = 1024 * 1024;
 const MAX_JSON: usize = 16 * 1024 * 1024;
@@ -11,6 +15,7 @@ pub(super) struct ObservedUsage {
     pub usage: Usage,
     pub model: Option<String>,
     pub raw: serde_json::Map<String, Value>,
+    pub output: Option<Output>,
 }
 
 pub(super) struct UsageReader {
@@ -49,6 +54,14 @@ impl UsageReader {
         }
     }
 
+    pub(super) fn capture_output(&mut self, format: Format) {
+        self.observed.output = Some(Output::new(format));
+    }
+
+    pub(super) fn output(&self) -> Option<&Output> {
+        self.observed.output.as_ref()
+    }
+
     pub(super) fn push(&mut self, chunk: &[u8]) {
         if !self.stream {
             if self.pending.len() + chunk.len() > MAX_JSON {
@@ -83,7 +96,11 @@ impl UsageReader {
         };
         if line.is_empty() {
             let mut data = std::mem::take(&mut self.event_data);
-            if !std::mem::take(&mut self.skipped) {
+            if std::mem::take(&mut self.skipped) {
+                if let Some(output) = &mut self.observed.output {
+                    output.mark_truncated();
+                }
+            } else {
                 if self.protocol == Protocol::Codex && data.trim_ascii() == b"[DONE]" {
                     self.terminal = true;
                 } else if let Ok(event) = serde_json::from_slice::<Value>(&data) {
@@ -109,6 +126,9 @@ impl UsageReader {
     }
 
     fn read_event(&mut self, event: &Value) {
+        if let Some(output) = &mut self.observed.output {
+            output.read_event(event);
+        }
         match (self.protocol, event["type"].as_str()) {
             (
                 Protocol::Codex,
@@ -172,8 +192,17 @@ impl UsageReader {
             && let Ok(response) = serde_json::from_slice::<Value>(&self.pending)
         {
             self.read_response(&response);
+            if let Some(output) = &mut self.observed.output {
+                output.read_json(&response);
+            }
             self.terminal = true;
             self.failed = response["type"] == "error" || response["status"] == "failed";
+        }
+        if let Some(output) = &mut self.observed.output {
+            if self.skipped {
+                output.mark_truncated();
+            }
+            output.finish(body_complete && self.terminal);
         }
         self.observed.usage.complete = self.terminal
             && (self.protocol != Protocol::Claude || !self.stream || self.final_output_reported)

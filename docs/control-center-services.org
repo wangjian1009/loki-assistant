@@ -760,6 +760,7 @@ Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_
 | PUT | ~/llm/clients/{id}~ | 提交新的 ~upstream~ 并更新客户端配置 |
 | DELETE | ~/llm/clients/{id}~ | 删除客户端配置并撤销令牌，保留历史用量 |
 | GET | ~/llm/requests~ | 只读查询在途请求与最近结束的推理请求 |
+| GET | ~/llm/requests/{id}~ | 查询单条实时请求详情与已采集的系统指令 |
 | GET | ~/llm/usage~ | 按客户端 ID 和供应商读取累计用量 |
 | GET | ~/llm/usage/sessions~ | 按客户端 ID、供应商和会话标识读取累计用量 |
 
@@ -768,6 +769,8 @@ Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_
 ~GET /llm/usage~ 每行返回 ~client_id~ 、 ~upstream~ 、 ~input_tokens~ 、 ~output_tokens~ 、 ~requests~ 和 ~incomplete_requests~ 。汇总累计已报告的用量，~incomplete_requests~ 表示其中有多少请求缺少完整用量。新明细保存到配置目录的 ~llm-usage.sqlite3~ 。~storage_error~ 表示最近一次持久化失败。
 
 ~GET /llm/requests~ 从用量任务读取在途请求，并合并待落盘和 SQLite 中最近结束的推理请求。字段和排序见 [[file:llm-usage-storage.org::*实时请求][实时请求接口]]。
+
+~GET /llm/requests/{id}~ 查询单条在途或最近结束请求的详情，以及本机内存中的系统指令、输入、工具定义和响应内容。响应禁止缓存。采集字段与保留范围见 [[file:llm-usage-storage.org::*实时请求][实时请求接口]]。
 
 ** 会话标识
 

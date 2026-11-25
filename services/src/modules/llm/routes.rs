@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     Json,
@@ -10,10 +10,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use loki_services_macros::loki_api;
+use serde::Serialize;
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
-    history::{Error as HistoryError, OptionsQuery, RequestsQuery, SummaryQuery},
+    history::{Dimension, Error as HistoryError, OptionsQuery, RequestsQuery, SummaryQuery},
     monitor::{SessionQuery, UsageReport},
     protocol::{Binding, Client, Protocol, SessionUsageRow, UsageRow, error},
     service::LlmService,
@@ -173,13 +175,35 @@ async fn revoke_client(
 )]
 async fn requests(
     State(service): State<Arc<LlmService>>,
-) -> Result<Json<serde_json::Value>, Response> {
-    service
-        .monitor
-        .requests()
-        .await
-        .map(Json)
-        .map_err(usage_error)
+) -> Result<Json<NamedUsage<Value>>, Response> {
+    let report = service.monitor.requests().await.map_err(usage_error)?;
+    Ok(named_usage(&service, report).await)
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "request-detail",
+    method = "GET",
+    path = "/llm/requests/{id}",
+    summary = "查询实时请求详情",
+    description = "返回在途或最近结束请求的元数据、输入、工具定义和响应内容。"
+)]
+async fn request_detail(
+    State(service): State<Arc<LlmService>>,
+    Path(id): Path<String>,
+) -> Response {
+    let result = async {
+        let id = Uuid::parse_str(&id).map_err(|_| usage_error(HistoryError::Invalid))?;
+        let mut report = service.monitor.live_detail(id).await.map_err(usage_error)?;
+        add_client_name(&mut report["item"], &service.client_names().await);
+        Ok::<_, Response>(Json(report))
+    };
+    let response = match result.await {
+        Ok(body) => body.into_response(),
+        Err(error) => error,
+    };
+    ([(header::CACHE_CONTROL, "no-store")], response).into_response()
 }
 
 #[loki_api(
@@ -191,8 +215,8 @@ async fn requests(
     summary = "查询代理用量",
     description = "按客户端令牌对应的公开 ID 和供应商汇总输入、输出 token 及用量不完整的请求数。"
 )]
-async fn usage(State(service): State<Arc<LlmService>>) -> Json<UsageReport<UsageRow>> {
-    Json(service.monitor.usage().await)
+async fn usage(State(service): State<Arc<LlmService>>) -> Json<NamedUsage<UsageReport<UsageRow>>> {
+    named_usage(&service, service.monitor.usage().await).await
 }
 
 #[loki_api(
@@ -207,13 +231,13 @@ async fn usage(State(service): State<Arc<LlmService>>) -> Json<UsageReport<Usage
 async fn session_usage(
     State(service): State<Arc<LlmService>>,
     query: Result<Query<SessionQuery>, QueryRejection>,
-) -> Result<Json<UsageReport<SessionUsageRow>>, Response> {
-    service
+) -> Result<Json<NamedUsage<UsageReport<SessionUsageRow>>>, Response> {
+    let report = service
         .monitor
         .session_usage(usage_query(query)?)
         .await
-        .map(Json)
-        .map_err(usage_error)
+        .map_err(usage_error)?;
+    Ok(named_usage(&service, report).await)
 }
 
 #[loki_api(
@@ -228,13 +252,21 @@ async fn session_usage(
 async fn usage_history(
     State(service): State<Arc<LlmService>>,
     query: Result<Query<RequestsQuery>, QueryRejection>,
-) -> Result<Json<serde_json::Value>, Response> {
-    service
+) -> Result<Json<NamedUsage<Value>>, Response> {
+    let mut report = service
         .monitor
         .history(usage_query(query)?)
         .await
-        .map(Json)
-        .map_err(usage_error)
+        .map_err(usage_error)?;
+    let items = report["items"].as_array_mut().expect("历史记录应为数组");
+    let client_names = service.client_names().await;
+    for item in items {
+        add_client_name(item, &client_names);
+    }
+    Ok(Json(NamedUsage {
+        report,
+        client_names,
+    }))
 }
 
 #[loki_api(
@@ -251,12 +283,9 @@ async fn usage_detail(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let id = Uuid::parse_str(&id).map_err(|_| usage_error(HistoryError::Invalid))?;
-    service
-        .monitor
-        .detail(id)
-        .await
-        .map(Json)
-        .map_err(usage_error)
+    let mut report = service.monitor.detail(id).await.map_err(usage_error)?;
+    add_client_name(&mut report["item"], &service.client_names().await);
+    Ok(Json(report))
 }
 
 #[loki_api(
@@ -271,13 +300,13 @@ async fn usage_detail(
 async fn usage_summary(
     State(service): State<Arc<LlmService>>,
     query: Result<Query<SummaryQuery>, QueryRejection>,
-) -> Result<Json<serde_json::Value>, Response> {
-    service
+) -> Result<Json<NamedUsage<Value>>, Response> {
+    let report = service
         .monitor
         .summary(usage_query(query)?)
         .await
-        .map(Json)
-        .map_err(usage_error)
+        .map_err(usage_error)?;
+    Ok(named_usage(&service, report).await)
 }
 
 #[loki_api(
@@ -293,12 +322,32 @@ async fn usage_options(
     State(service): State<Arc<LlmService>>,
     query: Result<Query<OptionsQuery>, QueryRejection>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    service
-        .monitor
-        .options(usage_query(query)?)
-        .await
-        .map(Json)
-        .map_err(usage_error)
+    let query = usage_query(query)?;
+    let clients = matches!(query.dimension, Dimension::ClientId);
+    let mut report = service.monitor.options(query).await.map_err(usage_error)?;
+    if clients {
+        report["client_names"] = serde_json::json!(service.client_names().await);
+    }
+    Ok(Json(report))
+}
+
+#[derive(Serialize)]
+struct NamedUsage<Report> {
+    #[serde(flatten)]
+    report: Report,
+    client_names: BTreeMap<String, String>,
+}
+
+async fn named_usage<Report>(service: &LlmService, report: Report) -> Json<NamedUsage<Report>> {
+    Json(NamedUsage {
+        report,
+        client_names: service.client_names().await,
+    })
+}
+
+fn add_client_name(item: &mut Value, names: &BTreeMap<String, String>) {
+    let name = item["client_id"].as_str().and_then(|id| names.get(id));
+    item["client_name"] = serde_json::json!(name);
 }
 
 fn usage_query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, Response> {

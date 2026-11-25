@@ -24,6 +24,11 @@
   :group 'applications
   :prefix "loki-assistant-")
 
+(defun loki-assistant--mode-line-keys (shortcuts &optional help-key)
+  "格式化状态栏快捷键 SHORTCUTS，HELP-KEY 默认为问号。"
+  (concat " · C-c C-q 退出  " (or help-key "?") " 帮助"
+          (when shortcuts (concat "  " shortcuts))))
+
 (autoload 'loki-assistant-logs "loki-assistant-log" "浏览 Loki Assistant 日志。" t)
 (autoload 'loki-assistant-config "loki-assistant-config"
   "打开 services 配置管理界面。" t)
