@@ -59,5 +59,29 @@
                                 (loki-assistant-llm-usage--state)))
                        '("new")))))))
 
+(ert-deftest loki-assistant-llm-usage-test-live-displays-null-and-reported-usage ()
+  (with-temp-buffer
+    (loki-assistant-llm-usage-mode)
+    (cl-letf (((symbol-function 'loki-assistant-request)
+               (lambda (method path &rest options)
+                 (should (equal method "GET"))
+                 (should (equal path "/llm/requests"))
+                 (funcall
+                  (plist-get options :callback)
+                  '(:ok t :data
+                    ((active . [((id . "active") (phase . "responding")
+                                 (usage . :null))])
+                     (recent . [((id . "recent") (phase . "completed")
+                                 (usage . ((output_tokens . 0) (complete . t))))])))))))
+      (call-interactively (key-binding (kbd "5")))
+      (should (equal (mapcar #'car tabulated-list-entries) '("active" "recent")))
+      (let ((active (cadar tabulated-list-entries))
+            (recent (cadadr tabulated-list-entries)))
+        (should (equal (aref active 3) "接收响应"))
+        (should (equal (aref active 6) "—"))
+        (should (equal (aref active 7) "—"))
+        (should (equal (aref recent 6) "0"))
+        (should (equal (aref recent 7) "完整"))))))
+
 (provide 'loki-assistant-llm-usage-tests)
 ;;; loki-assistant-llm-usage-tests.el ends here
