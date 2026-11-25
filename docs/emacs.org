@@ -2,7 +2,7 @@
 
 * 已实现能力
 
-~loki-assistant~ 提供 Customize 风格的服务配置管理界面，支持异步访问 services HTTP API，并向指定通知处理器发送目标 buffer、标题、可选正文和应用标识。~Package-Requires~ 声明 Emacs 27.1 及 Logview 0.19.3 的最低版本， ~make emacs-load~ 会通过 ~package.el~ 安装缺失依赖。
+~loki-assistant~ 提供 Customize 风格的服务配置管理界面，支持异步访问 services HTTP API，并向指定通知处理器发送目标 buffer、标题、可选正文和应用标识。~Package-Requires~ 声明最低版本为 Emacs 29.1、Logview 0.19.3 和 AgentShell 0.94.1。~make emacs-load~ 会通过 ~package.el~ 安装缺失依赖，安装 AgentShell 时可从 MELPA 获取。
 
 先按 [[file:../README.org::*快速开始][快速开始]] 启动 services；默认处理器的系统通知还需要菜单栏应用。加载与测试入口见 [[file:../README.org::*开发操作][开发操作]]。持久配置可将仓库的 ~emacs/~ 绝对路径加入 ~load-path~ ，再加载包：
 

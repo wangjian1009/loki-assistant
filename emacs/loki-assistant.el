@@ -1,7 +1,7 @@
 ;;; loki-assistant.el --- Loki Assistant 的 Emacs 入口 -*- lexical-binding: t; -*-
 
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1") (logview "0.19.3"))
+;; Package-Requires: ((emacs "29.1") (logview "0.19.3") (agent-shell "0.94.1"))
 ;; Keywords: convenience
 
 ;;; Commentary:

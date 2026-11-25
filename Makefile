@@ -72,6 +72,8 @@ emacs-deps:
 	      (let ((package-archives (copy-tree package-archives))) \
 	        (unless (assoc \"nongnu\" package-archives) \
 	          (push '(\"nongnu\" . \"https://elpa.nongnu.org/nongnu/\") package-archives)) \
+	        (when (and (assq 'agent-shell missing) (not (assoc \"melpa\" package-archives))) \
+	          (push '(\"melpa\" . \"https://melpa.org/packages/\") package-archives)) \
 	        (package-read-all-archive-contents) \
 	        (package-download-transaction \
 	         (or (ignore-errors (package-compute-transaction nil missing)) \
