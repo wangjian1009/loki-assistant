@@ -1,0 +1,134 @@
+#+TITLE: LLM 用量记录与长期存储设计
+
+* 范围
+
+本文为方案设计，当前运行接口见 [[file:control-center-services.org::*AI 统一代理][AI 统一代理]]。由 ~modules/llm~ 内独立的 Tokio task 接收转发事件、解析用量、写入明细和定期聚合。转发路径负责发送观测事件，继续按请求转发原始响应。选用单个 SQLite 数据库，使用 WAL、批量事务和只读连接。明细是长期保存的数据，日报是可重建的查询结果。
+
+* 转发与统计任务
+
+| 事件 | 发送时机 | 字段 |
+|------+----------+------|
+| ~Started~ | 选定上游后 | Loki 请求 ID、客户端 ID、实际上游 ID、协议、开始时间、请求方法及路径后缀 |
+| ~Headers~ | 收到上游响应头 | 请求 ID、HTTP 状态及观察所需的 ~Content-Type~ 和 ~Content-Encoding~ |
+| ~BodyBytes~ | 转交响应正文数据块时 | 请求 ID、原始数据块 |
+| ~Finished~ | 正文读完、上游失败或客户端断开 | 请求 ID、结束时间、结果、首包及总耗时、观测是否缺段 |
+
+- 转发入口用 ~mpsc::Sender::try_send~ 投递响应数据块。在登记 ~Started~ 前，先为该请求预留一个 ~Finished~ 的队列槽位。两者使用同一个有界 FIFO，统计任务先收到已投递的数据块，再收到终态。请求守卫在正常返回或被取消时发送一次 ~Finished~ 。
+- 首版以 1,024 个队列槽位和 16 MiB 正文预算为起点。正文按实际保留的字节计费，统计任务取出数据后释放预算。队列或预算满时，停止采集该请求后续正文，终态标记观测缺段。连起始事件也无法登记时，增加 ~unobserved_requests~ 计数。请求继续转发，统计查询通过状态字段显示缺口。
+- 统计任务根据事件解析 JSON、Responses SSE 或 Claude SSE，维护各请求的临时解析状态和全局内存上限。Claude 通常在 ~message_start~ 提供输入，在 ~message_delta~ 更新累计输出，同一字段取最后一次上报的值。只把提取的 ~usage~ 、可选模型名和请求元数据写入数据库。原始正文仅在提取期间经过内存。当前请求仍可由同一任务维护内存状态供监控查询。
+- 用量缺字段、传输中断或观察缺段时，终态保留已知数值并标记 ~incomplete~ 。缺失字段存 ~NULL~ ，明确上报的零存 ~0~ 。传输结果与用量完整性各用独立字段。供应商归属固定为请求开始时的选路结果。
+- Tokio task 负责接收、组批、定时和恢复调度。SQLite 同步 I/O 在 ~spawn_blocking~ 中串行执行，由同一个 task 调度唯一写连接。查询使用独立只读连接。关闭时序见 [[*进程退出][进程退出]]。
+
+* 存储结构
+
+数据库建议放在 =~/.assistant/llm-usage.sqlite3= 。~usage_event~ 仅追加，每个达到终态的已登记推理请求对应一行，重复请求 ID 保留首条已提交记录。输入 token 规范化为三个互斥分项 ~input_uncached_tokens~、~cache_read_tokens~ 和 ~cache_write_tokens~ 。OpenAI Responses 的缓存读取包含在输入中，归一化时扣除一次。Claude 的缓存读写独立上报。~raw_usage_json~ 只存上游报告的用量字段，以便公式变化后重算。响应未提供模型名时，索引列使用空字符串表示未知分组。
+
+明细存 UTC 毫秒，以请求完成时间归入报表日。日报用固定报表时区计算 ~report_day~ ，首版默认 ~Asia/Shanghai~ 。切换报表时区时从明细重建日报。日期过滤使用左闭右开区间，便于分页和跨日拼接。~input_reported_tokens~ 保存上游原始输入计数，供旧接口保持统计口径。SQLite 用 ~PRAGMA user_version~ 记录表结构版本，~normalization_version~ 记录单行用量采用的归一化版本。
+
+#+begin_src sql
+CREATE TABLE usage_event (
+    seq INTEGER PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    client_id TEXT NOT NULL,
+    upstream_id TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    finished_at_ms INTEGER NOT NULL,
+    report_day TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    upstream_status INTEGER,
+    first_byte_ms INTEGER,
+    duration_ms INTEGER NOT NULL,
+    input_reported_tokens INTEGER,
+    input_uncached_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    output_tokens INTEGER,
+    incomplete INTEGER NOT NULL CHECK (incomplete IN (0, 1)),
+    raw_usage_json TEXT,
+    normalization_version INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX usage_event_time
+    ON usage_event (finished_at_ms DESC, seq DESC);
+
+CREATE INDEX usage_event_client_upstream_time
+    ON usage_event (client_id, upstream_id, finished_at_ms DESC, seq DESC);
+
+CREATE TABLE usage_daily (
+    report_day TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    upstream_id TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL,
+    incomplete_requests INTEGER NOT NULL,
+    input_reported_tokens INTEGER NOT NULL,
+    input_uncached_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    PRIMARY KEY (report_day, client_id, upstream_id, protocol, model)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE usage_checkpoint (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    through_seq INTEGER NOT NULL
+) STRICT;
+
+INSERT INTO usage_checkpoint (id, through_seq) VALUES (1, 0);
+
+CREATE TABLE usage_legacy_total (
+    client_id TEXT NOT NULL,
+    upstream_id TEXT NOT NULL,
+    input_reported_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    requests INTEGER NOT NULL,
+    incomplete_requests INTEGER NOT NULL,
+    PRIMARY KEY (client_id, upstream_id)
+) STRICT, WITHOUT ROWID;
+#+end_src
+
+日报数值是各分项已知值之和，~incomplete_requests~ 提示该行存在未完整计量的请求。请求完成后才生成明细。模型列表和 token 估算仍可进入运行监控。它们的接口调用独立于推理用量聚合。
+
+下面两条明细的输入总量相同。OpenAI Responses 上报的 120 个输入已经包含 80 个缓存读取，Claude 分别上报 30 个未缓存输入、80 个缓存读取和 10 个缓存写入。
+
+| 协议 | 原始输入 | 未缓存输入 | 缓存读取 | 缓存写入 | 输出 |
+|------+----------+------------+----------+----------+------|
+| Codex | 120 | 40 | 80 | 0 | 10 |
+| Claude | 30 | 30 | 80 | 10 | 10 |
+
+在 OpenAI Responses 的归一化规则中，协议无独立缓存写入字段，该分项计为 ~0~ 。其他未上报且无法确定的分项保存为 ~NULL~ 。~raw_usage_json~ 保存对应协议实际返回的用量字段，例如 OpenAI 的 ~input_tokens_details.cached_tokens~ 。明细只保留采集到的字段及上游 ID，认证令牌和对话内容留在转发链路。
+
+* 增量写入、合并和保留
+
+1. 统计任务达到 128 条终态记录或最旧记录等待 250 ms 时提交事务。写连接使用 WAL 和 ~synchronous=FULL~ ，将落盘开销分摊到批次。重复 ~request_id~ 用 ~ON CONFLICT(request_id) DO NOTHING~ 处理。数据库暂时不可写时，保留待提交批次并退避重试。重试积压达到内存上限时停止接收新的用量观测，并公开存储错误、积压与观测缺口。
+2. 定时器每 60 秒合并一批，并在启动时补做。单次事务读取水位 ~through_seq~ ，取至多 10,000 条更大的 ~seq~ ，按日报主键组合聚合后 ~UPSERT~ ，再将水位推进到本批最大 ~seq~ 。聚合和推进水位同事务提交，断电后重跑有同样的汇总结果。迟到明细使用它自己的日期，仍由更大的 ~seq~ 纳入合并。积压由后续小批次追赶，期间可继续提交新明细。
+3. 长期保留全部明细和原始用量字段。在低流量时检查点 WAL，结合文件尺寸和写入量监控容量。数据库备份使用 SQLite Online Backup API 生成一致快照。聚合口径变更时从 ~raw_usage_json~ 重新提取并构建新的日报，重建完成后原子切换。正常维护使用增量聚合，完整重建属于显式维护操作。
+
+* 查询与兼容
+
+- 明细查询按 ~finished_at_ms DESC, seq DESC~ 排序，游标为上一页最后一行的这两个字段，避免 ~OFFSET~ 随页数增长。首版索引覆盖全局最近请求以及客户端加上游的时间区间查询。按实际查询频率再评估单独的上游索引。
+- 日报和月报扫描 ~usage_daily~ 的日期区间。实时结果在同一个只读快照里合并 ~seq > through_seq~ 的明细尾部，因此最近已提交的记录在下一次聚合前即可查询。月报在日报结果上按月聚合。聚合水位滞后时，报表暴露待合并行数，查询成本由日报行数和尾部长度决定。
+- 保留 ~GET /llm/usage~ 的累计查询语义。首次迁移把旧 ~llm-usage.json~ 按客户端和上游导入 ~usage_legacy_total~ ，与推进数据库结构版本同事务提交。旧数据能计入原字段的累计查询。按日期、模型、缓存分项的历史从第一条新明细开始。兼容的 ~input_tokens~ 对应 ~input_reported_tokens~ 的累计值，日报使用三个输入分项。
+- SQLite 查询最多只占用短时只读事务。返回聚合水位、最近成功落盘时间、队列积压与观测缺口，便于解释统计延迟。~unobserved_requests~ 至少在进程内更新，恢复写入后再与落盘记录一起持久化。长时间写入故障期间异常退出可能丢失尚未持久化的缺口计数。
+
+* 进程退出
+
+~main.rs~ 统一处理 ~SIGTERM~、~Ctrl-C~ 和 HTTP 服务异常返回。当前本机 Homebrew LaunchAgent 的 ~exit timeout~ 为 5 秒，方案以收到退出信号时的单调时钟为起点，内部总预算为 4 秒。以下时序为待实现设计。
+
+1. *先发退出消息。* 关闭新请求的准入，触发 Axum 的 ~with_graceful_shutdown~ 。通过独立控制通道向统计 task 发送 ~Shutdown~ 和确认发送端，同时通知网络入口和扩展任务停止接收或启动新工作。统计 task 收到 ~Shutdown~ 后进入排空阶段，继续接收已登记请求的 ~BodyBytes~ 和 ~Finished~ 。控制消息使用一次性通道，观测队列即使已满也能收到退出通知。
+2. *再限时等待。* 已进入的 HTTP 请求最多继续运行 2.5 秒。Axum 停止接受新连接，准入检查拦住已有连接或中转入口尝试发起的新业务请求。达到 2.5 秒时，取消仍在等待上游响应头或转发正文的请求，并关闭对应上游连接。取消通过请求守卫使用已预留的槽位投递 ~Finished~ 。终态记为 ~cancelled~，保留已提取的 token，未取得完整用量则标记 ~incomplete~ 。
+3. *封口并提交。* 等待所有已登记观测的生产者释放请求守卫后，通过一次性通道通知统计 task 可以关闭接收端。task 排空已入队事件，提交最后一批 ~usage_event~ ，关闭写连接，然后发送落盘确认。日报合并任务进入退出流程后不再启动，未合并的已提交记录由下一次启动从 ~through_seq~ 补做。网络和扩展的停止确认在同一全局预算内并行等待。
+4. *收尾并退出。* HTTP 和后台任务结束、统计落盘得到确认后，删除当前进程拥有的服务信息文件，刷出退出日志，再释放实例锁。HTTP 服务异常或最后一批写盘明确失败时记录失败原因，并返回非零退出状态。所有阶段共用同一个截止时间。
+
+取消等待某个 Future 可能只结束等待方，Axum 的连接任务及 ~spawn_blocking~ 中的 SQLite 调用仍可能运行。因此首版计划由独立于 Tokio runtime 的看门狗执行 4 秒硬截止。发出退出通知后启用看门狗，正常收尾完成后解除。到期时以非零状态终止进程，由操作系统释放监听端口和实例锁。已提交事务由 SQLite WAL 恢复。尚未提交的明细可能丢失，下一次启动会覆盖可能残留的服务信息文件。硬截止保障收尾耗时，正常退出以统计 task 的提交确认为准。
+
+验证使用临时端口、临时数据库和模拟上游。短 SSE 在退出消息后继续到终态，核对用量持久化。长 SSE 到期取消，核对已取得的部分用量和终态。队列塞满时退出消息仍应送达。模拟 SQLite 写入卡住时进程应在硬截止内退出，重启后核对已提交明细、水位与退出状态。
+
+* 本机样本验证
+
+用 SQLite 3.54.1 写入 100 万条模拟明细，包含 16 个客户端、8 个上游和 5 个模型。完成日报合并并截断 WAL 后数据库约 343 MiB。热缓存下，按客户端和上游读取 50 条明细平均约 0.036 ms，单月汇总查询平均约 3.9 ms。这些是直接执行 SQL 的本机样本结果。
+
+查询计划确认明细经复合索引定位，日报和尾部明细分别经日期主键和 ~seq~ 主键查找。样本中重复插入同一请求、合并回滚、重复合并，以及读取尚未合并的明细，均得到相同总量。

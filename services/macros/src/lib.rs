@@ -202,7 +202,7 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
     let method_name = method.value().to_ascii_lowercase();
     if !matches!(
         method_name.as_str(),
-        "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "any"
     ) {
         return syn::Error::new(method.span(), "不支持自动挂载此 HTTP 方法")
             .to_compile_error()

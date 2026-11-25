@@ -18,6 +18,7 @@
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
 | ~modules/doc~ | 提交网页全文、按 Org ID 查询文档和管理稍后阅读 | 已实现 |
+| ~modules/llm~ | 转发 Codex 和 Claude HTTP 请求，管理本机客户端绑定及用量 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
 | ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
 | ~modules/mail~ | 同步 Maildir、更新 mu 索引、通知新邮件及转交 Emacs 撰写草稿 | 已实现 |
@@ -723,6 +724,44 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 
 首次发布或实际变更时，状态更新后向通知模块提交 ~app~ 、 ~title~ 、 ~body~ 和 ~callback_url~ 。告警发布接口在状态更新后即可返回。通知模块负责后台发送与回执重试。相同内容重发和清理无需触发通知。
 
+* AI 统一代理
+
+~llm~ 模块与 services 共用本机 loopback 监听地址。供应商、客户端管理、请求监控和用量查询均限本机。客户端地址使用 services 实际监听的主机和端口。
+
+逐请求用量存储、定期聚合和查询方案见 [[file:llm-usage-storage.org][LLM 用量记录与长期存储设计]]。
+
+| 客户端 | 客户端基础 URI 路径 | 代理路径 |
+|--------+---------------------+----------|
+| Codex | ~/llm/codex/v1~ | ~/llm/codex/v1/{*path}~ |
+| Claude Code | ~/llm/claude~ | ~/llm/claude/v1/{*path}~ |
+
+Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_api = "responses"~ 和 ~supports_websockets = false~ 。Claude Code 使用 ~ANTHROPIC_BASE_URL~ 和 ~ANTHROPIC_API_KEY~ 。Codex 通过 ~Authorization: Bearer <token>~ 认证，Claude 也接受 ~x-api-key~ 。
+
+代理逐请求读取供应商绑定，把 HTTP 方法、路径后缀、查询参数和原始正文传给上游。模型由客户端选择，~model~ 随请求原样传递。代理替换鉴权头并按 HTTP 转发规则处理逐跳头和消息边界。上游状态码、正文和 SSE 数据原样返回。代理自身的错误使用 services 的标准错误结构。
+
+** 配置供应商
+
+通过 ~GET /meta/llm~ 读取供应商字段。用 ~PUT /data/llm/providers/{id}~ 添加供应商，用 ~PATCH~ 更新所需字段。~codex_uri~ 和 ~claude_uri~ 都填写对应协议的版本化基础 URI，例如 =https://api.openai.com/v1= 和 =https://api.anthropic.com/v1= 。同一供应商可以配置两个 URI。省略某个 URI 或将其清空表示该供应商不支持对应协议。
+
+~codex_api_key~ 和 ~claude_api_key~ 是可选的配置密码字段，经配置中心保存到本机 pass 密码库。配置值只保存其引用。代理向 Codex 上游发送 ~Authorization: Bearer~ ，向 Claude 上游发送 ~x-api-key~ 。上游收到的是供应商凭据。
+
+** 管理客户端和查看用量
+
+| 方法 | 路径 | 用途 |
+|------+------|------|
+| POST | ~/llm/clients~ | 提交 ~{"upstream":"work"}~ ，响应中的 ~client.token~ 是签发的客户端令牌 |
+| GET | ~/llm/clients~ | 列出客户端 ID 和供应商 |
+| PUT | ~/llm/clients/{id}~ | 提交新的 ~upstream~ ，替换供应商绑定 |
+| DELETE | ~/llm/clients/{id}~ | 撤销令牌，已累计的用量仍可通过客户端 ID 查询 |
+| GET | ~/llm/requests~ | 查询正在等待或流式输出的请求，以及最近 100 条终态记录 |
+| GET | ~/llm/usage~ | 按客户端 ID 和供应商读取累计用量 |
+
+每个客户端令牌对应一个供应商。明文令牌只在签发响应中交付，配置保存其摘要。切换写入成功后，新请求使用新绑定，已发出的请求及其用量归原供应商。
+
+用量观察独立于转发。统计从 ~POST~ 响应中旁路读取 ~input_tokens~ 和 ~output_tokens~ 。Codex 流读取终态事件的 ~response.usage~ ，Claude 流读取 ~message_start~ 和 ~message_delta~ 中的累计值。模型列表和输入 token 估算只计入请求监控。响应缺字段、流在报告终态前中断，或压缩及大小限制使字段无法读取时，记录中将 ~usage.complete~ 置为 ~false~ ，同时保留能读取的计数。用量读取上限为单条 SSE 事件 1 MiB 和非流式正文 16 MiB。
+
+~GET /llm/usage~ 每行返回 ~client_id~ 、 ~upstream~ 、 ~input_tokens~ 、 ~output_tokens~ 、 ~requests~ 和 ~incomplete_requests~ 。汇总累计已报告的用量，~incomplete_requests~ 表示其中有多少请求缺少完整用量。汇总保存到配置目录的 ~llm-usage.json~ 。~storage_error~ 表示最近一次持久化失败。
+
 * 邮件模块
 
 ~mail/enabled~ 默认为 ~false~ 。开启后立即执行首次同步，每轮结束五分钟后再次执行。关闭后当前轮次结束即停止定时任务。~mail/mbsync_config~ 默认为 ~~/.mbsyncrc~ ，其中的 ~loki-auto~ 组决定要同步的邮箱和文件夹。
@@ -1007,5 +1046,7 @@ services 通过独立参数调用 ~/usr/bin/open -g~ ，将通知 JSON 编码到
 services 自身由 Homebrew formula ~loki-assistant/local/loki-assistant-services~ 管理，注册与注销由根目录 ~make install-service~ 和 ~make uninstall-service~ 编排。安装当前本机构建后可直接通过 ~brew services list~ 和 ~brew services info loki-assistant-services~ 查看状态；更换源码后通过 ~make restart-service~ 更新构建并重启。具体操作与环境配置集中维护在 [[file:../services/README.org::*macOS 服务管理][services README]]。
 
 安装成功后清理旧的 ~cc.loki-assistant.services~ 自管 LaunchAgent，Rust binary 不再提供安装、卸载或启停该任务的 CLI。SIGTERM 和 Ctrl-C 共用服务关闭流程。托盘状态只依赖服务锁、pfile 和 HTTP 健康检查，不解释 Homebrew 任务名称，也不提供 services 启停按钮。
+
+退出消息、在途 HTTP 请求的排空顺序和退出超时见 [[file:llm-usage-storage.org::*进程退出][进程退出设计]]。
 
 托盘自己的 ~cc.loki-assistant.center~ 登录启动仍由控制中心配置处理器管理，和 Homebrew 服务管理相互独立。

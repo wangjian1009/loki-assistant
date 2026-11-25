@@ -7,6 +7,7 @@ pub mod discover;
 pub mod doc;
 pub mod emacs;
 pub mod health;
+pub mod llm;
 mod mail;
 pub mod network;
 pub mod notification;

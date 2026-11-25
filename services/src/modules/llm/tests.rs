@@ -1,0 +1,620 @@
+use std::{convert::Infallible, fs, path::PathBuf, sync::Arc, time::Duration};
+
+use axum::{
+    Json, Router,
+    body::{Body, Bytes, to_bytes},
+    extract::OriginalUri,
+    http::{HeaderMap, Method, Request, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use futures_util::{StreamExt, stream};
+use serde_json::{Value, json};
+use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle, time::timeout};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use super::{
+    Monitor, config::notification_router, protocol::Protocol, service::LlmService,
+    usage::UsageReader,
+};
+use crate::{
+    modules::{
+        config::{self, service::ConfigService},
+        password::service::{
+            CommandFuture, CommandOutput, CommandRunner, PasswordEnvironment, PasswordService,
+        },
+    },
+    runtime::RuntimeState,
+};
+
+const CODEX_FIRST: &str =
+    "event: response.created\r\ndata: {\"type\":\"response.created\"}\r\n\r\n";
+const CODEX_LAST: &str = "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}}\r\n\r\n";
+const CLAUDE_STREAM: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":23,\"output_tokens\":1,\"cache_read_input_tokens\":8}}}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
+async fn invoke(
+    app: &Router,
+    method: Method,
+    path: &str,
+    auth: Option<(&str, &str)>,
+    body: Option<Value>,
+) -> Response {
+    let mut request = Request::builder().method(method).uri(path);
+    if let Some((name, value)) = auth {
+        request = request.header(name, value);
+    }
+    let body = match body {
+        Some(value) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    timeout(
+        Duration::from_secs(5),
+        app.clone().oneshot(request.body(body).unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+async fn json_body(response: Response) -> Value {
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&bytes)))
+}
+
+async fn provider(app: &Router, id: &str, record: Value) {
+    let response = invoke(
+        app,
+        Method::PUT,
+        &format!("/data/llm/providers/{id}"),
+        None,
+        Some(record),
+    )
+    .await;
+    let status = response.status();
+    let body = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn issue(app: &Router, upstream: &str) -> (String, String) {
+    let response = invoke(
+        app,
+        Method::POST,
+        "/llm/clients",
+        None,
+        Some(json!({ "upstream": upstream })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = json_body(response).await;
+    (
+        body["client"]["id"].as_str().unwrap().into(),
+        body["client"]["token"].as_str().unwrap().into(),
+    )
+}
+
+async fn serve(app: Router) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), task)
+}
+
+fn sse(body: Body) -> Response {
+    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+}
+
+#[tokio::test]
+async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
+    let gate = Arc::new(Semaphore::new(0));
+    let response_gate = gate.clone();
+    let (upstream, server) = serve(
+        Router::new()
+            .route(
+                "/codex/v1/responses",
+                post(move |headers: HeaderMap, Json(request): Json<Value>| {
+                    let gate = response_gate.clone();
+                    async move {
+                        assert!(!headers.contains_key(header::AUTHORIZATION));
+                        assert_eq!(
+                            request,
+                            json!({"model":"codex-model","input":"测试","stream":true})
+                        );
+                        let first = stream::once(async {
+                            Ok::<_, Infallible>(Bytes::from_static(CODEX_FIRST.as_bytes()))
+                        });
+                        let last = stream::once(async move {
+                            gate.acquire().await.unwrap().forget();
+                            Ok(Bytes::from_static(CODEX_LAST.as_bytes()))
+                        });
+                        sse(Body::from_stream(first.chain(last)))
+                    }
+                }),
+            )
+            .route(
+                "/claude/v1/messages",
+                post(
+                    |headers: HeaderMap,
+                     OriginalUri(uri): OriginalUri,
+                     Json(request): Json<Value>| async move {
+                        assert!(!headers.contains_key("x-api-key"));
+                        assert_eq!(uri.query(), Some("beta=true"));
+                        assert_eq!(headers["anthropic-version"], "2023-06-01");
+                        assert_eq!(request, json!({"model":"claude-model","stream":true}));
+                        sse(Body::from(CLAUDE_STREAM))
+                    },
+                ),
+            )
+            .route(
+                "/claude/v1/messages/count_tokens",
+                post(|Json(request): Json<Value>| async move {
+                    assert_eq!(request, json!({}));
+                    Json(json!({"input_tokens":99}))
+                }),
+            ),
+    )
+    .await;
+
+    let app = crate::http::router(Arc::new(RuntimeState::default()));
+    provider(
+        &app,
+        "a",
+        json!({ "codex_uri": format!("{upstream}/codex/v1/") }),
+    )
+    .await;
+    provider(
+        &app,
+        "b",
+        json!({ "claude_uri": format!("{upstream}/claude/v1") }),
+    )
+    .await;
+    let (id, token) = issue(&app, "a").await;
+    let bearer = format!("Bearer {token}");
+    let response = invoke(
+        &app,
+        Method::POST,
+        "/llm/codex/v1/responses",
+        Some(("authorization", &bearer)),
+        Some(json!({"model":"codex-model","input":"测试","stream":true})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut old_stream = response.into_body().into_data_stream();
+    assert_eq!(
+        timeout(Duration::from_secs(3), old_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        CODEX_FIRST
+    );
+    let monitor = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    assert_eq!(monitor["active"][0]["phase"], "streaming");
+    assert_eq!(monitor["active"][0]["upstream"], "a");
+
+    let response = invoke(
+        &app,
+        Method::PUT,
+        &format!("/llm/clients/{id}"),
+        None,
+        Some(json!({"upstream":"b"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = invoke(
+        &app,
+        Method::POST,
+        "/llm/codex/v1/responses",
+        Some(("authorization", &bearer)),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "llm-protocol-unavailable"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/llm/claude/v1/messages?beta=true")
+                .header("x-api-key", &token)
+                .header("anthropic-version", "2023-06-01")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"model":"claude-model","stream":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), 1048576).await.unwrap(),
+        CLAUDE_STREAM
+    );
+    gate.add_permits(1);
+    assert_eq!(old_stream.next().await.unwrap().unwrap(), CODEX_LAST);
+    assert!(old_stream.next().await.is_none());
+
+    let response = invoke(
+        &app,
+        Method::POST,
+        "/llm/claude/v1/messages/count_tokens",
+        Some(("x-api-key", &token)),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(json_body(response).await["input_tokens"], 99);
+    let report = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
+    assert_eq!(
+        report["usage"],
+        json!([
+            {"client_id":id,"upstream":"a","input_tokens":11,"output_tokens":7,"requests":1,"incomplete_requests":0},
+            {"client_id":id,"upstream":"b","input_tokens":23,"output_tokens":5,"requests":1,"incomplete_requests":0}
+        ])
+    );
+    server.abort();
+}
+
+#[derive(Debug)]
+struct FixtureGpg;
+
+impl CommandRunner for FixtureGpg {
+    fn run<'a>(
+        &'a self,
+        _: &'a str,
+        args: &'a [String],
+        input: Option<&'a [u8]>,
+    ) -> CommandFuture<'a> {
+        Box::pin(async move {
+            let stdout = if args.iter().any(|arg| arg == "--show-only-session-key") {
+                b"[GNUPG:] SESSION_KEY 9:1111\n".to_vec()
+            } else if let Some(input) = input {
+                input.to_vec()
+            } else {
+                fs::read(args.last().unwrap()).unwrap()
+            };
+            Ok(CommandOutput {
+                status: Some(0),
+                stdout,
+            })
+        })
+    }
+}
+
+struct Directory(PathBuf);
+
+impl Directory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("loki-llm-test-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Directory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn persistent_router(directory: &Directory) -> (Router, Arc<Router>) {
+    let mut environment = PasswordEnvironment::new("/bin/echo".into(), directory.0.clone());
+    environment.recipients = vec!["fixture".into()];
+    let passwords = Arc::new(PasswordService::with_fixture_runner(
+        Some(environment),
+        Arc::new(FixtureGpg),
+        Duration::from_secs(3),
+    ));
+    let config = ConfigService::load(directory.0.join("config.yml"))
+        .unwrap()
+        .with_password_service(passwords);
+    let config = config::Module::from_service(config);
+    let notifications = Arc::new(notification_router());
+    config.service().attach_notifications(&notifications);
+    let monitor = Monitor::load(directory.0.join("llm-usage.json")).unwrap();
+    let llm = Arc::new(LlmService::new(config.service(), monitor));
+    (config.router().merge(llm.router()), notifications)
+}
+
+#[tokio::test]
+async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
+    let (upstream, server) = serve(
+        Router::new()
+            .route(
+                "/v1/models",
+                get(
+                    |headers: HeaderMap, OriginalUri(uri): OriginalUri| async move {
+                        assert_eq!(headers[header::AUTHORIZATION], "Bearer codex-upstream-key");
+                        assert!(!headers.contains_key("x-api-key"));
+                        assert_eq!(uri.query(), Some("client_version=1"));
+                        Json(json!({"data":[]}))
+                    },
+                ),
+            )
+            .route(
+                "/v1/responses/compact",
+                post(|headers: HeaderMap| async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer codex-upstream-key");
+                    Json(json!({"usage":{"input_tokens":4}}))
+                }),
+            )
+            .route(
+                "/v1/messages",
+                post(|headers: HeaderMap| async move {
+                    assert_eq!(headers["x-api-key"], "claude-upstream-key");
+                    assert!(!headers.contains_key(header::AUTHORIZATION));
+                    Json(json!({"usage":{"input_tokens":31,"output_tokens":0}}))
+                }),
+            ),
+    )
+    .await;
+    let directory = Directory::new();
+    let (app, _notifications) = persistent_router(&directory);
+    let root = format!("{upstream}/v1");
+    provider(
+        &app,
+        "shared",
+        json!({
+            "codex_uri":root,"claude_uri":root,
+            "codex_api_key":"codex-upstream-key","claude_api_key":"claude-upstream-key",
+        }),
+    )
+    .await;
+    let (id, token) = issue(&app, "shared").await;
+    let listed = json_body(invoke(&app, Method::GET, "/llm/clients", None, None).await).await;
+    assert_eq!(listed["clients"], json!([{"id":id,"upstream":"shared"}]));
+    let stored = fs::read_to_string(directory.0.join("config.yml")).unwrap();
+    for secret in [
+        &token,
+        &"codex-upstream-key".to_owned(),
+        &"claude-upstream-key".to_owned(),
+    ] {
+        assert!(!stored.contains(secret));
+    }
+    let updated = invoke(
+        &app,
+        Method::PATCH,
+        "/data/llm/providers/shared",
+        None,
+        Some(json!({"codex_uri":"file:///tmp"})),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bearer = format!("Bearer {token}");
+    let response = invoke(
+        &app,
+        Method::GET,
+        "/llm/codex/v1/models?client_version=1",
+        Some(("authorization", &bearer)),
+        None,
+    )
+    .await;
+    assert_eq!(json_body(response).await, json!({"data":[]}));
+    let response = invoke(
+        &app,
+        Method::POST,
+        "/llm/codex/v1/responses/compact",
+        Some(("authorization", &bearer)),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        json_body(response).await["usage"],
+        json!({"input_tokens":4})
+    );
+    let recent = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    assert_eq!(
+        recent["recent"][0]["usage"],
+        json!({"input_tokens":4,"output_tokens":null,"complete":false})
+    );
+
+    let (restarted, _notifications) = persistent_router(&directory);
+    let response = invoke(
+        &restarted,
+        Method::POST,
+        "/llm/claude/v1/messages",
+        Some(("authorization", &bearer)),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        json_body(response).await["usage"],
+        json!({"input_tokens":31,"output_tokens":0})
+    );
+    let report = json_body(invoke(&restarted, Method::GET, "/llm/usage", None, None).await).await;
+    assert_eq!(report["storage_error"], false);
+    assert_eq!(
+        report["usage"],
+        json!([
+            {"client_id":id,"upstream":"shared","input_tokens":35,"output_tokens":0,"requests":2,"incomplete_requests":1}
+        ])
+    );
+    let response = invoke(
+        &restarted,
+        Method::DELETE,
+        &format!("/llm/clients/{id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = invoke(
+        &restarted,
+        Method::GET,
+        "/llm/codex/v1/models",
+        Some(("authorization", &bearer)),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
+#[test]
+fn parses_split_frames_and_keeps_usage_in_an_interrupted_stream() {
+    let mut usage = UsageReader::new(Protocol::Claude, true);
+    let until_stop = CLAUDE_STREAM.split("event: message_stop").next().unwrap();
+    for byte in until_stop.as_bytes().chunks(1) {
+        usage.push(byte);
+    }
+    let (usage, failed) = usage.finish(false);
+    assert_eq!(usage.input_tokens, Some(23));
+    assert_eq!(usage.output_tokens, Some(5));
+    assert!(!usage.complete);
+    assert!(failed);
+
+    let mut usage = UsageReader::new(Protocol::Codex, true);
+    for chunk in CODEX_LAST.as_bytes().chunks(7) {
+        usage.push(chunk);
+    }
+    let (usage, _) = usage.finish(true);
+    assert!(usage.complete);
+    assert_eq!(usage.input_tokens, Some(11));
+    assert_eq!(usage.output_tokens, Some(7));
+}
+
+#[tokio::test]
+async fn dropping_an_active_stream_preserves_partial_usage() {
+    let first = CLAUDE_STREAM.split("event: message_delta").next().unwrap();
+    let (upstream, server) = serve(Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            let start =
+                stream::once(
+                    async move { Ok::<_, Infallible>(Bytes::from_static(first.as_bytes())) },
+                );
+            sse(Body::from_stream(start.chain(stream::pending())))
+        }),
+    ))
+    .await;
+    let app = crate::http::router(Arc::new(RuntimeState::default()));
+    provider(
+        &app,
+        "claude",
+        json!({"claude_uri": format!("{upstream}/v1")}),
+    )
+    .await;
+    let (id, token) = issue(&app, "claude").await;
+    let response = invoke(
+        &app,
+        Method::POST,
+        "/llm/claude/v1/messages",
+        Some(("x-api-key", &token)),
+        Some(json!({"stream":true})),
+    )
+    .await;
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(
+        timeout(Duration::from_secs(3), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    drop(body);
+
+    let recent = timeout(Duration::from_secs(3), async {
+        loop {
+            let requests =
+                json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+            if requests["recent"][0]["phase"] == "cancelled" {
+                break requests;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(recent["active"], json!([]));
+    assert_eq!(
+        recent["recent"][0]["usage"],
+        json!({"input_tokens":23,"output_tokens":1,"complete":false})
+    );
+    let report = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
+    assert_eq!(
+        report["usage"],
+        json!([
+            {"client_id":id,"upstream":"claude","input_tokens":23,"output_tokens":1,"requests":1,"incomplete_requests":1}
+        ])
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn forwards_an_arbitrary_http_request_without_buffering_or_rewriting_its_body() {
+    const PAYLOAD: &[u8] = b"first\x00second\xff";
+    let first_chunk = Arc::new(Semaphore::new(0));
+    let upstream_first_chunk = first_chunk.clone();
+    let (upstream, server) = serve(Router::new().fallback(
+        move |request: axum::extract::Request| {
+            let first_chunk = upstream_first_chunk.clone();
+            async move {
+                assert_eq!(request.method(), Method::PATCH);
+                assert_eq!(
+                    request.uri().path_and_query().unwrap().as_str(),
+                    "/vendor/v1/files/name%2Fid?key=a%2Bb&key=c"
+                );
+                assert!(!request.headers().contains_key(header::AUTHORIZATION));
+                assert_eq!(
+                    request.headers()[header::CONTENT_TYPE],
+                    "application/octet-stream"
+                );
+                assert_eq!(request.headers()[header::ACCEPT_ENCODING], "gzip");
+                assert_eq!(request.headers()["x-custom"], "keep");
+                assert_eq!(request.headers()[header::COOKIE], "hint=1");
+                let mut bytes = Vec::new();
+                let mut body = request.into_body().into_data_stream();
+                bytes.extend_from_slice(&body.next().await.unwrap().unwrap());
+                first_chunk.add_permits(1);
+                while let Some(chunk) = body.next().await {
+                    bytes.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(bytes, PAYLOAD);
+                (StatusCode::IM_A_TEAPOT, [("x-origin", "upstream")], bytes)
+            }
+        },
+    ))
+    .await;
+    let app = crate::http::router(Arc::new(RuntimeState::default()));
+    provider(
+        &app,
+        "raw",
+        json!({"codex_uri": format!("{upstream}/vendor/v1/")}),
+    )
+    .await;
+    let (_, token) = issue(&app, "raw").await;
+    let first = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(&PAYLOAD[..6])) });
+    let last = stream::once(async move {
+        first_chunk.acquire().await.unwrap().forget();
+        Ok(Bytes::from_static(&PAYLOAD[6..]))
+    });
+    let request = Request::builder()
+        .method(Method::PATCH)
+        .uri("/llm/codex/v1/files/name%2Fid?key=a%2Bb&key=c")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .header(header::COOKIE, "hint=1")
+        .header("x-custom", "keep")
+        .body(Body::from_stream(first.chain(last)))
+        .unwrap();
+    let response = timeout(Duration::from_secs(5), app.oneshot(request))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    assert_eq!(response.headers()["x-origin"], "upstream");
+    assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), PAYLOAD);
+    server.abort();
+}

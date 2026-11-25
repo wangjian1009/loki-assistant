@@ -61,6 +61,15 @@ impl<S: Send + 'static> Process<S> {
         let _ = self.0.send(Request::Apply(Box::new(operation)));
     }
 
+    pub(crate) fn post_async<F>(&self, operation: impl FnOnce(S) -> F + Send + 'static)
+    where
+        F: Future<Output = S> + Send + 'static,
+    {
+        let _ = self.0.send(Request::ApplyAsync(Box::new(move |state| {
+            Box::pin(operation(state))
+        })));
+    }
+
     pub(crate) async fn call<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut S) -> T + Send + 'static,

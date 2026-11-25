@@ -846,6 +846,20 @@ impl ConfigService {
         instance: &str,
         fields: [&str; N],
     ) -> Result<[Option<String>; N], ConfigServiceError> {
+        let (_, passwords) = self
+            .read_record_with_passwords(module, key, instance, fields)
+            .await?;
+        Ok(passwords)
+    }
+
+    /// 在同一记录快照中读取公开字段和凭据。
+    pub(crate) async fn read_record_with_passwords<const N: usize>(
+        &self,
+        module: &str,
+        key: &str,
+        instance: &str,
+        fields: [&str; N],
+    ) -> Result<(Value, [Option<String>; N]), ConfigServiceError> {
         let service = self.clone();
         let (module, key, instance) = (module.to_owned(), key.to_owned(), instance.to_owned());
         let fields = fields.map(str::to_owned);
@@ -867,14 +881,15 @@ impl ConfigService {
                             .find(|record| record[id_field].as_str() == Some(instance.as_str()))
                     })
                     .ok_or(ConfigServiceError::ActionNotFound)?;
-                service
+                let passwords = service
                     .load_record_passwords(
                         &options,
                         record,
                         &instance,
                         fields.each_ref().map(String::as_str),
                     )
-                    .await
+                    .await?;
+                Ok((record.clone(), passwords))
             })
             .await
     }

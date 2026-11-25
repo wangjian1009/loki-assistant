@@ -121,7 +121,10 @@ impl Gateway {
             policy = policy.route(
                 path,
                 any(move |method: Method| {
-                    let access = methods.get(method.as_str()).copied();
+                    let access = methods
+                        .get(method.as_str())
+                        .or_else(|| methods.get("ANY"))
+                        .copied();
                     async move {
                         match access {
                             Some("paired") => StatusCode::NO_CONTENT.into_response(),

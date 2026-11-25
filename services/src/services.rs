@@ -4,7 +4,7 @@ use axum::Router;
 
 use crate::{
     modules::{
-        alert::AlertService, config, control_center, discover, doc, emacs, health, network,
+        alert::AlertService, config, control_center, discover, doc, emacs, health, llm, network,
         notification::NotificationService, password, service, status::StatusService,
     },
     runtime::RuntimeState,
@@ -52,6 +52,7 @@ pub struct Services {
     pub alert: Arc<AlertService>,
     pub emacs: emacs::Module,
     pub doc: doc::DocService,
+    llm: Arc<llm::LlmService>,
     pub network: Arc<network::NetworkService>,
     pub password: password::Module,
     extensions: Vec<Arc<dyn ServiceExtension>>,
@@ -67,6 +68,7 @@ impl Services {
             config::service::ConfigService::from_registry(),
             NotificationService::new(),
             None,
+            llm::Monitor::memory(),
         )
     }
 
@@ -78,11 +80,13 @@ impl Services {
             .and_then(std::path::Path::parent)
             .ok_or(std::io::Error::other("无法确定本机缓存目录"))?;
         let notification = NotificationService::load(home.join(".cache/assistant/notification"))?;
+        let llm_monitor = llm::Monitor::load(config_path.with_file_name("llm-usage.json"))?;
         crate::modules::slack::migrate_legacy_cache(&home.join(".cache"))?;
         Ok(Self::with_config(
             config::service::ConfigService::load(config_path)?,
             notification,
             Some(password_environment),
+            llm_monitor,
         ))
     }
 
@@ -90,6 +94,7 @@ impl Services {
         config: config::service::ConfigService,
         notification: NotificationService,
         password_environment: Option<password::service::PasswordEnvironment>,
+        llm_monitor: llm::Monitor,
     ) -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
@@ -117,6 +122,7 @@ impl Services {
             Arc::clone(&status),
         );
         let doc = doc::DocService::new(emacs.service());
+        let llm = Arc::new(llm::LlmService::new(Arc::clone(&base_config), llm_monitor));
         let context = ExtensionContext {
             alert: &alert,
             config: &base_config,
@@ -138,10 +144,13 @@ impl Services {
             }
         }
         let config = config::Module::from_service(config);
-        let config_notification_router =
-            Arc::new(extensions.iter().fold(Router::new(), |router, extension| {
-                router.merge(extension.config_notification_router())
-            }));
+        let config_notification_router = Arc::new(
+            extensions
+                .iter()
+                .fold(llm::notification_router(), |router, extension| {
+                    router.merge(extension.config_notification_router())
+                }),
+        );
         config
             .service()
             .attach_notifications(&config_notification_router);
@@ -156,6 +165,7 @@ impl Services {
             alert,
             emacs,
             doc,
+            llm,
             network,
             password,
             extensions,
@@ -174,6 +184,7 @@ impl Services {
             .merge(self.network.router())
             .merge(self.emacs.router())
             .merge(self.doc.router())
+            .merge(self.llm.router())
             .merge(self.password.router());
         self.extensions
             .iter()
