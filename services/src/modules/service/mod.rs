@@ -1,3 +1,4 @@
+mod config;
 mod service;
 mod status;
 
@@ -5,6 +6,7 @@ use std::sync::Arc;
 
 use crate::modules::{discover::registry::ModuleRegistration, status::StatusService};
 
+pub(crate) use config::http_port;
 pub use service::SelfService;
 
 #[linkme::distributed_slice(crate::modules::discover::registry::MODULE_DESCRIPTORS)]

@@ -1861,6 +1861,16 @@ impl ConfigItemMetadata {
                 self.key
             )));
         }
+        if let Some(range) = &options.integer_range
+            && !value
+                .as_i64()
+                .is_some_and(|number| (range.min..=range.max).contains(&number))
+        {
+            return Err(ConfigServiceError::InvalidValue(format!(
+                "配置项 {} 必须是 {} 至 {} 之间的整数。",
+                self.key, range.min, range.max
+            )));
+        }
         if let Some(structure) = &options.structure {
             let records: &[Value] = match self.data_type {
                 ConfigDataType::Structure => std::slice::from_ref(value),

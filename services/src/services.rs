@@ -211,6 +211,10 @@ impl Services {
         self.llm.monitor.flush().await
     }
 
+    pub async fn configured_http_port(&self) -> Result<u16, config::service::ConfigServiceError> {
+        service::http_port(&self.config.service()).await
+    }
+
     pub fn attach_remote(self: &Arc<Self>, runtime: &Arc<RuntimeState>) {
         let runtime = Arc::downgrade(runtime);
         self.network.set_remote_dispatcher(Arc::new(
@@ -232,6 +236,48 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn http_port_is_registered_and_validated_by_the_config_routes() {
+        let services = Arc::new(Services::build());
+        let app = services.router(Arc::new(RuntimeState::new(Arc::clone(&services))));
+        assert_eq!(
+            services.configured_http_port().await.unwrap(),
+            crate::runtime::DEFAULT_HTTP_PORT
+        );
+        let metadata = app
+            .clone()
+            .oneshot(Request::get("/meta/service").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(metadata.into_body(), usize::MAX).await.unwrap();
+        let metadata: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metadata["items"][0]["key"], "http_port");
+        assert_eq!(
+            metadata["items"][0]["integer_range"],
+            json!({"min": 1, "max": 65535})
+        );
+        for (value, status) in [
+            ("48000", 200),
+            ("0", 400),
+            ("65536", 400),
+            ("-1", 400),
+            ("48000.5", 400),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put("/data/service/http_port")
+                        .header("content-type", "application/json")
+                        .body(Body::from(value))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        assert_eq!(services.configured_http_port().await.unwrap(), 48000);
+    }
 
     #[tokio::test]
     async fn publishers_and_http_readers_share_the_services_owned_instance() {

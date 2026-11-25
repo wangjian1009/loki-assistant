@@ -159,8 +159,7 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
         notification_endpoint: Some(TEAM_NOTIFICATION_ENDPOINT),
         create_fields: vec!["team_id"],
         save_timeout_seconds: Some(650),
-        requires_local_auth: false,
-        read_only: false,
+        ..ConfigItemOptions::default()
     },
 };
 

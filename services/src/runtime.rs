@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::services::Services;
 
 const HTTP_ADDR_ENV: &str = "LOKI_ASSISTANT_HTTP_ADDR";
-const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:47321";
+pub(crate) const DEFAULT_HTTP_PORT: u16 = 47321;
 
 /// 随服务进程持有文件锁；进程退出或崩溃时由操作系统释放。
 pub struct ServiceInstanceLock {
@@ -163,17 +163,17 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            http_addr: DEFAULT_HTTP_ADDR
-                .parse()
-                .expect("默认 HTTP 地址必须是有效的 loopback 地址"),
+            http_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)),
         }
     }
 }
 
 impl RuntimeConfig {
-    pub fn from_env() -> Result<Self, RuntimeConfigError> {
+    pub fn from_env(port: u16) -> Result<Self, RuntimeConfigError> {
         let Some(value) = env::var_os(HTTP_ADDR_ENV) else {
-            return Ok(Self::default());
+            return Ok(Self {
+                http_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            });
         };
         let value = value.to_string_lossy().into_owned();
         let http_addr = Self::parse_address(&value)?;
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn defaults_to_loopback() {
         let config = RuntimeConfig::default();
-        assert_eq!(config.http_addr.to_string(), DEFAULT_HTTP_ADDR);
+        assert_eq!(config.http_addr.to_string(), "127.0.0.1:47321");
     }
 
     #[test]

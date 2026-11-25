@@ -24,35 +24,48 @@ pub struct MacNotificationLauncher;
 
 impl NotificationLauncher for MacNotificationLauncher {
     fn launch(&self, content: NotificationContent) -> NotificationFuture<'_> {
-        Box::pin(async move {
-            #[cfg(target_os = "macos")]
-            {
-                let output = tokio::process::Command::new("/usr/bin/open")
-                    .args(["-g", &notification_url(&content)?])
-                    .kill_on_drop(true)
-                    .output()
-                    .await
-                    .map_err(|error| format!("无法唤起菜单栏应用：{error}"))?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "无法转交系统通知（退出码 {:?}）：{}；请先运行 Loki Assistant 菜单栏应用",
-                        output.status.code(),
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ))
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = content;
-                Err("当前平台不支持 macOS 系统通知".to_owned())
-            }
-        })
+        Box::pin(async move { launch_payload(&content).await })
     }
 }
 
-fn notification_url(content: &NotificationContent) -> Result<String, String> {
+#[derive(Serialize)]
+struct DisplayNotification<'a> {
+    title: &'a str,
+    body: &'a str,
+}
+
+/// HTTP 服务启动前也可以交付给菜单栏应用。
+pub async fn show_without_receipt(title: &str, body: &str) -> Result<(), String> {
+    launch_payload(&DisplayNotification { title, body }).await
+}
+
+async fn launch_payload(content: &impl Serialize) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = tokio::process::Command::new("/usr/bin/open")
+            .args(["-g", &notification_url(content)?])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| format!("无法唤起菜单栏应用：{error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "无法转交系统通知（退出码 {:?}）：{}。请先运行 Loki Assistant 菜单栏应用",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = content;
+        Err("当前平台不支持 macOS 系统通知".to_owned())
+    }
+}
+
+fn notification_url(content: &impl Serialize) -> Result<String, String> {
     let json = serde_json::to_string(content).map_err(|error| error.to_string())?;
     Ok(format!(
         "loki-assistant://notification/show?payload={}",
@@ -84,5 +97,26 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, serde_json::to_string(&content).unwrap());
         assert!(!encoded.contains([' ', '\n', '&', '#', '"']));
+    }
+
+    #[test]
+    fn startup_notification_uses_the_display_only_payload() {
+        let url = notification_url(&DisplayNotification {
+            title: "监听端口被占用",
+            body: "127.0.0.1:47321",
+        })
+        .unwrap();
+        let payload = url.split_once("payload=").unwrap().1;
+        let decoded = percent_encoding::percent_decode_str(payload)
+            .decode_utf8()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "title": "监听端口被占用",
+                "body": "127.0.0.1:47321",
+            })
+        );
     }
 }

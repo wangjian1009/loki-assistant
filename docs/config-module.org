@@ -59,7 +59,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 {"module_id":"emacs","key":"emacsclient_path","value":"emacsclient"}
 #+end_src
 
-接口与配置保存共用校验实现。~Executable~ 检查目标存在、是普通文件并具有执行权限，允许指向普通文件的符号链接。程序名先按服务进程 ~PATH~，再按元数据 ~search_paths~ 查找；有效值规范化为绝对路径。整个检查不会执行目标程序。
+接口与配置保存共用校验实现。整数配置可通过元数据 ~integer_range~ 声明包含上下界的取值范围。~Executable~ 检查目标存在、是普通文件并具有执行权限，允许指向普通文件的符号链接。程序名先按服务进程 ~PATH~，再按元数据 ~search_paths~ 查找；有效值规范化为绝对路径。整个检查不会执行目标程序。
 
 校验通过时返回 HTTP 200 与规范化后的值：
 

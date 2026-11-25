@@ -84,6 +84,8 @@ pub struct ConfigItemMetadata {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ConfigItemOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub integer_range: Option<IntegerRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notification_endpoint: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub create_fields: Vec<&'static str>,
@@ -95,6 +97,12 @@ pub struct ConfigItemOptions {
     pub requires_local_auth: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IntegerRange {
+    pub min: i64,
+    pub max: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
