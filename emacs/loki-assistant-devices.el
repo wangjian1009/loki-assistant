@@ -27,14 +27,23 @@
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "g") #'loki-assistant-devices-refresh)
     (define-key map (kbd "a") #'loki-assistant-devices-add)
+    (define-key map (kbd "TAB") #'forward-button)
+    (define-key map (kbd "<backtab>") #'backward-button)
+    (define-key map (kbd "RET") #'push-button)
     (define-key map (kbd "q") #'loki-assistant-devices-quit)
+    (define-key map (kbd "C-c C-q") #'loki-assistant-devices-quit)
+    (define-key map (kbd "?") #'describe-mode)
     map)
   "设备管理界面的快捷键。")
 
 (define-derived-mode loki-assistant-devices-mode special-mode "Loki Devices"
-  "展示已绑定设备，在当前 buffer 中展开新增设备信息。"
+  "展示已绑定设备，在当前 buffer 中展开新增设备信息。
+
+按 g 刷新，a 新增设备，TAB 或 S-TAB 移动到按钮，RET 激活按钮。
+按 C-c C-q 退出并取消未完成的邀请，按 ? 查看模式帮助。"
   (setq-local truncate-lines nil)
-  (setq-local header-line-format "  设备管理    g 刷新    a 新增设备    q 关闭")
+  (setq-local mode-line-process
+              (loki-assistant--mode-line-keys "g 刷新  a 新增设备  TAB/S-TAB 切换  RET 操作"))
   (setq loki-assistant-devices--generation (list nil))
   (add-hook 'kill-buffer-hook #'loki-assistant-devices--cleanup nil t)
   (add-hook 'change-major-mode-hook #'loki-assistant-devices--cleanup nil t))

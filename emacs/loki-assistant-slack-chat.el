@@ -689,7 +689,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
     (unless (equal name loki-assistant-slack--display-name)
       (unless (equal name (buffer-name)) (rename-buffer name t))
       (setq loki-assistant-slack--display-name name))
-    (setq header-line-format (concat " " escaped (propertize "    C-c n 设置昵称" 'face 'shadow)))
+    (setq header-line-format (concat " " escaped))
     (setq-local frame-title-format escaped)))
 
 (defun loki-assistant-slack--request-watch (&optional watching on-read)
@@ -1081,14 +1081,17 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
 (defun loki-assistant-slack-quit-thread (count)
   "退出线程视图。输入区的 q 按 COUNT 次数正常插入。"
   (interactive "p")
-  (cond
-   ((and (eq last-command-event ?q)
-         (or (not loki-assistant-slack--thread-root)
-             (>= (point) (loki-assistant-slack--draft-start))))
-    (self-insert-command count))
-   ((buffer-live-p loki-assistant-slack--parent-buffer)
-    (loki-assistant-slack--show-buffer loki-assistant-slack--parent-buffer))
-   (loki-assistant-slack--thread-root (bury-buffer))))
+  (if (or (not loki-assistant-slack--thread-root)
+          (loki-assistant-slack--in-draft-p))
+      (self-insert-command count)
+    (loki-assistant-slack-quit)))
+
+(defun loki-assistant-slack-quit ()
+  "退出当前聊天界面，保留草稿；在线程中返回主会话。"
+  (interactive)
+  (if (buffer-live-p loki-assistant-slack--parent-buffer)
+      (loki-assistant-slack--show-buffer loki-assistant-slack--parent-buffer)
+    (quit-window)))
 
 (defun loki-assistant-slack--shift-return ()
   "在输入区换行，或打开历史消息所在的线程。"
@@ -2367,6 +2370,20 @@ ROOTS 含本批次影响的顶层消息。"
                               (plist-get response :error-message)
                               "发送结果待确认，草稿已保留。")))))))))
 
+(defun loki-assistant-slack--in-draft-p ()
+  "光标是否在 Slack 的草稿输入区。"
+  (when-let* ((process (get-buffer-process (current-buffer)))
+              (start (marker-position (process-mark process))))
+    (>= (point) start)))
+
+(defun loki-assistant-slack--mode-line-keys ()
+  (let ((editing (loki-assistant-slack--in-draft-p)))
+    (loki-assistant--mode-line-keys
+     (concat (if editing "RET 发送  S-RET 换行" "RET 操作  S-RET 线程  n/p 导航")
+             "  TAB/S-TAB 切换  C-c C-r 刷新  C-c n 昵称  C-c C-k 输入"
+             (when (loki-assistant-slack--watchable-p) "  C-c C-w 关注"))
+     (when editing "C-c ?"))))
+
 (defvar loki-assistant-slack-input-mode-map nil
   "Slack 聊天输入和历史导航的按键映射。")
 
@@ -2383,7 +2400,14 @@ ROOTS 含本批次影响的顶层消息。"
     (define-key map (kbd "<return>") #'loki-assistant-slack--submit)
     (define-key map (kbd "S-<return>") #'loki-assistant-slack--shift-return)
     (define-key map (kbd "q") #'loki-assistant-slack-quit-thread)
-    (define-key map (kbd "C-c C-q") #'kill-current-buffer)
+    (define-key map (kbd "C-c C-q") #'loki-assistant-slack-quit)
+    (define-key map (kbd "?")
+      '(menu-item "" describe-mode
+                  :filter (lambda (command)
+                            (if (loki-assistant-slack--in-draft-p)
+                                #'self-insert-command
+                              command))))
+    (define-key map (kbd "C-c ?") #'describe-mode)
     (define-key map (kbd "C-c C-r") #'loki-assistant-slack-refresh)
     (define-key map (kbd "C-c n") #'loki-assistant-slack-set-nickname)
     (define-key map (kbd "C-c C-w")
@@ -2394,18 +2418,31 @@ ROOTS 含本批次影响的顶层消息。"
     map))
 
 (define-minor-mode loki-assistant-slack-input-mode
-  "在 shell-maker 缓冲区中编辑和发送 Slack 消息。"
+  "在 shell-maker 缓冲区中编辑和发送 Slack 消息。
+
+在消息区按 n 或 p 导航，RET 激活操作，S-RET 打开线程。
+在输入区按 RET 发送、S-RET 换行。TAB 或 S-TAB 切换消息或按钮。
+按 C-c C-r 刷新，C-c n 设置昵称，C-c C-k 将光标移到输入区。
+在频道主会话按 C-c C-w 切换关注。
+按 C-c C-q 退出并保留草稿，在线程中返回主会话。
+按 ? 查看模式帮助。在输入区按 C-c ? 打开同一帮助。"
   :keymap loki-assistant-slack-input-mode-map
   (if loki-assistant-slack-input-mode
-      (add-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user nil t)
+      (progn
+        (setq-local mode-line-process '(:eval (loki-assistant-slack--mode-line-keys)))
+        (add-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user nil t))
+    (kill-local-variable 'mode-line-process)
     (remove-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user t)))
 
 (dolist (buffer (buffer-list))
   (with-current-buffer buffer
     (when loki-assistant-slack-input-mode
+      (setq-local mode-line-process '(:eval (loki-assistant-slack--mode-line-keys)))
       (add-hook 'post-self-insert-hook #'loki-assistant-slack--complete-user nil t)))
   (when (loki-assistant-slack--chat-buffer-p buffer)
-    (with-current-buffer buffer (loki-assistant-slack--update-history))))
+    (with-current-buffer buffer
+      (loki-assistant-slack--update-title)
+      (loki-assistant-slack--update-history))))
 
 (provide 'loki-assistant-slack-chat)
 ;;; loki-assistant-slack-chat.el ends here

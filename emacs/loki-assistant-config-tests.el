@@ -49,6 +49,23 @@
   (cl-find key loki-assistant-config--entries :test #'equal
            :key (lambda (entry) (alist-get 'key (loki-assistant-config--entry-item entry)))))
 
+(ert-deftest loki-assistant-config-test-shortcuts-preserve-text-input ()
+  (loki-assistant-config-test--with-buffer
+    (loki-assistant-config-test--fixture)
+    (goto-char (point-min))
+    (should (eq (key-binding (kbd "?")) #'describe-mode))
+    (should (eq (key-binding (kbd "C-c C-q")) #'quit-window))
+    (should (string-match-p (regexp-quote "? 帮助")
+                            (loki-assistant-config--mode-line-keys)))
+    (let ((field (loki-assistant-config--entry-field (loki-assistant-config-test--entry "text"))))
+      (goto-char (widget-field-start field))
+      (should (eq (key-binding (kbd "?")) #'self-insert-command))
+      (should (eq (key-binding (kbd "C-c ?")) #'describe-mode))
+      (should (eq (key-binding (kbd "C-c C-q")) #'quit-window))
+      (should (eq (key-binding (kbd "C-c C-c")) #'loki-assistant-config-save))
+      (should (string-match-p (regexp-quote "C-c ? 帮助")
+                              (loki-assistant-config--mode-line-keys))))))
+
 (ert-deftest loki-assistant-config-test-load-real-http ()
   (loki-assistant-test--with-server
       (lambda (headers _body)
@@ -77,8 +94,9 @@
          (beta '((id . "config-test-beta") (name . "乙")
                  (items . [((key . "text") (name . "字段") (data_type . "string"))])))
          (empty '((id . "empty") (name . "空模块") (items . [])))
-         (selections '("甲 · config-test-alpha" "乙 · config-test-beta" "甲 · config-test-alpha"))
-         requests alpha-buffer beta-buffer)
+         (selections '("甲 · config-test-alpha" "乙 · config-test-beta"
+                       "甲 · config-test-alpha" "乙 · config-test-beta"))
+         requests alpha-buffer beta-buffer beta-updated)
     (save-window-excursion
       (unwind-protect
           (cl-letf (((symbol-function 'completing-read)
@@ -96,9 +114,12 @@
                                 ("/meta" (list (cons 'modules (vector alpha beta empty))))
                                 ("/meta/config-test-alpha" alpha)
                                 ((or "/data/config-test-alpha" "/data/config-test-beta")
-                                 (let ((id (substring path (length "/data/"))))
+                                 (let* ((id (substring path (length "/data/")))
+                                        (value (if (and beta-updated (equal id "config-test-beta"))
+                                                   "乙的新值"
+                                                 id)))
                                    `((module_id . ,id)
-                                     (values . ((text . ((value . ,id) (source . "user"))))))))
+                                     (values . ((text . ((value . ,value) (source . "user"))))))))
                                 (_ (error "意外的配置请求 %s" path))))))))
             (loki-assistant-config)
             (setq alpha-buffer (window-buffer))
@@ -119,8 +140,19 @@
               (should (equal (widget-value (loki-assistant-config--entry-field
                                             (loki-assistant-config-test--entry "text")))
                              "甲的草稿")))
+            (setq beta-updated t
+                  beta '((id . "config-test-beta") (name . "乙")
+                         (items . [((key . "text") (name . "新字段") (data_type . "string"))])))
+            (loki-assistant-config)
+            (should (eq (window-buffer) beta-buffer))
+            (with-current-buffer beta-buffer
+              (should (string-match-p "新字段" (buffer-string)))
+              (should (equal (widget-value (loki-assistant-config--entry-field
+                                            (loki-assistant-config-test--entry "text")))
+                             "乙的新值")))
             (should (equal (reverse requests)
-                           '("/meta" "/data/config-test-alpha" "/meta" "/data/config-test-beta" "/meta"))))
+                           '("/meta" "/data/config-test-alpha" "/meta" "/data/config-test-beta"
+                             "/meta" "/meta" "/data/config-test-beta"))))
         (when (buffer-live-p alpha-buffer) (kill-buffer alpha-buffer))
         (when (buffer-live-p beta-buffer) (kill-buffer beta-buffer))))))
 

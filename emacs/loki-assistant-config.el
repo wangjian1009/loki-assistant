@@ -40,13 +40,35 @@
     (define-key map (kbd "g") #'loki-assistant-config-refresh)
     (define-key map (kbd "C-c C-c") #'loki-assistant-config-save)
     (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "C-c C-q") #'quit-window)
+    (define-key map (kbd "?") #'describe-mode)
+    (define-key map (kbd "C-c ?") #'describe-mode)
     map)
   "配置管理界面的按键。")
 
+(defvar loki-assistant-config--field-keymap
+  (let ((map (copy-keymap widget-field-keymap)))
+    (define-key map (kbd "C-c C-c") #'loki-assistant-config-save)
+    (define-key map (kbd "C-c C-q") #'quit-window)
+    (define-key map (kbd "C-c ?") #'describe-mode)
+    map)
+  "保留文本输入，并让保存、退出和帮助在字段内也可用。")
+
+(defun loki-assistant-config--mode-line-keys ()
+  (let ((editing (widget-field-find (point))))
+    (loki-assistant--mode-line-keys
+     (concat "TAB/S-TAB 切换  C-c C-c 保存" (unless editing "  RET 操作  g 刷新"))
+     (when editing "C-c ?"))))
+
 (define-derived-mode loki-assistant-config-mode special-mode "Loki 配置"
-  "管理 services 配置，使用 TAB 移动、C-c C-c 保存修改、g 刷新。"
+  "管理 services 配置。
+
+按 TAB 或 S-TAB 切换控件，RET 激活按钮，C-c C-c 保存修改。
+在文本字段外按 g 刷新。按 C-c C-q 退出窗口并保留编辑。
+按 ? 查看模式帮助。在文本字段内按 C-c ? 打开同一帮助。"
   (setq-local revert-buffer-function
               (lambda (&rest _) (loki-assistant-config-refresh)))
+  (setq-local mode-line-process '(:eval (loki-assistant-config--mode-line-keys)))
   ;; widget 自行保护非编辑区域。
   (setq buffer-read-only nil)
   (add-hook 'kill-buffer-hook #'loki-assistant-config--stop-wait-timer nil t)
@@ -270,6 +292,8 @@
     (setf (loki-assistant-config--entry-field entry)
           (widget-create
            (if (equal type "boolean") 'checkbox 'editable-field)
+           :keymap (if (equal type "boolean") (widget-get '(checkbox) :keymap)
+                     loki-assistant-config--field-keymap)
            :value initial :size (unless (equal type "boolean") 54)
            :secret (when (equal type "password") ?*)
            :value-face (loki-assistant-config--input-face item initial)
@@ -365,7 +389,6 @@
    (propertize (format "Loki Assistant 配置 · %s\n\n"
                        (or (alist-get 'name module) loki-assistant-config--module-id))
                'face 'custom-group-tag))
-  (widget-insert "TAB 移动，RET 激活按钮，C-c C-c 保存，g 刷新，q 关闭。\n\n")
   (push (loki-assistant-config--button "刷新 / 重试" #'loki-assistant-config-refresh)
         loki-assistant-config--buttons)
   (unless error-text
@@ -657,13 +680,21 @@
       (next t))))
 
 (defun loki-assistant-config--open-module (module)
-  "打开 MODULE 独立的配置缓冲区。"
+  "打开 MODULE 的独立配置缓冲区，空闲时读取最新配置。"
   (let* ((id (alist-get 'id module))
          (buffer (get-buffer-create (format "*Loki 配置 · %s*" id))))
     (with-current-buffer buffer
       (unless (derived-mode-p 'loki-assistant-config-mode)
         (loki-assistant-config-mode)
-        (setq loki-assistant-config--module-id id)
+        (setq loki-assistant-config--module-id id))
+      (unless (or loki-assistant-config--loading
+                  loki-assistant-config--saving-all
+                  (loki-assistant-config--busy-p)
+                  (cl-some #'loki-assistant-config--dirty-p loki-assistant-config--entries)
+                  (cl-some (lambda (section)
+                             (or (loki-assistant-config--record-section-form section)
+                                 (loki-assistant-config--record-section-saving section)))
+                           loki-assistant-config--record-sections))
         (loki-assistant-config--load module)))
     (pop-to-buffer-same-window buffer)))
 
@@ -936,6 +967,7 @@
             (insert "  " (alist-get 'label field) "  ")
             (let* ((value (or (cdr (assoc key form)) ""))
                    (widget (widget-create 'editable-field :format "%v"
+                                          :keymap loki-assistant-config--field-keymap
                                           :size 45 :value value
                                           :value-face (loki-assistant-config--input-face field value)
                                           :notify (lambda (input &rest _)

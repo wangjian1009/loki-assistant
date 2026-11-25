@@ -11,7 +11,7 @@
   ("d" loki-assistant-devices "设备管理")
   ("r" loki-assistant-read-later "稍后阅读")
   ("u" loki-assistant-llm-usage "LLM 用量")
-  ("q" nil "退出"))
+  ("C-c C-q" nil "退出"))
 
 (defalias 'loki-assistant-command-map #'loki-assistant-command-menu/body
   "打开 Loki Assistant 的 Hydra 命令菜单。")

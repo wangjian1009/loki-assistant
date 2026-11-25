@@ -376,7 +376,8 @@
     (define-key map (kbd "RET") #'loki-assistant-read-later-open)
     (define-key map (kbd "b") #'loki-assistant-read-later-open-url)
     (define-key map (kbd "r") #'loki-assistant-read-later-mark-current-read)
-    (define-key map (kbd "?") #'loki-assistant-read-later-help)
+    (define-key map (kbd "C-c C-q") #'quit-window)
+    (define-key map (kbd "?") #'describe-mode)
     map)
   "稍后阅读列表的快捷键。")
 
@@ -388,11 +389,14 @@
 \\[loki-assistant-read-later-open-url]  打开当前记录的网页链接。
 \\[loki-assistant-read-later-mark-current-read]  保存已读时间，并从列表移除当前记录。
 \\[revert-buffer]  重新查询未读列表。
-\\[quit-window]  退出列表。"
+C-c C-q  退出列表。
+?  查看模式帮助。"
   (setq tabulated-list-format [("加入时间 (UTC)" 20 t) ("标题" 42 t) ("网页" 0 nil)]
         tabulated-list-padding 2)
   (setq-local mode-line-process
-              '(" · ? 帮助" (:eval (unless tabulated-list-entries " · 没有未读记录"))))
+              (list (loki-assistant--mode-line-keys
+                     "g 刷新  RET 打开日记  b 打开网页  r 标为已读")
+                    '(:eval (unless tabulated-list-entries " · 没有未读记录"))))
   (add-hook 'tabulated-list-revert-hook #'loki-assistant-read-later--load-rows nil t)
   (tabulated-list-init-header))
 

@@ -43,7 +43,7 @@
                (lambda () (interactive) (should-not menu) (push 'devices calls)))
               ((symbol-function 'loki-assistant-read-later)
                (lambda () (interactive) (should-not menu) (push 'read-later calls))))
-      (dolist (key '("c" "d" "r" "q"))
+      (dolist (key '("c" "d" "r" "C-c C-q"))
         (call-interactively (lookup-key entry-map (kbd "C-x a")))
         (should (keymapp menu))
         (should-not (lookup-key menu (kbd "s")))
