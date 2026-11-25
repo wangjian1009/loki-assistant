@@ -46,10 +46,6 @@ impl FileStorage {
             })
     }
 
-    pub fn sibling(&self, name: &str) -> PathBuf {
-        self.path.with_file_name(name)
-    }
-
     pub async fn write(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
         let storage = self.clone();
         tokio::task::spawn_blocking(move || storage.write_atomic(values))

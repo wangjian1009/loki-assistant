@@ -1,4 +1,10 @@
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+#[cfg(test)]
+use super::config::{relay_password, relay_token_is_set};
+#[cfg(test)]
+use crate::modules::config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler};
+use std::{fmt, sync::Arc, time::Duration};
+#[cfg(test)]
+use std::{future::Future, pin::Pin};
 
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
@@ -6,7 +12,7 @@ use tokio::{
 };
 
 use super::{
-    config::{relay_password, relay_token, relay_token_is_set},
+    config::relay_token,
     identity,
     pairing::PairingService,
     protocol::ConnectionStatus,
@@ -14,7 +20,7 @@ use super::{
 };
 use crate::modules::{
     alert::{AlertInput, AlertLevel, AlertService},
-    config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService},
+    config::service::ConfigService,
     notification::{NotificationService, protocol::NotificationRequest},
     status::StatusService,
 };
@@ -214,6 +220,12 @@ impl NetworkService {
         let (reply, response) = oneshot::channel();
         if self.commands.send(RelayCommand::Shutdown(reply)).is_ok() {
             let _ = response.await;
+        }
+    }
+
+    pub(super) fn configured_relay_changed(&self) {
+        if self.settings_changed.send(()).is_err() {
+            log::warn!("中转任务已关闭，无法应用网络配置。");
         }
     }
 
@@ -773,6 +785,7 @@ impl RelayContext {
     }
 }
 
+#[cfg(test)]
 impl ConfigChangeHandler for NetworkService {
     fn secret_is_set<'a>(
         &'a self,

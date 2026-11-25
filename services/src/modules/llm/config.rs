@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
@@ -11,14 +14,17 @@ use url::Url;
 use crate::modules::config::{
     model::{
         CheckerMetadata, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
-        ConfigModuleMetadata, ListMetadata, StructureField, StructureMetadata,
+        ConfigModuleMetadata, FieldOptions, ListMetadata, StructureField, StructureMetadata,
     },
     registry::ConfigItemRegistration,
-    service::NotificationValidationError,
+    service::{NotificationConfirmedFields, NotificationRequest, NotificationValidationError},
 };
 
 pub(super) const MODULE: &str = "llm";
 pub(super) const PROVIDERS: &str = "providers";
+pub(super) const CLIENTS: &str = "clients";
+const CLIENT_NOTIFICATION: &str = "/llm/config/clients";
+use super::service::LlmService;
 const PROVIDER_NOTIFICATION: &str = "/llm/config/providers";
 
 #[loki_config]
@@ -28,26 +34,76 @@ fn metadata() -> ConfigModuleMetadata {
         name: "AI 统一代理".into(),
         description: "配置支持 Codex 或 Claude 协议的上游供应商。".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        items: vec![ConfigItemMetadata {
-            key: PROVIDERS.into(),
-            name: "供应商".into(),
-            description: "为每个协议填写完整的版本化基础 URI 和可选凭据。".into(),
-            data_type: ConfigDataType::List,
-            remote_access: Default::default(),
-            required: false,
-            default: Some(json!([])),
-            dictionary: None,
-            list: Some(ListMetadata {
-                item_type: ConfigDataType::Structure,
-                min_items: None,
-                max_items: None,
-            }),
-            checker: None,
-            file_path: None,
-            executable: None,
-        }],
+        items: vec![
+            collection(
+                PROVIDERS,
+                "供应商",
+                "为每个协议填写版本化基础 URI 和可选凭据。",
+            ),
+            collection(
+                CLIENTS,
+                "LLM 客户端",
+                "填写名称和供应商，保存时自动生成客户端令牌。",
+            ),
+        ],
     }
 }
+
+fn collection(key: &str, name: &str, description: &str) -> ConfigItemMetadata {
+    ConfigItemMetadata {
+        key: key.into(),
+        name: name.into(),
+        description: description.into(),
+        data_type: ConfigDataType::List,
+        remote_access: Default::default(),
+        required: false,
+        default: Some(json!([])),
+        dictionary: None,
+        list: Some(ListMetadata {
+            item_type: ConfigDataType::Structure,
+            min_items: None,
+            max_items: None,
+        }),
+        checker: None,
+        file_path: None,
+        executable: None,
+    }
+}
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static CLIENT_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: MODULE,
+    key: CLIENTS,
+    options: || ConfigItemOptions {
+        notification_endpoint: Some(CLIENT_NOTIFICATION),
+        structure: Some(StructureMetadata {
+            id_field: Some("name".into()),
+            label_field: Some("name".into()),
+            add_label: Some("新增 LLM 客户端".into()),
+            type_name: "LLMClient".into(),
+            show_all_fields: true,
+            fields: vec![
+                StructureField {
+                    required: true,
+                    ..field("name", "客户端名称", ConfigDataType::Key)
+                },
+                StructureField {
+                    required: true,
+                    options: Some(FieldOptions {
+                        path: "/llm/providers".into(),
+                        items_field: "ids".into(),
+                    }),
+                    ..field("upstream", "供应商", ConfigDataType::String)
+                },
+                StructureField {
+                    read_only: true,
+                    ..field("token", "客户端 Token", ConfigDataType::String)
+                },
+            ],
+        }),
+        ..ConfigItemOptions::default()
+    },
+};
 
 #[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
 static PROVIDER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
@@ -59,7 +115,6 @@ static PROVIDER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             id_field: Some("id".into()),
             label_field: Some("id".into()),
             add_label: Some("新增供应商".into()),
-            legacy_dictionary: None,
             type_name: "LlmProvider".into(),
             show_all_fields: true,
             fields: vec![
@@ -131,26 +186,85 @@ pub(super) fn provider_uri(record: &Value, field: &str) -> Result<Option<Url>, S
     Ok(Some(url))
 }
 
-pub(crate) fn notification_router() -> Router {
-    Router::new().route(
-        &format!("{PROVIDER_NOTIFICATION}/{{id}}"),
-        post(validate_provider).delete(|| async { StatusCode::NO_CONTENT }),
-    )
+pub(crate) fn notification_router(service: Arc<LlmService>) -> Router {
+    Router::new()
+        .route(
+            &format!("{PROVIDER_NOTIFICATION}/{{id}}"),
+            post(validate_provider).delete(refresh_after_commit),
+        )
+        .route(
+            &format!("{CLIENT_NOTIFICATION}/{{name}}"),
+            post(prepare_client).delete(refresh_after_commit),
+        )
+        .with_state(service)
 }
 
-async fn validate_provider(Json(record): Json<Value>) -> Response {
+async fn validate_provider(
+    State(service): State<Arc<LlmService>>,
+    change: Extension<NotificationRequest>,
+    Json(record): Json<Value>,
+) -> Response {
     for field in ["codex_uri", "claude_uri"] {
         if let Err(message) = provider_uri(&record, field) {
-            let mut response = StatusCode::UNPROCESSABLE_ENTITY.into_response();
-            response
-                .extensions_mut()
-                .insert(NotificationValidationError {
-                    code: "llm-provider-uri".into(),
-                    message,
-                    clear_password_fields: Vec::new(),
-                });
-            return response;
+            return invalid("llm-provider-uri", message);
         }
     }
-    StatusCode::NO_CONTENT.into_response()
+    refresh_after_commit(State(service), change).await
+}
+
+async fn prepare_client(
+    State(service): State<Arc<LlmService>>,
+    Extension(change): Extension<NotificationRequest>,
+    Json(record): Json<Value>,
+) -> Response {
+    if !record["name"]
+        .as_str()
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        return invalid("llm-client-name", "客户端名称不能为空。".into());
+    }
+    let Some(upstream) = record["upstream"].as_str() else {
+        return invalid("llm-provider-not-found", "请选择供应商。".into());
+    };
+    let generated = match service
+        .prepare_client(upstream.to_owned(), change.created.then_some(change.id))
+        .await
+    {
+        Ok(token) => token,
+        Err(message) => return invalid("llm-client-validation", message),
+    };
+    let mut response = refresh_after_commit(State(service), Extension(change)).await;
+    if let Some(token) = generated {
+        response
+            .extensions_mut()
+            .insert(NotificationConfirmedFields(
+                [("token".into(), json!(token))].into_iter().collect(),
+            ));
+    }
+    response
+}
+
+async fn refresh_after_commit(
+    State(service): State<Arc<LlmService>>,
+    Extension(change): Extension<NotificationRequest>,
+) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    change.settle_with(&mut response, move |confirmed| async move {
+        if confirmed && let Err(error) = service.reload_authorization().await {
+            log::warn!("刷新 LLM 鉴权配置失败：{error}");
+        }
+    });
+    response
+}
+
+fn invalid(code: &str, message: String) -> Response {
+    let mut response = StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    response
+        .extensions_mut()
+        .insert(NotificationValidationError {
+            code: code.into(),
+            message,
+            clear_password_fields: Vec::new(),
+        });
+    response
 }

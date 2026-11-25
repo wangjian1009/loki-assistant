@@ -56,7 +56,75 @@ pub(super) fn config_notification_router(projects: Arc<Projects>) -> Router {
             "/slack/config/teams/{team_id}",
             post(team_config_changed).delete(team_config_changed),
         )
+        .route(
+            &format!("{}/{{value}}", super::RETENTION_NOTIFICATION),
+            post(retention_config_changed).delete(retention_after_commit),
+        )
+        .route(
+            &format!("{}/{{id}}", super::NICKNAME_NOTIFICATION),
+            post(nickname_config_changed).delete(nickname_after_commit),
+        )
         .with_state(projects)
+}
+
+async fn retention_config_changed(
+    State(projects): Service,
+    change: axum::Extension<crate::modules::config::service::NotificationRequest>,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    if super::projects::retention(&value).is_none() {
+        return config_rejected("缓存保留天数必须为可表示的正整数。".into());
+    }
+    retention_after_commit(State(projects), change).await
+}
+
+async fn retention_after_commit(
+    State(projects): Service,
+    axum::Extension(change): axum::Extension<crate::modules::config::service::NotificationRequest>,
+) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    change.settle_with(&mut response, move |confirmed| async move {
+        if confirmed {
+            projects.retention_changed();
+        }
+    });
+    response
+}
+
+async fn nickname_config_changed(
+    State(projects): Service,
+    change: axum::Extension<crate::modules::config::service::NotificationRequest>,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    if let Err(message) = super::projects::parse_nicknames(serde_json::json!([value])) {
+        return config_rejected(message);
+    }
+    nickname_after_commit(State(projects), change).await
+}
+
+async fn nickname_after_commit(
+    State(projects): Service,
+    axum::Extension(change): axum::Extension<crate::modules::config::service::NotificationRequest>,
+) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    change.settle_with(&mut response, move |confirmed| async move {
+        if confirmed {
+            projects.reload_nicknames().await;
+        }
+    });
+    response
+}
+
+fn config_rejected(message: String) -> Response {
+    let mut response = StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    response
+        .extensions_mut()
+        .insert(NotificationValidationError {
+            code: "slack-invalid-config".into(),
+            message,
+            clear_password_fields: Vec::new(),
+        });
+    response
 }
 
 async fn team_config_changed(

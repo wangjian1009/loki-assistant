@@ -1,10 +1,9 @@
+use crate::modules::password::service::SYSTEM_PASSWORD_PREFIX;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 
-use crate::modules::config::service::{
-    ConfigService, ConfigServiceError, LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX,
-};
+use crate::modules::config::service::{ConfigService, ConfigServiceError, Password};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,57 +39,39 @@ pub(super) async fn ensure(config: &ConfigService) -> Result<(SecretKey, bool), 
         let password = Password::new(format!("{SYSTEM_PASSWORD_PREFIX}identity.gpg"));
         let storage = config.clone();
         config
-            .update_system_value(
-                "network_identity",
-                Some(LegacySystemFile {
-                    name: "identity.json",
-                    limit: 4096,
-                }),
-                async move |previous| {
-                    let (key, created) = match previous {
-                        Some(value) if value["version"] == 2 => {
-                            let identity: StoredIdentity<Password> =
-                                serde_json::from_value(value.clone())
-                                    .map_err(|_| invalid_identity())?;
-                            if identity.secret_key.path() != password.path() {
-                                return Err(invalid_identity());
-                            }
-                            let key = decode(&identity.secret_key.read(&storage).await?)?;
-                            validate(&key, &identity.endpoint_id)?;
-                            return Ok((Some(value), (key, false)));
+            .update_system_value("network_identity", async move |previous| {
+                let (key, created) = match previous {
+                    Some(value) if value["version"] == 2 => {
+                        let identity: StoredIdentity<Password> =
+                            serde_json::from_value(value.clone())
+                                .map_err(|_| invalid_identity())?;
+                        if identity.secret_key.path() != password.path() {
+                            return Err(invalid_identity());
                         }
-                        Some(value) => {
-                            let identity: StoredIdentity<SecretKey> =
-                                serde_json::from_value(value).map_err(|_| invalid_identity())?;
-                            if identity.version != 1 {
-                                return Err(invalid_identity());
-                            }
-                            validate(&identity.secret_key, &identity.endpoint_id)?;
+                        let key = decode(&identity.secret_key.read(&storage).await?)?;
+                        validate(&key, &identity.endpoint_id)?;
+                        return Ok((Some(value), (key, false)));
+                    }
+                    Some(_) => return Err(invalid_identity()),
+                    None => match password.read_optional(&storage).await? {
+                        Some(value) => (decode(&value)?, false),
+                        None => {
+                            let key = SecretKey::generate();
                             password
-                                .import(&storage, &STANDARD.encode(identity.secret_key.to_bytes()))
+                                .import(&storage, &STANDARD.encode(key.to_bytes()))
                                 .await?;
-                            (identity.secret_key, false)
+                            (key, true)
                         }
-                        None => match password.read_optional(&storage).await? {
-                            Some(value) => (decode(&value)?, false),
-                            None => {
-                                let key = SecretKey::generate();
-                                password
-                                    .import(&storage, &STANDARD.encode(key.to_bytes()))
-                                    .await?;
-                                (key, true)
-                            }
-                        },
-                    };
-                    let value = serde_json::to_value(StoredIdentity {
-                        version: 2,
-                        endpoint_id: key.public().to_string(),
-                        secret_key: password,
-                    })
-                    .map_err(|_| invalid_identity())?;
-                    Ok((Some(value), (key, created)))
-                },
-            )
+                    },
+                };
+                let value = serde_json::to_value(StoredIdentity {
+                    version: 2,
+                    endpoint_id: key.public().to_string(),
+                    secret_key: password,
+                })
+                .map_err(|_| invalid_identity())?;
+                Ok((Some(value), (key, created)))
+            })
             .await
             .map_err(|error| error.to_string())
     })

@@ -22,9 +22,6 @@ pub struct ExtensionContext<'a> {
 pub type ExtensionFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
 pub trait ServiceExtension: std::fmt::Debug + Send + Sync {
-    fn config_handler(
-        &self,
-    ) -> Option<(&'static str, Arc<dyn config::service::ConfigChangeHandler>)>;
     fn router(&self) -> Router;
     fn config_notification_router(&self) -> Router {
         Router::new()
@@ -72,7 +69,7 @@ impl Services {
         )
     }
 
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let password_environment = password::service::PasswordEnvironment::from_env()?;
         let config_path = config::service::ConfigService::storage_path()?;
         let home = config_path
@@ -82,12 +79,14 @@ impl Services {
         let notification = NotificationService::load(home.join(".cache/assistant/notification"))?;
         let llm_monitor = llm::Monitor::load(config_path.with_file_name("llm-usage.json"))?;
         crate::modules::slack::migrate_legacy_cache(&home.join(".cache"))?;
-        Ok(Self::with_config(
+        let services = Self::with_config(
             config::service::ConfigService::load(config_path)?,
             notification,
             Some(password_environment),
             llm_monitor,
-        ))
+        );
+        services.llm.reload_authorization().await?;
+        Ok(services)
     }
 
     fn with_config(
@@ -135,21 +134,14 @@ impl Services {
             .iter()
             .map(|entry| (entry.build)(&context))
             .collect();
-        let mut config = config
-            .with_change_handler("control-center", control_center::handler())
-            .with_change_handler("network", network.clone());
-        for extension in &extensions {
-            if let Some((module, handler)) = extension.config_handler() {
-                config = config.with_change_handler(module, handler);
-            }
-        }
         let config = config::Module::from_service(config);
         let config_notification_router = Arc::new(
-            extensions
-                .iter()
-                .fold(llm::notification_router(), |router, extension| {
-                    router.merge(extension.config_notification_router())
-                }),
+            extensions.iter().fold(
+                llm::notification_router(llm.clone())
+                    .merge(control_center::notification_router())
+                    .merge(network::notification_router(network.clone())),
+                |router, extension| router.merge(extension.config_notification_router()),
+            ),
         );
         config
             .service()

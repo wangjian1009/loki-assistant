@@ -1,51 +1,69 @@
+use axum::{
+    Extension, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+};
 use loki_services_macros::loki_config;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::modules::config::{
     model::{ConfigDataType, ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata},
     registry::ConfigItemRegistration,
-    service::{ConfigService, ConfigServiceError, Password},
+    service::{ConfigService, ConfigServiceError, NotificationRequest, Password},
 };
 
+const RELAY_NOTIFICATION: &str = "/network/config/relay-url";
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static RELAY_URL_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: "network",
+    key: "relay_url",
+    options: || ConfigItemOptions {
+        notification_endpoint: Some(RELAY_NOTIFICATION),
+        ..ConfigItemOptions::default()
+    },
+};
+
+pub(crate) fn notification_router(service: Arc<super::NetworkService>) -> Router {
+    Router::new()
+        .route(
+            &format!("{RELAY_NOTIFICATION}/{{value}}"),
+            post(notify_relay_url).delete(notify_relay_url),
+        )
+        .with_state(service)
+}
+
+async fn notify_relay_url(
+    State(network): State<Arc<super::NetworkService>>,
+    Extension(change): Extension<NotificationRequest>,
+) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    change.settle_with(&mut response, move |confirmed| async move {
+        if confirmed {
+            network.configured_relay_changed();
+        }
+    });
+    response
+}
+
 const RELAY_PASSWORD_PATH: &str = "loki-assistant/network/relay.gpg";
-const LEGACY_RELAY_TOKEN: &str = "network_relay_token";
 
 pub(super) fn relay_password() -> Password {
     Password::new(RELAY_PASSWORD_PATH.into())
 }
 
 pub(super) async fn relay_token(config: &ConfigService) -> Result<String, ConfigServiceError> {
-    let password = relay_password();
-    if config.system_value(LEGACY_RELAY_TOKEN).await.is_some() {
-        let storage = config.clone();
-        config
-            .update_system_value(LEGACY_RELAY_TOKEN, None, async move |legacy| {
-                if let Some(value) = legacy {
-                    let value = value.as_str().ok_or_else(|| {
-                        ConfigServiceError::Storage("旧中转令牌格式无效。".into())
-                    })?;
-                    if !value.trim().is_empty() {
-                        password.import(&storage, value).await?;
-                    }
-                }
-                Ok((None, ()))
-            })
-            .await?;
-    }
     Ok(relay_password()
         .read_optional(config)
         .await?
         .unwrap_or_default())
 }
 
+#[cfg(test)]
 pub(super) async fn relay_token_is_set(config: &ConfigService) -> bool {
-    if let Some(legacy) = config.system_value(LEGACY_RELAY_TOKEN).await
-        && legacy
-            .as_str()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        return true;
-    }
     relay_password()
         .read_optional(config)
         .await

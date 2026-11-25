@@ -1,7 +1,22 @@
+use crate::modules::config::registry::ConfigItemRegistration;
 use loki_services_macros::loki_config;
 use serde_json::Value;
 
-use crate::modules::config::model::{ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata};
+pub(super) const NOTIFICATION: &str = "/control-center/config/center-auto-start";
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static AUTO_START: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: "control-center",
+    key: "center_auto_start",
+    options: || ConfigItemOptions {
+        notification_endpoint: Some(NOTIFICATION),
+        ..ConfigItemOptions::default()
+    },
+};
+
+use crate::modules::config::model::{
+    ConfigDataType, ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata,
+};
 
 #[loki_config]
 fn control_center_metadata() -> ConfigModuleMetadata {

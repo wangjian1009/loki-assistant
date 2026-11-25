@@ -418,6 +418,7 @@ impl RequestDispatcher for HttpDispatcher {
                 .header(REMOTE_DEVICES_HEADER, device)
                 .body(axum::body::Body::from(body))
                 .unwrap();
+            http.extensions_mut().insert(crate::http::RemoteRequest);
             http.extensions_mut()
                 .insert(AuthenticatedPeer(context.peer_id));
             let router = router.layer(middleware::from_fn(authorize_http_route));

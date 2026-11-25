@@ -1,18 +1,10 @@
-use std::{
-    fmt,
-    fs::{self, File},
-    io::{ErrorKind, Read},
-    path::Path,
-};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{ConfigService, ConfigServiceError, StoredConfig, StoredValues};
-use crate::modules::{
-    config::storage::open_private_file,
-    password::service::{PasswordError, validate_file},
-};
+use crate::modules::password::service::{PasswordError, SYSTEM_PASSWORD_PREFIX, validate_file};
 
 pub(super) const SECTION: &str = "_system";
 
@@ -60,13 +52,12 @@ impl ConfigService {
     >(
         &self,
         key: &str,
-        legacy: Option<LegacySystemFile>,
         update: impl FnOnce(Option<Value>) -> F + Send + 'static,
     ) -> Result<R, ConfigServiceError> {
         let key = key.to_owned();
         self.data
             .call_async(move |mut data| async move {
-                let result = data.update_system_value(&key, legacy, update).await;
+                let result = data.update_system_value(&key, update).await;
                 (data, result)
             })
             .await
@@ -95,26 +86,11 @@ impl StoredConfig {
     >(
         &mut self,
         key: &str,
-        legacy: Option<LegacySystemFile>,
         update: impl FnOnce(Option<Value>) -> F,
     ) -> Result<R, ConfigServiceError> {
         let mut system = self.system.clone();
         let previous = system.0.get(key).cloned();
-        let mut source = None;
-        let mut value = previous.clone();
-        if value.is_none()
-            && let Some(legacy) = legacy
-            && let Some(storage) = &self.storage
-        {
-            let path = storage.sibling(legacy.name);
-            (source, value) = tokio::task::spawn_blocking(move || {
-                let value = read_legacy(&path, legacy.limit)?;
-                Ok::<_, ConfigServiceError>((value.as_ref().map(|_| path), value))
-            })
-            .await
-            .map_err(task_error)??;
-        }
-        let (value, result) = update(value).await?;
+        let (value, result) = update(previous.clone()).await?;
         if value != previous {
             match value {
                 Some(value) => system.0.insert(key.to_owned(), value),
@@ -122,16 +98,6 @@ impl StoredConfig {
             };
             self.write_snapshot(&self.values, &system).await?;
             self.system = system;
-        }
-        if let Some(path) = source
-            && let Err(error) = tokio::task::spawn_blocking(move || {
-                File::open(path.parent().expect("旧配置文件位于配置目录"))?.sync_all()?;
-                fs::remove_file(path)
-            })
-            .await
-            .map_err(task_error)?
-        {
-            log::warn!("内部配置已迁移，清理旧文件失败：{error}");
         }
         Ok(result)
     }
@@ -146,17 +112,10 @@ impl ConfigService {
     ) -> Result<(), ConfigServiceError> {
         let value = serde_json::to_value(value)
             .map_err(|_| ConfigServiceError::Storage("内部配置序列化失败。".into()))?;
-        self.update_system_value(key, None, async move |_| Ok((Some(value), ())))
+        self.update_system_value(key, async move |_| Ok((Some(value), ())))
             .await
     }
 }
-
-pub(crate) struct LegacySystemFile {
-    pub name: &'static str,
-    pub limit: u64,
-}
-
-pub(crate) const SYSTEM_PASSWORD_PREFIX: &str = "loki-assistant/network/";
 
 /// 内部配置中保存的 Password 条目引用。
 #[derive(Clone, Serialize, Deserialize)]
@@ -211,7 +170,7 @@ impl Password {
             .map_err(password_error)
     }
 
-    /// 重试迁移时复用已写入且内容一致的条目。
+    /// 已写入且内容一致的条目可以复用。
     pub(crate) async fn import(
         &self,
         config: &ConfigService,
@@ -243,27 +202,5 @@ impl Password {
 }
 
 fn password_error(error: PasswordError) -> ConfigServiceError {
-    ConfigServiceError::Storage(error.to_string())
-}
-
-fn read_legacy(path: &Path, limit: u64) -> Result<Option<Value>, ConfigServiceError> {
-    let file = match open_private_file(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ConfigServiceError::Storage(error.to_string())),
-    };
-    let mut data = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut data)
-        .map_err(|error| ConfigServiceError::Storage(error.to_string()))?;
-    let invalid = || ConfigServiceError::Storage("旧配置文件过大或格式无效。".into());
-    if data.len() as u64 > limit {
-        return Err(invalid());
-    }
-    let value = serde_json::from_slice(&data).map_err(|_| invalid())?;
-    Ok(Some(value))
-}
-
-fn task_error(error: tokio::task::JoinError) -> ConfigServiceError {
     ConfigServiceError::Storage(error.to_string())
 }

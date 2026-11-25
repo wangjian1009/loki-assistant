@@ -15,7 +15,7 @@ use crate::{
         alert::AlertService,
         config::{
             model::{ConfigDataType, ConfigItemMetadata, ConfigModuleMetadata, ConfigRemoteAccess},
-            service::{ConfigChangeHandler, ConfigService, ConfigServiceError},
+            service::{ConfigService, ConfigServiceError},
         },
         discover::registry::ModuleRegistration,
         emacs::service::EmacsService,
@@ -137,10 +137,6 @@ impl MailService {
 }
 
 impl ServiceExtension for MailModule {
-    fn config_handler(&self) -> Option<(&'static str, Arc<dyn ConfigChangeHandler>)> {
-        None
-    }
-
     fn router(&self) -> Router {
         crate::http::mount_routes(Router::new(), MODULE_ID).with_state(Arc::clone(&self.0))
     }

@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 pub mod error;
 
+/// 请求通过已认证的远端入口进入。
+#[derive(Clone, Copy)]
+pub(crate) struct RemoteRequest;
+
 use axum::{Router, middleware};
 
 use crate::{modules::network::remote::strip_device_headers, runtime::RuntimeState};

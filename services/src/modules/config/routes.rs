@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
+    http::RemoteRequest,
     http::error::{ApiError, ErrorSource, response as api_error_response},
-    modules::network::remote::AuthenticatedPeer,
 };
 
 use axum::{
@@ -28,7 +28,17 @@ use super::{
 };
 
 pub fn router(service: Arc<ConfigService>) -> Router {
-    crate::http::mount_routes(Router::new(), "config").with_state(service)
+    crate::http::mount_routes(Router::new(), "config")
+        .with_state(service)
+        .layer(axum::middleware::map_response(no_store))
+}
+
+async fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[loki_api(
@@ -43,7 +53,7 @@ pub fn router(service: Arc<ConfigService>) -> Router {
 )]
 async fn validate(
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     Json(request): Json<ValidateRequest>,
 ) -> Result<Json<ValidateResponse>, Response> {
@@ -88,7 +98,7 @@ async fn validate(
 )]
 async fn meta(
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
 ) -> Json<MetaResponse> {
     Json(MetaResponse {
         modules: service
@@ -113,7 +123,7 @@ async fn meta(
 async fn module_meta(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
 ) -> Result<Json<ModuleMetaResponse>, Response> {
     service
         .metadata_for(peer.is_some())
@@ -137,7 +147,7 @@ async fn module_meta(
 async fn module_data(
     Path(module_id): Path<String>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
 ) -> Result<Json<ModuleDataResponse>, Response> {
     let remote = peer.is_some();
     let mut values = service
@@ -190,7 +200,7 @@ async fn module_data(
 async fn get_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
 ) -> Result<Json<ValueResponse>, Response> {
     let value = match service.value_for(&module_id, &key, peer.is_some()).await {
         Err(error) if !matches!(error, ConfigServiceError::ValueNotSet { .. }) => {
@@ -231,7 +241,7 @@ async fn get_value(
 async fn put_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
@@ -290,7 +300,7 @@ async fn put_value(
 async fn post_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Result<Json<ValueResponse>, Response> {
@@ -363,7 +373,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 async fn delete_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, Response> {
     check_write_access(&service, peer.is_some(), &module_id, &key).await?;
@@ -397,7 +407,7 @@ async fn delete_value(
 async fn put_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
@@ -448,25 +458,17 @@ async fn put_record(
         )
             .into_response());
     }
-    let value = if create_only && service.has_record_creation_handler(&module_id, &key) {
-        let config = Arc::clone(&service);
-        let (module, key, instance) = (module_id.clone(), key.clone(), instance.clone());
-        tokio::spawn(async move { config.prepare_record(&module, &key, &instance, value).await })
-            .await
-            .map_err(|_| error_response(ConfigServiceError::Storage("保存任务中断。".into())))?
-    } else {
-        service
-            .replace_record(
-                module_id.clone(),
-                key.clone(),
-                instance.clone(),
-                value,
-                create_only,
-                false,
-            )
-            .await
-    }
-    .map_err(error_response)?;
+    let value = service
+        .replace_record(
+            module_id.clone(),
+            key.clone(),
+            instance.clone(),
+            value,
+            create_only,
+            false,
+        )
+        .await
+        .map_err(error_response)?;
     Ok(Json(RecordResponse {
         module_id,
         key,
@@ -489,7 +491,7 @@ async fn put_record(
 async fn delete_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, Response> {
     check_write_access(&service, peer.is_some(), &module_id, &key).await?;
@@ -571,7 +573,7 @@ async fn retry_config(
 async fn patch_value(
     Path((module_id, key)): Path<(String, String)>,
     State(service): State<Arc<ConfigService>>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
@@ -618,7 +620,7 @@ async fn patch_value(
 async fn patch_record(
     State(service): State<Arc<ConfigService>>,
     Path((module_id, key, instance)): Path<(String, String, String)>,
-    peer: Option<Extension<AuthenticatedPeer>>,
+    peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
@@ -681,9 +683,7 @@ fn error_response(error: ConfigServiceError) -> Response {
         }
         ConfigServiceError::RetryInProgress => StatusCode::CONFLICT,
         ConfigServiceError::RecordExists => StatusCode::PRECONDITION_FAILED,
-        ConfigServiceError::RecordAuthorizationRequired | ConfigServiceError::ChangePending => {
-            StatusCode::CONFLICT
-        }
+        ConfigServiceError::ChangePending => StatusCode::CONFLICT,
         ConfigServiceError::InvalidValue(_) => StatusCode::BAD_REQUEST,
         ConfigServiceError::PendingValidation(_) => StatusCode::UNPROCESSABLE_ENTITY,
         ConfigServiceError::RemoteAccessForbidden { .. } | ConfigServiceError::ReadOnly { .. } => {
@@ -726,7 +726,6 @@ fn error_code(error: &ConfigServiceError) -> &str {
         ConfigServiceError::PendingNotFound => "config-pending-not-found",
         ConfigServiceError::PendingValidation(error) => &error.code,
         ConfigServiceError::RetryInProgress => "config-retry-in-progress",
-        ConfigServiceError::RecordAuthorizationRequired => "config-record-authorization-required",
         ConfigServiceError::Storage(_) => "config-storage-error",
         ConfigServiceError::ChangeRejected { .. } => "config-change-rejected",
     }
@@ -943,7 +942,23 @@ mod tests {
         let service = Arc::new(
             ConfigService::load_with_metadata(
                 &path,
-                vec![crate::modules::emacs::config::EmacsConfig::metadata()],
+                vec![ConfigModuleMetadata {
+                    id: "emacs".into(),
+                    name: "测试程序".into(),
+                    description: String::new(),
+                    version: "1".into(),
+                    items: vec![
+                        serde_json::from_value(json!({
+                            "key": "emacsclient_path",
+                            "name": "测试可执行路径",
+                            "description": "",
+                            "data_type": "executable",
+                            "required": false,
+                            "executable": {"default_program": "emacsclient"}
+                        }))
+                        .unwrap(),
+                    ],
+                }],
             )
             .unwrap()
             .with_executable_search_path(vec![directory.clone()]),

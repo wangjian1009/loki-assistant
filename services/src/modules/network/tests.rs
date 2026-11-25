@@ -1,6 +1,6 @@
 use std::{
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -254,18 +254,13 @@ async fn creates_private_identity_atomically_and_reuses_it_across_instances() {
 }
 
 #[tokio::test]
-async fn corrupt_or_symlinked_identity_is_not_overwritten() {
+async fn corrupt_current_identity_is_not_overwritten() {
     let fixture = Fixture::new();
-    let path = fixture.root.join("identity.json");
-    fs::write(&path, "损坏的身份").unwrap();
+    let path = fixture.root.join("config.yml");
+    let corrupted = "_system:\n  network_identity: 损坏的身份\n";
+    fs::write(&path, corrupted).unwrap();
     assert!(identity::ensure(&fixture.stored_config()).await.is_err());
-    assert_eq!(fs::read_to_string(&path).unwrap(), "损坏的身份");
-    fs::remove_file(&path).unwrap();
-    let target = fixture.root.join("target");
-    fs::write(&target, "保留原文件").unwrap();
-    symlink(&target, &path).unwrap();
-    assert!(identity::ensure(&fixture.stored_config()).await.is_err());
-    assert_eq!(fs::read_to_string(target).unwrap(), "保留原文件");
+    assert_eq!(fs::read_to_string(&path).unwrap(), corrupted);
 }
 
 #[tokio::test]
@@ -324,9 +319,13 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("config.yml"),
-        "network:\n  relay_url: https://saved.example\n  relay_token: saved-token\n",
+        "network:\n  relay_url: https://saved.example\n",
     )
     .unwrap();
+    super::config::relay_password()
+        .write(&fixture.stored_config(), "saved-token")
+        .await
+        .unwrap();
     let service = fixture.service();
     let config = fixture.config(service.clone());
     fixture.registrar.fail.store(true, Ordering::SeqCst);
@@ -391,6 +390,8 @@ async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
     let mut changes = config.subscribe();
     fixture.registrar.fail.store(true, Ordering::SeqCst);
     let config = Arc::try_unwrap(config).unwrap();
+    let router = Arc::new(super::config::notification_router(service.clone()));
+    config.attach_notifications(&router);
     let module = config::Module::from_service(config);
     let response = module
         .router()

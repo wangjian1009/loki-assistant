@@ -1,12 +1,11 @@
+use crate::modules::password::service::SYSTEM_PASSWORD_PREFIX;
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::modules::config::service::{
-    ConfigService, ConfigServiceError, LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX,
-};
+use crate::modules::config::service::{ConfigService, ConfigServiceError, Password};
 
 use super::protocol::{BindingToken, DeviceType, NetworkError, Peer};
 
@@ -177,30 +176,11 @@ async fn from_passwords(
 pub(super) async fn load(
     config: &ConfigService,
 ) -> Result<BTreeMap<String, StoredPeer>, NetworkError> {
-    let storage = config.clone();
-    let peers = config
-        .update_system_value(
-            KEY,
-            Some(LegacySystemFile {
-                name: "peers.json",
-                limit: 1_048_576,
-            }),
-            async move |previous| {
-                let Some(value) = previous else {
-                    return Ok((None, Vec::new()));
-                };
-                if value["version"] == 2 {
-                    let peers = from_passwords(&storage, decode(value.clone(), 2)?).await?;
-                    return Ok((Some(value), peers));
-                }
-                let peers = decode(value, 1)?.peers;
-                let records = to_passwords(&storage, &peers, &HashSet::new()).await?;
-                Ok((
-                    Some(serde_json::to_value(records).map_err(|_| invalid())?),
-                    peers,
-                ))
-            },
-        )
+    let Some(value) = config.system_value(KEY).await else {
+        return Ok(BTreeMap::new());
+    };
+    let records = decode(value, 2).map_err(|_| NetworkError::Storage)?;
+    let peers = from_passwords(config, records)
         .await
         .map_err(|_| NetworkError::Storage)?;
     Ok(peers
@@ -215,7 +195,7 @@ pub(super) async fn save(
 ) -> Result<(), NetworkError> {
     let storage = config.clone();
     let retired = config
-        .update_system_value(KEY, None, async move |previous| {
+        .update_system_value(KEY, async move |previous| {
             let existing = previous
                 .map(|value| decode::<Password>(value, 2))
                 .transpose()?

@@ -1,9 +1,4 @@
-use std::{
-    fs,
-    os::unix::fs::{PermissionsExt, symlink},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -283,14 +278,6 @@ async fn storage_failure_keeps_invitation_available_and_corrupt_records_are_pres
             .is_err()
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
-    fs::remove_file(&path).unwrap();
-    symlink(&path, fixture.root.join("peers.json")).unwrap();
-    assert!(
-        PairingService::new(fixture.stored_config())
-            .list()
-            .await
-            .is_err()
-    );
 }
 
 async fn http(app: axum::Router, method: &str, path: &str) -> (u16, Value) {
@@ -309,69 +296,6 @@ async fn http(app: axum::Router, method: &str, path: &str) -> (u16, Value) {
     let value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65_536).await.unwrap()).unwrap();
     (status, value)
-}
-
-#[tokio::test]
-async fn startup_migrates_network_credentials_without_exposing_or_changing_them() {
-    let fixture = Fixture::new();
-    let identity = SecretKey::generate();
-    let phone = SecretKey::generate().public();
-    let token = "ab".repeat(32);
-    let old_identity = fixture.root.join("identity.json");
-    let old_peers = fixture.root.join("peers.json");
-    fs::write(
-        &old_identity,
-        serde_json::to_vec(&json!({
-            "version": 1, "secret_key": identity, "endpoint_id": identity.public().to_string()
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        &old_peers,
-        serde_json::to_vec(&json!({
-            "version": 1,
-            "peers": [{
-                "endpoint_id": phone.to_string(), "name": "测试手机",
-                "bound_at": 1, "binding_token": token
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let service = fixture.service();
-    service.start().await.unwrap();
-    assert!(!old_identity.exists());
-    assert!(!old_peers.exists());
-
-    let config = fixture.config(service);
-    config
-        .replace("network", "relay_url", json!("https://relay.example"))
-        .await
-        .unwrap();
-    let reloaded = fixture.stored_config();
-    let (saved, created) = super::identity::ensure(&reloaded).await.unwrap();
-    assert!(!created);
-    assert_eq!(saved.public(), identity.public());
-    PairingService::new(reloaded.clone())
-        .authenticate(phone, &token)
-        .await
-        .unwrap();
-    let routes = crate::modules::config::Module::from_service(reloaded.clone()).router();
-    for (path, status) in [("/data/network", 200), ("/data/_system/network_peers", 404)] {
-        let response = routes
-            .clone()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), status);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = std::str::from_utf8(&body).unwrap();
-        assert!(!body.contains("secret_key"));
-        assert!(!body.contains("binding_token"));
-        assert!(!body.contains(&token));
-    }
-    assert!(!format!("{reloaded:?}").contains(&token));
 }
 
 #[tokio::test]

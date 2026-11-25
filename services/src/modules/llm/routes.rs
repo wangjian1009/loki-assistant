@@ -66,7 +66,7 @@ async fn clients(
 ) -> Result<Json<ClientsResponse>, Response> {
     Ok(Json(ClientsResponse {
         api_version: API_VERSION,
-        clients: service.clients().await?,
+        clients: service.clients().await,
     }))
 }
 
@@ -74,6 +74,26 @@ async fn clients(
 struct ClientsResponse {
     api_version: &'static str,
     clients: Vec<Client>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClientInput {
+    name: Option<String>,
+    #[serde(flatten)]
+    binding: Binding,
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "provider-ids",
+    method = "GET",
+    path = "/llm/providers",
+    summary = "列出上游供应商",
+    description = "返回可用于客户端绑定的供应商 ID。"
+)]
+async fn provider_ids(State(service): State<Arc<LlmService>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "api_version": API_VERSION, "ids": service.provider_ids().await }))
 }
 
 #[loki_api(
@@ -87,9 +107,16 @@ struct ClientsResponse {
 )]
 async fn issue_client(
     State(service): State<Arc<LlmService>>,
-    body: Result<Json<Binding>, JsonRejection>,
+    body: Result<Json<ClientInput>, JsonRejection>,
 ) -> Result<Response, Response> {
-    let client = service.issue(binding(body)?).await?;
+    let Json(input) = body.map_err(|rejection| {
+        error(
+            rejection.status(),
+            "llm-invalid-binding",
+            "请提交供应商和可选的客户端名称。",
+        )
+    })?;
+    let client = service.issue(input.name, input.binding).await?;
     Ok((
         StatusCode::CREATED,
         [(header::CACHE_CONTROL, "no-store")],

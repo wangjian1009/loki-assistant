@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::modules::config::service::{ChangeFuture, ConfigChange, ConfigChangeHandler};
 use std::{
     collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
 };
@@ -14,9 +16,7 @@ use crate::process::Process;
 
 use crate::modules::{
     alert::AlertService,
-    config::service::{
-        ChangeFuture, ConfigChange, ConfigChangeHandler, ConfigService, ConfigServiceError,
-    },
+    config::service::{ConfigService, ConfigServiceError},
     emacs::service::EmacsService,
     notification::NotificationService,
     status::StatusService,
@@ -107,7 +107,7 @@ pub(super) async fn read_team_nicknames(
         .collect())
 }
 
-fn parse_nicknames(value: Value) -> Result<BTreeMap<String, String>, String> {
+pub(super) fn parse_nicknames(value: Value) -> Result<BTreeMap<String, String>, String> {
     let entries: Vec<SlackNickname> =
         serde_json::from_value(value).map_err(|_| "Slack 昵称配置格式无效。".to_owned())?;
     let mut nicknames = BTreeMap::new();
@@ -330,7 +330,7 @@ impl Projects {
         }
     }
 
-    async fn reload_nicknames(&self) {
+    pub(super) async fn reload_nicknames(&self) {
         match self.nicknames().await {
             Ok(nicknames) => self.apply_nicknames(nicknames).await,
             Err(error) => log::warn!("读取 Slack 昵称配置失败：{error:?}"),
@@ -473,24 +473,16 @@ impl Projects {
         let service = self.service(team).await?;
         let profile = service.lookup_user(session, user).await?;
         let id = format!("{team}.{user}");
-        if let Some(nickname) = nickname {
-            self.config
-                .replace_record(
-                    "slack".into(),
-                    NICKNAMES.into(),
-                    id.clone(),
-                    json!({"id":id,"nickname":nickname}),
-                    false,
-                    false,
-                )
-                .await
-                .map_err(|_| Error::NicknameStorage)?;
-        } else {
-            self.config
-                .remove_record("slack".into(), NICKNAMES.into(), id)
-                .await
-                .map_err(|_| Error::NicknameStorage)?;
-        }
+        self.config
+            .notify_write(
+                "slack".into(),
+                NICKNAMES.into(),
+                Some(id),
+                nickname.map(|value| json!({"nickname": value})),
+                false,
+            )
+            .await
+            .map_err(|_| Error::NicknameStorage)?;
         let mut profile = service.user_result(session, &profile).await?;
         profile["nickname"] = json!(self.nicknames().await?.get(&format!("{team}.{user}")));
         Ok(profile)
@@ -840,6 +832,18 @@ impl Projects {
     }
 }
 
+impl Projects {
+    pub(super) fn retention_changed(&self) {
+        self.clean_dormant_caches.notify_one();
+        self.teams.post(|teams| {
+            for project in teams.projects.values() {
+                project.internal.clean_cache.notify_one();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
 impl ConfigChangeHandler for Projects {
     fn handle(&self, change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async move {
@@ -862,12 +866,7 @@ impl ConfigChangeHandler for Projects {
                 return Ok(());
             }
             if change.key == CACHE_RETENTION_DAYS {
-                self.clean_dormant_caches.notify_one();
-                self.teams.post(|teams| {
-                    for project in teams.projects.values() {
-                        project.internal.clean_cache.notify_one();
-                    }
-                });
+                self.retention_changed();
                 return Ok(());
             }
             self.sync_projects(None).await

@@ -1,4 +1,5 @@
 mod config;
+pub(crate) use config::notification_router;
 mod identity;
 mod pairing;
 mod peers;

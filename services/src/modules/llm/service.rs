@@ -8,35 +8,71 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, stream};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use super::{
-    config::{MODULE, PROVIDERS, provider_uri},
+    config::{CLIENTS, MODULE, PROVIDERS, provider_uri},
     monitor::{Monitor, RequestGuard},
     protocol::{Binding, Client, IssuedClient, Phase, Protocol, error},
     usage::UsageReader,
 };
-use crate::modules::config::service::{ConfigService, ConfigServiceError};
+use crate::{
+    modules::config::service::{ConfigService, ConfigServiceError},
+    process::Process,
+};
 
-const CLIENTS: &str = "llm_clients";
 const TOKEN_PREFIX: &str = "loki-llm-";
 const API_KEY: &str = "x-api-key";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize)]
 struct StoredClient {
-    digest: [u8; 32],
+    name: String,
+    token: String,
+    #[serde(flatten)]
     binding: Binding,
 }
 
 type Clients = BTreeMap<Uuid, StoredClient>;
 
+#[derive(Default)]
+struct Authorization {
+    clients: Clients,
+    providers: BTreeMap<String, Provider>,
+}
+
+struct Provider {
+    codex: Result<Option<Upstream>, &'static str>,
+    claude: Result<Option<Upstream>, &'static str>,
+}
+
+#[derive(Clone)]
+struct Upstream {
+    uri: url::Url,
+    credential: Option<HeaderValue>,
+}
+
+fn token_id(token: &str) -> Option<Uuid> {
+    let (id, secret) = token.strip_prefix(TOKEN_PREFIX)?.split_once('.')?;
+    (secret.len() == 43).then_some(())?;
+    Uuid::parse_str(id).ok()
+}
+
+pub(super) fn new_token(id: Uuid) -> Result<String, getrandom::Error> {
+    let mut secret = [0; 32];
+    getrandom::fill(&mut secret)?;
+    Ok(format!(
+        "{TOKEN_PREFIX}{id}.{}",
+        URL_SAFE_NO_PAD.encode(secret)
+    ))
+}
+
 #[derive(Debug)]
 pub(crate) struct LlmService {
     config: Arc<ConfigService>,
+    authorization: Process<Authorization>,
     pub(crate) monitor: Monitor,
     http: reqwest::Client,
 }
@@ -46,6 +82,7 @@ impl LlmService {
         let _ = rustls::crypto::ring::default_provider().install_default();
         Self {
             config,
+            authorization: Process::start(Authorization::default()),
             monitor,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -65,40 +102,109 @@ impl LlmService {
         crate::http::mount_routes(axum::Router::new(), MODULE).with_state(self.clone())
     }
 
-    pub(super) async fn clients(&self) -> Result<Vec<Client>, Response> {
-        Ok(self
-            .load_clients()
-            .await?
-            .into_iter()
-            .map(|(id, stored)| Client {
-                id,
-                binding: stored.binding,
+    pub(crate) async fn reload_authorization(&self) -> Result<(), ConfigServiceError> {
+        let config = self.config.clone();
+        self.authorization
+            .with(move |state| {
+                Box::pin(async move {
+                    let values = config.module_values(MODULE).await?;
+                    let mut clients = Clients::new();
+                    let records: Vec<StoredClient> =
+                        serde_json::from_value(values[CLIENTS].value.clone()).map_err(|_| {
+                            ConfigServiceError::InvalidValue("LLM 客户端配置格式无效。".into())
+                        })?;
+                    for record in records {
+                        let id = token_id(&record.token).ok_or_else(|| {
+                            ConfigServiceError::InvalidValue("LLM 客户端令牌格式无效。".into())
+                        })?;
+                        if clients.insert(id, record).is_some() {
+                            return Err(ConfigServiceError::InvalidValue(
+                                "LLM 客户端令牌重复。".into(),
+                            ));
+                        }
+                    }
+                    let mut providers = BTreeMap::new();
+                    for record in values[PROVIDERS]
+                        .value
+                        .as_array()
+                        .expect("供应商配置应为列表")
+                    {
+                        let id = record["id"].as_str().expect("供应商记录应有标识");
+                        let mut resolved = [Ok(None), Ok(None)];
+                        for (protocol, result) in [Protocol::Codex, Protocol::Claude]
+                            .into_iter()
+                            .zip(&mut resolved)
+                        {
+                            *result = read_upstream(&config, id, record, protocol).await;
+                        }
+                        let [codex, claude] = resolved;
+                        providers.insert(id.to_owned(), Provider { codex, claude });
+                    }
+                    *state = Authorization { clients, providers };
+                    Ok(())
+                })
             })
-            .collect())
+            .await
     }
 
-    pub(super) async fn issue(&self, binding: Binding) -> Result<IssuedClient, Response> {
-        let binding = self.validate_binding(binding).await?;
-        let id = Uuid::new_v4();
-        let mut secret = [0; 32];
-        getrandom::fill(&mut secret).map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "llm-random-error",
-                "无法生成客户端令牌。",
+    pub(super) async fn prepare_client(
+        &self,
+        upstream: String,
+        id: Option<Uuid>,
+    ) -> Result<Option<String>, String> {
+        self.authorization
+            .call(move |state| {
+                if !state.providers.contains_key(&upstream) {
+                    return Err("供应商不存在。".into());
+                }
+                id.map(new_token)
+                    .transpose()
+                    .map_err(|_| "无法生成客户端令牌。".into())
+            })
+            .await
+    }
+
+    pub(super) async fn provider_ids(&self) -> Vec<String> {
+        self.authorization
+            .call(|state| state.providers.keys().cloned().collect())
+            .await
+    }
+
+    pub(super) async fn clients(&self) -> Vec<Client> {
+        self.authorization
+            .call(|state| {
+                state
+                    .clients
+                    .iter()
+                    .map(|(&id, record)| Client {
+                        id,
+                        binding: record.binding.clone(),
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    pub(super) async fn issue(
+        &self,
+        name: Option<String>,
+        binding: Binding,
+    ) -> Result<IssuedClient, Response> {
+        let name = name.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let (value, _) = self
+            .config
+            .notify_write(
+                MODULE.into(),
+                CLIENTS.into(),
+                Some(name),
+                Some(serde_json::json!({"upstream": binding.upstream})),
+                true,
             )
-        })?;
-        let token = format!("{TOKEN_PREFIX}{id}.{}", URL_SAFE_NO_PAD.encode(secret));
-        let digest = Sha256::digest(token.as_bytes()).into();
-        let stored = StoredClient {
-            digest,
-            binding: binding.clone(),
-        };
-        self.update_clients(move |clients| {
-            clients.insert(id, stored);
-            Some(())
-        })
-        .await?;
+            .await
+            .map_err(config_change_error)?
+            .ok_or_else(config_error)?;
+        let token = value["token"].as_str().ok_or_else(config_error)?.to_owned();
+        let id = token_id(&token).ok_or_else(config_error)?;
         Ok(IssuedClient {
             client: Client { id, binding },
             token,
@@ -106,76 +212,46 @@ impl LlmService {
     }
 
     pub(super) async fn switch(&self, id: Uuid, binding: Binding) -> Result<Client, Response> {
-        let binding = self.validate_binding(binding).await?;
-        let next = binding.clone();
-        self.update_clients(move |clients| {
-            clients.get_mut(&id)?.binding = next;
-            Some(())
-        })
-        .await?;
+        let name = self.client_name(id).await?;
+        self.config
+            .notify_patch(
+                MODULE.into(),
+                CLIENTS.into(),
+                Some(name),
+                serde_json::json!({"upstream": binding.upstream}),
+            )
+            .await
+            .map_err(config_change_error)?;
         Ok(Client { id, binding })
     }
 
     pub(super) async fn revoke(&self, id: Uuid) -> Result<(), Response> {
-        self.update_clients(move |clients| clients.remove(&id).map(|_| ()))
+        let name = self.client_name(id).await?;
+        self.config
+            .notify_write(MODULE.into(), CLIENTS.into(), Some(name), None, false)
             .await
-    }
-
-    async fn load_clients(&self) -> Result<Clients, Response> {
-        decode_clients(self.config.system_value(CLIENTS).await).map_err(|_| config_error())
-    }
-
-    async fn update_clients(
-        &self,
-        update: impl FnOnce(&mut Clients) -> Option<()> + Send + 'static,
-    ) -> Result<(), Response> {
-        let updated = self
-            .config
-            .update_system_value(CLIENTS, None, async move |previous| {
-                let mut clients = decode_clients(previous.clone())?;
-                if update(&mut clients).is_none() {
-                    return Ok((previous, false));
-                }
-                let value = serde_json::to_value(clients).map_err(client_storage_error)?;
-                Ok((Some(value), true))
-            })
-            .await
-            .map_err(|_| config_error())?;
-        if !updated {
-            return Err(error(
-                StatusCode::NOT_FOUND,
-                "llm-client-not-found",
-                "客户端不存在。",
-            ));
-        }
+            .map_err(config_change_error)?;
         Ok(())
     }
 
-    async fn validate_binding(&self, binding: Binding) -> Result<Binding, Response> {
-        let providers = self
-            .config
-            .value(MODULE, PROVIDERS)
+    async fn client_name(&self, id: Uuid) -> Result<String, Response> {
+        self.authorization
+            .call(move |state| state.clients.get(&id).map(|client| client.name.clone()))
             .await
-            .map_err(|_| config_error())?;
-        if !providers.value.as_array().is_some_and(|providers| {
-            providers
-                .iter()
-                .any(|record| record["id"].as_str() == Some(&binding.upstream))
-        }) {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "llm-provider-not-found",
-                "供应商不存在。",
-            ));
-        }
-        Ok(binding)
+            .ok_or_else(|| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "llm-client-not-found",
+                    "客户端不存在。",
+                )
+            })
     }
 
     async fn authenticate(
         &self,
         headers: &HeaderMap,
         protocol: Protocol,
-    ) -> Result<Client, Response> {
+    ) -> Result<(Client, Upstream), Response> {
         let bearer = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -188,23 +264,49 @@ impl LlmService {
                     .then(|| headers.get(API_KEY)?.to_str().ok())
                     .flatten()
             })
-            .ok_or_else(invalid_token)?;
-        let (id, _) = token
-            .strip_prefix(TOKEN_PREFIX)
-            .and_then(|value| value.split_once('.'))
-            .filter(|(_, secret)| secret.len() == 43)
-            .ok_or_else(invalid_token)?;
-        let id = Uuid::parse_str(id).map_err(|_| invalid_token())?;
-        let mut clients = self.load_clients().await?;
-        let stored = clients.remove(&id).ok_or_else(invalid_token)?;
-        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        if !bool::from(digest.ct_eq(&stored.digest)) {
-            return Err(invalid_token());
-        }
-        Ok(Client {
-            id,
-            binding: stored.binding,
-        })
+            .ok_or_else(invalid_token)?
+            .to_owned();
+        self.authorization
+            .call(move |state| {
+                let id = token_id(&token).ok_or_else(invalid_token)?;
+                let record = state
+                    .clients
+                    .get(&id)
+                    .filter(|record| bool::from(token.as_bytes().ct_eq(record.token.as_bytes())))
+                    .ok_or_else(invalid_token)?;
+                let provider = state
+                    .providers
+                    .get(&record.binding.upstream)
+                    .ok_or_else(|| {
+                        error(
+                            StatusCode::BAD_GATEWAY,
+                            "llm-provider-not-found",
+                            "当前绑定的供应商不存在。",
+                        )
+                    })?;
+                let upstream = match protocol {
+                    Protocol::Codex => &provider.codex,
+                    Protocol::Claude => &provider.claude,
+                }
+                .as_ref()
+                .map_err(|code| error(StatusCode::BAD_GATEWAY, code, "供应商的 API Key 不可用。"))?
+                .clone()
+                .ok_or_else(|| {
+                    error(
+                        StatusCode::BAD_GATEWAY,
+                        "llm-protocol-unavailable",
+                        "当前供应商未配置此协议。",
+                    )
+                })?;
+                Ok((
+                    Client {
+                        id,
+                        binding: record.binding.clone(),
+                    },
+                    upstream,
+                ))
+            })
+            .await
     }
 
     pub(super) async fn forward(
@@ -212,40 +314,13 @@ impl LlmService {
         protocol: Protocol,
         request: Request,
     ) -> Result<Response, Response> {
-        let client = self.authenticate(request.headers(), protocol).await?;
-        let (provider, [api_key]) = self
-            .config
-            .read_record_with_passwords(
-                MODULE,
-                PROVIDERS,
-                &client.binding.upstream,
-                [protocol.key_field()],
-            )
-            .await
-            .map_err(|error_value| match error_value {
-                ConfigServiceError::ActionNotFound => error(
-                    StatusCode::BAD_GATEWAY,
-                    "llm-provider-not-found",
-                    "当前绑定的供应商不存在。",
-                ),
-                _ => config_error(),
-            })?;
-        let mut uri = provider_uri(&provider, protocol.uri_field())
-            .map_err(|message| error(StatusCode::BAD_GATEWAY, "llm-provider-uri", message))?
-            .ok_or_else(|| {
-                error(
-                    StatusCode::BAD_GATEWAY,
-                    "llm-protocol-unavailable",
-                    "当前供应商未配置此协议。",
-                )
-            })?;
-        if provider[protocol.key_field()].is_string() && api_key.is_none() {
-            return Err(error(
-                StatusCode::BAD_GATEWAY,
-                "llm-provider-key-missing",
-                "供应商的 API Key 条目不可用。",
-            ));
-        }
+        let (
+            client,
+            Upstream {
+                mut uri,
+                credential,
+            },
+        ) = self.authenticate(request.headers(), protocol).await?;
         let (parts, body) = request.into_parts();
         let endpoint = parts
             .uri
@@ -259,20 +334,12 @@ impl LlmService {
         headers.remove(header::AUTHORIZATION);
         headers.remove(API_KEY);
         headers.remove(header::HOST);
-        if let Some(key) = api_key {
-            let (name, value) = match protocol {
-                Protocol::Codex => (header::AUTHORIZATION, format!("Bearer {key}")),
-                Protocol::Claude => (HeaderName::from_static(API_KEY), key),
+        if let Some(credential) = credential {
+            let header = match protocol {
+                Protocol::Codex => header::AUTHORIZATION,
+                Protocol::Claude => HeaderName::from_static(API_KEY),
             };
-            let mut value = HeaderValue::from_str(&value).map_err(|_| {
-                error(
-                    StatusCode::BAD_GATEWAY,
-                    "llm-provider-key-invalid",
-                    "供应商的 API Key 格式无效。",
-                )
-            })?;
-            value.set_sensitive(true);
-            headers.insert(name, value);
+            headers.insert(header, credential);
         }
 
         let head = parts.method == Method::HEAD;
@@ -440,16 +507,52 @@ fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
     result
 }
 
-fn decode_clients(value: Option<Value>) -> Result<Clients, ConfigServiceError> {
-    value
-        .map(serde_json::from_value)
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .map_err(client_storage_error)
+async fn read_upstream(
+    config: &ConfigService,
+    id: &str,
+    record: &Value,
+    protocol: Protocol,
+) -> Result<Option<Upstream>, &'static str> {
+    let Some(uri) = provider_uri(record, protocol.uri_field()).map_err(|_| "llm-provider-uri")?
+    else {
+        return Ok(None);
+    };
+    let credential = if record[protocol.key_field()].is_string() {
+        let [key] = config
+            .read_record_passwords(MODULE, PROVIDERS, id, [protocol.key_field()])
+            .await
+            .map_err(|_| "llm-provider-key-missing")?;
+        let key = key.ok_or("llm-provider-key-missing")?;
+        let value = match protocol {
+            Protocol::Codex => format!("Bearer {key}"),
+            Protocol::Claude => key,
+        };
+        let mut header = HeaderValue::from_str(&value).map_err(|_| "llm-provider-key-invalid")?;
+        header.set_sensitive(true);
+        Some(header)
+    } else {
+        None
+    };
+    Ok(Some(Upstream { uri, credential }))
 }
 
-fn client_storage_error(_: serde_json::Error) -> ConfigServiceError {
-    ConfigServiceError::Storage("LLM 客户端配置格式无效。".into())
+fn config_change_error(error_value: ConfigServiceError) -> Response {
+    match error_value {
+        ConfigServiceError::PendingValidation(detail) => error(
+            StatusCode::BAD_REQUEST,
+            "llm-invalid-client",
+            detail.message,
+        ),
+        ConfigServiceError::RecordExists => error(
+            StatusCode::CONFLICT,
+            "llm-client-exists",
+            "客户端名称已存在。",
+        ),
+        ConfigServiceError::InvalidValue(message) => {
+            error(StatusCode::BAD_REQUEST, "llm-invalid-client", message)
+        }
+        _ => config_error(),
+    }
 }
 
 fn config_error() -> Response {

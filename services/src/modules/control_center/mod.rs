@@ -2,7 +2,7 @@ mod config;
 mod service;
 
 pub use service::ControlCenterService;
-pub(crate) use service::handler;
+pub(crate) use service::notification_router;
 
 use crate::modules::discover::registry::ModuleRegistration;
 

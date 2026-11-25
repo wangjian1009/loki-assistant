@@ -173,7 +173,14 @@ async fn failed_handler_returns_http_error_without_modifying_config_or_notifying
         .replace("control-center", "center_auto_start", json!(false))
         .await
         .unwrap();
-    let original = fs::read(&path).unwrap();
+    let notification_router = Arc::new(super::service::notification_router_with(Ok(Arc::new(
+        ControlCenterService::with_manager(
+            LaunchdManager::for_user(&fixture.root, 123, fixture.runner.clone()),
+            fixture.executable.clone(),
+            fixture.root.clone(),
+        ),
+    ))));
+    service.attach_notifications(&notification_router);
     fixture.runner.0.lock().unwrap().fail = Some("bootstrap".to_owned());
     let mut changes = service.subscribe();
     let module = config::Module::from_service(service);
@@ -189,17 +196,21 @@ async fn failed_handler_returns_http_error_without_modifying_config_or_notifying
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), 500);
+    assert_eq!(response.status(), 422);
     let error: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(error["error"]["code"], "config-change-rejected");
+    assert_eq!(error["error"]["code"], "center-auto-start");
     assert!(
         error["error"]["message"]
             .as_str()
             .unwrap()
             .contains("系统拒绝操作")
     );
-    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains("_pending_config_notifications")
+    );
     assert_eq!(
         module
             .service()

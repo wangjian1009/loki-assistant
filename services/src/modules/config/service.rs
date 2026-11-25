@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use std::{fmt::Debug, future::Future, pin::Pin};
 
 use regex::Regex;
@@ -23,10 +24,11 @@ use super::{
 mod notifications;
 mod system;
 pub use notifications::NotificationValidationError;
+use notifications::pending_password_id;
 pub(crate) use notifications::{NotificationConfirmedFields, NotificationRequest};
-use notifications::{legacy_pending_password_id, pending_password_id};
-pub(crate) use system::{LegacySystemFile, Password, SYSTEM_PASSWORD_PREFIX};
+pub(crate) use system::Password;
 
+#[cfg(test)]
 type SecretWriters = HashMap<(String, String), Process<()>>;
 
 #[derive(Clone, Debug)]
@@ -35,9 +37,11 @@ pub struct ConfigService {
     data: Process<StoredConfig>,
     values: Process<Arc<StoredValues>>,
     record_credentials: Process<()>,
+    #[cfg(test)]
     secret_writers: Process<SecretWriters>,
     changes: broadcast::Sender<ConfigChange>,
     commits: Process<()>,
+    #[cfg(test)]
     handlers: HashMap<String, Arc<dyn ConfigChangeHandler>>,
     passwords: Option<Arc<PasswordService>>,
     executable_search_path: Vec<PathBuf>,
@@ -72,12 +76,12 @@ pub enum ConfigChangeOperation {
     AuthorizedCreate,
 }
 
+#[cfg(test)]
 pub type ChangeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+#[cfg(test)]
 pub type ProcessFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
-pub type ActionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Value, ConfigServiceError>> + Send + 'a>>;
-
 /// 提交前处理配置变化；不得递归提交配置。失败时处理器负责撤销自身的部分操作。
+#[cfg(test)]
 pub trait ConfigChangeHandler: Debug + Send + Sync {
     fn handle(&self, _change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async { Ok(()) })
@@ -119,21 +123,6 @@ pub trait ConfigChangeHandler: Debug + Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// 注册需要由模块处理新增的配置项。
-    fn record_creation_keys(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    fn prepare_record<'a>(
-        &'a self,
-        _key: &'a str,
-        _instance: &'a str,
-        _value: Value,
-        _config: std::sync::Weak<ConfigService>,
-    ) -> ActionFuture<'a> {
-        Box::pin(async { Err(ConfigServiceError::ActionNotFound) })
-    }
-
     /// 配置落盘、内存更新后完成外部状态切换；错误只记录，不能撤回已提交配置。
     fn committed(&self, _change: ConfigChange) -> ChangeFuture<'_> {
         Box::pin(async { Ok(()) })
@@ -170,8 +159,6 @@ pub enum ConfigServiceError {
     ActionNotFound,
     #[error("该配置记录已存在。")]
     RecordExists,
-    #[error("请先完成配置记录的授权。")]
-    RecordAuthorizationRequired,
     #[error("该配置已有待确认的变更。")]
     ChangePending,
     #[error("此资源没有待确认变更。")]
@@ -279,24 +266,7 @@ impl ConfigService {
     ) -> Result<Self, ConfigServiceError> {
         let storage = FileStorage::new(path)?;
         let mut values = storage.read()?;
-        let mut cleaned = None;
-        if let Some(password) = values.get_mut("password") {
-            let pass_path = password.remove("pass_path");
-            let store_dir = password.remove("store_dir");
-            if pass_path.is_some() || store_dir.is_some() {
-                if password.is_empty() {
-                    values.remove("password");
-                }
-                cleaned = Some(values.clone());
-            }
-        }
-        let mut system_values = values.remove(system::SECTION).unwrap_or_default();
-        if let Some(token) = values
-            .get_mut("network")
-            .and_then(|network| network.remove("relay_token"))
-        {
-            system_values.entry("network_relay_token").or_insert(token);
-        }
+        let system_values = values.remove(system::SECTION).unwrap_or_default();
         for (module_id, entries) in &mut values {
             // 保留其他版本或插件的配置，仅校验当前已知配置项。
             if let Some(module) = metadata.iter().find(|module| &module.id == module_id) {
@@ -305,34 +275,12 @@ impl ConfigService {
                         .item(key)
                         .is_none_or(|item| !item.data_type.is_password())
                 });
-                for item in &module.items {
-                    let options = item_options(module_id, &item.key);
-                    if let Some(legacy) = options
-                        .structure
-                        .as_ref()
-                        .and_then(|structure| structure.legacy_dictionary.as_ref())
-                        && !entries.contains_key(&item.key)
-                        && let Some(previous) = entries.remove(&legacy.key)
-                    {
-                        entries.insert(item.key.clone(), options.migrate_dictionary(previous)?);
-                    }
-                    if let Some(records) = entries.get_mut(&item.key).and_then(Value::as_array_mut)
-                    {
-                        for record in records {
-                            options.clear_retired_password_references(record, false);
-                        }
-                    }
-                }
                 for (key, value) in entries.iter() {
                     if let Some(item) = module.item(key) {
                         item.validate_with(&item_options(module_id, key), value)?;
                     }
                 }
             }
-        }
-        notifications::clear_retired_pending_password_references(&mut values);
-        if let Some(cleaned) = cleaned {
-            storage.write_atomic(cleaned)?;
         }
         Ok(Self::with_data(
             metadata,
@@ -345,6 +293,7 @@ impl ConfigService {
     }
 
     /// 在服务组装阶段为模块配置提交处理器，每个模块至多一个。
+    #[cfg(test)]
     pub fn with_change_handler(
         mut self,
         module_id: impl Into<String>,
@@ -380,9 +329,11 @@ impl ConfigService {
             values: Process::start(data.values.clone()),
             data: Process::start(data),
             record_credentials: Process::start(()),
+            #[cfg(test)]
             secret_writers: Process::start(HashMap::new()),
             changes,
             commits: Process::start(()),
+            #[cfg(test)]
             handlers: HashMap::new(),
             passwords: None,
             notification_router: Arc::default(),
@@ -636,6 +587,7 @@ impl ConfigService {
         let service = self.clone();
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
         // HTTP 请求取消后仍完成已接受的落盘事务。
+        #[cfg(test)]
         if secret {
             let id = (module_id.clone(), key.clone());
             let writer = self
@@ -650,6 +602,10 @@ impl ConfigService {
             return writer
                 .run(async move { service.replace_secret(&module_id, &key, value).await })
                 .await;
+        }
+        #[cfg(not(test))]
+        if secret {
+            return Err(ConfigServiceError::SecretUnauthorized);
         }
         self.commits
             .run(async move {
@@ -670,98 +626,6 @@ impl ConfigService {
         let (module_id, key) = (module_id.to_owned(), key.to_owned());
         self.commits
             .run(async move { service.partial_inner(&module_id, &key, partial).await })
-            .await
-    }
-
-    pub(super) fn has_record_creation_handler(&self, module: &str, key: &str) -> bool {
-        self.handlers
-            .get(module)
-            .is_some_and(|handler| handler.record_creation_keys().contains(&key))
-    }
-
-    pub(super) async fn prepare_record(
-        self: &Arc<Self>,
-        module: &str,
-        key: &str,
-        instance: &str,
-        value: Value,
-    ) -> Result<Value, ConfigServiceError> {
-        let handler = self
-            .handlers
-            .get(module)
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        let metadata = self.module_metadata(module).await?;
-        let item = metadata
-            .item(key)
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        let options = item_options(module, key);
-        let id_field = options
-            .structure
-            .as_ref()
-            .and_then(|structure| structure.id_field.as_ref())
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        let mut record = value.as_object().cloned().ok_or_else(|| {
-            ConfigServiceError::InvalidValue("配置记录必须为 JSON object。".into())
-        })?;
-        if record
-            .get(id_field)
-            .is_some_and(|id| id.as_str() != Some(instance))
-        {
-            return Err(ConfigServiceError::InvalidValue(
-                "配置记录标识不一致。".into(),
-            ));
-        }
-        if options.structure.as_ref().is_some_and(|structure| {
-            structure
-                .fields
-                .iter()
-                .any(|field| field.read_only && record.contains_key(&field.key))
-        }) {
-            return Err(ConfigServiceError::InvalidValue(
-                "配置记录包含只读字段。".into(),
-            ));
-        }
-        record.insert(id_field.clone(), Value::String(instance.into()));
-        let record = Value::Object(record);
-        let current = self.value(module, key).await?.value;
-        let mut records = current
-            .as_array()
-            .cloned()
-            .ok_or(ConfigServiceError::ActionNotFound)?;
-        if records
-            .iter()
-            .any(|value| value[id_field].as_str() == Some(instance))
-        {
-            return Err(ConfigServiceError::RecordExists);
-        }
-        records.push(record.clone());
-        let candidate = Value::Array(records);
-        item.validate_with(&options, &candidate)?;
-        let mut module_values: BTreeMap<_, _> = self
-            .module_values(module)
-            .await?
-            .into_iter()
-            .map(|(key, value)| (key, value.value))
-            .collect();
-        module_values.insert(key.into(), candidate.clone());
-        let change = ConfigChange {
-            module_id: module.into(),
-            key: key.into(),
-            value: candidate,
-            operation: ConfigChangeOperation::AuthorizedCreate,
-            previous_value: Some(current),
-            module_values,
-        };
-        handler
-            .handle(change)
-            .await
-            .map_err(|message| ConfigServiceError::ChangeRejected {
-                module_id: module.into(),
-                key: key.into(),
-                message,
-            })?;
-        handler
-            .prepare_record(key, instance, record, Arc::downgrade(self))
             .await
     }
 
@@ -1029,15 +893,6 @@ impl ConfigService {
                             }
                         }
                     }
-                    if let Some(previous_id) = options
-                        .structure
-                        .as_ref()
-                        .and_then(|structure| structure.legacy_dictionary.as_ref())
-                        .and_then(|legacy| legacy.previous_id_field.as_deref())
-                        .and_then(|key| current.get(key).cloned().map(|value| (key, value)))
-                    {
-                        record.insert(previous_id.0.to_owned(), previous_id.1);
-                    }
                     let record = Value::Object(record);
                     if patch {
                         merge_patch(current, &record);
@@ -1247,6 +1102,7 @@ impl ConfigService {
             })?;
         let value = self.normalize_value(module_id, item, value).await?;
         if item.data_type.is_password() {
+            #[cfg(test)]
             if let Some(handler) = self.handlers.get(module_id) {
                 handler
                     .validate_secret(key, &value)
@@ -1263,28 +1119,57 @@ impl ConfigService {
         &self,
         module_id: &str,
         key: &str,
-        bearer: Option<&str>,
+        _bearer: Option<&str>,
     ) -> Result<(), ConfigServiceError> {
         let metadata = self.module_metadata(module_id).await?;
         if metadata.item(key).is_some_and(|item| {
             item.data_type.is_password() || item_options(module_id, key).requires_local_auth
         }) {
-            let handler = self
-                .handlers
-                .get(module_id)
-                .ok_or(ConfigServiceError::SecretUnauthorized)?;
-            handler
-                .authorize_secret(bearer)
-                .await
-                .map_err(|_| ConfigServiceError::SecretUnauthorized)?;
+            #[cfg(test)]
+            {
+                let handler = self
+                    .handlers
+                    .get(module_id)
+                    .ok_or(ConfigServiceError::SecretUnauthorized)?;
+                return handler
+                    .authorize_secret(_bearer)
+                    .await
+                    .map_err(|_| ConfigServiceError::SecretUnauthorized);
+            }
+            #[cfg(not(test))]
+            return Err(ConfigServiceError::SecretUnauthorized);
         }
         Ok(())
     }
 
     async fn secret_value(&self, module_id: &str, key: &str) -> ConfigValue {
-        let is_set = match self.handlers.get(module_id) {
-            Some(handler) => handler.secret_is_set(key).await,
-            None => false,
+        #[cfg(test)]
+        let handler = self.handlers.get(module_id);
+        #[cfg(test)]
+        let handled = if let Some(handler) = handler {
+            Some(handler.secret_is_set(key).await)
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let handled = None;
+        let is_set = if let Some(is_set) = handled {
+            is_set
+        } else {
+            match self
+                .metadata
+                .get(module_id)
+                .and_then(|module| module.item(key))
+                .map(|item| &item.data_type)
+            {
+                Some(ConfigDataType::Password { path, .. }) => self
+                    .load_password_entry(path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+                _ => false,
+            }
         };
         ConfigValue {
             value: Value::Bool(is_set),
@@ -1296,6 +1181,7 @@ impl ConfigService {
         }
     }
 
+    #[cfg(test)]
     async fn replace_secret(
         &self,
         module_id: &str,
@@ -1424,24 +1310,6 @@ impl ConfigService {
             ));
         }
         if operation != ConfigChangeOperation::AuthorizedCreate
-            && self.has_record_creation_handler(module_id, key)
-            && let Some(id_field) = options
-                .structure
-                .as_ref()
-                .and_then(|structure| structure.id_field.as_ref())
-            && let Some(records) = value.as_array()
-            && records.iter().any(|record| {
-                !previous_value
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .is_some_and(|existing| {
-                        existing.iter().any(|old| old[id_field] == record[id_field])
-                    })
-            })
-        {
-            return Err(ConfigServiceError::RecordAuthorizationRequired);
-        }
-        if operation != ConfigChangeOperation::AuthorizedCreate
             && let Some(structure) = &options.structure
             && let Some(id_field) = &structure.id_field
             && let Some(records) = value.as_array()
@@ -1509,7 +1377,7 @@ impl ConfigService {
             }
             _ => operation,
         };
-        let mut change = ConfigChange {
+        let change = ConfigChange {
             module_id: module_id.to_owned(),
             key: key.to_owned(),
             operation,
@@ -1517,7 +1385,11 @@ impl ConfigService {
             module_values,
             value,
         };
+        #[cfg(test)]
+        let mut change = change;
+        #[cfg(test)]
         let handler = self.handlers.get(module_id);
+        #[cfg(test)]
         if let Some(handler) = handler {
             let rejected = |message| ConfigServiceError::ChangeRejected {
                 module_id: module_id.to_owned(),
@@ -1596,6 +1468,7 @@ impl ConfigService {
             None => self.persist_values(values).await,
         };
         if let Err(error) = result {
+            #[cfg(test)]
             if let Some(handler) = handler {
                 if let Err(message) = handler.rollback(change.clone()).await {
                     return Err(ConfigServiceError::Storage(format!(
@@ -1606,6 +1479,7 @@ impl ConfigService {
             return Err(error);
         }
         let _ = self.changes.send(change.clone());
+        #[cfg(test)]
         if let Some(handler) = handler {
             if let Err(error) = handler.committed(change).await {
                 log::warn!("配置已保存，完成配置变化处理失败：{module_id}/{key}：{error}");
@@ -1696,41 +1570,6 @@ impl ConfigItemOptions {
             })
     }
 
-    fn clear_retired_password_references(&self, record: &mut Value, pending: bool) -> bool {
-        let Some(structure) = &self.structure else {
-            return false;
-        };
-        let Some(record) = record.as_object_mut() else {
-            return false;
-        };
-        let Some(instance) = structure
-            .id_field
-            .as_ref()
-            .and_then(|key| record.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            return false;
-        };
-        let mut changed = false;
-        for field in structure
-            .fields
-            .iter()
-            .filter(|field| field.data_type.is_password())
-        {
-            if let Some(path) = record.get(&field.key).and_then(Value::as_str)
-                && self.password_path(&field.key, &instance).is_ok_and(|base| {
-                    path != base
-                        && (!pending || !self.matches_password_path(&field.key, &instance, path))
-                })
-            {
-                record.remove(&field.key);
-                changed = true;
-            }
-        }
-        changed
-    }
-
     fn password_field(&self, key: &str) -> Option<&StructureField> {
         self.structure
             .as_ref()?
@@ -1789,9 +1628,7 @@ impl ConfigItemOptions {
             return false;
         };
         path == base
-            || (self.notification_endpoint.is_some()
-                && (legacy_pending_password_id(&base, path).is_some()
-                    || pending_password_id(&base, path).is_some()))
+            || (self.notification_endpoint.is_some() && pending_password_id(&base, path).is_some())
     }
 
     fn password_path(&self, key: &str, instance: &str) -> Result<String, ConfigServiceError> {
@@ -1814,34 +1651,6 @@ impl ConfigItemOptions {
         validate_file(&path)
             .map_err(|error| ConfigServiceError::InvalidValue(error.to_string()))?;
         Ok(path)
-    }
-
-    fn migrate_dictionary(&self, value: Value) -> Result<Value, ConfigServiceError> {
-        let structure = self.structure.as_ref().expect("迁移结构已声明");
-        let legacy = structure
-            .legacy_dictionary
-            .as_ref()
-            .expect("字典迁移已声明");
-        let entries = value.as_object().ok_or_else(|| {
-            ConfigServiceError::InvalidValue("旧版配置集合必须为 JSON object。".into())
-        })?;
-        let mut records = Vec::with_capacity(entries.len());
-        for (id, value) in entries {
-            let mut record = value.as_object().cloned().ok_or_else(|| {
-                ConfigServiceError::InvalidValue("旧版配置记录必须为 JSON object。".into())
-            })?;
-            record.retain(|key, _| structure.fields.iter().any(|field| &field.key == key));
-            if let Some(id_field) = &structure.id_field {
-                record
-                    .entry(id_field.clone())
-                    .or_insert_with(|| Value::String(id.clone()));
-            }
-            if let Some(previous_id_field) = &legacy.previous_id_field {
-                record.insert(previous_id_field.clone(), Value::String(id.clone()));
-            }
-            records.push(Value::Object(record));
-        }
-        Ok(Value::Array(records))
     }
 }
 
@@ -2518,22 +2327,6 @@ mod tests {
         fs::write(&path, "module_a: [broken").unwrap();
         assert!(ConfigService::load_with_metadata(&path, vec![metadata()]).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "module_a: [broken");
-    }
-
-    #[tokio::test]
-    async fn removes_retired_password_settings_from_the_file() {
-        let fixture = Fixture::new();
-        let path = fixture.0.join("config.yml");
-        fs::write(
-            &path,
-            "password:\n  store_dir: /old/store\n  pass_path: /old/pass\nother:\n  setting: true\n",
-        )
-        .unwrap();
-
-        ConfigService::load(&path).unwrap();
-
-        let saved: Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved, json!({"other": {"setting": true}}));
     }
 
     #[tokio::test]

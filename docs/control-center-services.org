@@ -148,9 +148,9 @@ Slack 模块通过只读配置 ~slack/watches~ 持久化全局主题聊天关注
 
 * 控制中心模块
 
-~control-center~ 通过静态模块描述加入服务发现，配置元数据归属 ~modules/control_center/config.rs~ 。现有 ~center_auto_start~ 键保持兼容，类型为 ~boolean~ ，默认 ~false~ ，通过 ~GET /meta/control-center~ 和通用配置接口访问；没有独立业务 HTTP 路由。
+~control-center~ 通过静态模块描述加入服务发现，配置元数据归属 ~modules/control_center/config.rs~ 。~center_auto_start~ 的类型为 ~boolean~ ，默认 ~false~ ，通过 ~GET /meta/control-center~ 和通用配置接口访问；没有独立业务 HTTP 路由。
 
-~Services~ 为它注入提交前处理器。提交 ~center_auto_start~ 时，由该模块同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent：开启先检查托盘可执行文件，生成包含 ~RunAtLoad=true~ 、 ~KeepAlive=false~ 和 ~LimitLoadToSessionType=Aqua~ 的 plist，再执行 ~enable~ ，已加载则 ~kickstart~ ，否则 ~bootstrap~ ；关闭时对已加载任务执行 ~bootout~ 并删除 plist。重复关闭未安装的任务成功。系统调用使用独立参数，在阻塞任务中执行；测试注入 ~CommandRunner~ ，不操作真实用户的 launchd。
+~center_auto_start~ 的候选值落盘为待确认后，配置中心通知控制中心。该模块同步 ~cc.loki-assistant.center~ 用户级 LaunchAgent：开启先检查托盘可执行文件，生成包含 ~RunAtLoad=true~ 、 ~KeepAlive=false~ 和 ~LimitLoadToSessionType=Aqua~ 的 plist，再执行 ~enable~ ，已加载则 ~kickstart~ ，否则 ~bootstrap~ ；关闭时对已加载任务执行 ~bootout~ 并删除 plist。重复关闭未安装的任务成功。系统调用使用独立参数，在阻塞任务中执行；测试注入 ~CommandRunner~ ，不操作真实用户的 launchd。
 
 托盘默认路径为构建仓库的 ~apps/center/mac/.build/Debug/LokiAssistant.app/Contents/MacOS/LokiAssistant~ 。自定义构建位置时，在 services 启动环境中设置绝对路径 ~LOKI_ASSISTANT_CENTER_EXECUTABLE~ 。日志位于 ~~/Library/Logs/LokiAssistant/center.log~ 和 ~~/Library/Logs/LokiAssistant/center.error.log~ 。Emacs 仅提交该配置，失败时显示服务端说明并保留输入；构造模块和服务启动不自动修改 LaunchAgent。
 
@@ -747,19 +747,23 @@ Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_
 
 ** 管理客户端和查看用量
 
+在 Emacs 配置中心的「AI 统一代理 → LLM 客户端」点「新增 LLM 客户端」，填写唯一名称和供应商，再保存。配置中心先保存待确认记录。LLM 监控点把候选绑定交给鉴权进程校验，由该进程随机生成 token。收到成功确认后，配置中心把只读 ~token~ 和客户端记录写入 ~~/.assistant/config.yml~ 的 ~llm.clients~ 。可从配置中心复制该 token 给应用使用。配置文件权限为 ~0600~ 。
+
+修改客户端的供应商与删除客户端均走同一监控点。确认保存后，鉴权进程主动刷新内存。每个推理请求先通过队列获得鉴权与分发结果，随后用该结果发起 HTTP 请求。已获得分发结果的请求使用原供应商，后续取得结果的请求使用新绑定。令牌、供应商 URI 和所需凭据在启动及配置确认时加载到鉴权进程。
+
 | 方法 | 路径 | 用途 |
 |------+------|------|
-| POST | ~/llm/clients~ | 提交 ~{"upstream":"work"}~ ，响应中的 ~client.token~ 是签发的客户端令牌 |
+| GET | ~/data/llm/clients~ | 读取客户端名称、供应商和只读 token |
+| GET | ~/llm/providers~ | 列出可绑定的供应商 ID |
+| POST | ~/llm/clients~ | 提交 ~{"name":"editor","upstream":"work"}~ 并创建同一类配置记录 |
 | GET | ~/llm/clients~ | 列出客户端 ID 和供应商 |
-| PUT | ~/llm/clients/{id}~ | 提交新的 ~upstream~ ，替换供应商绑定 |
-| DELETE | ~/llm/clients/{id}~ | 撤销令牌，已累计的用量仍可通过客户端 ID 查询 |
+| PUT | ~/llm/clients/{id}~ | 提交新的 ~upstream~ 并更新客户端配置 |
+| DELETE | ~/llm/clients/{id}~ | 删除客户端配置并撤销令牌，保留历史用量 |
 | GET | ~/llm/requests~ | 查询正在等待或流式输出的请求，以及最近 100 条终态记录 |
 | GET | ~/llm/usage~ | 按客户端 ID 和供应商读取累计用量 |
 | GET | ~/llm/usage/sessions~ | 按客户端 ID、供应商和会话标识读取累计用量 |
 
-每个客户端令牌对应一个供应商。明文令牌只在签发响应中交付，配置保存其摘要。切换写入成功后，新请求使用新绑定，已发出的请求及其用量归原供应商。
-
-用量观察独立于转发。统计从 ~POST~ 响应中旁路读取 ~input_tokens~ 和 ~output_tokens~ 。Codex 流读取终态事件的 ~response.usage~ ，Claude 流读取 ~message_start~ 和 ~message_delta~ 中的累计值。模型列表和输入 token 估算只计入请求监控。响应缺字段、流在报告终态前中断，或压缩及大小限制使字段无法读取时，记录中将 ~usage.complete~ 置为 ~false~ ，同时保留能读取的计数。用量读取上限为单条 SSE 事件 1 MiB 和非流式正文 16 MiB。
+用量观察独立于转发。转发端将观测数据送入用量任务的队列。用量任务缓存、计算并批量落盘，从 ~POST~ 响应中读取 ~input_tokens~ 和 ~output_tokens~ 。Codex 流读取终态事件的 ~response.usage~ ，Claude 流读取 ~message_start~ 和 ~message_delta~ 中的累计值。模型列表和输入 token 估算只计入请求监控。响应缺字段、流在报告终态前中断，或压缩及大小限制使字段无法读取时，记录中将 ~usage.complete~ 置为 ~false~ ，同时保留能读取的计数。用量读取上限为单条 SSE 事件 1 MiB 和非流式正文 16 MiB。
 
 ~GET /llm/usage~ 每行返回 ~client_id~ 、 ~upstream~ 、 ~input_tokens~ 、 ~output_tokens~ 、 ~requests~ 和 ~incomplete_requests~ 。汇总累计已报告的用量，~incomplete_requests~ 表示其中有多少请求缺少完整用量。新明细保存到配置目录的 ~llm-usage.sqlite3~ 。~storage_error~ 表示最近一次持久化失败。
 

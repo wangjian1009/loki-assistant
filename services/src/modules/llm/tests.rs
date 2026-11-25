@@ -307,7 +307,7 @@ impl Drop for Directory {
     }
 }
 
-fn persistent_router(directory: &Directory) -> (Router, Arc<Router>) {
+async fn persistent_router(directory: &Directory) -> (Router, Arc<Router>) {
     let mut environment = PasswordEnvironment::new("/bin/echo".into(), directory.0.clone());
     environment.recipients = vec!["fixture".into()];
     let passwords = Arc::new(PasswordService::with_fixture_runner(
@@ -319,10 +319,11 @@ fn persistent_router(directory: &Directory) -> (Router, Arc<Router>) {
         .unwrap()
         .with_password_service(passwords);
     let config = config::Module::from_service(config);
-    let notifications = Arc::new(notification_router());
-    config.service().attach_notifications(&notifications);
     let monitor = Monitor::load(directory.0.join("llm-usage.json")).unwrap();
     let llm = Arc::new(LlmService::new(config.service(), monitor));
+    let notifications = Arc::new(notification_router(llm.clone()));
+    config.service().attach_notifications(&notifications);
+    llm.reload_authorization().await.unwrap();
     (config.router().merge(llm.router()), notifications)
 }
 
@@ -359,7 +360,7 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
     )
     .await;
     let directory = Directory::new();
-    let (app, _notifications) = persistent_router(&directory);
+    let (app, _notifications) = persistent_router(&directory).await;
     let root = format!("{upstream}/v1");
     provider(
         &app,
@@ -375,7 +376,6 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
     assert_eq!(listed["clients"], json!([{"id":id,"upstream":"shared"}]));
     let stored = fs::read_to_string(directory.0.join("config.yml")).unwrap();
     for secret in [
-        &token,
         &"codex-upstream-key".to_owned(),
         &"claude-upstream-key".to_owned(),
     ] {
@@ -419,7 +419,7 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
     );
 
     let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
-    let (restarted, _notifications) = persistent_router(&directory);
+    let (restarted, _notifications) = persistent_router(&directory).await;
     let response = invoke(
         &restarted,
         Method::POST,
@@ -646,7 +646,7 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
         .to_string(),
     )
     .unwrap();
-    let (app, _notifications) = persistent_router(&directory);
+    let (app, _notifications) = persistent_router(&directory).await;
     provider(&app, "a", json!({"codex_uri":format!("{upstream}/v1")})).await;
     provider(
         &app,
@@ -742,7 +742,7 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
     assert_eq!(report["recent"][0]["session_id"], Value::Null);
 
     let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
-    let (restarted, _notifications) = persistent_router(&directory);
+    let (restarted, _notifications) = persistent_router(&directory).await;
     let sessions =
         json_body(invoke(&restarted, Method::GET, "/llm/usage/sessions", None, None).await).await;
     assert_eq!(
@@ -782,7 +782,7 @@ async fn queries_persisted_usage_by_model_session_and_stable_page() {
     ))
     .await;
     let directory = Directory::new();
-    let (app, _notifications) = persistent_router(&directory);
+    let (app, _notifications) = persistent_router(&directory).await;
     provider(&app, "work", json!({"codex_uri":format!("{upstream}/v1")})).await;
     let (client, token) = issue(&app, "work").await;
     for _ in 0..2 {
@@ -881,10 +881,93 @@ async fn queries_persisted_usage_by_model_session_and_stable_page() {
     assert_eq!(sessions["usage"][0]["requests"], 2);
     assert_eq!(sessions["next_cursor"], Value::Null);
 
-    let (restarted, _notifications) = persistent_router(&directory);
+    let (restarted, _notifications) = persistent_router(&directory).await;
     let report =
         json_body(invoke(&restarted, Method::GET, "/llm/usage/summary", None, None).await).await;
     assert_eq!(report["totals"]["requests"], 2);
     assert_eq!(report["totals"]["output_tokens"], 20);
+    server.abort();
+}
+
+#[tokio::test]
+async fn configured_client_issues_read_only_token_and_refreshes_its_route_after_confirmation() {
+    use axum::routing::get;
+
+    let (upstream, server) = serve(
+        Router::new()
+            .route("/a/models", get(|| async { "A" }))
+            .route("/b/models", get(|| async { "B" })),
+    )
+    .await;
+    let directory = Directory::new();
+    let (app, _notifications) = persistent_router(&directory).await;
+    provider(&app, "a", json!({"codex_uri":format!("{upstream}/a")})).await;
+    provider(&app, "b", json!({"codex_uri":format!("{upstream}/b")})).await;
+
+    let path = "/data/llm/clients/editor";
+    let response = invoke(&app, Method::PUT, path, None, Some(json!({"upstream":"a"}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let created = json_body(response).await;
+    assert_eq!(created["status"], "confirmed");
+    assert_eq!(created["value"]["name"], "editor");
+    let token = created["value"]["token"].as_str().unwrap();
+    assert!(token.starts_with("loki-llm-"));
+    let bearer = format!("Bearer {token}");
+    let request = |app: &Router| {
+        let app = app.clone();
+        let bearer = bearer.clone();
+        async move {
+            let response = invoke(
+                &app,
+                Method::GET,
+                "/llm/codex/v1/models",
+                Some(("authorization", &bearer)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 4096).await.unwrap()
+        }
+    };
+    assert_eq!(request(&app).await, "A");
+
+    let response = invoke(
+        &app,
+        Method::PATCH,
+        path,
+        None,
+        Some(json!({"token":"fake"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = invoke(
+        &app,
+        Method::PATCH,
+        path,
+        None,
+        Some(json!({"upstream":"b"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["value"]["token"], token);
+    assert_eq!(request(&app).await, "B");
+    let (restarted, _notifications) = persistent_router(&directory).await;
+    assert_eq!(request(&restarted).await, "B");
+    let records =
+        json_body(invoke(&restarted, Method::GET, "/data/llm/clients", None, None).await).await;
+    assert_eq!(records["value"][0]["token"], token);
+
+    let response = invoke(&restarted, Method::DELETE, path, None, None).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = invoke(
+        &restarted,
+        Method::GET,
+        "/llm/codex/v1/models",
+        Some(("authorization", &bearer)),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     server.abort();
 }

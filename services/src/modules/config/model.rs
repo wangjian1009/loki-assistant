@@ -172,18 +172,10 @@ pub struct StructureMetadata {
     pub id_field: Option<String>,
     pub label_field: Option<String>,
     pub add_label: Option<String>,
-    #[serde(skip_serializing, default)]
-    pub legacy_dictionary: Option<LegacyDictionary>,
     pub type_name: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_all_fields: bool,
     pub fields: Vec<StructureField>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct LegacyDictionary {
-    pub key: String,
-    pub previous_id_field: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -2324,44 +2324,6 @@ fn password_config(
 }
 
 #[tokio::test]
-async fn pending_team_passwords_migrate_to_team_id_filename() {
-    let directory = Directory::new();
-    let config_path = directory.0.join("config.yml");
-    fs::write(&config_path, "{}\n").unwrap();
-    let (_, passwords) = password_config(&config_path, &directory.0);
-    let id = uuid::Uuid::new_v4();
-    let path = "loki-assistant/slack/TLEGACY.gpg";
-    let legacy = format!("loki-assistant/slack/TLEGACY-{id}.gpg");
-    passwords
-        .save_multiline(&legacy, "xoxc-fixture")
-        .await
-        .unwrap();
-    let mut values: Value =
-        serde_yaml_ng::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-    values["_pending_config_notifications"] = json!({
-        (id.to_string()): {
-            "id":id,"module":"slack","item":"teams","instance":"TLEGACY","key":"TLEGACY",
-            "value":{"team_id":"TLEGACY","token":legacy},"previous":null,"delete":false
-        }
-    });
-    fs::write(&config_path, serde_yaml_ng::to_string(&values).unwrap()).unwrap();
-
-    let (config, _) = password_config(&config_path, &directory.0);
-    config.migrate_pending_password_paths().await.unwrap();
-    config.migrate_pending_password_paths().await.unwrap();
-
-    let app =
-        crate::modules::config::Module::from_service(ConfigService::load(&config_path).unwrap())
-            .router();
-    let (_, _, response) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
-    assert_eq!(response["pending"][0]["status"], "pending");
-    assert_eq!(response["pending"][0]["value"]["token"], path);
-    assert!(response["pending"][0]["value"].get("d_cookie").is_none());
-    assert_eq!(passwords.fetch(path).await.unwrap(), "xoxc-fixture\n");
-    assert!(!directory.0.join(legacy).exists());
-}
-
-#[tokio::test]
 async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation() {
     use crate::modules::config;
 
@@ -2607,7 +2569,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let (_, _, default) = invoke(&app, "GET", path, None, None, None).await;
     assert_eq!(default["value"], 30);
     let (_, _, invalid) = invoke(&app, "PUT", path, None, None, Some(json!(0))).await;
-    assert_eq!(invalid["error"]["code"], "config-change-rejected");
+    assert_eq!(invalid["error"]["code"], "slack-invalid-config");
     assert!(old_path.is_file());
     let (code, _, saved) = invoke(&app, "PUT", path, None, None, Some(json!(1))).await;
     assert_eq!(code, StatusCode::OK, "{saved}");

@@ -33,15 +33,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let services = Arc::new(Services::load()?);
+    let services = Arc::new(Services::load().await?);
     let runtime_config = RuntimeConfig::from_env(services.configured_http_port().await?)?;
     let listener = bind_http(runtime_config.http_addr, notify_port_conflict).await?;
     let address = listener.local_addr()?;
     let service_pfile = ServicePfile::for_listener(address);
-    let config = services.config.service();
-    if let Err(error) = config.migrate_pending_password_paths().await {
-        log::warn!("迁移待确认配置的密码路径失败：{error}");
-    }
     let service_path = service_pfile.write()?;
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
     services.attach_remote(&runtime);

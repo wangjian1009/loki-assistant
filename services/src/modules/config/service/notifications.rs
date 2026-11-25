@@ -15,11 +15,6 @@ use super::*;
 
 const JOURNAL: &str = "_pending_config_notifications";
 
-pub(super) fn legacy_pending_password_id(base: &str, path: &str) -> Option<Uuid> {
-    let suffix = path.strip_prefix(base.strip_suffix(".gpg")?)?;
-    Uuid::parse_str(suffix.strip_prefix('-')?.strip_suffix(".gpg")?).ok()
-}
-
 fn pending_password_location(base: &str) -> (String, &str) {
     match base.rsplit_once('/') {
         Some((parent, name)) => (format!("{parent}/pending/"), name),
@@ -69,6 +64,15 @@ pub struct NotificationValidationError {
 #[derive(Clone)]
 pub(crate) struct NotificationConfirmedFields(pub serde_json::Map<String, Value>);
 
+#[derive(Clone)]
+struct NotificationSettled(tokio::sync::watch::Receiver<bool>);
+
+async fn wait_for_settlement(settlement: Option<NotificationSettled>) {
+    if let Some(NotificationSettled(mut settled)) = settlement {
+        let _ = settled.wait_for(|done| *done).await;
+    }
+}
+
 type Resource = (String, String, Option<String>);
 pub(super) type InFlight = HashSet<Resource>;
 
@@ -86,10 +90,12 @@ impl Drop for NotificationGuard {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct NotificationRequest {
     pub id: Uuid,
     pub deleted: bool,
+    pub created: bool,
+    pub previous: Option<Value>,
     pub password_entry_removed: bool,
     completion: tokio::sync::watch::Receiver<bool>,
 }
@@ -100,6 +106,23 @@ impl NotificationRequest {
             .wait_for(|confirmed| *confirmed)
             .await
             .is_ok()
+    }
+
+    /// 业务在自己的任务里等待确认，再通过通道报告状态已应用。
+    pub fn settle_with<F: std::future::Future<Output = ()> + Send + 'static>(
+        self,
+        response: &mut axum::response::Response,
+        work: impl FnOnce(bool) -> F + Send + 'static,
+    ) {
+        let (settled, receiver) = tokio::sync::watch::channel(false);
+        response
+            .extensions_mut()
+            .insert(NotificationSettled(receiver));
+        tokio::spawn(async move {
+            let confirmed = self.confirmed().await;
+            work(confirmed).await;
+            let _ = settled.send(true);
+        });
     }
 }
 
@@ -225,7 +248,7 @@ impl ConfigService {
             .await
     }
 
-    pub(in crate::modules::config) async fn notify_write(
+    pub(crate) async fn notify_write(
         &self,
         module: String,
         item: String,
@@ -237,7 +260,7 @@ impl ConfigService {
             .await
     }
 
-    pub(in crate::modules::config) async fn notify_patch(
+    pub(crate) async fn notify_patch(
         &self,
         module: String,
         item: String,
@@ -377,7 +400,9 @@ impl ConfigService {
                         });
                         if let Some(entry) = &existing {
                             if create_only
-                                || (instance.is_none() && !patch)
+                                || (instance.is_none()
+                                    && !patch
+                                    && entry.validation_error.is_none())
                                 || entry.delete
                                 || (preserve_pending && entry.validation_error.is_none())
                             {
@@ -663,100 +688,6 @@ impl ConfigService {
 
     async fn persist_notifications(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
         self.persist_values(values).await
-    }
-
-    pub async fn migrate_pending_password_paths(&self) -> Result<(), ConfigServiceError> {
-        let service = self.clone();
-        self.commits
-            .run(async move {
-                let credentials = service.record_credentials.clone();
-                credentials
-                    .run(async move {
-                        let mut values = service.stored_values().await;
-                        let mut migrated = Vec::new();
-                        let mut password_changes = Vec::new();
-                        for mut entry in pending(&values).into_iter().filter(|entry| !entry.delete)
-                        {
-                            let (Some(instance), Some(record)) =
-                                (entry.instance.as_deref(), entry.value.as_object_mut())
-                            else {
-                                continue;
-                            };
-                            let options = item_options(&entry.module, &entry.item);
-                            let mut bases = std::collections::BTreeSet::new();
-                            for field in options
-                                .structure
-                                .iter()
-                                .flat_map(|structure| &structure.fields)
-                            {
-                                if !field.data_type.is_password() {
-                                    continue;
-                                }
-                                if let Some(path) = record.get(&field.key).and_then(Value::as_str) {
-                                    let base = options.password_path(&field.key, instance)?;
-                                    if legacy_pending_password_id(&base, path).is_some() {
-                                        bases.insert(base);
-                                    }
-                                }
-                            }
-                            if bases.is_empty() {
-                                continue;
-                            }
-                            let old_value = Value::Object(record.clone());
-                            for base in bases {
-                                let (path, previous) = service
-                                    .pending_password_destination(
-                                        &options,
-                                        instance,
-                                        &base,
-                                        entry.id,
-                                        record,
-                                        entry.previous.as_ref(),
-                                    )
-                                    .await?;
-                                if let Some(contents) = service
-                                    .stage_password_lines(
-                                        &options,
-                                        instance,
-                                        &base,
-                                        &path,
-                                        &BTreeMap::new(),
-                                        record,
-                                    )
-                                    .await?
-                                {
-                                    password_changes.push(PasswordChange {
-                                        path,
-                                        contents: Some(contents),
-                                        previous,
-                                    });
-                                }
-                            }
-                            values
-                                .get_mut(JOURNAL)
-                                .expect("待确认操作存在")
-                                .insert(entry.id.to_string(), json!(entry));
-                            migrated.push((entry, old_value));
-                        }
-                        if !migrated.is_empty() {
-                            service
-                                .persist_password_changes(values, &password_changes)
-                                .await?;
-                            for (entry, old_value) in migrated {
-                                service
-                                    .discard_notification_passwords(
-                                        &entry,
-                                        &old_value,
-                                        &[Some(&entry.value), entry.previous.as_ref()],
-                                    )
-                                    .await;
-                            }
-                        }
-                        Ok(())
-                    })
-                    .await
-            })
-            .await
     }
 
     async fn pending_password_destination(
@@ -1052,7 +983,11 @@ impl ConfigService {
         }
         let service = self.clone();
         let pending = entry.clone();
-        *entry = self
+        let settlement = response
+            .as_ref()
+            .and_then(|response| response.extensions().get::<NotificationSettled>())
+            .cloned();
+        let committed = self
             .commits
             .run(async move {
                 let credentials = service.record_credentials.clone();
@@ -1140,9 +1075,40 @@ impl ConfigService {
                     })
                     .await
             })
-            .await?;
+            .await;
+        *entry = match committed {
+            Ok(entry) => entry,
+            Err(error) => {
+                drop(completion);
+                wait_for_settlement(settlement).await;
+                return Err(error);
+            }
+        };
         if result == Outcome::Confirmed {
             let _ = completion.send(true);
+            wait_for_settlement(settlement).await;
+            let operation = if entry.delete {
+                ConfigChangeOperation::Remove
+            } else if entry.previous.is_some() {
+                ConfigChangeOperation::Merge
+            } else {
+                ConfigChangeOperation::Append
+            };
+            if let Ok(values) = self.module_values(&entry.module).await {
+                let _ = self.changes.send(ConfigChange {
+                    module_id: entry.module.clone(),
+                    key: entry.item.clone(),
+                    value: values
+                        .get(&entry.item)
+                        .map_or(Value::Null, |value| value.value.clone()),
+                    operation,
+                    previous_value: entry.previous.clone(),
+                    module_values: values
+                        .into_iter()
+                        .map(|(key, value)| (key, value.value))
+                        .collect(),
+                });
+            }
         }
         Ok(result)
     }
@@ -1276,6 +1242,8 @@ impl ConfigService {
             .extension(NotificationRequest {
                 id: entry.id,
                 deleted: entry.delete,
+                created: !entry.delete && entry.previous.is_none(),
+                previous: entry.previous.clone(),
                 password_entry_removed: !entry.removed_password_entries.is_empty(),
                 completion,
             })
@@ -1306,29 +1274,6 @@ fn pending(values: &StoredValues) -> Vec<Pending> {
         .flat_map(|entries| entries.values())
         .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
         .collect()
-}
-
-pub(super) fn clear_retired_pending_password_references(values: &mut StoredValues) {
-    let Some(journal) = values.get_mut(JOURNAL) else {
-        return;
-    };
-    for value in journal.values_mut() {
-        let Ok(mut entry) = serde_json::from_value::<Pending>(value.clone()) else {
-            continue;
-        };
-        let options = item_options(&entry.module, &entry.item);
-        let changed = options.clear_retired_password_references(&mut entry.value, true);
-        if changed {
-            entry.validation_error = None;
-        }
-        let previous_changed = entry
-            .previous
-            .as_mut()
-            .is_some_and(|previous| options.clear_retired_password_references(previous, false));
-        if changed || previous_changed {
-            *value = json!(entry);
-        }
-    }
 }
 
 #[cfg(test)]

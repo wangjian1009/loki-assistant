@@ -20,9 +20,9 @@ use zeroize::Zeroizing;
 
 use crate::process::{Process, WeakProcess};
 
-use crate::modules::config::{
-    executable, model::ExecutableMetadata, service::SYSTEM_PASSWORD_PREFIX,
-};
+use crate::modules::config::{executable, model::ExecutableMetadata};
+
+pub(crate) const SYSTEM_PASSWORD_PREFIX: &str = "loki-assistant/network/";
 
 #[derive(Debug)]
 pub(crate) struct PasswordEnvironment {

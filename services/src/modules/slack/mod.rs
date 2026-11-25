@@ -26,8 +26,8 @@ use crate::modules::{
     config::{
         model::{
             CheckerMetadata, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
-            ConfigModuleMetadata, ConfigRemoteAccess, LegacyDictionary, ListMetadata,
-            StructureField, StructureMetadata,
+            ConfigModuleMetadata, ConfigRemoteAccess, ListMetadata, StructureField,
+            StructureMetadata,
         },
         registry::ConfigItemRegistration,
     },
@@ -62,6 +62,19 @@ static SLACK_MODULE: ModuleRegistration = ModuleRegistration {
 const TEAM_NOTIFICATION_ENDPOINT: &str = "/slack/config/teams";
 const NICKNAMES: &str = "nicknames";
 const WATCHES: &str = "watches";
+const RETENTION_NOTIFICATION: &str = "/slack/config/cache-retention";
+const NICKNAME_NOTIFICATION: &str = "/slack/config/nicknames";
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static RETENTION_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: "slack",
+    key: CACHE_RETENTION_DAYS,
+    options: || ConfigItemOptions {
+        notification_endpoint: Some(RETENTION_NOTIFICATION),
+        ..ConfigItemOptions::default()
+    },
+};
+
 const CACHE_RETENTION_DAYS: &str = "cache_retention_days";
 const DEFAULT_CACHE_RETENTION_DAYS: u64 = 30;
 
@@ -73,10 +86,6 @@ impl projects::SlackTeam {
             add_label: Some("新增工作区".into()),
             type_name: "SlackTeam".into(),
             show_all_fields: true,
-            legacy_dictionary: Some(LegacyDictionary {
-                key: "projects".into(),
-                previous_id_field: Some("id".into()),
-            }),
             fields: vec![
                 StructureField {
                     key: "team_id".into(),
@@ -173,7 +182,6 @@ static WATCH_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             id_field: Some("id".into()),
             label_field: Some("display_name".into()),
             add_label: None,
-            legacy_dictionary: None,
             type_name: "SlackWatch".into(),
             show_all_fields: false,
             fields: [
@@ -202,11 +210,11 @@ static NICKNAME_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: "slack",
     key: NICKNAMES,
     options: || ConfigItemOptions {
+        notification_endpoint: Some(NICKNAME_NOTIFICATION),
         structure: Some(StructureMetadata {
             id_field: Some("id".into()),
             label_field: Some("nickname".into()),
             add_label: Some("添加用户昵称".into()),
-            legacy_dictionary: None,
             type_name: "SlackNickname".into(),
             show_all_fields: false,
             fields: [
@@ -322,15 +330,6 @@ static EXTENSION: crate::services::ExtensionRegistration = crate::services::Exte
 };
 
 impl crate::services::ServiceExtension for Module {
-    fn config_handler(
-        &self,
-    ) -> Option<(
-        &'static str,
-        Arc<dyn crate::modules::config::service::ConfigChangeHandler>,
-    )> {
-        Some(("slack", self.0.clone()))
-    }
-
     fn router(&self) -> Router {
         self.0.router()
     }
