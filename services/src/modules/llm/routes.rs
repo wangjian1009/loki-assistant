@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{
     history::{Error as HistoryError, OptionsQuery, RequestsQuery, SummaryQuery},
-    monitor::{Requests, SessionQuery, UsageReport},
+    monitor::{SessionQuery, UsageReport},
     protocol::{Binding, Client, Protocol, SessionUsageRow, UsageRow, error},
     service::LlmService,
 };
@@ -168,11 +168,18 @@ async fn revoke_client(
     id = "requests",
     method = "GET",
     path = "/llm/requests",
-    summary = "查询代理请求状态",
-    description = "列出进行中的请求和最近结束的请求，以及耗时、HTTP 状态和已知用量。"
+    summary = "查询实时请求",
+    description = "返回正在处理的请求和最近结束的推理请求。"
 )]
-async fn requests(State(service): State<Arc<LlmService>>) -> Json<Requests> {
-    Json(service.monitor.requests().await)
+async fn requests(
+    State(service): State<Arc<LlmService>>,
+) -> Result<Json<serde_json::Value>, Response> {
+    service
+        .monitor
+        .requests()
+        .await
+        .map(Json)
+        .map_err(usage_error)
 }
 
 #[loki_api(

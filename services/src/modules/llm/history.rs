@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    protocol::{Phase, Protocol, RequestStatus},
+    protocol::{Phase, Protocol, RequestStatus, Usage},
     usage::ObservedUsage,
 };
 use crate::http::error::API_VERSION;
@@ -218,6 +218,43 @@ impl Event {
             observed,
         }
     }
+
+    pub(super) fn snapshot(&self) -> (i64, Value) {
+        (
+            self.finished,
+            request_snapshot(
+                &self.request,
+                Some(self.finished),
+                Some(self.observed.usage),
+            ),
+        )
+    }
+}
+
+pub(super) fn request_snapshot(
+    request: &RequestStatus,
+    finished: Option<i64>,
+    usage: Option<Usage>,
+) -> Value {
+    let phase = match (finished, request.first_byte_ms) {
+        (None, Some(_)) => "responding",
+        _ => phase_name(request.phase),
+    };
+    json!({
+        "id": request.id,
+        "client_id": request.client_id,
+        "session_id": request.session_id,
+        "upstream": request.upstream,
+        "protocol": request.protocol,
+        "model": request.model,
+        "phase": phase,
+        "started_at": timestamp(DateTime::<Utc>::from(request.started_at).timestamp_millis()),
+        "finished_at": finished.and_then(timestamp),
+        "first_byte_ms": request.first_byte_ms,
+        "duration_ms": request.duration_ms,
+        "upstream_status": request.upstream_status,
+        "usage": usage,
+    })
 }
 
 pub(super) struct History {
@@ -313,7 +350,9 @@ impl History {
                 let raw = Value::Object(observed.raw.clone());
                 let (uncached, cache_read, cache_write) = match request.protocol {
                     Protocol::Codex => {
-                        let cached = raw["input_tokens_details"]["cached_tokens"].as_u64();
+                        let cached = raw["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .or_else(|| raw["prompt_tokens_details"]["cached_tokens"].as_u64());
                         (
                             usage
                                 .input_tokens
@@ -335,7 +374,7 @@ impl History {
                     request.session_id,
                     request.upstream,
                     protocol_name(request.protocol),
-                    observed.model.as_deref().unwrap_or(""),
+                    request.model.as_deref().unwrap_or(""),
                     DateTime::<Utc>::from(request.started_at).timestamp_millis(),
                     finished,
                     day(*finished)
@@ -388,6 +427,30 @@ impl History {
             )?;
         }
         transaction.commit()
+    }
+
+    pub(super) fn recent(&self, limit: usize) -> Result<Vec<(i64, Value)>, Error> {
+        let mut stmt = self.db.prepare_cached(&format!(
+            "SELECT {DETAIL} FROM usage_event ORDER BY finished_at_ms DESC, seq DESC LIMIT ?"
+        ))?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                let mut item = detail(row)?;
+                let fields = item.as_object_mut().expect("请求详情应为对象");
+                fields.insert("phase".into(), row.get::<_, String>(8)?.into());
+                fields.remove("outcome");
+                fields.insert(
+                    "usage".into(),
+                    json!({
+                        "input_tokens": row.get::<_, Option<i64>>(12)?,
+                        "output_tokens": row.get::<_, Option<i64>>(16)?,
+                        "complete": !row.get::<_, bool>(17)?,
+                    }),
+                );
+                Ok((row.get(7)?, item))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn requests(&self, query: RequestsQuery, storage_error: bool) -> Result<Value, Error> {
@@ -649,7 +712,6 @@ fn protocol_name(protocol: Protocol) -> &'static str {
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::Waiting => "waiting",
-        Phase::Streaming => "streaming",
         Phase::Completed => "completed",
         Phase::Failed => "failed",
         Phase::Cancelled => "cancelled",

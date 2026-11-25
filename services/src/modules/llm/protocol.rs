@@ -59,7 +59,6 @@ pub(super) struct IssuedClient {
 #[serde(rename_all = "snake_case")]
 pub(super) enum Phase {
     Waiting,
-    Streaming,
     Completed,
     Failed,
     Cancelled,
@@ -72,20 +71,18 @@ pub(super) struct Usage {
     pub complete: bool,
 }
 
-#[derive(Clone, Serialize)]
 pub(super) struct RequestStatus {
     pub id: Uuid,
     pub client_id: Uuid,
     pub session_id: Option<String>,
     pub upstream: String,
     pub protocol: Protocol,
-    pub endpoint: String,
+    pub model: Option<String>,
     pub started_at: SystemTime,
     pub phase: Phase,
     pub first_byte_ms: Option<u64>,
     pub duration_ms: Option<u64>,
     pub upstream_status: Option<u16>,
-    pub usage: Option<Usage>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

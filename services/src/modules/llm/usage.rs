@@ -83,10 +83,12 @@ impl UsageReader {
         };
         if line.is_empty() {
             let mut data = std::mem::take(&mut self.event_data);
-            if !std::mem::take(&mut self.skipped)
-                && let Ok(event) = serde_json::from_slice::<Value>(&data)
-            {
-                self.read_event(&event);
+            if !std::mem::take(&mut self.skipped) {
+                if self.protocol == Protocol::Codex && data.trim_ascii() == b"[DONE]" {
+                    self.terminal = true;
+                } else if let Ok(event) = serde_json::from_slice::<Value>(&data) {
+                    self.read_event(&event);
+                }
             }
             data.clear();
             self.event_data = data;
@@ -116,6 +118,12 @@ impl UsageReader {
                 self.terminal = true;
                 self.failed |= event["type"] == "response.failed";
             }
+            (Protocol::Codex, Some("response.created" | "response.in_progress")) => {
+                self.read_model(&event["response"]);
+            }
+            (Protocol::Codex, _) if event["object"] == "chat.completion.chunk" => {
+                self.read_response(event);
+            }
             (Protocol::Claude, Some("message_start")) => self.read_response(&event["message"]),
             (Protocol::Claude, Some("message_delta")) => {
                 let usage = &event["usage"];
@@ -128,18 +136,28 @@ impl UsageReader {
         }
     }
 
-    fn read_response(&mut self, response: &Value) {
+    fn read_model(&mut self, response: &Value) {
         if let Some(model) = response["model"].as_str().filter(|model| !model.is_empty()) {
             self.observed.model = Some(model.to_owned());
         }
+    }
+
+    fn read_response(&mut self, response: &Value) {
+        self.read_model(response);
         self.read_usage(&response["usage"]);
     }
 
     fn read_usage(&mut self, usage: &Value) {
-        if let Some(input) = usage["input_tokens"].as_u64() {
+        if let Some(input) = usage["input_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens"].as_u64())
+        {
             self.observed.usage.input_tokens = Some(input);
         }
-        if let Some(output) = usage["output_tokens"].as_u64() {
+        if let Some(output) = usage["output_tokens"]
+            .as_u64()
+            .or_else(|| usage["completion_tokens"].as_u64())
+        {
             self.observed.usage.output_tokens = Some(output);
         }
         if let Some(fields) = usage.as_object() {

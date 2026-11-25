@@ -197,10 +197,16 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
             .unwrap(),
         CODEX_FIRST
     );
-    let monitor = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
-    assert_eq!(monitor["active"][0]["phase"], "streaming");
-    assert_eq!(monitor["active"][0]["upstream"], "a");
-
+    let snapshot = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    let active = snapshot["active"].as_array().unwrap();
+    assert_eq!(active.len(), 1);
+    let codex_id = active[0]["id"].clone();
+    assert_eq!(active[0]["upstream"], "a");
+    assert_eq!(active[0]["model"], "codex-model");
+    assert_eq!(active[0]["phase"], "responding");
+    assert!(active[0]["first_byte_ms"].is_u64());
+    assert!(active[0]["usage"].is_null());
+    assert_eq!(snapshot["recent"], json!([]));
     let response = invoke(
         &app,
         Method::PUT,
@@ -241,6 +247,11 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
         to_bytes(response.into_body(), 1048576).await.unwrap(),
         CLAUDE_STREAM
     );
+    let snapshot = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    assert_eq!(snapshot["active"][0]["id"], codex_id);
+    assert_eq!(snapshot["active"][0]["upstream"], "a");
+    assert_eq!(snapshot["recent"][0]["model"], "claude-model");
+    assert_eq!(snapshot["recent"][0]["phase"], "completed");
     gate.add_permits(1);
     assert_eq!(old_stream.next().await.unwrap().unwrap(), CODEX_LAST);
     assert!(old_stream.next().await.is_none());
@@ -254,6 +265,15 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     )
     .await;
     assert_eq!(json_body(response).await["input_tokens"], 99);
+    let snapshot = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    assert_eq!(snapshot["active"], json!([]));
+    assert_eq!(snapshot["recent"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["recent"][0]["id"], codex_id);
+    assert_eq!(snapshot["recent"][0]["phase"], "completed");
+    assert_eq!(
+        snapshot["recent"][0]["usage"],
+        json!({"input_tokens":11,"output_tokens":7,"complete":true})
+    );
     let report = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
     assert_eq!(
         report["usage"],
@@ -262,6 +282,8 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
             {"client_id":id,"upstream":"b","input_tokens":23,"output_tokens":5,"requests":1,"incomplete_requests":0}
         ])
     );
+    let persisted = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    assert_eq!(persisted, snapshot);
     server.abort();
 }
 
@@ -412,11 +434,11 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
         json_body(response).await["usage"],
         json!({"input_tokens":4})
     );
-    let recent = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
-    assert_eq!(
-        recent["recent"][0]["usage"],
-        json!({"input_tokens":4,"output_tokens":null,"complete":false})
-    );
+    let recent =
+        json_body(invoke(&app, Method::GET, "/llm/usage/requests?limit=1", None, None).await).await;
+    assert_eq!(recent["items"][0]["usage"]["input_reported_tokens"], 4);
+    assert_eq!(recent["items"][0]["usage"]["output_tokens"], Value::Null);
+    assert_eq!(recent["items"][0]["usage"]["complete"], false);
 
     let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
     let (restarted, _notifications) = persistent_router(&directory).await;
@@ -513,7 +535,7 @@ async fn dropping_an_active_stream_preserves_partial_usage() {
         Method::POST,
         "/llm/claude/v1/messages",
         Some(("x-api-key", &token)),
-        Some(json!({"stream":true})),
+        Some(json!({"model":"requested-model","stream":true})),
     )
     .await;
     let mut body = response.into_body().into_data_stream();
@@ -529,9 +551,11 @@ async fn dropping_an_active_stream_preserves_partial_usage() {
 
     let recent = timeout(Duration::from_secs(3), async {
         loop {
-            let requests =
-                json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
-            if requests["recent"][0]["phase"] == "cancelled" {
+            let requests = json_body(
+                invoke(&app, Method::GET, "/llm/usage/requests?limit=1", None, None).await,
+            )
+            .await;
+            if requests["items"][0]["outcome"] == "cancelled" {
                 break requests;
             }
             tokio::task::yield_now().await;
@@ -539,11 +563,10 @@ async fn dropping_an_active_stream_preserves_partial_usage() {
     })
     .await
     .unwrap();
-    assert_eq!(recent["active"], json!([]));
-    assert_eq!(
-        recent["recent"][0]["usage"],
-        json!({"input_tokens":23,"output_tokens":1,"complete":false})
-    );
+    assert_eq!(recent["items"][0]["model"], "requested-model");
+    assert_eq!(recent["items"][0]["usage"]["input_reported_tokens"], 23);
+    assert_eq!(recent["items"][0]["usage"]["output_tokens"], 1);
+    assert_eq!(recent["items"][0]["usage"]["complete"], false);
     let report = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
     assert_eq!(
         report["usage"],
@@ -705,8 +728,10 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
             json_body(response).await["usage"],
             json!({"input_tokens":3,"output_tokens":2})
         );
-        let report = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
-        assert_eq!(report["recent"][0]["session_id"], json!(expected));
+        let report =
+            json_body(invoke(&app, Method::GET, "/llm/usage/requests?limit=1", None, None).await)
+                .await;
+        assert_eq!(report["items"][0]["session_id"], json!(expected));
     }
 
     let response = invoke(
@@ -738,8 +763,9 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
         json_body(response).await["usage"],
         json!({"input_tokens":3,"output_tokens":2})
     );
-    let report = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
-    assert_eq!(report["recent"][0]["session_id"], Value::Null);
+    let report =
+        json_body(invoke(&app, Method::GET, "/llm/usage/requests?limit=1", None, None).await).await;
+    assert_eq!(report["items"][0]["session_id"], Value::Null);
 
     let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
     let (restarted, _notifications) = persistent_router(&directory).await;
@@ -969,5 +995,64 @@ async fn configured_client_issues_read_only_token_and_refreshes_its_route_after_
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
+#[tokio::test]
+async fn chat_completions_records_the_model_with_or_without_upstream_metadata() {
+    let (upstream, server) = serve(Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(request): Json<Value>| async move {
+            assert_eq!(request["model"], "requested-model");
+            if request["stream"] == true {
+                sse(Body::from(concat!(
+                    "data: {\"object\":\"chat.completion.chunk\",\"model\":\"served-model\",\"choices\":[]}\n\n",
+                    "data: {\"object\":\"chat.completion.chunk\",\"model\":\"served-model\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
+                    "data: [DONE]\n\n"
+                )))
+            } else {
+                (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"rejected"}}))).into_response()
+            }
+        }),
+    ))
+    .await;
+    let app = crate::http::router(Arc::new(RuntimeState::default()));
+    provider(&app, "work", json!({"codex_uri":format!("{upstream}/v1")})).await;
+    let (_, token) = issue(&app, "work").await;
+    let bearer = format!("Bearer {token}");
+    for (stream, status, model) in [
+        (true, StatusCode::OK, "served-model"),
+        (false, StatusCode::BAD_REQUEST, "requested-model"),
+    ] {
+        let response = invoke(
+            &app,
+            Method::POST,
+            "/llm/codex/v1/chat/completions",
+            Some(("authorization", &bearer)),
+            Some(json!({"model":"requested-model","stream":stream})),
+        )
+        .await;
+        assert_eq!(response.status(), status);
+        let _ = to_bytes(response.into_body(), 4096).await.unwrap();
+        let history = json_body(
+            invoke(
+                &app,
+                Method::GET,
+                &format!("/llm/usage/requests?model={model}"),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        let item = &history["items"][0];
+        assert_eq!(item["model"], model);
+        if stream {
+            assert_eq!(item["outcome"], "completed");
+            assert_eq!(item["usage"]["input_uncached_tokens"], 8);
+            assert_eq!(item["usage"]["output_tokens"], 3);
+            assert_eq!(item["usage"]["complete"], true);
+        }
+    }
     server.abort();
 }

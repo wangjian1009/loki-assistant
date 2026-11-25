@@ -344,16 +344,18 @@ impl LlmService {
 
         let head = parts.method == Method::HEAD;
         let track_usage = UsageReader::tracks(&parts.method, endpoint);
-        let mut guard = self.monitor.start(
-            client,
-            protocol,
-            &parts.headers,
-            endpoint.to_owned(),
-            track_usage,
-        );
+        let mut guard = self
+            .monitor
+            .start(client, protocol, &parts.headers, track_usage);
         let mut upstream = self.http.request(parts.method, uri).headers(headers);
         if !body.is_end_stream() {
-            upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+            let mut observation = track_usage.then(|| guard.request_body_observer());
+            let body = body.into_data_stream().inspect(move |item| {
+                if let (Some(observer), Ok(chunk)) = (&mut observation, item) {
+                    observer.push(chunk);
+                }
+            });
+            upstream = upstream.body(reqwest::Body::wrap_stream(body));
         }
         let upstream = match upstream.send().await {
             Ok(response) => response,
@@ -419,7 +421,6 @@ impl LlmService {
         let body = ForwardBody {
             upstream: Box::pin(upstream.bytes_stream()),
             guard: Some(guard),
-            stream,
             first_chunk: true,
             success: status.is_success(),
         };
@@ -447,7 +448,6 @@ impl LlmService {
 struct ForwardBody {
     upstream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     guard: Option<RequestGuard>,
-    stream: bool,
     first_chunk: bool,
     success: bool,
 }
@@ -455,10 +455,7 @@ struct ForwardBody {
 impl ForwardBody {
     fn observe(&mut self, chunk: &Bytes) {
         if !chunk.is_empty() && std::mem::take(&mut self.first_chunk) {
-            self.guard
-                .as_ref()
-                .expect("请求尚未结束")
-                .first_byte(self.stream);
+            self.guard.as_ref().expect("请求尚未结束").first_byte();
         }
         if let Some(guard) = &mut self.guard {
             guard.body_bytes(chunk);

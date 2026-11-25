@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::PathBuf,
     sync::Arc,
@@ -9,7 +9,7 @@ use std::{
 use axum::{body::Bytes, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use super::protocol::{
@@ -23,7 +23,6 @@ use super::{
 };
 use crate::{http::error::API_VERSION, process::Process};
 
-const RECENT_REQUESTS: usize = 100;
 type Totals = BTreeMap<Uuid, BTreeMap<String, UpstreamUsage>>;
 
 #[derive(Default, Deserialize, Serialize)]
@@ -38,22 +37,16 @@ struct UpstreamUsage {
 pub(crate) struct Monitor(Process<State>, Arc<Semaphore>);
 
 const OBSERVATION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MODEL_REQUEST_BYTES: usize = 1024 * 1024;
 
 struct State {
     active: BTreeMap<Uuid, RequestStatus>,
-    recent: VecDeque<RequestStatus>,
     observers: BTreeMap<Uuid, UsageReader>,
+    request_bodies: BTreeMap<Uuid, Vec<(Bytes, OwnedSemaphorePermit)>>,
     totals: Totals,
     history: History,
     pending: Vec<Event>,
     storage_error: bool,
-}
-
-#[derive(Serialize)]
-pub(super) struct Requests {
-    api_version: &'static str,
-    active: Vec<RequestStatus>,
-    recent: Vec<RequestStatus>,
 }
 
 #[derive(Serialize)]
@@ -100,8 +93,8 @@ impl Monitor {
         history.merge().map_err(io::Error::other)?;
         let task = Process::start(State {
             active: BTreeMap::new(),
-            recent: VecDeque::new(),
             observers: BTreeMap::new(),
+            request_bodies: BTreeMap::new(),
             totals,
             history,
             pending: Vec::new(),
@@ -140,6 +133,35 @@ impl Monitor {
             .blocking(move |state| {
                 state.flush();
                 state.history.requests(query, state.storage_error)
+            })
+            .await
+    }
+
+    pub(super) async fn requests(&self) -> Result<Value, Error> {
+        const LIMIT: usize = 100;
+        self.0
+            .blocking(|state| {
+                let mut active: Vec<_> = state.active.values().collect();
+                active.sort_by_key(|request| (request.started_at, request.id));
+                let active: Vec<_> = active
+                    .into_iter()
+                    .map(|request| history::request_snapshot(request, None, None))
+                    .collect();
+
+                let mut recent: Vec<_> = state.pending.iter().rev().map(Event::snapshot).collect();
+                recent.extend(state.history.recent(LIMIT)?);
+                recent.sort_by_key(|(finished, _)| std::cmp::Reverse(*finished));
+                let recent: Vec<_> = recent
+                    .into_iter()
+                    .take(LIMIT)
+                    .map(|(_, request)| request)
+                    .collect();
+                Ok(serde_json::json!({
+                    "api_version": API_VERSION,
+                    "active": active,
+                    "recent": recent,
+                    "storage_error": state.storage_error,
+                }))
             })
             .await
     }
@@ -206,7 +228,6 @@ impl Monitor {
         client: Client,
         protocol: Protocol,
         headers: &HeaderMap,
-        endpoint: String,
         track_usage: bool,
     ) -> RequestGuard {
         let id = Uuid::new_v4();
@@ -216,13 +237,12 @@ impl Monitor {
             session_id: session_id(headers, protocol),
             upstream: client.binding.upstream,
             protocol,
-            endpoint,
+            model: None,
             started_at: SystemTime::now(),
             phase: Phase::Waiting,
             first_byte_ms: None,
             duration_ms: None,
             upstream_status: None,
-            usage: None,
         };
         self.0.post(move |state| {
             state.active.insert(id, request);
@@ -236,20 +256,6 @@ impl Monitor {
             observe_usage: false,
             observation_lost: false,
         }
-    }
-
-    pub(super) async fn requests(&self) -> Requests {
-        self.0
-            .call(|state| {
-                let mut active: Vec<_> = state.active.values().cloned().collect();
-                active.sort_by_key(|request| request.started_at);
-                Requests {
-                    api_version: API_VERSION,
-                    active,
-                    recent: state.recent.iter().cloned().collect(),
-                }
-            })
-            .await
     }
 
     pub(crate) async fn flush(&self) -> bool {
@@ -436,6 +442,15 @@ pub(super) struct RequestGuard {
 }
 
 impl RequestGuard {
+    pub(super) fn request_body_observer(&self) -> RequestBodyObserver {
+        RequestBodyObserver {
+            monitor: self.monitor.clone(),
+            budget: self.budget.clone(),
+            id: self.id.expect("请求尚未结束"),
+            remaining: MAX_MODEL_REQUEST_BYTES,
+        }
+    }
+
     pub(super) fn response_headers(
         &mut self,
         status: u16,
@@ -447,6 +462,7 @@ impl RequestGuard {
         self.observe_usage = self.track_usage && identity;
         let observe_usage = self.observe_usage;
         self.monitor.post(move |state| {
+            finish_request_body(state, id);
             state
                 .active
                 .get_mut(&id)
@@ -484,15 +500,12 @@ impl RequestGuard {
         });
     }
 
-    pub(super) fn first_byte(&self, stream: bool) {
+    pub(super) fn first_byte(&self) {
         let id = self.id.expect("请求尚未结束");
         let elapsed = millis(self.started);
         self.monitor.post(move |state| {
             let request = state.active.get_mut(&id).expect("请求已经登记");
             request.first_byte_ms = Some(elapsed);
-            if stream {
-                request.phase = Phase::Streaming;
-            }
         });
     }
 
@@ -502,6 +515,7 @@ impl RequestGuard {
         let observation_lost = self.observation_lost;
         let duration_ms = millis(self.started);
         self.monitor.post_async(move |mut state| async move {
+            finish_request_body(&mut state, id);
             let reading = state
                 .observers
                 .remove(&id)
@@ -526,6 +540,82 @@ impl RequestGuard {
     }
 }
 
+pub(super) struct RequestBodyObserver {
+    monitor: Process<State>,
+    budget: Arc<Semaphore>,
+    id: Uuid,
+    remaining: usize,
+}
+
+impl RequestBodyObserver {
+    pub(super) fn push(&mut self, chunk: &Bytes) {
+        if chunk.is_empty() || self.remaining == 0 {
+            return;
+        }
+        let permit = (chunk.len() <= self.remaining)
+            .then(|| {
+                self.budget
+                    .clone()
+                    .try_acquire_many_owned(chunk.len().max(64) as u32)
+                    .ok()
+            })
+            .flatten();
+        let id = self.id;
+        if let Some(permit) = permit {
+            self.remaining -= chunk.len();
+            let chunk = chunk.clone();
+            self.monitor.post(move |state| {
+                if state
+                    .active
+                    .get(&id)
+                    .is_some_and(|request| request.upstream_status.is_none())
+                {
+                    state
+                        .request_bodies
+                        .entry(id)
+                        .or_default()
+                        .push((chunk, permit));
+                }
+            });
+        } else {
+            self.remaining = 0;
+            self.monitor.post(move |state| {
+                state.request_bodies.remove(&id);
+            });
+        }
+    }
+}
+
+impl Drop for RequestBodyObserver {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.monitor
+            .post(move |state| finish_request_body(state, id));
+    }
+}
+
+fn finish_request_body(state: &mut State, id: Uuid) {
+    #[derive(Deserialize)]
+    struct RequestModel {
+        model: String,
+    }
+
+    if let Some(chunks) = state.request_bodies.remove(&id)
+        && let Some(request) = state.active.get_mut(&id)
+        && request.model.is_none()
+    {
+        let mut bytes = Vec::with_capacity(chunks.iter().map(|(bytes, _)| bytes.len()).sum());
+        for (chunk, _permit) in &chunks {
+            bytes.extend_from_slice(chunk);
+        }
+        if let Ok(value) = serde_json::from_slice::<RequestModel>(&bytes)
+            && !value.model.is_empty()
+        {
+            request.model = Some(value.model);
+        }
+    }
+}
+
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.finish(Phase::Cancelled, false);
@@ -546,8 +636,10 @@ async fn finish(
     let mut request = state.active.remove(&id).expect("请求已经登记");
     request.phase = phase;
     request.duration_ms = Some(duration_ms);
-    request.usage = observed.as_ref().map(|observed| observed.usage);
     if let Some(observed) = observed {
+        if observed.model.is_some() {
+            request.model = observed.model.clone();
+        }
         let usage = observed.usage;
         let totals = state
             .totals
@@ -563,10 +655,8 @@ async fn finish(
                 .or_default()
                 .record(usage);
         }
-        state.pending.push(Event::new(request.clone(), observed));
+        state.pending.push(Event::new(request, observed));
     }
-    state.recent.push_front(request);
-    state.recent.truncate(RECENT_REQUESTS);
     if state.pending.len() >= 128 {
         state = tokio::task::spawn_blocking(move || {
             state.flush();

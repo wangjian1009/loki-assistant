@@ -11,17 +11,18 @@
 | ~Started~ | 选定上游后 | Loki 请求 ID、客户端 ID、可选会话标识、实际上游 ID、协议、开始时间、请求方法及路径后缀 |
 | ~Headers~ | 收到上游响应头 | 请求 ID、HTTP 状态及观察所需的 ~Content-Type~ 和 ~Content-Encoding~ |
 | ~BodyBytes~ | 转交响应正文数据块时 | 请求 ID、原始数据块 |
+| 请求正文观测 | 转发请求正文时 | 请求 ID、用于提取 ~model~ 的正文数据块 |
 | ~Finished~ | 正文读完、上游失败或客户端断开 | 请求 ID、结束时间、结果、首包及总耗时、观测是否缺段 |
 
 - 转发入口用 ~mpsc::Sender::try_send~ 投递响应数据块。控制事件和正文观测进入同一任务队列。正文额度不足时只停止投递这一请求后续的正文观测。请求守卫在正常返回或被取消时发送一次 ~Finished~ ，统计任务先处理已经投递的正文，再处理终态。
 - 正文观测队列的字节预算为 16 MiB，每条正文消息至少占 64 字节额度。统计任务处理数据块后释放额度。额度不足时，该请求继续转发，终态将用量标记为不完整。
-- 统计任务根据事件解析 JSON、Responses SSE 或 Claude SSE，维护各请求的临时解析状态和全局内存上限。Claude 通常在 ~message_start~ 提供输入，在 ~message_delta~ 更新累计输出，同一字段取最后一次上报的值。只把提取的 ~usage~ 、可选模型名和请求元数据写入数据库。原始正文仅在提取期间经过内存。当前请求仍可由同一任务维护内存状态供监控查询。
+- 统计任务根据事件解析 JSON、Chat Completions SSE、Responses SSE 和 Claude SSE。模型优先采用响应中的 ~model~ ，也可从最多 1 MiB 的请求正文中旁路提取。只把提取的 ~usage~ 、可选模型名和请求元数据写入数据库。原始正文仅在提取期间经过内存。
 - 用量缺字段、传输中断或观察缺段时，终态保留已知数值并标记 ~incomplete~ 。缺失字段存 ~NULL~ ，明确上报的零存 ~0~ 。传输结果与用量完整性各用独立字段。供应商归属固定为请求开始时的选路结果。
 - Tokio task 负责接收、组批、定时和恢复调度。SQLite 同步 I/O 在 ~spawn_blocking~ 中串行执行，由同一个 task 调度唯一写连接。查询与写入共享串行数据库连接。当前退出流程会提交已入队的批次，完整排空时序见 [[*进程退出][进程退出]]。
 
 * 存储结构
 
-数据库建议放在 =~/.assistant/llm-usage.sqlite3= 。~usage_event~ 仅追加，每个达到终态的已登记推理请求对应一行，重复请求 ID 保留首条已提交记录。输入 token 规范化为三个互斥分项 ~input_uncached_tokens~、~cache_read_tokens~ 和 ~cache_write_tokens~ 。OpenAI Responses 的缓存读取包含在输入中，归一化时扣除一次。Claude 的缓存读写独立上报。~raw_usage_json~ 只存上游报告的用量字段，以便公式变化后重算。响应未提供模型名时，索引列使用空字符串表示未知分组。
+数据库位于 =~/.assistant/llm-usage.sqlite3= 。~usage_event~ 仅追加，每个达到终态的已登记推理请求对应一行，重复请求 ID 保留首条已提交记录。输入 token 规范化为三个互斥分项 ~input_uncached_tokens~、~cache_read_tokens~ 和 ~cache_write_tokens~ 。OpenAI 兼容接口的缓存读取包含在输入中，归一化时扣除一次。Claude 的缓存读写独立上报。~raw_usage_json~ 只存上游报告的用量字段，以便公式变化后重算。请求和响应均未提供可用模型名时，索引列使用空字符串表示未知分组。
 
 明细存 UTC 毫秒，以请求完成时间归入报表日。日报用固定报表时区计算 ~report_day~ ，首版默认 ~Asia/Shanghai~ 。日期过滤使用左闭右开区间，便于分页和跨日拼接。~input_reported_tokens~ 保存上游原始输入计数，供旧接口保持统计口径。~normalization_version~ 记录单行用量采用的归一化版本。
 
@@ -110,17 +111,23 @@ CREATE TABLE usage_meta (
 
 * 用量查询接口
 
-接口均限本机，成功响应中的 ~api_version~ 为 ~"1"~ 。接口可查询实时状态、累计值及 SQLite 历史明细。
+接口均限本机，成功响应中的 ~api_version~ 为 ~"1"~ 。接口可查询实时请求、累计值和 SQLite 历史明细。
 
 | 方法与路径 | 用途 | 实现状态 |
 |------------+------+----------|
-| ~GET /llm/requests~ | 查看进行中和最近结束的请求 | 已实现 |
+| ~GET /llm/requests~ | 查看在途请求和最近结束的推理请求 | 已实现 |
 | ~GET /llm/usage~ | 按客户端和供应商查看全量累计 | 已实现 |
 | ~GET /llm/usage/sessions~ | 按客户端、原生会话标识和实际供应商查看全量累计 | 已实现 |
 | ~GET /llm/usage/requests~ | 按条件分页查询已落盘的推理请求 | 已实现 |
 | ~GET /llm/usage/requests/{id}~ | 查看单次请求和原始用量字段 | 已实现 |
 | ~GET /llm/usage/summary~ | 查询指定区间内的日或月用量 | 已实现 |
 | ~GET /llm/usage/options~ | 查找筛选控件使用的客户端、供应商和模型 | 已实现 |
+
+** 实时请求
+
+~GET /llm/requests~ 从用量任务读取一次快照。~active~ 按开始时间列出在途请求，首包到达前的 ~phase~ 为 ~waiting~ ，首包到达后为 ~responding~ 。在途请求的 ~usage~ 为 ~null~ 。
+
+~recent~ 合并待落盘记录和 SQLite 已落盘明细，按完成时间倒序返回最近 100 条已结束的推理请求。~phase~ 为 ~completed~ 、 ~failed~ 或 ~cancelled~ 。~usage~ 包含上游上报口径的 ~input_tokens~ 、 ~output_tokens~ 及完整标记 ~complete~ ，缺失的计数为 ~null~ 。~storage_error~ 表示最近一次落盘失败。此查询为只读操作。
 
 ** 历史请求
 
@@ -129,7 +136,7 @@ CREATE TABLE usage_meta (
 | 参数 | 含义 |
 |------+------|
 | ~from~ 、 ~to~ | 按请求完成时间筛选，格式为 RFC 3339，精度到毫秒，含 ~from~ ，到 ~to~ 前为止。可单独传入。 |
-| ~client_id~ 、 ~upstream~ 、 ~protocol~ 、 ~model~ | 按客户端 UUID、实际供应商 ID、协议或上游响应中的模型名精确匹配。~protocol~ 为 ~codex~ 或 ~claude~ 。 |
+| ~client_id~ 、 ~upstream~ 、 ~protocol~ 、 ~model~ | 按客户端 UUID、实际供应商 ID、协议或所记录的模型名精确匹配。~protocol~ 为 ~codex~ 或 ~claude~ 。 |
 | ~session_id~ | 精确匹配客户端原生会话标识，同时传入 ~client_id~ 。 |
 | ~outcome~ 、 ~incomplete~ | 结果为 ~completed~、~failed~ 或 ~cancelled~ 。~incomplete~ 为 ~true~ 或 ~false~ 。 |
 | ~limit~ 、 ~cursor~ | 每页默认 50 条，允许 1 至 100 条。后续页原样传回 ~next_cursor~ ，沿用原筛选条件。 |
@@ -251,7 +258,7 @@ CREATE TABLE usage_meta (
 | 查单次请求 | 按时间、客户端、供应商、模型、协议、结果和完整性筛选。列表显示完成时间、耗时、结果及输出 token，支持继续加载。选中一行可查看首包耗时、HTTP 状态及原始 ~usage~ ，也可复制请求 ID。 | ~GET /llm/usage/requests~ 、 ~GET /llm/usage/requests/{id}~ 、 ~GET /llm/usage/options~ |
 | 查会话用量 | 从客户端的会话累计列表进入指定会话，按实际供应商查看用量。按客户端 ID、原生会话标识和供应商查找该会话的历史请求。 | ~GET /llm/usage/sessions~ 、 ~GET /llm/usage/requests~ 、 ~GET /llm/usage/options~ |
 | 查全量累计 | 查看按客户端和供应商归集的全量用量，含已导入的旧累计数据。 | ~GET /llm/usage~ |
-| 查运行状态 | 查看等待响应和正在流式输出的请求，以及最近结束的请求。打开或刷新时读取当时的状态。 | ~GET /llm/requests~ |
+| 查实时请求 | 查看在途请求和最近结束的推理请求，显示供应商、模型、首包耗时、总耗时及已报告的输出 token。按 ~g~ 读取最新快照，按 ~RET~ 查看选中请求。 | ~GET /llm/requests~ |
 
 - 从趋势选中某一天或某个月时，按报表时区把所选周期与当前日期范围取交集，带着现有筛选条件打开明细。选中的数据系列有明确分组值时，同时按该值筛选。返回概览时恢复原日期范围和筛选条件。
 - 概览表展示四项用量和按已知 token 总量缩放的文本趋势。选中一行并按 ~RET~ 下钻，日期范围转成由报表时区计算的 UTC 时间边界。

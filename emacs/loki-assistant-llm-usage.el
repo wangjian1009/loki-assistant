@@ -46,7 +46,7 @@
     (or missing "—")))
 
 (defun loki-assistant-llm-usage--phase (value)
-  (or (cdr (assoc value '(("waiting" . "等待响应") ("streaming" . "正在输出")
+  (or (cdr (assoc value '(("waiting" . "等待响应") ("responding" . "接收响应")
                           ("completed" . "完成") ("failed" . "失败")
                           ("cancelled" . "取消"))))
       "—"))
@@ -136,9 +136,10 @@
                (loki-assistant-llm-usage--usage-label (alist-get 'usage item))))
       ('live
        (vector (loki-assistant-llm-usage--time (alist-get 'started_at item))
-               (cell 'upstream) (cell 'endpoint)
+               (cell 'upstream) (cell 'model)
                (loki-assistant-llm-usage--phase (alist-get 'phase item))
                (cell 'first_byte_ms) (cell 'duration_ms)
+               (loki-assistant-llm-usage--cell 'output_tokens (alist-get 'usage item))
                (loki-assistant-llm-usage--usage-label (alist-get 'usage item))))
       (_
        (vconcat (when (eq loki-assistant-llm-usage--current 'sessions)
@@ -168,8 +169,9 @@
                         ("请求" 8 nil) ("不完整" 8 nil) ("趋势" 16 nil)])
             ('history [("完成时间" 20 nil) ("供应商" 15 nil) ("模型" 20 nil)
                        ("结果" 8 nil) ("耗时 ms" 10 nil) ("输出" 12 nil) ("用量" 8 nil)])
-            ('live [("开始时间" 20 nil) ("供应商" 15 nil) ("接口" 16 nil)
-                    ("状态" 12 nil) ("首包 ms" 10 nil) ("耗时 ms" 10 nil) ("用量" 8 nil)])
+            ('live [("开始时间" 20 nil) ("供应商" 15 nil) ("模型" 20 nil)
+                    ("状态" 12 nil) ("首包 ms" 10 nil) ("耗时 ms" 10 nil)
+                    ("输出" 12 nil) ("用量" 8 nil)])
             (_ (vconcat (when (eq loki-assistant-llm-usage--current 'sessions)
                           [("会话" 26 nil)])
                         [("客户端" 38 nil) ("供应商" 17 nil) ("上游输入" 16 nil)
@@ -187,7 +189,9 @@
       (when (eobp) (goto-char (point-min))))
     (setq-local mode-line-process
                 (list " · " (nth 1 (assq loki-assistant-llm-usage--current loki-assistant-llm-usage--views))
-                      " · 1-5 切换  f 筛选  g 刷新  RET 打开"
+                      " · 1-5 切换  g 刷新  RET 打开"
+                      (when (memq loki-assistant-llm-usage--current '(overview history sessions))
+                        "  f 筛选")
                       (when (loki-assistant-llm-usage--view-cursor state) "  l 下一页")
                       (when (loki-assistant-llm-usage--view-loading state) " · 查询中…")
                       (when (loki-assistant-llm-usage--view-error state)
@@ -228,7 +232,10 @@
 (defun loki-assistant-llm-usage-history () "打开请求历史。" (interactive) (loki-assistant-llm-usage--switch 'history))
 (defun loki-assistant-llm-usage-sessions () "打开会话用量。" (interactive) (loki-assistant-llm-usage--switch 'sessions))
 (defun loki-assistant-llm-usage-totals () "打开全量累计用量。" (interactive) (loki-assistant-llm-usage--switch 'totals))
-(defun loki-assistant-llm-usage-live () "打开实时请求。" (interactive) (loki-assistant-llm-usage--switch 'live))
+(defun loki-assistant-llm-usage-live ()
+  "打开实时请求快照。"
+  (interactive)
+  (loki-assistant-llm-usage--switch 'live))
 (defun loki-assistant-llm-usage-refresh () "按当前筛选条件重新加载。" (interactive) (loki-assistant-llm-usage--load))
 
 (defun loki-assistant-llm-usage-more ()
