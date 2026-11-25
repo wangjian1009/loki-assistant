@@ -27,18 +27,22 @@
   (declare (indent 0))
   `(with-temp-buffer
      (loki-assistant-config-mode)
-     (setq loki-assistant-config--generation (list nil))
+     (setq loki-assistant-config--module-id "test"
+           loki-assistant-config--generation (list nil))
      (unwind-protect (progn ,@body)
        (loki-assistant-config--stop-wait-timer))))
 
+(defun loki-assistant-config-test--module ()
+  "返回测试模块元数据。"
+  (aref (alist-get 'modules (json-parse-string loki-assistant-config-test--meta
+                                             :object-type 'alist)) 1))
+
 (defun loki-assistant-config-test--fixture ()
   "绘制配置快照，用于控件和保存测试。"
-  (let* ((json-object-type 'alist) (json-array-type 'vector)
-         (json-key-type 'symbol) (json-false :false) (json-null :null)
-         (modules (alist-get 'modules (json-read-from-string loki-assistant-config-test--meta)))
-         (data (json-read-from-string loki-assistant-config-test--data)))
-    (loki-assistant-config--render (list (aref modules 1))
-                                   (list (cons "test" (alist-get 'values data))))))
+  (loki-assistant-config--render
+   (loki-assistant-config-test--module)
+   (alist-get 'values (json-parse-string loki-assistant-config-test--data
+                                        :object-type 'alist :false-object :false))))
 
 (defun loki-assistant-config-test--entry (key)
   "查找 KEY 对应控件。"
@@ -48,9 +52,12 @@
 (ert-deftest loki-assistant-config-test-load-real-http ()
   (loki-assistant-test--with-server
       (lambda (headers _body)
-        (if (string-prefix-p "GET /meta " headers)
-            (list 200 loki-assistant-config-test--meta)
-          (list 200 loki-assistant-config-test--data)))
+        (cond
+         ((string-prefix-p "GET /meta/test " headers)
+          (list 200 (loki-assistant-config--json (loki-assistant-config-test--module))))
+         ((string-prefix-p "GET /data/test " headers)
+          (list 200 loki-assistant-config-test--data))
+         (t (list 404 "{}"))))
     (loki-assistant-config-test--with-buffer
       (loki-assistant-config--load)
       (loki-assistant-config-test--wait (lambda () (not loki-assistant-config--loading)))
@@ -64,17 +71,70 @@
       (should (string-match-p (regexp-quote "[撤销编辑] 默认值\n") (buffer-string)))
       (should (string-match-p (regexp-quote "[撤销编辑] 用户设置，已保存\n") (buffer-string))))))
 
+(ert-deftest loki-assistant-config-test-picker-keeps-module-buffers-independent ()
+  (let* ((alpha '((id . "config-test-alpha") (name . "甲")
+                  (items . [((key . "text") (name . "字段") (data_type . "string"))])))
+         (beta '((id . "config-test-beta") (name . "乙")
+                 (items . [((key . "text") (name . "字段") (data_type . "string"))])))
+         (empty '((id . "empty") (name . "空模块") (items . [])))
+         (selections '("甲 · config-test-alpha" "乙 · config-test-beta" "甲 · config-test-alpha"))
+         requests alpha-buffer beta-buffer)
+    (save-window-excursion
+      (unwind-protect
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt choices &rest _)
+                       (should (equal (mapcar #'car choices)
+                                      '("甲 · config-test-alpha" "乙 · config-test-beta")))
+                       (pop selections)))
+                    ((symbol-function 'loki-assistant-request)
+                     (lambda (_method path &rest args)
+                       (push path requests)
+                       (funcall
+                        (plist-get args :callback)
+                        (list :ok t :data
+                              (pcase path
+                                ("/meta" (list (cons 'modules (vector alpha beta empty))))
+                                ("/meta/config-test-alpha" alpha)
+                                ((or "/data/config-test-alpha" "/data/config-test-beta")
+                                 (let ((id (substring path (length "/data/"))))
+                                   `((module_id . ,id)
+                                     (values . ((text . ((value . ,id) (source . "user"))))))))
+                                (_ (error "意外的配置请求 %s" path))))))))
+            (loki-assistant-config)
+            (setq alpha-buffer (window-buffer))
+            (with-current-buffer alpha-buffer
+              (should (equal loki-assistant-config--module-id "config-test-alpha"))
+              (widget-value-set (loki-assistant-config--entry-field
+                                 (loki-assistant-config-test--entry "text")) "甲的草稿"))
+            (loki-assistant-config)
+            (setq beta-buffer (window-buffer))
+            (with-current-buffer beta-buffer
+              (should (equal loki-assistant-config--module-id "config-test-beta"))
+              (should (equal (widget-value (loki-assistant-config--entry-field
+                                            (loki-assistant-config-test--entry "text")))
+                             "config-test-beta")))
+            (loki-assistant-config)
+            (should (eq (window-buffer) alpha-buffer))
+            (with-current-buffer alpha-buffer
+              (should (equal (widget-value (loki-assistant-config--entry-field
+                                            (loki-assistant-config-test--entry "text")))
+                             "甲的草稿")))
+            (should (equal (reverse requests)
+                           '("/meta" "/data/config-test-alpha" "/meta" "/data/config-test-beta" "/meta"))))
+        (when (buffer-live-p alpha-buffer) (kill-buffer alpha-buffer))
+        (when (buffer-live-p beta-buffer) (kill-buffer beta-buffer))))))
+
 (ert-deftest loki-assistant-config-test-read-only-and-checker-controls ()
   (loki-assistant-config-test--with-buffer
     (loki-assistant-config--render
-     '(((id . "network") (name . "网络")
+     '((id . "network") (name . "网络")
         (items . [((key . "relay_token") (name . "中转令牌")
                    (data_type . ((password . ((path . "loki-assistant/network/relay.gpg")))))
                    (read_only . t))
                   ((key . "plain") (name . "普通字段") (data_type . "string") (checker . :null))
                   ((key . "checked") (name . "带校验字段") (data_type . "string")
-                   (checker . ((pattern . "^T[0-9]+$") (emacs_pattern . "\\`T[0-9]+\\'"))))])))
-     '(("network" . ((relay_token . ((value . :false)))))))
+                   (checker . ((pattern . "^T[0-9]+$") (emacs_pattern . "\\`T[0-9]+\\'"))))]))
+     '((relay_token . ((value . :false)))))
     (should-not (loki-assistant-config-test--entry "relay_token"))
     (should (string-match-p "中转令牌：未设置  只读" (buffer-string)))
     (dolist (key '("plain" "checked"))
@@ -194,17 +254,15 @@
           (loki-assistant-config--load)
           (funcall old '(:ok nil :error-message "过期失败"))
           (should-not (string-match-p "过期失败" (buffer-string))))
-        (funcall (cdar pending)
-                 '(:ok t :data ((modules . [((id . "a") (name . "A") (items . [((key . "v") (name . "值") (data_type . "string"))]))
-                                            ((id . "b") (name . "B") (items . [((key . "v") (name . "值") (data_type . "string"))]))]))))
+        (should (equal (caar pending) "/meta/test"))
+        (funcall (cdar pending) (list :ok t :data (loki-assistant-config-test--module)))
+        (should loki-assistant-config--loading)
         (should-not loki-assistant-config--entries)
-        (funcall (cdr (assoc "/data/a" pending))
-                 '(:ok t :data ((module_id . "a") (values . ((v . ((value . "a") (source . "user"))))))))
-        (should-not loki-assistant-config--entries)
-        (funcall (cdr (assoc "/data/b" pending)) '(:ok nil :error-message "无法读取 B"))
+        (should (equal (caar pending) "/data/test"))
+        (funcall (cdar pending) '(:ok nil :error-message "无法读取测试模块"))
         (should-not loki-assistant-config--loading)
         (should-not loki-assistant-config--entries)
-        (should (string-match-p "无法读取 B" (buffer-string)))))))
+        (should (string-match-p "无法读取测试模块" (buffer-string)))))))
 
 (ert-deftest loki-assistant-config-test-refresh-and-invalid-json ()
   (loki-assistant-config-test--with-buffer
@@ -248,9 +306,9 @@
 (ert-deftest loki-assistant-config-test-change-handler-failure-preserves-input ()
   (loki-assistant-config-test--with-buffer
     (loki-assistant-config--render
-     '(((id . "control-center") (name . "控制中心")
-        (items . [((key . "center_auto_start") (name . "登录启动") (data_type . "boolean"))])))
-     '(("control-center" . ((center_auto_start . ((value . :false) (source . "default")))))))
+     '((id . "control-center") (name . "控制中心")
+        (items . [((key . "center_auto_start") (name . "登录启动") (data_type . "boolean"))]))
+     '((center_auto_start . ((value . :false) (source . "default")))))
     (let ((entry (car loki-assistant-config--entries)))
       (widget-value-set (loki-assistant-config--entry-field entry) t)
       (cl-letf (((symbol-function 'loki-assistant-request)
@@ -353,9 +411,9 @@
                      (line-number-at-pos (widget-field-start
                                           (loki-assistant-config--entry-field entry))))))
         (loki-assistant-config-refresh)
-        (should (equal (nth 1 (car requests)) "/meta"))
+        (should (equal (nth 1 (car requests)) "/meta/test"))
         (let* ((json-object-type 'alist) (json-array-type 'vector) (json-key-type 'symbol)
-               (meta (json-read-from-string loki-assistant-config-test--meta)))
+               (meta (loki-assistant-config-test--module)))
           (loki-assistant-config-test--respond (pop requests) (list :ok t :data meta)))
         (let* ((json-object-type 'alist) (json-array-type 'vector) (json-key-type 'symbol)
                (json-false :false)
@@ -391,9 +449,9 @@
           (dolist (button (loki-assistant-config--entry-buttons entry))
             (should (widget-get button :inactive)))
           (loki-assistant-config-refresh)
-          (should (equal (nth 1 (car requests)) "/meta"))
+          (should (equal (nth 1 (car requests)) "/meta/test"))
           (let* ((json-object-type 'alist) (json-array-type 'vector) (json-key-type 'symbol)
-                 (meta (json-read-from-string loki-assistant-config-test--meta)))
+                 (meta (loki-assistant-config-test--module)))
             (loki-assistant-config-test--respond (pop requests) (list :ok t :data meta)))
           (let* ((json-object-type 'alist) (json-array-type 'vector) (json-key-type 'symbol)
                  (json-false :false)

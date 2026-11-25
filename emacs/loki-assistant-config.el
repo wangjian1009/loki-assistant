@@ -22,6 +22,8 @@
   module item value source field baseline status busy error result started-at buttons uncertain
   pending retry-point retry-button)
 
+(defvar loki-assistant-config--selection-generation nil)
+(defvar-local loki-assistant-config--module-id nil)
 (defvar-local loki-assistant-config--entries nil)
 (defvar-local loki-assistant-config--generation nil)
 (defvar-local loki-assistant-config--loading nil)
@@ -356,40 +358,35 @@
     (setq widget-field-list nil widget-field-new nil
           loki-assistant-config--entries nil loki-assistant-config--buttons nil)))
 
-(defun loki-assistant-config--render (modules data &optional error-text)
-  "显示 MODULES 和 DATA 的完整快照，或 ERROR-TEXT。"
+(defun loki-assistant-config--render (module values &optional error-text)
+  "显示 MODULE 的配置 VALUES，或 ERROR-TEXT。"
   (loki-assistant-config--clear)
-  (widget-insert (propertize "Loki Assistant 服务配置\n\n" 'face 'custom-group-tag))
-  (widget-insert "TAB 移动，RET 激活按钮；C-c C-c 保存修改，g 刷新，q 关闭。\n")
-  (widget-insert "输入格式有误时显示红底。撤销编辑回到最近读取或保存的值。\n\n")
+  (widget-insert
+   (propertize (format "Loki Assistant 配置 · %s\n\n"
+                       (or (alist-get 'name module) loki-assistant-config--module-id))
+               'face 'custom-group-tag))
+  (widget-insert "TAB 移动，RET 激活按钮，C-c C-c 保存，g 刷新，q 关闭。\n\n")
   (push (loki-assistant-config--button "刷新 / 重试" #'loki-assistant-config-refresh)
         loki-assistant-config--buttons)
   (unless error-text
-    (let ((button (loki-assistant-config--button "保存所有修改" #'loki-assistant-config-save)))
+    (let ((button (loki-assistant-config--button "保存本模块修改" #'loki-assistant-config-save)))
       (widget-put button :loki-save-all t)
       (push button loki-assistant-config--buttons)))
   (widget-insert "\n\n")
   (setq loki-assistant-config--message (widget-create 'item :format "%v\n\n" "就绪"))
-  (cond
-   (error-text (loki-assistant-config--set-widget-text
-                loki-assistant-config--message error-text 'error))
-   ((null modules) (widget-insert "没有可编辑的配置模块。\n"))
-   (t
-    (dolist (module modules)
-      (let* ((id (alist-get 'id module))
-             (items (append (alist-get 'items module) nil))
-             (values (cdr (assoc id data))))
-        (widget-insert (propertize (concat (alist-get 'name module) "\n")
-                                  'face 'custom-group-tag))
-        (widget-insert (concat (or (alist-get 'description module) "") "\n\n"))
-        (dolist (item items)
-          (cond
-           ((consp (alist-get 'structure item))
-            (loki-assistant-config--record-insert id item values))
-           ((eq (alist-get 'read_only item) t)
-            (loki-assistant-config--render-read-only-entry item values))
-           (t
-            (loki-assistant-config--render-entry id item values))))))))
+  (if error-text
+      (loki-assistant-config--set-widget-text loki-assistant-config--message error-text 'error)
+    (let ((id (alist-get 'id module))
+          (description (alist-get 'description module)))
+      (when (and (stringp description) (not (string-empty-p description)))
+        (widget-insert description "\n\n"))
+      (dolist (item (append (alist-get 'items module) nil))
+        (cond
+         ((consp (alist-get 'structure item))
+          (loki-assistant-config--record-insert id item values))
+         ((eq (alist-get 'read_only item) t)
+          (loki-assistant-config--render-read-only-entry item values))
+         (t (loki-assistant-config--render-entry id item values))))))
   (setq loki-assistant-config--entries (nreverse loki-assistant-config--entries))
   (widget-setup)
   (set-buffer-modified-p nil)
@@ -411,85 +408,97 @@
        (member (alist-get 'source value) '("user" "default"))))
 
 (defun loki-assistant-config--modules (response)
-  "从 RESPONSE 读取并检查配置模块。"
+  "从 RESPONSE 读取具有配置项的模块。"
   (unless (plist-get response :ok) (error "%s" (loki-assistant-config--error response)))
-  (let ((raw (alist-get 'modules (plist-get response :data))))
-    (unless (vectorp raw) (error "配置元数据缺少 modules 数组"))
-    (dolist (module (append raw nil))
-      (unless (and (stringp (alist-get 'id module))
-                   (stringp (alist-get 'name module))
-                   (vectorp (alist-get 'items module))
-                   (cl-every
-                    (lambda (item)
-                      (and (stringp (alist-get 'key item))
-                           (stringp (alist-get 'name item))
-                           (member (loki-assistant-config--data-type item)
-                                   '("string" "password" "integer" "number" "boolean"
-                                     "dictionary" "structure" "list" "password_reference" "file_path" "executable"))))
-                    (alist-get 'items module)))
-        (error "配置模块元数据格式无效")))
-    (sort (cl-remove-if (lambda (module) (zerop (length (alist-get 'items module))))
-                        (append raw nil))
-          (lambda (a b) (string< (alist-get 'id a) (alist-get 'id b))))))
+  (let ((modules (alist-get 'modules (plist-get response :data))))
+    (unless (vectorp modules) (error "配置元数据缺少 modules 数组"))
+    (seq-filter
+     (lambda (module)
+       (and (stringp (alist-get 'id module))
+            (stringp (alist-get 'name module))
+            (vectorp (alist-get 'items module))
+            (not (seq-empty-p (alist-get 'items module)))))
+     (append modules nil))))
 
-(defun loki-assistant-config--load-data (modules buffer generation)
-  "为 BUFFER 的 GENERATION 并行读取 MODULES 的实例。"
-  (let ((pending (length modules)) data failed)
-    (dolist (module modules)
-      (let ((id (alist-get 'id module)))
-        (loki-assistant-request
-         'get (concat "/data/" (url-hexify-string id))
-         :callback
-         (lambda (response)
-           (loki-assistant-config--with-current
-            buffer generation
-            (lambda ()
-              (unless failed
-                (condition-case err
-                    (let* ((body (plist-get response :data))
-                           (values (alist-get 'values body)))
-                      (unless (and (plist-get response :ok)
-                                   (equal (alist-get 'module_id body) id)
-                                   (assq 'values body) (listp values)
-                                   (cl-every (lambda (entry)
-                                               (loki-assistant-config--valid-value-p (cdr entry)))
-                                             values))
-                        (error "%s" (loki-assistant-config--error response)))
-                      (dolist (entry (alist-get 'pending body))
-                        (unless (assq (car entry) values)
-                          (push (list (car entry) (cons 'value :null)) values))
-                        (push (cons 'pending (cdr entry)) (cdr (assq (car entry) values))))
-                      (push (cons id values) data)
-                      (when (zerop (cl-decf pending))
-                        (setq loki-assistant-config--loading nil)
-                        (loki-assistant-config--render modules data)))
-                  (error
-                   (setq failed t loki-assistant-config--loading nil)
-                   (loki-assistant-config--render nil nil (error-message-string err)))))))))))))
+(defun loki-assistant-config--read-values (response id)
+  "从 RESPONSE 读取模块 ID 的生效值和待确认变更。"
+  (unless (plist-get response :ok) (error "%s" (loki-assistant-config--error response)))
+  (let* ((body (plist-get response :data))
+         (values (copy-tree (alist-get 'values body))))
+    (unless (and (equal (alist-get 'module_id body) id)
+                 (assq 'values body) (listp values)
+                 (cl-every (lambda (entry)
+                             (loki-assistant-config--valid-value-p (cdr entry)))
+                           values))
+      (error "services 返回了无效的模块配置"))
+    (dolist (entry (alist-get 'pending body))
+      (unless (assq (car entry) values)
+        (push (list (car entry) (cons 'value :null)) values))
+      (push (cons 'pending (cdr entry)) (cdr (assq (car entry) values))))
+    values))
 
-(defun loki-assistant-config--load ()
-  "异步加载元数据和全部模块实例，只展示完整快照。"
-  (let ((buffer (current-buffer))
-        (generation (setq loki-assistant-config--generation (list nil))))
-    (setq loki-assistant-config--loading t)
-    (loki-assistant-config--clear)
-    (widget-insert "正在读取 services 配置…\n")
+(defun loki-assistant-config--finish-load (module values &optional error-text)
+  "结束当前读取，展示 MODULE 的 VALUES 或 ERROR-TEXT。"
+  (setq loki-assistant-config--loading nil)
+  (loki-assistant-config--render module values error-text))
+
+(defun loki-assistant-config--load-data (module buffer generation)
+  "为 BUFFER 的 GENERATION 读取 MODULE 的配置。"
+  (let ((id (alist-get 'id module)))
     (loki-assistant-request
-     'get "/meta"
+     'get (concat "/data/" (url-hexify-string id))
      :callback
      (lambda (response)
        (loki-assistant-config--with-current
         buffer generation
         (lambda ()
           (condition-case err
-              (let ((modules (loki-assistant-config--modules response)))
-                (if modules
-                    (loki-assistant-config--load-data modules buffer generation)
-                  (setq loki-assistant-config--loading nil)
-                  (loki-assistant-config--render nil nil)))
+              (loki-assistant-config--finish-load
+               module (loki-assistant-config--read-values response id))
             (error
-             (setq loki-assistant-config--loading nil)
-             (loki-assistant-config--render nil nil (error-message-string err))))))))))
+             (loki-assistant-config--finish-load module nil (error-message-string err))))))))))
+
+(defun loki-assistant-config--load (&optional module)
+  "异步读取当前模块。可复用选择器已获取的 MODULE 元数据。"
+  (let* ((id loki-assistant-config--module-id)
+         (buffer (current-buffer))
+         (generation (setq loki-assistant-config--generation (list nil))))
+    (setq loki-assistant-config--loading t)
+    (loki-assistant-config--clear)
+    (widget-insert (format "正在读取模块 %s 的配置…\n" id))
+    (cl-labels ((load-module (metadata)
+                  (unless (and (equal (alist-get 'id metadata) id)
+                               (vectorp (alist-get 'items metadata))
+                               (not (seq-empty-p (alist-get 'items metadata)))
+                               (cl-every
+                                (lambda (item)
+                                  (and (stringp (alist-get 'key item))
+                                       (stringp (alist-get 'name item))
+                                       (member (loki-assistant-config--data-type item)
+                                               '("string" "password" "integer" "number" "boolean"
+                                                 "dictionary" "structure" "list" "password_reference"
+                                                 "file_path" "executable"))))
+                                (alist-get 'items metadata)))
+                    (error "模块 %s 的配置元数据格式无效" id))
+                  (loki-assistant-config--load-data metadata buffer generation)))
+      (if module
+          (condition-case err
+              (load-module module)
+            (error (loki-assistant-config--finish-load nil nil (error-message-string err))))
+        (loki-assistant-request
+         'get (concat "/meta/" (url-hexify-string id))
+         :callback
+         (lambda (response)
+           (loki-assistant-config--with-current
+            buffer generation
+            (lambda ()
+              (condition-case err
+                  (progn
+                    (unless (plist-get response :ok)
+                      (error "%s" (loki-assistant-config--error response)))
+                    (load-module (plist-get response :data)))
+                (error
+                 (loki-assistant-config--finish-load nil nil (error-message-string err))))))))))))
 
 (defun loki-assistant-config-refresh ()
   "重新获取配置；有未保存输入时先确认。"
@@ -647,16 +656,43 @@
              (loki-assistant-config--sync-controls)))))
       (next t))))
 
+(defun loki-assistant-config--open-module (module)
+  "打开 MODULE 独立的配置缓冲区。"
+  (let* ((id (alist-get 'id module))
+         (buffer (get-buffer-create (format "*Loki 配置 · %s*" id))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'loki-assistant-config-mode)
+        (loki-assistant-config-mode)
+        (setq loki-assistant-config--module-id id)
+        (loki-assistant-config--load module)))
+    (pop-to-buffer-same-window buffer)))
+
 ;;;###autoload
 (defun loki-assistant-config ()
-  "打开 Customize 风格的 services 配置管理界面。"
+  "选择一个 services 模块并打开它的配置。"
   (interactive)
-  (let ((buffer (get-buffer-create "*Loki Assistant 配置*")))
-    (pop-to-buffer buffer)
-    (unless (derived-mode-p 'loki-assistant-config-mode)
-      (loki-assistant-config-mode)
-      (loki-assistant-config--load))
-    buffer))
+  (let ((window (selected-window))
+        (generation (setq loki-assistant-config--selection-generation (list nil))))
+    (loki-assistant-request
+     'get "/meta"
+     :callback
+     (lambda (response)
+       (when (and (eq generation loki-assistant-config--selection-generation)
+                  (window-live-p window))
+         (condition-case err
+             (with-selected-window window
+               (let ((choices
+                      (mapcar (lambda (module)
+                                (cons (format "%s · %s" (alist-get 'name module)
+                                                       (alist-get 'id module))
+                                      module))
+                              (loki-assistant-config--modules response))))
+                 (unless choices (user-error "没有可配置的模块"))
+                 (let ((selected (completing-read "选择配置模块：" choices nil t)))
+                   (when-let ((module (cdr (assoc selected choices))))
+                     (loki-assistant-config--open-module module)))))
+           (quit nil)
+           (error (message "%s" (error-message-string err)))))))))
 
 (defun loki-assistant-config--retry (path data-path headers timeout callback)
   "向 PATH 发送空 PUT，再读取 DATA-PATH 的最新配置。"
