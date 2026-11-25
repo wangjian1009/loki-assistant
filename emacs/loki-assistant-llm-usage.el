@@ -40,6 +40,12 @@
 
 (defconst loki-assistant-llm-usage--chart-width 32)
 
+(defface loki-assistant-llm-usage-instruction-role
+  '((((background dark)) :background "gray34" :foreground "gray92")
+    (((background light)) :background "gray88" :foreground "gray20"))
+  "系统指令标题中的角色标签。"
+  :group 'loki-assistant)
+
 (cl-defstruct loki-assistant-llm-usage--view
   filters items data cursor selected loading error)
 
@@ -325,16 +331,21 @@
           (pcase loki-assistant-llm-usage--current
             ('overview
              (vconcat
-              (vector (list (if (equal (alist-get 'bucket data) "month") "月份" "日期") 10 nil))
+              (vector (list (if (equal (alist-get 'bucket data) "month") "月份" "日期")
+                            (if chart-maximum 10 12) nil :pad-right (if chart-maximum 1 4)))
               (when-let ((label (loki-assistant-llm-usage--group-label (alist-get 'group_by data))))
-                (vector (list label 14 nil)))
+                (vector (list label (if chart-maximum 14 20) nil
+                              :pad-right (if chart-maximum 1 4))))
               (if chart-maximum
                   (vector (list "用量" loki-assistant-llm-usage--chart-width nil)
                           '("合计 token" 16 nil :right-align t)
                           '("用量不完整" 10 nil :right-align t))
-                [("请求数" 8 nil :right-align t) ("用量不完整" 10 nil :right-align t)
-                 ("未缓存输入" 12 nil :right-align t) ("读缓存" 11 nil :right-align t)
-                 ("写缓存" 11 nil :right-align t) ("输出" 11 nil :right-align t)])))
+                [("请求数" 10 nil :right-align t :pad-right 4)
+                 ("用量不完整" 13 nil :right-align t :pad-right 4)
+                 ("未缓存输入" 17 nil :right-align t :pad-right 4)
+                 ("读缓存" 15 nil :right-align t :pad-right 4)
+                 ("写缓存" 15 nil :right-align t :pad-right 4)
+                 ("输出" 15 nil :right-align t)])))
             ('history [("完成时间" 20 nil) ("客户端" 18 nil) ("供应商" 15 nil) ("模型" 20 nil)
                        ("结果" 8 nil) ("耗时 ms" 10 nil) ("输出" 12 nil) ("用量" 8 nil)])
             ('live [("开始时间" 9 nil) ("客户端" 14 nil) ("状态" 10 nil) ("采集详情" 9 nil)
@@ -1069,6 +1080,30 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
               (buffer-string))))
         (loki-assistant-llm-usage--render-markdown text))))
 
+(defun loki-assistant-llm-usage--instruction-title (block)
+  (let* ((source (alist-get 'source block))
+         (role (loki-assistant-llm-usage--value 'role block))
+         (text (alist-get 'text block))
+         (position
+          (cond
+           ((string-match
+             (rx string-start (or "input" "messages") "[" (group (+ digit)) "]"
+                 (optional ".content[" (group (+ digit)) "].text") string-end)
+             source)
+            (concat (match-string 1 source) "." (or (match-string 2 source) "0")))
+           ((string-match (rx string-start "system[" (group (+ digit)) "].text" string-end)
+                          source)
+            (match-string 1 source))
+           (t source))))
+    (propertize
+     (string-join
+      (remove "" (delq nil (list position
+                                (when role
+                                  (propertize role 'face 'loki-assistant-llm-usage-instruction-role))
+                                (string-trim (substring text 0 (string-match "[\r\n]" text))))))
+      " ")
+     'help-echo source)))
+
 (defun loki-assistant-llm-usage--insert-instructions (capture)
   (let ((blocks (vconcat (loki-assistant-llm-usage--value 'blocks capture))))
     (if (seq-empty-p blocks)
@@ -1077,10 +1112,8 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
        (format "系统指令 · %d 段" (length blocks)) t
        (lambda ()
          (cl-loop for block across blocks
-                  for source = (alist-get 'source block)
-                  for role = (loki-assistant-llm-usage--value 'role block)
                   do (loki-assistant-llm-usage--insert-block
-                      (if role (concat source " · " role) source)
+                      (loki-assistant-llm-usage--instruction-title block)
                       (alist-get 'text block) t)))))))
 
 (defun loki-assistant-llm-usage--pretty-json (text)
