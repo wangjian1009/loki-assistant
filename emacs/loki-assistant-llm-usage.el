@@ -227,8 +227,7 @@
                    started)
                  (loki-assistant-llm-usage--client-label item data)
                  (loki-assistant-llm-usage--phase (alist-get 'phase item))
-                 (loki-assistant-llm-usage--instruction-label
-                  (loki-assistant-llm-usage--value 'instructions item))
+                 (if (eq t (alist-get 'has_detail item)) "可查看" "—")
                  (cell 'upstream) (cell 'model)
                  (cell 'first_byte_ms) (cell 'duration_ms)
                  (loki-assistant-llm-usage--cell 'output_tokens usage)
@@ -338,7 +337,7 @@
                  ("写缓存" 11 nil :right-align t) ("输出" 11 nil :right-align t)])))
             ('history [("完成时间" 20 nil) ("客户端" 18 nil) ("供应商" 15 nil) ("模型" 20 nil)
                        ("结果" 8 nil) ("耗时 ms" 10 nil) ("输出" 12 nil) ("用量" 8 nil)])
-            ('live [("开始时间" 9 nil) ("客户端" 14 nil) ("状态" 10 nil) ("系统指令" 9 nil)
+            ('live [("开始时间" 9 nil) ("客户端" 14 nil) ("状态" 10 nil) ("采集详情" 9 nil)
                     ("供应商" 15 nil) ("模型" 20 nil) ("首包 ms" 10 nil) ("耗时 ms" 10 nil)
                     ("输出" 12 nil) ("用量" 8 nil)])
             (_ (vconcat (when (eq loki-assistant-llm-usage--current 'sessions)
@@ -379,6 +378,7 @@
                                (when overview (if loki-assistant-llm-usage--chart
                                                   "  t 表格" "  t 图表"))
                                (when (and overview items) "  e 导出 PNG")
+                               (when (eq loki-assistant-llm-usage--current 'live) "  m 监控设置")
                                (when loki-assistant-llm-usage--context "  b 返回")))
                       (when (loki-assistant-llm-usage--view-cursor state) "  l 下一页")
                       (when (loki-assistant-llm-usage--view-loading state) " · 查询中…")
@@ -689,6 +689,86 @@
           (puthash 'history (cdr context) loki-assistant-llm-usage--views-state))
         (loki-assistant-llm-usage--switch (car context)))
     (quit-window)))
+
+(defun loki-assistant-llm-usage--monitoring-label (filter names)
+  (let* ((protocols (alist-get 'protocols filter))
+         (clients (alist-get 'clients filter))
+         (upstreams (alist-get 'upstreams filter))
+         (parts (delq nil
+                      (list (when (length> protocols 0)
+                              (concat "协议 " (string-join protocols ",")))
+                            (when (length> clients 0)
+                              (concat "客户端 "
+                                      (mapconcat (lambda (id) (or (cdr (assoc-string id names)) id))
+                                                 clients ",")))
+                            (when (length> upstreams 0)
+                              (concat "供应商 " (string-join upstreams ",")))))))
+    (if parts (string-join parts " · ") "全部请求")))
+
+(defun loki-assistant-llm-usage--read-monitoring-filter (filter)
+  (cl-loop for (key label) in '((protocols "协议（codex 或 claude）")
+                               (clients "客户端 UUID")
+                               (upstreams "供应商 ID"))
+           for input = (read-string (concat label "，逗号分隔，空为全部：")
+                                    (string-join (alist-get key filter) ","))
+           collect (cons key (vconcat (split-string input "[,， \t]+" t)))))
+
+(defun loki-assistant-llm-usage--save-monitoring (patch)
+  (loki-assistant-request
+   "PATCH" "/llm/monitoring" :body patch
+   :callback (lambda (reply)
+               (if (plist-get reply :ok)
+                   (message "请求监控已%s"
+                            (if (eq t (alist-get 'enabled (plist-get reply :data))) "开启" "关闭"))
+                 (message "%s" (or (plist-get reply :error-message) "保存请求监控配置失败"))))))
+
+(defun loki-assistant-llm-usage-monitoring ()
+  "在实时列表中打开请求监控的快捷配置。"
+  (interactive)
+  (unless (eq loki-assistant-llm-usage--current 'live)
+    (user-error "请在实时请求列表中设置监控"))
+  (let* ((origin (current-buffer))
+         (state (loki-assistant-llm-usage--state))
+         (names (alist-get 'client_names (loki-assistant-llm-usage--view-data state)))
+         (client (ignore-errors (alist-get 'client_id (loki-assistant-llm-usage--item)))))
+    (loki-assistant-request
+     "GET" "/llm/monitoring"
+     :callback
+     (lambda (reply)
+       (when (and (buffer-live-p origin) (eq (window-buffer) origin)
+                  (eq (buffer-local-value 'loki-assistant-llm-usage--current origin) 'live))
+         (if (not (plist-get reply :ok))
+             (message "%s" (or (plist-get reply :error-message) "读取请求监控配置失败"))
+           (let* ((settings (plist-get reply :data))
+                  (filter (alist-get 'filter settings))
+                  (enabled (eq t (alist-get 'enabled settings)))
+                  (actions
+                   (append
+                    (list (cons (if enabled "关闭监控" "开启当前范围") 'toggle)
+                          '("配置范围并开启" . configure)
+                          '("设置保留条数" . retention))
+                    (when client '(("仅监控选中请求的客户端" . client)))
+                    (cl-loop for recent across (vconcat (alist-get 'history settings))
+                             for index from 1
+                             collect (cons (format "最近 %d · %s" index
+                                                   (loki-assistant-llm-usage--monitoring-label recent names))
+                                           recent))))
+                  (choice (completing-read
+                           (format "监控%s · %s："
+                                   (if enabled "已开启" "已关闭")
+                                   (loki-assistant-llm-usage--monitoring-label filter names))
+                           actions nil t))
+                  (action (cdr (assoc choice actions))))
+             (loki-assistant-llm-usage--save-monitoring
+              (pcase action
+                ('toggle (list (cons 'enabled (if enabled :false t))))
+                ('configure (list '(enabled . t)
+                                  (cons 'filter (loki-assistant-llm-usage--read-monitoring-filter filter))))
+                ('retention (let ((count (read-number "保留条数：" (alist-get 'retention settings))))
+                              (unless (natnump count) (user-error "保留条数须为非负整数"))
+                              (list (cons 'retention count))))
+                ('client (list '(enabled . t) (list 'filter (cons 'clients (vector client)))))
+                (_ (list '(enabled . t) (cons 'filter action))))))))))))
 
 (defun loki-assistant-llm-usage--open-request (row state live)
   (let* ((origin (current-buffer))
@@ -1252,6 +1332,7 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
     (define-key map (kbd "4") #'loki-assistant-llm-usage-totals)
     (define-key map (kbd "5") #'loki-assistant-llm-usage-live)
     (define-key map (kbd "g") #'loki-assistant-llm-usage-refresh)
+    (define-key map (kbd "m") #'loki-assistant-llm-usage-monitoring)
     (define-key map (kbd "t") #'loki-assistant-llm-usage-toggle-chart)
     (define-key map (kbd "e") #'loki-assistant-llm-usage-export-png)
     (define-key map (kbd "f") #'loki-assistant-llm-usage-filter)
@@ -1268,6 +1349,7 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
 
 按 1 至 5 切换视图，g 刷新。按 RET 查看选中行的请求或详情。
 在概览中按 t 切换表格和用量图，按 e 导出 PNG。
+在实时请求中按 m 切换监控、配置范围或恢复最近的过滤条件。
 概览、历史和会话支持 f 筛选和 F 清除筛选。列表有下一页时按 l。
 下钻后按 b 返回上一视图。按 C-c C-q 退出，按 ? 查看模式帮助。"
   (setq-local loki-assistant-llm-usage--views-state (make-hash-table :test #'eq))

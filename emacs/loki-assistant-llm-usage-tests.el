@@ -105,10 +105,10 @@
                   '(:ok t :data
                     ((client_names . ((editor-id . "editor")))
                      (active . [((id . "active") (client_id . "editor-id") (phase . "responding")
-                                 (instructions . ((status . "captured") (count . 2)))
+                                 (has_detail . t)
                                  (usage . :null))])
                      (recent . [((id . "recent") (phase . "completed")
-                                 (instructions . ((status . "absent") (count . 0)))
+                                 (has_detail . :false)
                                  (usage . ((output_tokens . 0) (complete . t))))])))))))
       (call-interactively (key-binding (kbd "5")))
       (should (equal (mapcar #'car tabulated-list-entries) '("active" "recent")))
@@ -116,10 +116,10 @@
             (recent (cadadr tabulated-list-entries)))
         (should (equal (aref active 1) "editor"))
         (should (equal (aref active 2) "接收响应"))
-        (should (equal (aref active 3) "2 段"))
+        (should (equal (aref active 3) "可查看"))
         (should (equal (aref active 8) "—"))
         (should (equal (aref active 9) "—"))
-        (should (equal (aref recent 3) "未携带"))
+        (should (equal (aref recent 3) "—"))
         (should (equal (aref recent 8) "0"))
         (should (equal (aref recent 9) "完整"))))))
 
@@ -375,6 +375,31 @@
       (should (search-forward "验证结果" nil t))
       (should (eq (get-text-property (1- (point)) 'face) 'org-level-1))
       (should-not (string-match-p fence (buffer-string))))))
+
+(ert-deftest loki-assistant-llm-usage-test-reenables-a-recent-monitoring-filter ()
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (loki-assistant-llm-usage-mode)
+      (setq loki-assistant-llm-usage--current 'live)
+      (let ((filter '((protocols . ["codex"]) (clients . []) (upstreams . ["work"])))
+            saved)
+        (cl-letf (((symbol-function 'loki-assistant-request)
+                   (lambda (method path &rest options)
+                     (should (equal path "/llm/monitoring"))
+                     (if (equal method "GET")
+                         (funcall (plist-get options :callback)
+                                  (list :ok t :data
+                                        (list '(enabled . :false)
+                                              (cons 'history (vector filter)))))
+                       (should (equal method "PATCH"))
+                       (setq saved (plist-get options :body)))))
+                  ((symbol-function 'completing-read)
+                   (lambda (_prompt choices &rest _)
+                     (car (seq-find (lambda (choice)
+                                      (string-prefix-p "最近 1 ·" (car choice))) choices)))))
+          (call-interactively (key-binding (kbd "m")))
+          (should (equal saved (list '(enabled . t) (cons 'filter filter)))))))))
 
 (provide 'loki-assistant-llm-usage-tests)
 ;;; loki-assistant-llm-usage-tests.el ends here

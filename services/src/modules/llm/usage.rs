@@ -10,6 +10,90 @@ use super::{
 const MAX_SSE_EVENT: usize = 1024 * 1024;
 const MAX_JSON: usize = 16 * 1024 * 1024;
 
+/// 逐块读取顶层 model，跳过其他字段而不保留正文。
+#[derive(Default)]
+pub(super) struct RequestedModel {
+    depth: usize,
+    expecting_key: bool,
+    model_key: bool,
+    string: Option<ModelToken>,
+    escaped: bool,
+    token: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelToken {
+    Key,
+    Model,
+    Ignore,
+}
+
+impl RequestedModel {
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Option<String> {
+        for &byte in chunk {
+            if let Some(kind) = self.string {
+                if kind != ModelToken::Ignore && self.token.len() <= 4096 {
+                    self.token.push(byte);
+                }
+                if std::mem::take(&mut self.escaped) {
+                    continue;
+                }
+                if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.string = None;
+                    match kind {
+                        ModelToken::Key => {
+                            self.model_key = serde_json::from_slice::<String>(&self.token)
+                                .is_ok_and(|key| key == "model");
+                            self.expecting_key = false;
+                        }
+                        ModelToken::Model => {
+                            return serde_json::from_slice::<String>(&self.token)
+                                .ok()
+                                .filter(|model| !model.is_empty());
+                        }
+                        ModelToken::Ignore => {}
+                    }
+                }
+                continue;
+            }
+            match byte {
+                b'{' | b'[' => {
+                    self.depth += 1;
+                    self.expecting_key |= self.depth == 1 && byte == b'{';
+                }
+                b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                b',' if self.depth == 1 => {
+                    self.expecting_key = true;
+                    self.model_key = false;
+                }
+                b'"' => {
+                    let kind = if self.depth != 1 {
+                        ModelToken::Ignore
+                    } else if self.expecting_key {
+                        ModelToken::Key
+                    } else if self.model_key {
+                        ModelToken::Model
+                    } else {
+                        ModelToken::Ignore
+                    };
+                    self.string = Some(kind);
+                    self.token.clear();
+                    if kind != ModelToken::Ignore {
+                        self.token.push(b'"');
+                    }
+                }
+                byte if self.depth == 1 && byte != b':' && !byte.is_ascii_whitespace() => {
+                    self.model_key = false;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ObservedUsage {
     pub usage: Usage,
@@ -58,13 +142,9 @@ impl UsageReader {
         self.observed.output = Some(Output::new(format));
     }
 
-    pub(super) fn output(&self) -> Option<&Output> {
-        self.observed.output.as_ref()
-    }
-
     pub(super) fn push(&mut self, chunk: &[u8]) {
         if !self.stream {
-            if self.pending.len() + chunk.len() > MAX_JSON {
+            if self.observed.output.is_none() && self.pending.len() + chunk.len() > MAX_JSON {
                 self.pending.clear();
                 self.skipped = true;
             } else if !self.skipped {
@@ -80,7 +160,7 @@ impl UsageReader {
             if matches!(byte, b'\r' | b'\n') {
                 self.read_line();
                 self.after_cr = byte == b'\r';
-            } else if self.pending.len() <= MAX_SSE_EVENT {
+            } else if self.observed.output.is_some() || self.pending.len() <= MAX_SSE_EVENT {
                 self.pending.push(byte);
             }
         }
@@ -115,7 +195,8 @@ impl UsageReader {
                 .or_else(|| (line == b"data").then_some(&[][..]))
         {
             let data = data.strip_prefix(b" ").unwrap_or(data);
-            if self.event_data.len() + data.len() >= MAX_SSE_EVENT {
+            if self.observed.output.is_none() && self.event_data.len() + data.len() >= MAX_SSE_EVENT
+            {
                 self.skipped = true;
             } else {
                 self.event_data.extend_from_slice(data);

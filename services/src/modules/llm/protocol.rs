@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::http::error::{ErrorSource, response};
 
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Protocol {
     Codex,
@@ -71,6 +71,7 @@ pub(super) struct Usage {
     pub complete: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct RequestStatus {
     pub id: Uuid,
     pub client_id: Uuid,

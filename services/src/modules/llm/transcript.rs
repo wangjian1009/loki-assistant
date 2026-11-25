@@ -5,9 +5,6 @@ use serde_json::{Map, Value};
 
 use super::instructions::Format;
 
-const MAX_TEXT: usize = 256 * 1024;
-const MAX_BLOCKS: usize = 128;
-
 #[derive(Default, Serialize)]
 struct Block {
     kind: &'static str,
@@ -43,18 +40,11 @@ impl Input {
             "parallel_tool_calls",
         ] {
             if let Some(value) = request.get(field) {
-                let serialized = value.to_string();
-                if serialized.len() <= 4096 {
-                    settings.insert(field.into(), value.clone());
-                } else {
-                    settings.insert(field.into(), "…".into());
-                }
+                settings.insert(field.into(), value.clone());
             }
         }
-        let mut remaining = MAX_TEXT;
-        let mut truncated = false;
         let mut tools = Vec::new();
-        for tool in array(&request["tools"]).iter().take(MAX_BLOCKS) {
+        for tool in array(&request["tools"]) {
             let name = text(&tool["name"])
                 .or_else(|| text(&tool["function"]["name"]))
                 .or_else(|| text(&tool["type"]))
@@ -62,15 +52,11 @@ impl Input {
             tools.push(Block {
                 kind: "tool_definition",
                 name: name.chars().take(128).collect(),
-                text: bounded(&tool.to_string(), &mut remaining, &mut truncated),
+                text: tool.to_string(),
                 ..Block::default()
             });
-            if remaining == 0 {
-                break;
-            }
         }
-        truncated |= tools.len() < array(&request["tools"]).len();
-        let mut blocks = match format {
+        let blocks = match format {
             Format::Responses => match request["input"].as_str() {
                 Some(input) => vec![message("user", input.into())],
                 None => array(&request["input"])
@@ -83,21 +69,11 @@ impl Input {
                 .flat_map(|value| conversation_message(format, value))
                 .collect(),
         };
-        // 大段历史上下文常被重复发送，保留最新消息以便定位当前请求。
-        if blocks.len() > MAX_BLOCKS {
-            blocks.drain(..blocks.len() - MAX_BLOCKS);
-            truncated = true;
-        }
-        let mut remaining = MAX_TEXT;
-        for block in blocks.iter_mut().rev() {
-            block.text = bounded(&block.text, &mut remaining, &mut truncated);
-        }
-        blocks.retain(|block| !block.text.is_empty() || block.kind != "message");
         Self {
             settings,
             tools,
             blocks,
-            truncated,
+            truncated: false,
         }
     }
 }
@@ -268,13 +244,6 @@ fn conversation_message(format: Format, value: &Value) -> Vec<Block> {
     blocks
 }
 
-fn bounded(value: &str, remaining: &mut usize, truncated: &mut bool) -> String {
-    let length = value.floor_char_boundary(value.len().min(*remaining));
-    *remaining -= length;
-    *truncated |= length < value.len();
-    value[..length].into()
-}
-
 pub(super) struct Output {
     format: Format,
     stream: BTreeMap<(usize, usize), Block>,
@@ -331,39 +300,17 @@ impl Output {
             });
         }
         if !blocks.is_empty() {
-            let mut remaining = MAX_TEXT;
-            self.truncated = blocks.len() > MAX_BLOCKS;
-            self.blocks = blocks
-                .into_iter()
-                .take(MAX_BLOCKS)
-                .map(|mut block| {
-                    block.text = bounded(&block.text, &mut remaining, &mut self.truncated);
-                    block
-                })
-                .collect();
+            self.blocks = blocks;
             self.stream.clear();
         }
     }
 
     fn append(&mut self, key: (usize, usize), initial: Block, delta: &str, replace: bool) {
-        if !self.stream.contains_key(&key) && self.stream.len() >= MAX_BLOCKS {
-            self.truncated = true;
-            return;
-        }
-        let mut remaining = MAX_TEXT.saturating_sub(
-            self.stream
-                .values()
-                .map(|block| block.text.len())
-                .sum::<usize>(),
-        );
         let block = self.stream.entry(key).or_insert(initial);
         if replace {
-            remaining += block.text.len();
             block.text.clear();
         }
-        block
-            .text
-            .push_str(&bounded(delta, &mut remaining, &mut self.truncated));
+        block.text.push_str(delta);
     }
 
     fn put(&mut self, key: (usize, usize), mut block: Block) {

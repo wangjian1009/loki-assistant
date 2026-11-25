@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::Router;
 
@@ -66,6 +66,7 @@ impl Services {
             NotificationService::new(),
             None,
             llm::Monitor::memory(),
+            None,
         )
     }
 
@@ -77,6 +78,7 @@ impl Services {
             .and_then(std::path::Path::parent)
             .ok_or(std::io::Error::other("无法确定本机缓存目录"))?;
         let notification = NotificationService::load(home.join(".cache/assistant/notification"))?;
+        let llm_archive = home.join(".cache/assistant/llm/requests");
         let llm_monitor = llm::Monitor::load(config_path.with_file_name("llm-usage.json"))?;
         crate::modules::slack::migrate_legacy_cache(&home.join(".cache"))?;
         let services = Self::with_config(
@@ -84,6 +86,7 @@ impl Services {
             notification,
             Some(password_environment),
             llm_monitor,
+            Some(llm_archive),
         );
         services.llm.reload_authorization().await?;
         Ok(services)
@@ -94,6 +97,7 @@ impl Services {
         notification: NotificationService,
         password_environment: Option<password::service::PasswordEnvironment>,
         llm_monitor: llm::Monitor,
+        llm_archive: Option<PathBuf>,
     ) -> Self {
         let health = health::Module::new();
         let discover = discover::Module::new();
@@ -121,7 +125,11 @@ impl Services {
             Arc::clone(&status),
         );
         let doc = doc::DocService::new(emacs.service());
-        let llm = Arc::new(llm::LlmService::new(Arc::clone(&base_config), llm_monitor));
+        let llm = Arc::new(llm::LlmService::new(
+            Arc::clone(&base_config),
+            llm_monitor,
+            llm_archive,
+        ));
         let context = ExtensionContext {
             alert: &alert,
             config: &base_config,

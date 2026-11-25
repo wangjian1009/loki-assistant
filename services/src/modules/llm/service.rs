@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::{Body, Bytes, HttpBody},
@@ -14,11 +20,12 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use super::{
+    archive::{self, Archive, Settings, SettingsPatch, Update, Writer},
     config::{CLIENTS, MODULE, PROVIDERS, provider_uri},
     instructions::Format,
     monitor::{Monitor, RequestGuard},
     protocol::{Binding, Client, IssuedClient, Phase, Protocol, error},
-    usage::UsageReader,
+    usage::{RequestedModel, UsageReader},
 };
 use crate::{
     modules::config::service::{ConfigService, ConfigServiceError},
@@ -75,16 +82,24 @@ pub(crate) struct LlmService {
     config: Arc<ConfigService>,
     authorization: Process<Authorization>,
     pub(crate) monitor: Monitor,
+    pub(super) archive: Arc<Archive>,
     http: reqwest::Client,
 }
 
 impl LlmService {
-    pub(crate) fn new(config: Arc<ConfigService>, monitor: Monitor) -> Self {
+    pub(crate) fn new(
+        config: Arc<ConfigService>,
+        monitor: Monitor,
+        archive_directory: Option<PathBuf>,
+    ) -> Self {
+        let archive = Archive::new(archive_directory);
+        archive.schedule(config.clone());
         let _ = rustls::crypto::ring::default_provider().install_default();
         Self {
             config,
             authorization: Process::start(Authorization::default()),
             monitor,
+            archive,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .read_timeout(Duration::from_secs(300))
@@ -322,6 +337,14 @@ impl LlmService {
             .await
     }
 
+    pub(super) async fn monitoring(&self) -> Result<Settings, String> {
+        Archive::settings(&self.config).await
+    }
+
+    pub(super) async fn change_monitoring(&self, patch: SettingsPatch) -> Result<Settings, String> {
+        self.archive.change(self.config.clone(), patch).await
+    }
+
     pub(super) async fn forward(
         &self,
         protocol: Protocol,
@@ -357,49 +380,61 @@ impl LlmService {
 
         let head = parts.method == Method::HEAD;
         let track_usage = UsageReader::tracks(&parts.method, endpoint);
-        let observe_request = track_usage && identity_encoding(&parts.headers);
-        let instruction_format = track_usage
-            .then(|| Format::for_endpoint(protocol, endpoint))
-            .flatten();
-        let mut guard = self.monitor.start(
-            client,
-            protocol,
-            &parts.headers,
-            track_usage,
-            instruction_format,
-        );
+        let started = Instant::now();
+        let (mut guard, request) =
+            self.monitor
+                .start(client, protocol, &parts.headers, track_usage);
+        let writer = if track_usage && let Some(format) = Format::for_endpoint(protocol, endpoint) {
+            match self.monitoring().await {
+                Ok(settings) => match self
+                    .archive
+                    .begin(
+                        &settings,
+                        &request,
+                        format,
+                        identity_encoding(&parts.headers),
+                    )
+                    .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        log::warn!("打开 LLM 请求缓存失败：{err}");
+                        None
+                    }
+                },
+                Err(err) => {
+                    log::warn!("无法读取 LLM 监控配置：{err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut upstream = self.http.request(parts.method, uri).headers(headers);
         if !body.is_end_stream() {
-            let length = body.size_hint().exact();
             let body = body.into_data_stream();
-            let body = if observe_request {
-                let observed = stream::unfold(
-                    (body, guard.request_body_observer(), length),
-                    |(mut body, mut observer, mut remaining)| async move {
-                        match body.next().await {
-                            Some(item) => {
-                                if let Ok(chunk) = &item {
-                                    observer.push(chunk);
-                                    remaining = remaining
-                                        .and_then(|size| size.checked_sub(chunk.len() as u64));
-                                    if remaining == Some(0) {
-                                        observer.complete();
-                                    }
+            let model = (track_usage && identity_encoding(&parts.headers))
+                .then(|| (RequestedModel::default(), guard.request_model_callback()));
+            let body = if model.is_some() || writer.is_some() {
+                reqwest::Body::wrap_stream(stream::unfold(
+                    (body, writer.clone(), model),
+                    |(mut body, writer, mut model)| async move {
+                        let item = body.next().await?;
+                        if let Ok(chunk) = &item {
+                            if let Some((mut reader, found)) = model.take() {
+                                if let Some(value) = reader.push(chunk) {
+                                    found(value);
                                 } else {
-                                    observer.abort();
+                                    model = Some((reader, found));
                                 }
-                                Some((item, (body, observer, remaining)))
                             }
-                            None => {
-                                if matches!(remaining, None | Some(0)) {
-                                    observer.complete();
-                                }
-                                None
+                            if let Some(writer) = &writer {
+                                writer.request(chunk).await;
                             }
                         }
+                        Some((item, (body, writer, model)))
                     },
-                );
-                reqwest::Body::wrap_stream(observed)
+                ))
             } else {
                 reqwest::Body::wrap_stream(body)
             };
@@ -408,6 +443,11 @@ impl LlmService {
         let upstream = match upstream.send().await {
             Ok(response) => response,
             Err(error_value) => {
+                if let Some(writer) = &writer {
+                    writer
+                        .update(archive::finished(Phase::Failed, elapsed_ms(started), false))
+                        .await;
+                }
                 guard.finish(Phase::Failed, false);
                 return Err(if error_value.is_timeout() {
                     error(
@@ -433,6 +473,15 @@ impl LlmService {
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
         let identity = identity_encoding(upstream.headers());
         guard.response_headers(status.as_u16(), protocol, stream, identity);
+        if let Some(writer) = &writer {
+            writer
+                .update(Update::Headers {
+                    status: status.as_u16(),
+                    stream,
+                    identity,
+                })
+                .await;
+        }
         let mut response_headers = forwarded_headers(upstream.headers());
         // 由 Axum 重新生成流式传输的消息边界。
         if !head && status != StatusCode::NOT_MODIFIED {
@@ -452,6 +501,11 @@ impl LlmService {
             } else {
                 Phase::Failed
             };
+            if let Some(writer) = &writer {
+                writer
+                    .update(archive::finished(phase, elapsed_ms(started), false))
+                    .await;
+            }
             guard.finish(phase, false);
             return Ok(response);
         }
@@ -461,20 +515,22 @@ impl LlmService {
             guard: Some(guard),
             first_chunk: true,
             success: status.is_success(),
+            writer,
+            started,
         };
         *response.body_mut() = Body::from_stream(stream::unfold(body, |mut body| async move {
             body.guard.as_ref()?;
             match body.upstream.next().await {
                 Some(Ok(chunk)) => {
-                    body.observe(&chunk);
+                    body.observe(&chunk).await;
                     Some((Ok(chunk), body))
                 }
                 Some(Err(error_value)) => {
-                    body.finish(false);
+                    body.finish(false).await;
                     Some((Err(error_value), body))
                 }
                 None => {
-                    body.finish(true);
+                    body.finish(true).await;
                     None
                 }
             }
@@ -488,29 +544,52 @@ struct ForwardBody {
     guard: Option<RequestGuard>,
     first_chunk: bool,
     success: bool,
+    writer: Option<Writer>,
+    started: Instant,
 }
 
 impl ForwardBody {
-    fn observe(&mut self, chunk: &Bytes) {
+    async fn observe(&mut self, chunk: &Bytes) {
         if !chunk.is_empty() && std::mem::take(&mut self.first_chunk) {
             self.guard.as_ref().expect("请求尚未结束").first_byte();
+            if let Some(writer) = &self.writer {
+                writer
+                    .update(Update::FirstByte(elapsed_ms(self.started)))
+                    .await;
+            }
         }
         if let Some(guard) = &mut self.guard {
             guard.body_bytes(chunk);
         }
+        if let Some(writer) = &self.writer {
+            writer.response(chunk).await;
+        }
     }
 
-    fn finish(&mut self, body_complete: bool) {
+    async fn finish(&mut self, body_complete: bool) {
         let phase = if self.success && body_complete {
             Phase::Completed
         } else {
             Phase::Failed
         };
+        if let Some(writer) = self.writer.take() {
+            writer
+                .update(archive::finished(
+                    phase,
+                    elapsed_ms(self.started),
+                    body_complete,
+                ))
+                .await;
+        }
         self.guard
             .take()
             .expect("请求尚未结束")
             .finish(phase, body_complete);
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn identity_encoding(headers: &HeaderMap) -> bool {

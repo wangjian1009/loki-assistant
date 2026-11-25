@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::PathBuf,
     sync::Arc,
@@ -9,7 +9,7 @@ use std::{
 use axum::{body::Bytes, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::protocol::{
@@ -19,8 +19,6 @@ use super::{
     history::{
         self, Dimension, Error, Event, Filters, History, OptionsQuery, RequestsQuery, SummaryQuery,
     },
-    instructions::{Capture, Format},
-    transcript::{Input, Output},
     usage::{ObservedUsage, UsageReader},
 };
 use crate::{http::error::API_VERSION, process::Process};
@@ -39,17 +37,11 @@ struct UpstreamUsage {
 pub(crate) struct Monitor(Process<State>, Arc<Semaphore>);
 
 const OBSERVATION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_REQUEST_OBSERVATION_BYTES: usize = 4 * 1024 * 1024;
 const RECENT_REQUEST_LIMIT: usize = 100;
 
 struct State {
     active: BTreeMap<Uuid, RequestStatus>,
     observers: BTreeMap<Uuid, UsageReader>,
-    request_bodies: BTreeMap<Uuid, Vec<(Bytes, OwnedSemaphorePermit)>>,
-    instructions: BTreeMap<Uuid, Capture>,
-    inputs: BTreeMap<Uuid, Input>,
-    outputs: BTreeMap<Uuid, Output>,
-    recent_content_ids: VecDeque<Uuid>,
     totals: Totals,
     history: History,
     pending: Vec<Event>,
@@ -101,11 +93,6 @@ impl Monitor {
         let task = Process::start(State {
             active: BTreeMap::new(),
             observers: BTreeMap::new(),
-            request_bodies: BTreeMap::new(),
-            instructions: BTreeMap::new(),
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            recent_content_ids: VecDeque::new(),
             totals,
             history,
             pending: Vec::new(),
@@ -155,50 +142,16 @@ impl Monitor {
                 active.sort_by_key(|request| (request.started_at, request.id));
                 let active: Vec<_> = active
                     .into_iter()
-                    .map(|request| {
-                        state.with_instructions(
-                            history::request_snapshot(request, None, None),
-                            false,
-                        )
-                    })
+                    .map(|request| history::request_snapshot(request, None, None))
                     .collect();
 
-                let recent: Vec<_> = state
-                    .recent_requests()?
-                    .into_iter()
-                    .map(|request| state.with_instructions(request, false))
-                    .collect();
+                let recent = state.recent_requests()?;
                 Ok(serde_json::json!({
                     "api_version": API_VERSION,
                     "active": active,
                     "recent": recent,
                     "storage_error": state.storage_error,
                 }))
-            })
-            .await
-    }
-
-    pub(super) async fn live_detail(&self, id: Uuid) -> Result<Value, Error> {
-        self.0
-            .blocking(move |state| {
-                let request = if let Some(request) = state.active.get(&id) {
-                    history::request_snapshot(request, None, None)
-                } else {
-                    let request_id = id.to_string();
-                    state
-                        .recent_requests()?
-                        .into_iter()
-                        .find(|request| request["id"] == request_id)
-                        .ok_or(Error::NotFound)?
-                };
-                let mut request = state.with_instructions(request, true);
-                request["request_content"] = serde_json::json!(state.inputs.get(&id));
-                let output = state
-                    .outputs
-                    .get(&id)
-                    .or_else(|| state.observers.get(&id).and_then(UsageReader::output));
-                request["response_content"] = output.map(Output::view).unwrap_or(Value::Null);
-                Ok(serde_json::json!({"api_version": API_VERSION, "item": request}))
             })
             .await
     }
@@ -266,8 +219,7 @@ impl Monitor {
         protocol: Protocol,
         headers: &HeaderMap,
         track_usage: bool,
-        instruction_format: Option<Format>,
-    ) -> RequestGuard {
+    ) -> (RequestGuard, RequestStatus) {
         let id = Uuid::new_v4();
         let request = RequestStatus {
             id,
@@ -282,22 +234,22 @@ impl Monitor {
             duration_ms: None,
             upstream_status: None,
         };
+        let active = request.clone();
         self.0.post(move |state| {
-            state.active.insert(id, request);
-            if let Some(format) = instruction_format {
-                state.instructions.insert(id, Capture::Reading(format));
-            }
+            state.active.insert(id, active);
         });
-        RequestGuard {
-            monitor: self.0.clone(),
-            id: Some(id),
-            started: Instant::now(),
-            budget: self.1.clone(),
-            track_usage,
-            format: instruction_format,
-            observe_usage: false,
-            observation_lost: false,
-        }
+        (
+            RequestGuard {
+                monitor: self.0.clone(),
+                id: Some(id),
+                started: Instant::now(),
+                budget: self.1.clone(),
+                track_usage,
+                observe_usage: false,
+                observation_lost: false,
+            },
+            request,
+        )
     }
 
     pub(crate) async fn flush(&self) -> bool {
@@ -448,29 +400,6 @@ impl State {
             .collect())
     }
 
-    fn with_instructions(&self, mut request: Value, include_text: bool) -> Value {
-        let capture = request["id"]
-            .as_str()
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .and_then(|id| self.instructions.get(&id));
-        request["instructions"] = Capture::view(capture, include_text);
-        request
-    }
-
-    fn retain_content(&mut self, id: Uuid) {
-        if !self.instructions.contains_key(&id) && !self.outputs.contains_key(&id) {
-            return;
-        }
-        self.recent_content_ids.push_back(id);
-        if self.recent_content_ids.len() > RECENT_REQUEST_LIMIT
-            && let Some(oldest) = self.recent_content_ids.pop_front()
-        {
-            self.instructions.remove(&oldest);
-            self.inputs.remove(&oldest);
-            self.outputs.remove(&oldest);
-        }
-    }
-
     fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
@@ -513,19 +442,20 @@ pub(super) struct RequestGuard {
     started: Instant,
     budget: Arc<Semaphore>,
     track_usage: bool,
-    format: Option<Format>,
     observe_usage: bool,
     observation_lost: bool,
 }
 
 impl RequestGuard {
-    pub(super) fn request_body_observer(&self) -> RequestBodyObserver {
-        RequestBodyObserver {
-            monitor: self.monitor.clone(),
-            budget: self.budget.clone(),
-            id: self.id.expect("请求尚未结束"),
-            remaining: Some(MAX_REQUEST_OBSERVATION_BYTES),
-            completed: false,
+    pub(super) fn request_model_callback(&self) -> impl FnOnce(String) + Send + 'static {
+        let id = self.id.expect("请求尚未结束");
+        let monitor = self.monitor.clone();
+        move |model| {
+            monitor.post(move |state| {
+                if let Some(request) = state.active.get_mut(&id) {
+                    request.model = Some(model);
+                }
+            })
         }
     }
 
@@ -539,7 +469,6 @@ impl RequestGuard {
         let id = self.id.expect("请求尚未结束");
         self.observe_usage = self.track_usage && identity;
         let observe_usage = self.observe_usage;
-        let format = self.format;
         self.monitor.post(move |state| {
             state
                 .active
@@ -547,11 +476,9 @@ impl RequestGuard {
                 .expect("请求已经登记")
                 .upstream_status = Some(status);
             if observe_usage {
-                let mut reader = UsageReader::new(protocol, stream);
-                if let Some(format) = format {
-                    reader.capture_output(format);
-                }
-                state.observers.insert(id, reader);
+                state
+                    .observers
+                    .insert(id, UsageReader::new(protocol, stream));
             }
         });
     }
@@ -595,7 +522,6 @@ impl RequestGuard {
         let observation_lost = self.observation_lost;
         let duration_ms = millis(self.started);
         self.monitor.post_async(move |mut state| async move {
-            finish_request_body(&mut state, id, false);
             let reading = state
                 .observers
                 .remove(&id)
@@ -620,97 +546,6 @@ impl RequestGuard {
     }
 }
 
-pub(super) struct RequestBodyObserver {
-    monitor: Process<State>,
-    budget: Arc<Semaphore>,
-    id: Uuid,
-    remaining: Option<usize>,
-    completed: bool,
-}
-
-impl RequestBodyObserver {
-    pub(super) fn push(&mut self, chunk: &Bytes) {
-        let Some(remaining) = self.remaining else {
-            return;
-        };
-        if chunk.is_empty() || self.completed {
-            return;
-        }
-        let permit = (chunk.len() <= remaining)
-            .then(|| {
-                self.budget
-                    .clone()
-                    .try_acquire_many_owned(chunk.len().max(64) as u32)
-                    .ok()
-            })
-            .flatten();
-        let id = self.id;
-        if let Some(permit) = permit {
-            self.remaining = Some(remaining - chunk.len());
-            let chunk = chunk.clone();
-            self.monitor.post(move |state| {
-                if state.active.contains_key(&id) {
-                    state
-                        .request_bodies
-                        .entry(id)
-                        .or_default()
-                        .push((chunk, permit));
-                }
-            });
-        } else {
-            self.remaining = None;
-            self.monitor.post(move |state| {
-                finish_request_body(state, id, false);
-            });
-        }
-    }
-
-    pub(super) fn complete(&mut self) {
-        if std::mem::replace(&mut self.completed, true) || self.remaining.is_none() {
-            return;
-        }
-        let id = self.id;
-        self.monitor
-            .post(move |state| finish_request_body(state, id, true));
-    }
-
-    pub(super) fn abort(&mut self) {
-        if !std::mem::replace(&mut self.completed, true) {
-            let id = self.id;
-            self.monitor
-                .post(move |state| finish_request_body(state, id, false));
-        }
-    }
-}
-
-fn finish_request_body(state: &mut State, id: Uuid, complete: bool) {
-    let body = state.request_bodies.remove(&id).and_then(|chunks| {
-        let mut bytes = Vec::with_capacity(chunks.iter().map(|(bytes, _)| bytes.len()).sum());
-        for (chunk, _permit) in &chunks {
-            bytes.extend_from_slice(chunk);
-        }
-        serde_json::from_slice::<Value>(&bytes).ok()
-    });
-    if let Some(request) = state.active.get_mut(&id)
-        && request.model.is_none()
-        && let Some(model) = body.as_ref().and_then(|body| body["model"].as_str())
-        && !model.is_empty()
-    {
-        request.model = Some(model.to_owned());
-    }
-    if let Some(capture) = state.instructions.get_mut(&id)
-        && let Capture::Reading(format) = *capture
-    {
-        *capture = match body.as_ref().filter(|body| complete && body.is_object()) {
-            Some(body) => {
-                state.inputs.insert(id, Input::read(format, body));
-                Capture::Captured(format.read(body))
-            }
-            None => Capture::Unavailable,
-        };
-    }
-}
-
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.finish(Phase::Cancelled, false);
@@ -731,11 +566,7 @@ async fn finish(
     let mut request = state.active.remove(&id).expect("请求已经登记");
     request.phase = phase;
     request.duration_ms = Some(duration_ms);
-    if let Some(mut observed) = observed {
-        if let Some(output) = observed.output.take() {
-            state.outputs.insert(id, output);
-        }
-        state.retain_content(id);
+    if let Some(observed) = observed {
         if observed.model.is_some() {
             request.model = observed.model.clone();
         }

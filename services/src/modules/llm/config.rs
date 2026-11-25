@@ -24,7 +24,9 @@ pub(super) const MODULE: &str = "llm";
 pub(super) const PROVIDERS: &str = "providers";
 pub(super) const CLIENTS: &str = "clients";
 const CLIENT_NOTIFICATION: &str = "/llm/config/clients";
+use super::archive::Settings;
 use super::service::LlmService;
+pub(super) const MONITORING: &str = "monitoring";
 const PROVIDER_NOTIFICATION: &str = "/llm/config/providers";
 
 #[loki_config]
@@ -45,6 +47,21 @@ fn metadata() -> ConfigModuleMetadata {
                 "LLM 客户端",
                 "填写名称和供应商，保存时自动生成客户端令牌。",
             ),
+            ConfigItemMetadata {
+                key: MONITORING.into(),
+                name: "请求详情监控".into(),
+                description: "通过实时请求的监控设置修改范围、保留条数和最近使用的过滤条件。"
+                    .into(),
+                data_type: ConfigDataType::Dictionary,
+                default: Some(json!(Settings::default())),
+                dictionary: None,
+                remote_access: Default::default(),
+                required: false,
+                list: None,
+                checker: None,
+                file_path: None,
+                executable: None,
+            },
         ],
     }
 }

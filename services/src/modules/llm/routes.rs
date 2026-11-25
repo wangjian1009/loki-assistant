@@ -15,6 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
+    archive::{Settings, SettingsPatch},
     history::{Dimension, Error as HistoryError, OptionsQuery, RequestsQuery, SummaryQuery},
     monitor::{SessionQuery, UsageReport},
     protocol::{Binding, Client, Protocol, SessionUsageRow, UsageRow, error},
@@ -177,7 +178,7 @@ async fn requests(
     State(service): State<Arc<LlmService>>,
 ) -> Result<Json<NamedUsage<Value>>, Response> {
     let report = service.monitor.requests().await.map_err(usage_error)?;
-    Ok(named_usage(&service, report).await)
+    Ok(named_usage(&service, service.archive.annotate(report).await).await)
 }
 
 #[loki_api(
@@ -186,8 +187,8 @@ async fn requests(
     id = "request-detail",
     method = "GET",
     path = "/llm/requests/{id}",
-    summary = "查询实时请求详情",
-    description = "返回在途或最近结束请求的元数据、输入、工具定义和响应内容。"
+    summary = "查询已采集的请求详情",
+    description = "根据请求 ID 从缓存文件读取请求元数据、输入、工具定义和响应。"
 )]
 async fn request_detail(
     State(service): State<Arc<LlmService>>,
@@ -195,7 +196,7 @@ async fn request_detail(
 ) -> Response {
     let result = async {
         let id = Uuid::parse_str(&id).map_err(|_| usage_error(HistoryError::Invalid))?;
-        let mut report = service.monitor.live_detail(id).await.map_err(usage_error)?;
+        let mut report = service.archive.detail(id).await.map_err(detail_error)?;
         add_client_name(&mut report["item"], &service.client_names().await);
         Ok::<_, Response>(Json(report))
     };
@@ -204,6 +205,111 @@ async fn request_detail(
         Err(error) => error,
     };
     ([(header::CACHE_CONTROL, "no-store")], response).into_response()
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "request-detail-raw",
+    method = "GET",
+    path = "/llm/requests/{id}/raw/{part}",
+    summary = "读取请求缓存原始正文",
+    description = "按请求 ID 读取 request 或 response 的原始字节流。"
+)]
+async fn request_detail_raw(
+    State(service): State<Arc<LlmService>>,
+    Path((id, part)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let id = Uuid::parse_str(&id).map_err(|_| usage_error(HistoryError::Invalid))?;
+    let response = match part.as_str() {
+        "request" => false,
+        "response" => true,
+        _ => return Err(usage_error(HistoryError::Invalid)),
+    };
+    let body = service
+        .archive
+        .raw(id, response)
+        .await
+        .map_err(detail_error)?;
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "application/octet-stream"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn detail_error(err: std::io::Error) -> Response {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        error(
+            StatusCode::NOT_FOUND,
+            "llm-request-detail-not-found",
+            "未找到该请求的采集详情。",
+        )
+    } else {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llm-request-detail-unavailable",
+            "无法读取请求缓存。",
+        )
+    }
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "monitoring",
+    method = "GET",
+    path = "/llm/monitoring",
+    summary = "读取请求监控配置",
+    description = "返回监控开关、范围、保留条数和最近使用的过滤条件。"
+)]
+async fn get_monitoring(
+    State(service): State<Arc<LlmService>>,
+) -> Result<Json<Settings>, Response> {
+    service.monitoring().await.map(Json).map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llm-monitoring-config-unavailable",
+            "无法读取请求监控配置。",
+        )
+    })
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "update-monitoring",
+    method = "PATCH",
+    path = "/llm/monitoring",
+    summary = "修改请求监控配置",
+    description = "修改开关、过滤条件或保留条数，启用的过滤条件计入最近使用记录。"
+)]
+async fn update_monitoring(
+    State(service): State<Arc<LlmService>>,
+    body: Result<Json<SettingsPatch>, JsonRejection>,
+) -> Result<Json<Settings>, Response> {
+    let Json(patch) = body.map_err(|_| {
+        error(
+            StatusCode::BAD_REQUEST,
+            "llm-monitoring-config-invalid",
+            "请求监控配置格式无效。",
+        )
+    })?;
+    service
+        .change_monitoring(patch)
+        .await
+        .map(Json)
+        .map_err(|_| {
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "llm-monitoring-config-unavailable",
+                "无法保存请求监控配置。",
+            )
+        })
 }
 
 #[loki_api(

@@ -11,12 +11,12 @@
 | ~Started~ | 选定上游后 | Loki 请求 ID、客户端 ID、可选会话标识、实际上游 ID、协议、开始时间、请求方法及路径后缀 |
 | ~Headers~ | 收到上游响应头 | 请求 ID、HTTP 状态及观察所需的 ~Content-Type~ 和 ~Content-Encoding~ |
 | ~BodyBytes~ | 转交响应正文数据块时 | 请求 ID、原始数据块 |
-| 请求正文观测 | 转发请求正文时 | 请求 ID、用于提取 ~model~ 和系统指令的正文数据块 |
+| 请求模型 | 转发请求正文时 | 请求 ID、逐块识别的顶层 ~model~ |
 | ~Finished~ | 正文读完、上游失败或客户端断开 | 请求 ID、结束时间、结果、首包及总耗时、观测是否缺段 |
 
 - 转发入口用 ~mpsc::Sender::try_send~ 投递响应数据块。控制事件和正文观测进入同一任务队列。正文额度不足时只停止投递这一请求后续的正文观测。请求守卫在正常返回或被取消时发送一次 ~Finished~ ，统计任务先处理已经投递的正文，再处理终态。
 - 正文观测队列的字节预算为 16 MiB，每条正文消息至少占 64 字节额度。统计任务处理数据块后释放额度。额度不足时，该请求继续转发，终态将用量标记为不完整。
-- 统计任务根据事件解析 JSON、Chat Completions SSE、Responses SSE 和 Claude SSE。模型优先采用响应中的 ~model~ ，也可从最多 4 MiB 的请求正文中旁路提取。支持的推理接口从完整的 JSON 正文提取系统指令。原始正文仅在提取期间经过内存，数据库保存提取的 ~usage~ 、可选模型名和请求元数据。
+- 统计任务解析 JSON、Chat Completions SSE、Responses SSE 和 Claude SSE。模型优先采用响应中的 ~model~ ，也可从请求流识别顶层 ~model~ 。SQLite 保存提取的 ~usage~ 、可选模型名和请求元数据。请求详情由独立文件缓存提供。
 - 用量缺字段、传输中断或观察缺段时，终态保留已知数值并标记 ~incomplete~ 。缺失字段存 ~NULL~ ，明确上报的零存 ~0~ 。传输结果与用量完整性各用独立字段。供应商归属固定为请求开始时的选路结果。
 - Tokio task 负责接收、组批、定时和恢复调度。SQLite 同步 I/O 在 ~spawn_blocking~ 中串行执行，由同一个 task 调度唯一写连接。查询与写入共享串行数据库连接。当前退出流程会提交已入队的批次，完整排空时序见 [[*进程退出][进程退出]]。
 
@@ -116,7 +116,9 @@ CREATE TABLE usage_meta (
 | 方法与路径 | 用途 | 实现状态 |
 |------------+------+----------|
 | ~GET /llm/requests~ | 查看在途请求和最近结束的推理请求 | 已实现 |
-| ~GET /llm/requests/{id}~ | 查询单条在途或最近结束的请求及其系统指令 | 已实现 |
+| ~GET /llm/requests/{id}~ | 按 ID 从缓存读取请求详情、系统指令和响应 | 已实现 |
+| ~GET /llm/requests/{id}/raw/{part}~ | 流式读取缓存中的原始请求或响应 | 已实现 |
+| ~GET /llm/monitoring~ 、 ~PATCH /llm/monitoring~ | 查询和修改监控开关、范围、保留条数和最近过滤条件 | 已实现 |
 | ~GET /llm/usage~ | 按客户端和供应商查看全量累计 | 已实现 |
 | ~GET /llm/usage/sessions~ | 按客户端、原生会话标识和实际供应商查看全量累计 | 已实现 |
 | ~GET /llm/usage/requests~ | 按条件分页查询已落盘的推理请求 | 已实现 |
@@ -130,11 +132,19 @@ CREATE TABLE usage_meta (
 
 ~recent~ 合并待落盘记录和 SQLite 已落盘明细，按完成时间倒序返回最近 100 条已结束的推理请求。~phase~ 为 ~completed~ 、 ~failed~ 或 ~cancelled~ 。~usage~ 包含上游上报口径的 ~input_tokens~ 、 ~output_tokens~ 及完整标记 ~complete~ ，缺失的计数为 ~null~ 。~storage_error~ 表示最近一次落盘失败。此查询为只读操作。
 
-每条请求的 ~instructions~ 仅报告状态和已识别段数。~reading~ 对应「读取中」，~captured~ 带 ~count~ ，~absent~ 表示完整的请求正文中没有可显示的系统指令，~unavailable~ 表示正文无法观测、超过容量、请求中断、该接口不支持采集，或请求早于当前进程。
+~has_detail~ 表示对应请求的缓存文件可用。实时列表只查询这个状态，需要查看正文时按 ID 查询详情。
 
-~GET /llm/requests/{id}~ 返回 ~item~ 。已采集时，~item.instructions.blocks~ 按请求顺序返回，每段包含字段路径 ~source~ 、角色 ~role~ 和原文 ~text~ 。Responses 从 ~instructions~ 和 ~input~ 中提取，Chat Completions 从 ~messages~ 中提取 ~system~ 和 ~developer~ 角色，Claude Messages 从顶层 ~system~ 提取。
+** 请求详情缓存
 
-~item.request_content~ 包含请求参数 ~settings~ 、工具定义 ~tools~ 和按顺序排列的输入 ~blocks~ 。~item.response_content~ 包含响应块 ~blocks~ 和完整性标记 ~complete~ 。块以 ~kind~ 区分消息、工具调用、工具结果和上游错误，可携带 ~role~ 、工具名 ~name~ 、调用标识 ~id~ 和正文 ~text~ 。SSE 响应在流式传输时累积已收到的内容，工具结果在客户端把结果发回代理或上游提供执行结果时可见。图片、文件和音频以类型提示显示。请求和响应内容超出保留上限时标记 ~truncated~ 。详情限本机读取，响应带 ~Cache-Control: no-store~ 。内容保存在进程内存中，覆盖在途和最近结束的请求。
+~llm.monitoring~ 保存采集开关 ~enabled~ 、保留条数 ~retention~ 、当前过滤条件 ~filter~ 和最近使用记录 ~history~ 。~filter~ 支持协议 ~protocols~ 、客户端 UUID ~clients~ 和供应商 ID ~upstreams~ ，每个字段为数组。空数组匹配该维度的全部值，填写的维度需要同时匹配。同一维度内任一值匹配即可。范围在请求开始时确定，默认开启并匹配所有已支持的推理接口。
+
+~PATCH /llm/monitoring~ 接受可选的 ~enabled~ 、 ~retention~ 和 ~filter~ ，修改并启用的范围保存到配置历史。历史按最近启用顺序去重，保留 10 条。关闭监控后，下一条请求按关闭状态处理，已有缓存继续正常到期清理。
+
+命中范围的请求在 =~/.cache/assistant/llm/requests/= 下按 ID 各建一个文件，转发过程中依次追加元数据、请求与响应分块。写入按收到的分块进行，详情采集没有单条正文体积上限。启动时和每 60 秒按请求开始时间清理旧文件，默认保留最近 500 条，仍在写入的文件等请求结束后的后续清理。缓存保留期间可以在服务重启后继续按 ID 查询。
+
+~GET /llm/requests/{id}~ 返回 ~item~ 。已采集时，~item.instructions.blocks~ 按请求顺序返回，每段包含字段路径 ~source~ 、角色 ~role~ 和原文 ~text~ 。Responses 从 ~instructions~ 和 ~input~ 中提取，Chat Completions 从 ~messages~ 中提取 ~system~ 和 ~developer~ 角色，Claude Messages 从顶层 ~system~ 提取。缓存缺失或已清理时返回 HTTP 404。
+
+~item.request_content~ 包含请求参数 ~settings~ 、工具定义 ~tools~ 和按顺序排列的输入 ~blocks~ 。~item.response_content~ 包含响应块 ~blocks~ 和完整性标记 ~complete~ 。块以 ~kind~ 区分消息、工具调用、工具结果和上游错误，可携带 ~role~ 、工具名 ~name~ 、调用标识 ~id~ 和正文 ~text~ 。SSE 响应在读取详情时按序还原。工具结果在客户端把结果发回代理或上游提供执行结果时可见。结构化视图用类型表示图片、文件和音频。~GET /llm/requests/{id}/raw/{part}~ 按 ~request~ 或 ~response~ 流式返回原字节，也可取出压缩正文。详情和原始正文均限本机读取，响应带 ~Cache-Control: no-store~ 。
 
 ** 历史请求
 
@@ -268,13 +278,14 @@ CREATE TABLE usage_meta (
 | 查单次请求 | 按时间、客户端、供应商、模型、协议、结果和完整性筛选。列表显示客户端名称、完成时间、耗时、结果及输出 token，支持继续加载。选中一行可查看首包耗时、HTTP 状态及原始 ~usage~ ，也可复制请求 ID。 | ~GET /llm/usage/requests~ 、 ~GET /llm/usage/requests/{id}~ 、 ~GET /llm/usage/options~ |
 | 查会话用量 | 从客户端的会话累计列表进入指定会话，按实际供应商查看用量。按客户端 ID、原生会话标识和供应商查找该会话的历史请求。 | ~GET /llm/usage/sessions~ 、 ~GET /llm/usage/requests~ 、 ~GET /llm/usage/options~ |
 | 查全量累计 | 查看按客户端和供应商归集的全量用量，含已导入的旧累计数据。 | ~GET /llm/usage~ |
-| 查实时请求 | 查看在途请求和最近结束的推理请求，显示系统指令段数、供应商、模型、首包和总耗时及已报告的输出 token。按 ~g~ 读取最新快照，按 ~RET~ 查看选中请求的详情与系统指令。 | ~GET /llm/requests~ 、 ~GET /llm/requests/{id}~ |
+| 查实时请求 | 查看在途请求和最近结束的推理请求，显示详情可用状态、供应商、模型、耗时和输出 token。按 ~g~ 刷新，按 ~RET~ 查看选中请求。 | ~GET /llm/requests~ 、 ~GET /llm/requests/{id}~ |
 
 - 概览顶部显示含首尾的统计日期、报表时区和区间汇总。请求数注明其中用量不完整的条数。输入 token 分为未缓存、读缓存和写缓存，输出 token 单列。下方按日或月显示明细，选定分组时显示相应的列。 [[file:../design/emacs/llm-usage-overview.fig][概览设计稿]]
 - 在概览按 ~t~ 切换表格和条形图。图表沿用当前日期、分组和筛选条件，按同一刻度堆叠未缓存输入、缓存读取、缓存写入及输出，另列已上报 token 合计和用量不完整的请求数。
 - 在概览按 ~e~ 可将当前筛选结果导出到本机 PNG 文件。Emacs 根据同一份日或月汇总绘制 SVG，再调用 ~rsvg-convert~ 生成 PNG。图片包含日期范围、分组、图例、已上报 token 合计和用量不完整的请求数。
 - 选中一行并按 ~RET~ 打开请求历史。查询取所选周期与统计范围的交集，按报表时区转换成 UTC 时间边界，并带上当前筛选条件及所选行的分组值。返回概览时恢复原日期范围和筛选条件。
 - 历史列表按完成时间倒序显示。翻页沿用同一查询的游标，刷新时重新读取第一页。详情按请求 ID 加载，只在打开时读取原始 ~usage~ 。宽窗口并排显示列表和详情，窄窗口从列表打开详情，返回后恢复选中行。普通列表键可移动选中行。
+- 在实时请求列表中按 ~m~ 打开监控设置。可关闭监控、开启当前范围、配置过滤条件、只监控选中请求的客户端、设置保留条数或直接恢复最近使用的过滤条件。
 - 实时请求详情使用整个 Emacs 窗口。顶部显示模型、状态、耗时和用量。对话按请求顺序排列并展开最近的用户消息。「本次响应」直接显示助手回复和工具调用标题，调用参数可展开查看。历史对话、输入中的工具活动和请求上下文默认折叠，标题显示内容类型和数量。每次展开显示下一层标题，可继续查看单条历史消息、系统指令、工具定义、调用参数和结果。安装 AgentShell 时，详情使用其角色标签、主题配色和 Markdown 渲染。Org 正文和单独的 Org 代码块使用 Org 语法着色，复制时保留原始格式。
 - 用 ~Tab~ 或 ~n~ 到下一个可见项目，用 ~Shift-Tab~ 或 ~p~ 返回上一项。按 ~RET~ 展开或折叠当前项目，按 ~C-M-u~ 回到上一级。按 ~g~ 刷新、 ~j~ 跳到章节、 ~C-s~ 搜索、 ~w~ 复制当前项目。按 ~q~ 或 ~C-c C-q~ 返回列表并恢复窗口布局。 [[file:../design/emacs/llm-request-monitor.fig][实时请求设计稿]]
 - 请求缺少原生会话标识时，详情显示「未知会话」，仍可按客户端和供应商查询这条记录。历史请求的结果与用量完整性分别显示。选择客户端后可填写用于精确匹配的会话 ID。

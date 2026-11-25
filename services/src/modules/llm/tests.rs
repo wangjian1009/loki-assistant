@@ -70,8 +70,64 @@ async fn invoke(
 }
 
 async fn json_body(response: Response) -> Value {
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&bytes)))
+}
+
+#[tokio::test]
+async fn monitoring_settings_survive_restart_and_keep_ten_recent_filters() {
+    let directory = Directory::new();
+    let (app, _notifications) = persistent_router(&directory).await;
+    let settings = json_body(invoke(&app, Method::GET, "/llm/monitoring", None, None).await).await;
+    assert_eq!(settings["retention"], 500);
+    for index in 0..12 {
+        let filter = json!({"upstreams":[format!("work-{index}"), format!("work-{index}")]});
+        let response = invoke(
+            &app,
+            Method::PATCH,
+            "/llm/monitoring",
+            None,
+            Some(json!({"enabled":true,"filter":filter})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let disabled = json_body(
+        invoke(
+            &app,
+            Method::PATCH,
+            "/llm/monitoring",
+            None,
+            Some(json!({"enabled":false,"retention":8})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["history"].as_array().unwrap().len(), 10);
+    assert_eq!(disabled["history"][0]["upstreams"], json!(["work-11"]));
+    assert_eq!(disabled["history"][9]["upstreams"], json!(["work-2"]));
+    let (restarted, _notifications) = persistent_router(&directory).await;
+    let settings =
+        json_body(invoke(&restarted, Method::GET, "/llm/monitoring", None, None).await).await;
+    assert_eq!(settings, disabled);
+    let restored = json_body(
+        invoke(
+            &restarted,
+            Method::PATCH,
+            "/llm/monitoring",
+            None,
+            Some(json!({"enabled":true,"filter":settings["history"][5]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(restored["enabled"], true);
+    assert_eq!(restored["retention"], 8);
+    assert_eq!(restored["history"][0]["upstreams"], json!(["work-6"]));
+    assert_eq!(restored["history"].as_array().unwrap().len(), 10);
 }
 
 async fn provider(app: &Router, id: &str, record: Value) {
@@ -162,7 +218,7 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
                     Json(json!({"input_tokens":99}))
                 }),
             )
-            .layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+            .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
     )
     .await;
 
@@ -208,10 +264,9 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     assert_eq!(active[0]["phase"], "responding");
     assert!(active[0]["first_byte_ms"].is_u64());
     assert!(active[0]["usage"].is_null());
-    assert_eq!(
-        active[0]["instructions"],
-        json!({"status":"captured","count":3})
-    );
+    assert_eq!(active[0]["has_detail"], true);
+    assert!(active[0].get("instructions").is_none());
+    assert!(active[0].get("request_content").is_none());
     assert_eq!(snapshot["recent"], json!([]));
     let codex_path = format!("/llm/requests/{}", codex_id.as_str().unwrap());
     let detail = invoke(&app, Method::GET, &codex_path, None, None).await;
@@ -229,6 +284,26 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     assert_eq!(
         detail["item"]["request_content"]["blocks"][0]["kind"],
         "tool_result"
+    );
+    assert_eq!(
+        detail["item"]["request_content"]["blocks"][1]["text"]
+            .as_str()
+            .unwrap()
+            .len(),
+        5_300_000
+    );
+    let raw = invoke(
+        &app,
+        Method::GET,
+        &format!("{codex_path}/raw/request"),
+        None,
+        None,
+    )
+    .await;
+    let raw = to_bytes(raw.into_body(), 8 * 1024 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw).unwrap(),
+        native_responses_request()
     );
     assert_eq!(
         detail["item"]["response_content"],
@@ -293,10 +368,8 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     assert_eq!(snapshot["active"][0]["upstream"], "a");
     assert_eq!(snapshot["recent"][0]["model"], "claude-model");
     assert_eq!(snapshot["recent"][0]["phase"], "completed");
-    assert_eq!(
-        snapshot["recent"][0]["instructions"],
-        json!({"status":"captured","count":1})
-    );
+    assert_eq!(snapshot["recent"][0]["has_detail"], true);
+    assert!(snapshot["recent"][0].get("response_content").is_none());
     let claude_path = format!(
         "/llm/requests/{}",
         snapshot["recent"][0]["id"].as_str().unwrap()
@@ -362,7 +435,7 @@ fn native_responses_request() -> Value {
             {"role":"system","content":"系统示例"},
             {"role":"developer","content":[{"type":"input_text","text":"开发者示例"}]},
             {"type":"function_call_output","call_id":"call-1","output":"工具结果示例"},
-            {"role":"user","content":"a".repeat(2_300_000)}
+            {"role":"user","content":"a".repeat(5_300_000)}
         ],
         "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}],
         "tool_choice":"auto",
@@ -433,7 +506,11 @@ async fn persistent_router(directory: &Directory) -> (Router, Arc<Router>) {
         .with_password_service(passwords);
     let config = config::Module::from_service(config);
     let monitor = Monitor::load(directory.0.join("llm-usage.json")).unwrap();
-    let llm = Arc::new(LlmService::new(config.service(), monitor));
+    let llm = Arc::new(LlmService::new(
+        config.service(),
+        monitor,
+        Some(directory.0.join("requests")),
+    ));
     let notifications = Arc::new(notification_router(llm.clone()));
     config.service().attach_notifications(&notifications);
     llm.reload_authorization().await.unwrap();

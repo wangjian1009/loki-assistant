@@ -1,9 +1,9 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::protocol::Protocol;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub(super) enum Format {
     Responses,
     ChatCompletions,
@@ -110,23 +110,20 @@ fn read_messages(instructions: &mut Vec<Instruction>, field: &str, value: &Value
 }
 
 pub(super) enum Capture {
-    Reading(Format),
     Captured(Vec<Instruction>),
     Unavailable,
 }
 
 impl Capture {
-    pub(super) fn view(capture: Option<&Self>, include_text: bool) -> Value {
-        match capture {
-            Some(Self::Reading(_)) => json!({"status":"reading"}),
-            Some(Self::Captured(blocks)) if blocks.is_empty() => {
+    pub(super) fn view(&self) -> Value {
+        match self {
+            Self::Captured(blocks) if blocks.is_empty() => {
                 json!({"status":"absent","count":0})
             }
-            Some(Self::Captured(blocks)) if include_text => {
+            Self::Captured(blocks) => {
                 json!({"status":"captured","count":blocks.len(),"blocks":blocks})
             }
-            Some(Self::Captured(blocks)) => json!({"status":"captured","count":blocks.len()}),
-            _ => json!({"status":"unavailable"}),
+            Self::Unavailable => json!({"status":"unavailable"}),
         }
     }
 }
