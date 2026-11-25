@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, Request, State, rejection::JsonRejection},
+    extract::{
+        Path, Query, Request, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -10,7 +13,8 @@ use loki_services_macros::loki_api;
 use uuid::Uuid;
 
 use super::{
-    monitor::{Requests, UsageReport},
+    history::{Error as HistoryError, OptionsQuery, RequestsQuery, SummaryQuery},
+    monitor::{Requests, SessionQuery, UsageReport},
     protocol::{Binding, Client, Protocol, SessionUsageRow, UsageRow, error},
     service::LlmService,
 };
@@ -168,8 +172,125 @@ async fn usage(State(service): State<Arc<LlmService>>) -> Json<UsageReport<Usage
 )]
 async fn session_usage(
     State(service): State<Arc<LlmService>>,
-) -> Json<UsageReport<SessionUsageRow>> {
-    Json(service.monitor.session_usage().await)
+    query: Result<Query<SessionQuery>, QueryRejection>,
+) -> Result<Json<UsageReport<SessionUsageRow>>, Response> {
+    service
+        .monitor
+        .session_usage(usage_query(query)?)
+        .await
+        .map(Json)
+        .map_err(usage_error)
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "usage-history",
+    method = "GET",
+    path = "/llm/usage/requests",
+    summary = "查询历史推理请求",
+    description = "按时间、客户端、供应商、模型、协议和会话过滤已持久化的请求。"
+)]
+async fn usage_history(
+    State(service): State<Arc<LlmService>>,
+    query: Result<Query<RequestsQuery>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, Response> {
+    service
+        .monitor
+        .history(usage_query(query)?)
+        .await
+        .map(Json)
+        .map_err(usage_error)
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "usage-detail",
+    method = "GET",
+    path = "/llm/usage/requests/{id}",
+    summary = "查询历史请求详情",
+    description = "返回归一化用量和上游报告的原始用量。"
+)]
+async fn usage_detail(
+    State(service): State<Arc<LlmService>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let id = Uuid::parse_str(&id).map_err(|_| usage_error(HistoryError::Invalid))?;
+    service
+        .monitor
+        .detail(id)
+        .await
+        .map(Json)
+        .map_err(usage_error)
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "usage-summary",
+    method = "GET",
+    path = "/llm/usage/summary",
+    summary = "查询用量报表",
+    description = "按报表时区汇总已持久化的日或月用量。"
+)]
+async fn usage_summary(
+    State(service): State<Arc<LlmService>>,
+    query: Result<Query<SummaryQuery>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, Response> {
+    service
+        .monitor
+        .summary(usage_query(query)?)
+        .await
+        .map(Json)
+        .map_err(usage_error)
+}
+
+#[loki_api(
+    module = "llm",
+    mount = "Arc<LlmService>",
+    id = "usage-options",
+    method = "GET",
+    path = "/llm/usage/options",
+    summary = "查询用量筛选候选",
+    description = "查询历史请求或会话中的客户端、供应商或模型。"
+)]
+async fn usage_options(
+    State(service): State<Arc<LlmService>>,
+    query: Result<Query<OptionsQuery>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, Response> {
+    service
+        .monitor
+        .options(usage_query(query)?)
+        .await
+        .map(Json)
+        .map_err(usage_error)
+}
+
+fn usage_query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, Response> {
+    query
+        .map(|Query(query)| query)
+        .map_err(|_| usage_error(HistoryError::Invalid))
+}
+
+fn usage_error(error_value: HistoryError) -> Response {
+    match error_value {
+        HistoryError::Invalid => error(
+            StatusCode::BAD_REQUEST,
+            "llm-invalid-usage-query",
+            "用量查询参数无效。",
+        ),
+        HistoryError::NotFound => error(
+            StatusCode::NOT_FOUND,
+            "llm-usage-request-not-found",
+            "未找到该请求。",
+        ),
+        HistoryError::Store => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llm-usage-unavailable",
+            "无法读取用量数据库。",
+        ),
+    }
 }
 
 fn binding(body: Result<Json<Binding>, JsonRejection>) -> Result<Binding, Response> {

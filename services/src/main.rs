@@ -67,8 +67,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     services.stop_extensions(extensions).await;
     let _ = network_start.await;
     services.network.shutdown().await;
+    let usage_saved = services.flush_llm_usage().await;
     service_pfile.remove_if_owner()?;
     result?;
+    if !usage_saved {
+        return Err("无法保存 LLM 用量明细。".into());
+    }
     log::info!(
         "services 已停止，已移除服务信息文件 {}",
         service_path.display()

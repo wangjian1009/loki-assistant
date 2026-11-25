@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::http::error::{ErrorSource, response};
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Protocol {
     Codex,
@@ -55,7 +55,7 @@ pub(super) struct IssuedClient {
     pub token: String,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Phase {
     Waiting,
@@ -97,6 +97,15 @@ pub(super) struct UsageTotal {
 }
 
 impl UsageTotal {
+    pub(super) fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.requests = self.requests.saturating_add(other.requests);
+        self.incomplete_requests = self
+            .incomplete_requests
+            .saturating_add(other.incomplete_requests);
+    }
+
     pub(super) fn record(&mut self, usage: Usage) {
         self.input_tokens = self
             .input_tokens

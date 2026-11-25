@@ -1,0 +1,63 @@
+;;; loki-assistant-llm-usage-tests.el --- LLM 用量查询测试 -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'loki-assistant-llm-usage)
+
+(ert-deftest loki-assistant-llm-usage-test-drill-into-filtered-month ()
+  (with-temp-buffer
+    (loki-assistant-llm-usage-mode)
+    (let ((requests nil)
+          (overview '((bucket . "month") (group_by . "upstream")
+                      (from_date . "2026-11-15") (to_date . "2026-11-26")
+                      (protocol . "codex"))))
+      (setf (loki-assistant-llm-usage--view-filters
+             (loki-assistant-llm-usage--state)) overview)
+      (cl-letf (((symbol-function 'loki-assistant-request)
+                 (lambda (_method path &rest options)
+                   (push (cons path (plist-get options :params)) requests)
+                   (funcall (plist-get options :callback)
+                            (list :ok t :data
+                                  (if (equal path "/llm/usage/summary")
+                                      '((bucket . "month") (group_by . "upstream")
+                                        (from_date . "2026-11-15") (to_date . "2026-11-26")
+                                        (time_zone . "Asia/Shanghai")
+                                        (items . [((period_start . "2026-11-01")
+                                                   (group . "work") (output_tokens . 2))]))
+                                    '((items . []) (next_cursor . :null))))))))
+        (loki-assistant-llm-usage--load)
+        (goto-char (point-min))
+        (loki-assistant-llm-usage-open)
+        (should (equal (caar requests) "/llm/usage/requests"))
+        (should (equal (cdr (assoc "from" (cdar requests))) "2026-11-14T16:00:00Z"))
+        (should (equal (cdr (assoc "to" (cdar requests))) "2026-11-25T16:00:00Z"))
+        (should (equal (cdr (assoc "upstream" (cdar requests))) "work"))
+        (should (equal (cdr (assoc "protocol" (cdar requests))) "codex"))
+        (loki-assistant-llm-usage-back)
+        (should (eq loki-assistant-llm-usage--current 'overview))
+        (should (equal (loki-assistant-llm-usage--view-filters
+                        (loki-assistant-llm-usage--state)) overview))))))
+
+(ert-deftest loki-assistant-llm-usage-test-discards-late-pages ()
+  (with-temp-buffer
+    (loki-assistant-llm-usage-mode)
+    (setq loki-assistant-llm-usage--current 'history)
+    (let ((callbacks nil))
+      (cl-letf (((symbol-function 'loki-assistant-request)
+                 (lambda (_method _path &rest options)
+                   (push (plist-get options :callback) callbacks))))
+        (loki-assistant-llm-usage-refresh)
+        (funcall (pop callbacks)
+                 '(:ok t :data ((items . [((id . "first"))]) (next_cursor . "cursor"))))
+        (loki-assistant-llm-usage-more)
+        (loki-assistant-llm-usage-refresh)
+        (funcall (pop callbacks)
+                 '(:ok t :data ((items . [((id . "new"))]) (next_cursor . :null))))
+        (funcall (pop callbacks)
+                 '(:ok t :data ((items . [((id . "old-page"))]) (next_cursor . :null))))
+        (should (equal (mapcar (lambda (item) (alist-get 'id item))
+                               (loki-assistant-llm-usage--view-items
+                                (loki-assistant-llm-usage--state)))
+                       '("new")))))))
+
+(provide 'loki-assistant-llm-usage-tests)
+;;; loki-assistant-llm-usage-tests.el ends here

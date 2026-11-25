@@ -1,4 +1,5 @@
 mod config;
+mod history;
 mod monitor;
 mod protocol;
 mod routes;

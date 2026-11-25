@@ -44,6 +44,8 @@ zeroize = "1"
 url = "2"
 tower = { version = "0.5", features = ["util"] }
 pgp = { version = "0.21.1", default-features = false }
+rusqlite = { version = "0.43", features = ["bundled"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 
 [dev-dependencies]
 loki-mobile-network = { path = "../apps/harmony/entry/src/main/rust" }

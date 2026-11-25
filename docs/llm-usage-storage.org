@@ -2,7 +2,7 @@
 
 * 范围
 
-本文为方案设计，当前运行接口见 [[file:control-center-services.org::*AI 统一代理][AI 统一代理]]。由 ~modules/llm~ 内独立的 Tokio task 接收转发事件、解析用量、写入明细和定期聚合。转发路径负责发送观测事件，继续按请求转发原始响应。选用单个 SQLite 数据库，使用 WAL、批量事务和只读连接。明细是长期保存的数据，日报是可重建的查询结果。
+本文说明当前用量存储、查询和 Emacs 界面，以及待实现的进程退出设计。当前运行接口见 [[file:control-center-services.org::*AI 统一代理][AI 统一代理]]。由 ~modules/llm~ 内独立的 Tokio task 接收转发事件、解析用量、写入明细和定期聚合。转发路径负责发送观测事件，继续按请求转发原始响应。选用单个 SQLite 数据库，使用 WAL 和批量事务。数据库操作由统计任务串行安排到阻塞线程，查询使用短时 SQL 语句。明细是长期保存的数据，日报是可重建的查询结果。
 
 * 转发与统计任务
 
@@ -13,17 +13,17 @@
 | ~BodyBytes~ | 转交响应正文数据块时 | 请求 ID、原始数据块 |
 | ~Finished~ | 正文读完、上游失败或客户端断开 | 请求 ID、结束时间、结果、首包及总耗时、观测是否缺段 |
 
-- 转发入口用 ~mpsc::Sender::try_send~ 投递响应数据块。在登记 ~Started~ 前，先为该请求预留一个 ~Finished~ 的队列槽位。两者使用同一个有界 FIFO，统计任务先收到已投递的数据块，再收到终态。请求守卫在正常返回或被取消时发送一次 ~Finished~ 。
-- 首版以 1,024 个队列槽位和 16 MiB 正文预算为起点。正文按实际保留的字节计费，统计任务取出数据后释放预算。队列或预算满时，停止采集该请求后续正文，终态标记观测缺段。连起始事件也无法登记时，增加 ~unobserved_requests~ 计数。请求继续转发，统计查询通过状态字段显示缺口。
+- 转发入口用 ~mpsc::Sender::try_send~ 投递响应数据块。控制事件和正文观测进入同一任务队列。正文额度不足时只停止投递这一请求后续的正文观测。请求守卫在正常返回或被取消时发送一次 ~Finished~ ，统计任务先处理已经投递的正文，再处理终态。
+- 正文观测队列的字节预算为 16 MiB，每条正文消息至少占 64 字节额度。统计任务处理数据块后释放额度。额度不足时，该请求继续转发，终态将用量标记为不完整。
 - 统计任务根据事件解析 JSON、Responses SSE 或 Claude SSE，维护各请求的临时解析状态和全局内存上限。Claude 通常在 ~message_start~ 提供输入，在 ~message_delta~ 更新累计输出，同一字段取最后一次上报的值。只把提取的 ~usage~ 、可选模型名和请求元数据写入数据库。原始正文仅在提取期间经过内存。当前请求仍可由同一任务维护内存状态供监控查询。
 - 用量缺字段、传输中断或观察缺段时，终态保留已知数值并标记 ~incomplete~ 。缺失字段存 ~NULL~ ，明确上报的零存 ~0~ 。传输结果与用量完整性各用独立字段。供应商归属固定为请求开始时的选路结果。
-- Tokio task 负责接收、组批、定时和恢复调度。SQLite 同步 I/O 在 ~spawn_blocking~ 中串行执行，由同一个 task 调度唯一写连接。查询使用独立只读连接。关闭时序见 [[*进程退出][进程退出]]。
+- Tokio task 负责接收、组批、定时和恢复调度。SQLite 同步 I/O 在 ~spawn_blocking~ 中串行执行，由同一个 task 调度唯一写连接。查询与写入共享串行数据库连接。当前退出流程会提交已入队的批次，完整排空时序见 [[*进程退出][进程退出]]。
 
 * 存储结构
 
 数据库建议放在 =~/.assistant/llm-usage.sqlite3= 。~usage_event~ 仅追加，每个达到终态的已登记推理请求对应一行，重复请求 ID 保留首条已提交记录。输入 token 规范化为三个互斥分项 ~input_uncached_tokens~、~cache_read_tokens~ 和 ~cache_write_tokens~ 。OpenAI Responses 的缓存读取包含在输入中，归一化时扣除一次。Claude 的缓存读写独立上报。~raw_usage_json~ 只存上游报告的用量字段，以便公式变化后重算。响应未提供模型名时，索引列使用空字符串表示未知分组。
 
-明细存 UTC 毫秒，以请求完成时间归入报表日。日报用固定报表时区计算 ~report_day~ ，首版默认 ~Asia/Shanghai~ 。切换报表时区时从明细重建日报。日期过滤使用左闭右开区间，便于分页和跨日拼接。~input_reported_tokens~ 保存上游原始输入计数，供旧接口保持统计口径。SQLite 用 ~PRAGMA user_version~ 记录表结构版本，~normalization_version~ 记录单行用量采用的归一化版本。
+明细存 UTC 毫秒，以请求完成时间归入报表日。日报用固定报表时区计算 ~report_day~ ，首版默认 ~Asia/Shanghai~ 。日期过滤使用左闭右开区间，便于分页和跨日拼接。~input_reported_tokens~ 保存上游原始输入计数，供旧接口保持统计口径。~normalization_version~ 记录单行用量采用的归一化版本。
 
 #+begin_src sql
 CREATE TABLE usage_event (
@@ -84,15 +84,11 @@ CREATE TABLE usage_checkpoint (
 
 INSERT INTO usage_checkpoint (id, through_seq) VALUES (1, 0);
 
-CREATE TABLE usage_legacy_total (
-    client_id TEXT NOT NULL,
-    upstream_id TEXT NOT NULL,
-    input_reported_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    requests INTEGER NOT NULL,
-    incomplete_requests INTEGER NOT NULL,
-    PRIMARY KEY (client_id, upstream_id)
-) STRICT, WITHOUT ROWID;
+CREATE TABLE usage_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    data_from_ms INTEGER NOT NULL,
+    legacy_json TEXT NOT NULL
+) STRICT;
 #+end_src
 
 日报数值是各分项已知值之和，~incomplete_requests~ 提示该行存在未完整计量的请求。请求完成后才生成明细。模型列表和 token 估算仍可进入运行监控。它们的接口调用独立于推理用量聚合。
@@ -108,17 +104,161 @@ CREATE TABLE usage_legacy_total (
 
 * 增量写入、合并和保留
 
-1. 统计任务达到 128 条终态记录或最旧记录等待 250 ms 时提交事务。写连接使用 WAL 和 ~synchronous=FULL~ ，将落盘开销分摊到批次。重复 ~request_id~ 用 ~ON CONFLICT(request_id) DO NOTHING~ 处理。数据库暂时不可写时，保留待提交批次并退避重试。重试积压达到内存上限时停止接收新的用量观测，并公开存储错误、积压与观测缺口。
+1. 统计任务达到 128 条终态记录或最旧记录等待 250 ms 时提交事务。写连接使用 WAL 和 ~synchronous=FULL~ ，将落盘开销分摊到批次。重复 ~request_id~ 用 ~ON CONFLICT(request_id) DO NOTHING~ 处理。数据库暂时不可写时保留待提交批次，后续定时与查询尝试重新提交，并在查询响应中报告存储错误。
 2. 定时器每 60 秒合并一批，并在启动时补做。单次事务读取水位 ~through_seq~ ，取至多 10,000 条更大的 ~seq~ ，按日报主键组合聚合后 ~UPSERT~ ，再将水位推进到本批最大 ~seq~ 。聚合和推进水位同事务提交，断电后重跑有同样的汇总结果。迟到明细使用它自己的日期，仍由更大的 ~seq~ 纳入合并。积压由后续小批次追赶，期间可继续提交新明细。
-3. 长期保留全部明细和原始用量字段。在低流量时检查点 WAL，结合文件尺寸和写入量监控容量。数据库备份使用 SQLite Online Backup API 生成一致快照。聚合口径变更时从 ~raw_usage_json~ 重新提取并构建新的日报，重建完成后原子切换。正常维护使用增量聚合，完整重建属于显式维护操作。
+3. 长期保留明细和原始用量字段。SQLite 执行常规 WAL 检查点，日报使用增量合并。
 
-* 查询与兼容
+* 用量查询接口
 
-- 明细查询按 ~finished_at_ms DESC, seq DESC~ 排序，游标为上一页最后一行的这两个字段，避免 ~OFFSET~ 随页数增长。首版索引覆盖全局最近请求以及客户端加上游的时间区间查询。按实际查询频率再评估单独的上游索引。
-- 会话查询按 ~client_id~ 和 ~session_id~ 过滤明细，再按实际上游汇总。迁移时将现有 JSON 中的会话累计导入独立期初余额，沿用客户端、会话和上游的组合键。按会话查询只加该会话的期初余额。客户端总量继续使用 ~usage_legacy_total~ 。
-- 日报和月报扫描 ~usage_daily~ 的日期区间。实时结果在同一个只读快照里合并 ~seq > through_seq~ 的明细尾部，因此最近已提交的记录在下一次聚合前即可查询。月报在日报结果上按月聚合。聚合水位滞后时，报表暴露待合并行数，查询成本由日报行数和尾部长度决定。
-- 保留 ~GET /llm/usage~ 的累计查询语义。首次迁移把旧 ~llm-usage.json~ 按客户端和上游导入 ~usage_legacy_total~ ，与推进数据库结构版本同事务提交。旧数据能计入原字段的累计查询。按日期、模型、缓存分项的历史从第一条新明细开始。兼容的 ~input_tokens~ 对应 ~input_reported_tokens~ 的累计值，日报使用三个输入分项。
-- SQLite 查询最多只占用短时只读事务。返回聚合水位、最近成功落盘时间、队列积压与观测缺口，便于解释统计延迟。~unobserved_requests~ 至少在进程内更新，恢复写入后再与落盘记录一起持久化。长时间写入故障期间异常退出可能丢失尚未持久化的缺口计数。
+接口均限本机，成功响应中的 ~api_version~ 为 ~"1"~ 。接口可查询实时状态、累计值及 SQLite 历史明细。
+
+| 方法与路径 | 用途 | 实现状态 |
+|------------+------+----------|
+| ~GET /llm/requests~ | 查看进行中和最近结束的请求 | 已实现 |
+| ~GET /llm/usage~ | 按客户端和供应商查看全量累计 | 已实现 |
+| ~GET /llm/usage/sessions~ | 按客户端、原生会话标识和实际供应商查看全量累计 | 已实现 |
+| ~GET /llm/usage/requests~ | 按条件分页查询已落盘的推理请求 | 已实现 |
+| ~GET /llm/usage/requests/{id}~ | 查看单次请求和原始用量字段 | 已实现 |
+| ~GET /llm/usage/summary~ | 查询指定区间内的日或月用量 | 已实现 |
+| ~GET /llm/usage/options~ | 查找筛选控件使用的客户端、供应商和模型 | 已实现 |
+
+** 历史请求
+
+~GET /llm/usage/requests~ 接受下列参数。多个筛选条件同时生效。
+
+| 参数 | 含义 |
+|------+------|
+| ~from~ 、 ~to~ | 按请求完成时间筛选，格式为 RFC 3339，精度到毫秒，含 ~from~ ，到 ~to~ 前为止。可单独传入。 |
+| ~client_id~ 、 ~upstream~ 、 ~protocol~ 、 ~model~ | 按客户端 UUID、实际供应商 ID、协议或上游响应中的模型名精确匹配。~protocol~ 为 ~codex~ 或 ~claude~ 。 |
+| ~session_id~ | 精确匹配客户端原生会话标识，同时传入 ~client_id~ 。 |
+| ~outcome~ 、 ~incomplete~ | 结果为 ~completed~、~failed~ 或 ~cancelled~ 。~incomplete~ 为 ~true~ 或 ~false~ 。 |
+| ~limit~ 、 ~cursor~ | 每页默认 50 条，允许 1 至 100 条。后续页原样传回 ~next_cursor~ ，沿用原筛选条件。 |
+
+明细按 ~finished_at_ms DESC, seq DESC~ 排序。第一页在读事务内取得当时的最大 ~seq~ 。游标包含这次查询的最大 ~seq~ 、末条结果的完成时间和序号，以及筛选条件的摘要。后续页将 ~seq~ 限制在首次查询水位内，并从末条结果之后继续读。新插入的记录即使完成时间较早，也会在下一次从第一页查询时出现。~next_cursor~ 为 ~null~ 表示已到末页。
+
+明细的输入计数同时提供上游口径 ~input_reported_tokens~ 和归一化后的未缓存输入、缓存读写。时间使用 UTC RFC 3339 表示。未知计数或会话标识返回 ~null~ 。单条查询返回 ~item~ 和同一条记录的 ~raw_usage~ ，其值为提取出的上游用量对象或 ~null~ 。列表响应省略 ~raw_usage~ 。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "items": [
+    {
+      "id": "56f993aa-644d-4440-9b7a-8cc9237327d8",
+      "client_id": "85be6d83-615b-4323-b8db-b5b79400cc11",
+      "session_id": "thread-17",
+      "upstream": "work",
+      "protocol": "codex",
+      "model": "model-a",
+      "started_at": "2026-11-25T02:40:00Z",
+      "finished_at": "2026-11-25T02:40:02Z",
+      "outcome": "completed",
+      "upstream_status": 200,
+      "first_byte_ms": 450,
+      "duration_ms": 2000,
+      "usage": {
+        "input_reported_tokens": 120,
+        "input_uncached_tokens": 40,
+        "cache_read_tokens": 80,
+        "cache_write_tokens": 0,
+        "output_tokens": 10,
+        "complete": true
+      }
+    }
+  ],
+  "next_cursor": null,
+  "storage_error": false
+}
+#+end_src
+
+** 日报与月报
+
+~GET /llm/usage/summary~ 接受 ~from_date~ 和 ~to_date~ ，按数据库的报表时区解释 ~YYYY-MM-DD~ 日期，含起始日、到结束日期前为止。默认查询截至当天的 30 个自然日。显式指定区间时同时提供两个日期。~bucket~ 取 ~day~ 或 ~month~ ，默认为 ~day~ 。月分组按月初日期标识，区间边缘仅计入请求的日期。~group_by~ 可选 ~client_id~、~upstream~、~protocol~ 或 ~model~ 。省略时每个日期分组只返回一行。
+
+日报接受与明细相同的 ~client_id~、~upstream~、~protocol~、~model~ 和 ~session_id~ 筛选。带会话标识时，使用会话索引查询该客户端的明细并按时间汇总。没有标识的请求仍计入普通日报。
+
+~items~ 按 ~period_start~ 和分组值升序排列，有记录的日期分组才生成行。省略分组维度时，~group_by~ 和各行的 ~group~ 返回 ~null~ 。按模型分组时，未知模型的 ~group~ 也为 ~null~ 。~totals~ 汇总选定区间内全部匹配记录，计数为已知值之和，~incomplete_requests~ 表示其中有多少条用量不完整。响应包含 ~time_zone~ 、实际查询区间和 ~bucket~ 。~data_from~ 为数据库记录的历史明细采集启用时间，用于解释迁移前的空白。~storage_error~ 表示最近一次写入失败。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "time_zone": "Asia/Shanghai",
+  "from_date": "2026-11-25",
+  "to_date": "2026-11-26",
+  "data_from": "2026-11-25T01:00:00Z",
+  "bucket": "day",
+  "group_by": "upstream",
+  "items": [
+    {
+      "period_start": "2026-11-25",
+      "group": "work",
+      "requests": 1,
+      "incomplete_requests": 0,
+      "input_uncached_tokens": 40,
+      "cache_read_tokens": 80,
+      "cache_write_tokens": 0,
+      "output_tokens": 10
+    }
+  ],
+  "totals": {
+    "requests": 1,
+    "incomplete_requests": 0,
+    "input_uncached_tokens": 40,
+    "cache_read_tokens": 80,
+    "cache_write_tokens": 0,
+    "output_tokens": 10
+  },
+  "storage_error": false
+}
+#+end_src
+
+日历筛选、聚合维度或游标无效时返回标准 ~400~ 错误 ~llm-invalid-usage-query~ 。合法筛选无匹配时返回 ~200~ 、空 ~items~ 和适用的零值总计。单条请求 ID 无效时返回 ~400~ ，没有对应记录时返回 ~404 llm-usage-request-not-found~ 。读取存储失败时返回 ~503 llm-usage-unavailable~ 。
+
+** 筛选候选
+
+~GET /llm/usage/options~ 按 ~dimension~ 返回可选值，支持 ~client_id~ 、 ~upstream~ 和 ~model~ 。~source~ 默认为 ~history~ ，从历史明细中读取，可传入与历史请求一致的 ~from~ 、 ~to~ 、 ~client_id~ 、 ~upstream~ 、 ~protocol~ 和 ~model~ 限定范围。推荐调用时省略正在编辑的维度。~source=sessions~ 从会话累计记录及已导入的会话期初余额中读取客户端或供应商，可传入另一维的精确值限定范围。协议、结果和用量完整性选项使用接口已定义的枚举。
+
+候选去重后按值升序返回。可选参数 ~q~ 按前缀查找，~limit~ 默认为 30，范围为 1 至 100。响应示例如下。~has_more~ 为 ~true~ 时，控件提示继续输入以缩小范围。历史中已经撤销的客户端和已移除的供应商仍可作为筛选值。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "items": [{"value": "openai"}, {"value": "backup-openai"}],
+  "has_more": false
+}
+#+end_src
+
+~value~ 直接用于精确筛选。界面可缩略显示客户端 ID，保留完整 UUID 供查询和复制。未知模型在报表中单列为「未知模型」，其余可筛选模型均来自有效模型名。
+
+** 会话累计查询
+
+~GET /llm/usage/sessions~ 增加可选精确筛选 ~client_id~ 、 ~upstream~ 和 ~session_id~ 。指定 ~session_id~ 时同时提供 ~client_id~ 。用量按客户端、会话和实际供应商分别返回，包含旧会话期初余额。响应沿用现有 ~usage~ 数组，用量字段使用上游口径。界面的「查看请求」将该行的客户端、会话和供应商值传给历史请求接口。
+
+界面请求传入 ~limit~ 以分页，默认使用 50 条，允许 1 至 100 条。分页顺序为 ~client_id~ 、 ~session_id~ 、 ~upstream~ 升序。返回 ~next_cursor~ ，客户端用它继续查询并沿用原筛选条件。省略 ~limit~ 和 ~cursor~ 时沿用当前全量响应。
+
+** 读取路径与旧数据
+
+- 历史列表使用时间索引或带客户端、上游或会话条件的复合索引，按游标定位。单条请求通过唯一 ~request_id~ 查找。历史候选沿用时间条件，查询请求的维度列并去重，按实际执行计划补充索引。
+- 日报和月报在同一短时只读事务中读取 ~usage_daily~ 及水位 ~through_seq~ ，加上过滤后 ~seq > through_seq~ 的明细尾部。已落盘的记录直接进入查询，下一次聚合将尾部转入日报。按会话查询使用原生会话标识，直接从会话索引聚合。
+- 首次写入数据库元数据时，将旧 JSON 冻结为 ~usage_meta.legacy_json~ 。启动时分别从旧累计值和新明细恢复总量及会话用量。日报、月报及历史请求从首条新明细起计算。累计接口的 ~input_tokens~ 继续对应上游上报值。
+
+* 用量查询界面
+
+运行 ~M-x loki-assistant-llm-usage~ 或在 Loki Assistant Hydra 菜单按 ~u~ 打开 Emacs 用量查询。按 ~1~ 至 ~5~ 切换概览、请求历史、会话、累计用量和实时请求。概览默认查询最近 30 个自然日，按报表时区显示日期。
+
+| 能力 | 用户可以做什么 | 数据来源 |
+|------+----------------+----------|
+| 查趋势和区间总量 | 选择日期范围，按日或月查看未缓存输入、缓存读取、缓存写入、输出、请求数及不完整请求数。可按供应商、模型、客户端或协议比较。 | ~GET /llm/usage/summary~ 、 ~GET /llm/usage/options~ |
+| 查单次请求 | 按时间、客户端、供应商、模型、协议、结果和完整性筛选。列表显示完成时间、耗时、结果及输出 token，支持继续加载。选中一行可查看首包耗时、HTTP 状态及原始 ~usage~ ，也可复制请求 ID。 | ~GET /llm/usage/requests~ 、 ~GET /llm/usage/requests/{id}~ 、 ~GET /llm/usage/options~ |
+| 查会话用量 | 从客户端的会话累计列表进入指定会话，按实际供应商查看用量。按客户端 ID、原生会话标识和供应商查找该会话的历史请求。 | ~GET /llm/usage/sessions~ 、 ~GET /llm/usage/requests~ 、 ~GET /llm/usage/options~ |
+| 查全量累计 | 查看按客户端和供应商归集的全量用量，含已导入的旧累计数据。 | ~GET /llm/usage~ |
+| 查运行状态 | 查看等待响应和正在流式输出的请求，以及最近结束的请求。打开或刷新时读取当时的状态。 | ~GET /llm/requests~ |
+
+- 从趋势选中某一天或某个月时，按报表时区把所选周期与当前日期范围取交集，带着现有筛选条件打开明细。选中的数据系列有明确分组值时，同时按该值筛选。返回概览时恢复原日期范围和筛选条件。
+- 概览表展示四项用量和按已知 token 总量缩放的文本趋势。选中一行并按 ~RET~ 下钻，日期范围转成由报表时区计算的 UTC 时间边界。
+- 历史列表按完成时间倒序显示。翻页沿用同一查询的游标，刷新时重新读取第一页。详情按请求 ID 加载，只在打开时读取原始 ~usage~ 。宽窗口并排显示列表和详情，窄窗口从列表打开详情，返回后恢复选中行。普通列表键可移动选中行。
+- 请求缺少原生会话标识时，详情显示「未知会话」，仍可按客户端和供应商查询这条记录。历史请求的结果与用量完整性分别显示。选择客户端后可填写用于精确匹配的会话 ID。
+- 单条记录的已知零值显示 ~0~ ，缺失值显示「未上报」。汇总展示已知用量并标明不完整请求数。区间早于明细采集启用时间时，提示历史覆盖范围。全量累计明确标为「全量」，用户可以区分旧累计值和指定区间的明细汇总。
+- 页面区分无匹配记录、读取失败和最近一次落盘失败。服务读取失败时提供重试入口，保留当前筛选条件。仅落盘失败时，仍展示已读取的用量并标明数据可能滞后。
 
 * 进程退出
 

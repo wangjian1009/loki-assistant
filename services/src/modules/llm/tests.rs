@@ -418,6 +418,7 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
         json!({"input_tokens":4,"output_tokens":null,"complete":false})
     );
 
+    let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
     let (restarted, _notifications) = persistent_router(&directory);
     let response = invoke(
         &restarted,
@@ -467,7 +468,8 @@ fn parses_split_frames_and_keeps_usage_in_an_interrupted_stream() {
     for byte in until_stop.as_bytes().chunks(1) {
         usage.push(byte);
     }
-    let (usage, failed) = usage.finish(false);
+    let (observed, failed) = usage.finish(false);
+    let usage = observed.usage;
     assert_eq!(usage.input_tokens, Some(23));
     assert_eq!(usage.output_tokens, Some(5));
     assert!(!usage.complete);
@@ -477,7 +479,8 @@ fn parses_split_frames_and_keeps_usage_in_an_interrupted_stream() {
     for chunk in CODEX_LAST.as_bytes().chunks(7) {
         usage.push(chunk);
     }
-    let (usage, _) = usage.finish(true);
+    let (observed, _) = usage.finish(true);
+    let usage = observed.usage;
     assert!(usage.complete);
     assert_eq!(usage.input_tokens, Some(11));
     assert_eq!(usage.output_tokens, Some(7));
@@ -623,11 +626,10 @@ async fn forwards_an_arbitrary_http_request_without_buffering_or_rewriting_its_b
 async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
     let (upstream, server) = serve(Router::new().fallback(post(
         |headers: HeaderMap, OriginalUri(uri): OriginalUri| async move {
-            if uri.path() == "/v1/responses" {
-                assert!(headers.contains_key("session_id"));
-            } else {
-                assert_eq!(uri.path(), "/v1/messages");
+            if uri.path() == "/v1/messages" {
                 assert_eq!(headers["x-loki-session-id"], "shared-session");
+            } else {
+                assert_eq!(uri.path(), "/v1/responses");
             }
             Json(json!({"usage":{"input_tokens":3,"output_tokens":2}}))
         },
@@ -646,7 +648,12 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
     .unwrap();
     let (app, _notifications) = persistent_router(&directory);
     provider(&app, "a", json!({"codex_uri":format!("{upstream}/v1")})).await;
-    provider(&app, "b", json!({"claude_uri":format!("{upstream}/v1")})).await;
+    provider(
+        &app,
+        "b",
+        json!({"codex_uri":format!("{upstream}/v1"),"claude_uri":format!("{upstream}/v1")}),
+    )
+    .await;
     let (client_id, token) = issue(&app, "a").await;
     let bearer = format!("Bearer {token}");
 
@@ -658,29 +665,31 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
                 ("session-id", "codex-session"),
                 ("session_id", "dsh-session"),
             ][..],
-            "shared-session",
+            Some("shared-session"),
         ),
         (
             "/llm/codex/v1/responses",
             &[("session_id", "dsh-session")],
-            "dsh-session",
+            Some("dsh-session"),
+        ),
+        (
+            "/llm/codex/v1/responses",
+            &[("session-id", "invalid id"), ("session_id", "dsh-session")],
+            Some("dsh-session"),
         ),
         (
             "/llm/codex/v1/responses",
             &[
-                ("x-loki-session-id", "invalid id"),
+                ("x-loki-session-id", "ignored"),
+                ("session-id", "shared-session"),
                 ("session_id", "dsh-session"),
             ],
-            "dsh-session",
+            Some("shared-session"),
         ),
         (
             "/llm/codex/v1/responses",
-            &[
-                ("x-loki-session-id", "shared-session"),
-                ("thread-id", "ignored"),
-                ("session_id", "dsh-session"),
-            ],
-            "shared-session",
+            &[("x-loki-session-id", "shared-session")],
+            None,
         ),
     ] {
         let mut request = Request::post(route).header(header::AUTHORIZATION, &bearer);
@@ -697,7 +706,7 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
             json!({"input_tokens":3,"output_tokens":2})
         );
         let report = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
-        assert_eq!(report["recent"][0]["session_id"], expected);
+        assert_eq!(report["recent"][0]["session_id"], json!(expected));
     }
 
     let response = invoke(
@@ -709,6 +718,16 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request = Request::post("/llm/codex/v1/responses")
+        .header(header::AUTHORIZATION, &bearer)
+        .header("thread-id", "shared-session")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        json_body(response).await["usage"],
+        json!({"input_tokens":3,"output_tokens":2})
+    );
     let request = Request::post("/llm/claude/v1/messages")
         .header("x-api-key", token)
         .header("x-loki-session-id", "shared-session")
@@ -719,8 +738,10 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
         json_body(response).await["usage"],
         json!({"input_tokens":3,"output_tokens":2})
     );
-    let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
+    let report = json_body(invoke(&app, Method::GET, "/llm/requests", None, None).await).await;
+    assert_eq!(report["recent"][0]["session_id"], Value::Null);
 
+    let _ = json_body(invoke(&app, Method::GET, "/llm/usage", None, None).await).await;
     let (restarted, _notifications) = persistent_router(&directory);
     let sessions =
         json_body(invoke(&restarted, Method::GET, "/llm/usage/sessions", None, None).await).await;
@@ -737,9 +758,133 @@ async fn groups_sessions_and_restores_them_alongside_legacy_totals() {
         totals["usage"],
         json!([
             {"client_id":legacy_id,"upstream":"legacy","input_tokens":8,"output_tokens":9,"requests":1,"incomplete_requests":0},
-            {"client_id":client_id,"upstream":"a","input_tokens":12,"output_tokens":8,"requests":4,"incomplete_requests":0},
-            {"client_id":client_id,"upstream":"b","input_tokens":3,"output_tokens":2,"requests":1,"incomplete_requests":0}
+            {"client_id":client_id,"upstream":"a","input_tokens":15,"output_tokens":10,"requests":5,"incomplete_requests":0},
+            {"client_id":client_id,"upstream":"b","input_tokens":6,"output_tokens":4,"requests":2,"incomplete_requests":0}
         ])
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn queries_persisted_usage_by_model_session_and_stable_page() {
+    let (upstream, server) = serve(Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            Json(json!({
+                "model": "test-model",
+                "usage": {
+                    "input_tokens": 120,
+                    "input_tokens_details":{"cached_tokens":80},
+                    "output_tokens":10,
+                }
+            }))
+        }),
+    ))
+    .await;
+    let directory = Directory::new();
+    let (app, _notifications) = persistent_router(&directory);
+    provider(&app, "work", json!({"codex_uri":format!("{upstream}/v1")})).await;
+    let (client, token) = issue(&app, "work").await;
+    for _ in 0..2 {
+        let request = Request::post("/llm/codex/v1/responses")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header("thread-id", "thread-17")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(json_body(response).await["model"], "test-model");
+    }
+    let path = format!("/llm/usage/requests?client_id={client}&session_id=thread-17&limit=1");
+    let response = invoke(&app, Method::GET, &path, None, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = json_body(response).await;
+    let row = &data["items"][0];
+    assert_eq!(row["model"], "test-model");
+    assert_eq!(row["usage"]["input_uncached_tokens"], 40);
+    assert_eq!(row["usage"]["cache_read_tokens"], 80);
+    let cursor = data["next_cursor"].as_str().unwrap();
+    let next = json_body(
+        invoke(
+            &app,
+            Method::GET,
+            &format!("{path}&cursor={cursor}"),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(next["items"][0]["id"], row["id"]);
+    assert_eq!(next["next_cursor"], Value::Null);
+    let response = invoke(
+        &app,
+        Method::GET,
+        &format!("/llm/usage/requests?limit=1&cursor={cursor}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let detail = json_body(
+        invoke(
+            &app,
+            Method::GET,
+            &format!("/llm/usage/requests/{}", row["id"].as_str().unwrap()),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        detail["raw_usage"]["input_tokens_details"]["cached_tokens"],
+        80
+    );
+
+    let summary = json_body(
+        invoke(
+            &app,
+            Method::GET,
+            "/llm/usage/summary?group_by=model&bucket=month",
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(summary["items"][0]["group"], "test-model");
+    assert_eq!(summary["totals"]["requests"], 2);
+    assert_eq!(summary["totals"]["cache_read_tokens"], 160);
+    let options = json_body(
+        invoke(
+            &app,
+            Method::GET,
+            "/llm/usage/options?dimension=model&q=test",
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(options["items"], json!([{"value":"test-model"}]));
+    let sessions = json_body(
+        invoke(
+            &app,
+            Method::GET,
+            &format!("/llm/usage/sessions?client_id={client}&session_id=thread-17&limit=1"),
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(sessions["usage"][0]["requests"], 2);
+    assert_eq!(sessions["next_cursor"], Value::Null);
+
+    let (restarted, _notifications) = persistent_router(&directory);
+    let report =
+        json_body(invoke(&restarted, Method::GET, "/llm/usage/summary", None, None).await).await;
+    assert_eq!(report["totals"]["requests"], 2);
+    assert_eq!(report["totals"]["output_tokens"], 20);
     server.abort();
 }

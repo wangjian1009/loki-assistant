@@ -6,6 +6,13 @@ use super::protocol::{Protocol, Usage};
 const MAX_SSE_EVENT: usize = 1024 * 1024;
 const MAX_JSON: usize = 16 * 1024 * 1024;
 
+#[derive(Default)]
+pub(super) struct ObservedUsage {
+    pub usage: Usage,
+    pub model: Option<String>,
+    pub raw: serde_json::Map<String, Value>,
+}
+
 pub(super) struct UsageReader {
     protocol: Protocol,
     stream: bool,
@@ -14,7 +21,7 @@ pub(super) struct UsageReader {
     skipped: bool,
     after_cr: bool,
     first_line: bool,
-    usage: Usage,
+    observed: ObservedUsage,
     terminal: bool,
     final_output_reported: bool,
     failed: bool,
@@ -35,7 +42,7 @@ impl UsageReader {
             skipped: false,
             after_cr: false,
             first_line: true,
-            usage: Usage::default(),
+            observed: ObservedUsage::default(),
             terminal: false,
             final_output_reported: false,
             failed: false,
@@ -105,13 +112,11 @@ impl UsageReader {
                 Protocol::Codex,
                 Some("response.completed" | "response.incomplete" | "response.failed"),
             ) => {
-                self.read_usage(&event["response"]["usage"]);
+                self.read_response(&event["response"]);
                 self.terminal = true;
                 self.failed |= event["type"] == "response.failed";
             }
-            (Protocol::Claude, Some("message_start")) => {
-                self.read_usage(&event["message"]["usage"])
-            }
+            (Protocol::Claude, Some("message_start")) => self.read_response(&event["message"]),
             (Protocol::Claude, Some("message_delta")) => {
                 let usage = &event["usage"];
                 self.final_output_reported |= usage["output_tokens"].as_u64().is_some();
@@ -123,29 +128,42 @@ impl UsageReader {
         }
     }
 
+    fn read_response(&mut self, response: &Value) {
+        if let Some(model) = response["model"].as_str().filter(|model| !model.is_empty()) {
+            self.observed.model = Some(model.to_owned());
+        }
+        self.read_usage(&response["usage"]);
+    }
+
     fn read_usage(&mut self, usage: &Value) {
         if let Some(input) = usage["input_tokens"].as_u64() {
-            self.usage.input_tokens = Some(input);
+            self.observed.usage.input_tokens = Some(input);
         }
         if let Some(output) = usage["output_tokens"].as_u64() {
-            self.usage.output_tokens = Some(output);
+            self.observed.usage.output_tokens = Some(output);
+        }
+        if let Some(fields) = usage.as_object() {
+            self.observed.raw.extend(fields.clone());
         }
     }
 
-    pub(super) fn finish(mut self, body_complete: bool) -> (Usage, bool) {
+    pub(super) fn finish(mut self, body_complete: bool) -> (ObservedUsage, bool) {
         if !self.stream
             && body_complete
             && !self.skipped
             && let Ok(response) = serde_json::from_slice::<Value>(&self.pending)
         {
-            self.read_usage(&response["usage"]);
+            self.read_response(&response);
             self.terminal = true;
             self.failed = response["type"] == "error" || response["status"] == "failed";
         }
-        self.usage.complete = self.terminal
+        self.observed.usage.complete = self.terminal
             && (self.protocol != Protocol::Claude || !self.stream || self.final_output_reported)
-            && self.usage.input_tokens.is_some()
-            && self.usage.output_tokens.is_some();
-        (self.usage, self.failed || (self.stream && !self.terminal))
+            && self.observed.usage.input_tokens.is_some()
+            && self.observed.usage.output_tokens.is_some();
+        (
+            self.observed,
+            self.failed || (self.stream && !self.terminal),
+        )
     }
 }

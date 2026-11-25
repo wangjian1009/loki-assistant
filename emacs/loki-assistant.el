@@ -31,6 +31,8 @@
   "打开已绑定设备管理界面。" t)
 (autoload 'loki-assistant-read-later "loki-assistant-read-later"
   "打开稍后阅读列表。" t)
+(autoload 'loki-assistant-llm-usage "loki-assistant-llm-usage"
+  "打开 LLM 用量查询界面。" t)
 (autoload 'loki-assistant-mail-open-inbox "loki-assistant-mail"
   "打开 mu4e 中配置的收件箱书签。" t)
 (autoload 'loki-assistant-mail-open-message "loki-assistant-mail"

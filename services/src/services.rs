@@ -207,6 +207,10 @@ impl Services {
         }
     }
 
+    pub async fn flush_llm_usage(&self) -> bool {
+        self.llm.monitor.flush().await
+    }
+
     pub fn attach_remote(self: &Arc<Self>, runtime: &Arc<RuntimeState>) {
         let runtime = Arc::downgrade(runtime);
         self.network.set_remote_dispatcher(Arc::new(

@@ -37,7 +37,7 @@ type Clients = BTreeMap<Uuid, StoredClient>;
 #[derive(Debug)]
 pub(crate) struct LlmService {
     config: Arc<ConfigService>,
-    pub(super) monitor: Monitor,
+    pub(crate) monitor: Monitor,
     http: reqwest::Client,
 }
 
@@ -291,7 +291,7 @@ impl LlmService {
         let upstream = match upstream.send().await {
             Ok(response) => response,
             Err(error_value) => {
-                guard.finish(Phase::Failed, None);
+                guard.finish(Phase::Failed, false);
                 return Err(if error_value.is_timeout() {
                     error(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -308,7 +308,6 @@ impl LlmService {
             }
         };
         let status = upstream.status();
-        guard.upstream_status(status.as_u16());
         let stream = upstream
             .headers()
             .get(header::CONTENT_TYPE)
@@ -326,6 +325,7 @@ impl LlmService {
                         .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
                 })
             });
+        guard.response_headers(status.as_u16(), protocol, stream, identity);
         let mut response_headers = forwarded_headers(upstream.headers());
         // 由 Axum 重新生成流式传输的消息边界。
         if !head && status != StatusCode::NOT_MODIFIED {
@@ -345,14 +345,13 @@ impl LlmService {
             } else {
                 Phase::Failed
             };
-            guard.finish(phase, None);
+            guard.finish(phase, false);
             return Ok(response);
         }
 
         let body = ForwardBody {
             upstream: Box::pin(upstream.bytes_stream()),
             guard: Some(guard),
-            usage: (track_usage && identity).then(|| UsageReader::new(protocol, stream)),
             stream,
             first_chunk: true,
             success: status.is_success(),
@@ -381,7 +380,6 @@ impl LlmService {
 struct ForwardBody {
     upstream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     guard: Option<RequestGuard>,
-    usage: Option<UsageReader>,
     stream: bool,
     first_chunk: bool,
     success: bool,
@@ -395,16 +393,13 @@ impl ForwardBody {
                 .expect("请求尚未结束")
                 .first_byte(self.stream);
         }
-        if let Some(usage) = &mut self.usage {
-            usage.push(chunk);
+        if let Some(guard) = &mut self.guard {
+            guard.body_bytes(chunk);
         }
     }
 
     fn finish(&mut self, body_complete: bool) {
-        let observed = self.usage.take().map(|usage| usage.finish(body_complete));
-        let succeeded =
-            self.success && body_complete && !observed.is_some_and(|(_, failed)| failed);
-        let phase = if succeeded {
+        let phase = if self.success && body_complete {
             Phase::Completed
         } else {
             Phase::Failed
@@ -412,18 +407,7 @@ impl ForwardBody {
         self.guard
             .take()
             .expect("请求尚未结束")
-            .finish(phase, observed.map(|(usage, _)| usage));
-    }
-}
-
-impl Drop for ForwardBody {
-    fn drop(&mut self) {
-        if let Some(guard) = &mut self.guard {
-            guard.finish(
-                Phase::Cancelled,
-                self.usage.take().map(|usage| usage.finish(false).0),
-            );
-        }
+            .finish(phase, body_complete);
     }
 }
 
