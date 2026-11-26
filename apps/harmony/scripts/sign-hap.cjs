@@ -1,4 +1,4 @@
-// 证书和 Profile 由项目管理，私钥放在 .signing，密码从 macOS Keychain 读取。
+// 调试签名材料由 signing/ 维护，密钥库密码从 macOS Keychain 读取。
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');

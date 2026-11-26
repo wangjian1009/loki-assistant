@@ -1,7 +1,7 @@
 {
   "certificate": "signing/OrgTasksDebug.cer",
   "profile": "signing/LokiAssistantDebug.p7b",
-  "storeFile": ".signing/org-tasks.p12",
+  "storeFile": "signing/org-tasks.p12",
   "keyAlias": "orgTasksKey",
   "keychainService": "org-tasks-signing",
   "keychainAccount": "development"

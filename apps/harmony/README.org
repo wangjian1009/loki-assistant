@@ -85,6 +85,6 @@ GET 返回从根到当前页的完整 ~pages~ 。PUT 接收相同结构并设置
 - ~signing/OrgTasksDebug.cer~ ：公共证书链，纳入版本管理。
 - ~signing/LokiAssistantDebug.p7b~ ：Loki 专用调试 Profile，纳入版本管理；增加调试设备时需在华为后台更新并重新下载。
 - ~signing/config.json~ ：证书、Profile、私钥路径、keyAlias 和 Keychain 条目名称，纳入版本管理。
-- ~.signing/org-tasks.p12~ ：与证书配套的本地私钥库，由 Git 忽略；新开发环境需要恢复此文件。
+- ~signing/org-tasks.p12~ ：与调试证书配套的密码保护 PKCS#12 密钥库，纳入版本管理。
 
 签名脚本从 macOS Keychain 的 ~org-tasks-signing~ / ~development~ 条目读取密码，通过 stdin 交给 JVM 内的签名工具；密码不写入工程配置或命令行。签名前校验签名材料的有效期、Profile 包名以及证书与私钥是否配套。
