@@ -21,6 +21,6 @@
 - 应用、Ability 和启动窗口图标统一引用 `$media:app_icon`；`AppScope/resources/base/media/app_icon.png` 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
 - 使用 DevEco Studio 内置 Hvigor 构建；常用操作统一维护在本目录 `Makefile` 和根目录 `Makefile` 中。
 - 构建产物、Hvigor 缓存和依赖目录不提交到仓库。
-- `signing/` 管理调试与发布的公共证书和 Profile，以及密码保护的调试 PKCS#12 密钥库和签名配置。密钥库密码从 macOS Keychain 读取。签名工具的编译产物放在 Git 忽略的 `.signing/`。
+- `signing/` 管理调试证书、Profile、密码保护的 PKCS#12 密钥库和签名配置。密钥库密码从 macOS Keychain 读取。签名工具的编译产物放在 Git 忽略的 `.signing/`。
 - `make build` 先检查 SDK 并安装 OHPM 依赖，显式指定 Debug 模式与可调试标记，通过 Hvigor 的 `PackingCheck` 和 `CollectDebugSymbol` 打包，再由 `scripts/sign-hap.cjs` 独立签名；安装入口只使用已签名 HAP。
 - `install`、`run`、`deploy` 统一通过 `scripts/select-hdc-target.sh` 选择设备；默认选择唯一已连接真机。`install` 和 `run` 可显式指定模拟器，`deploy` 始终要求真机并顺序完成构建、安装、启动。
