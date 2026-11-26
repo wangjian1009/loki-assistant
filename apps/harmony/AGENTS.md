@@ -18,7 +18,7 @@
 
 - `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。
 - `bundleName` 为 `cc.github.wangjian1009.assistant`，由 `AppScope/app.json5` 定义。
-- 应用、Ability 和启动窗口图标统一引用 `$media:app_icon`；`AppScope/resources/base/media/app_icon.png` 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
+- 应用和 Ability 引用 `$media:app_layered_icon`，由系统裁切桌面图标的底板。启动窗口引用静态 `$media:app_icon`。图标 PNG 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
 - 使用 DevEco Studio 内置 Hvigor 构建；常用操作统一维护在本目录 `Makefile` 和根目录 `Makefile` 中。
 - 构建产物、Hvigor 缓存和依赖目录不提交到仓库。
 - `signing/` 管理调试证书、Profile、密码保护的 PKCS#12 密钥库和签名配置。密钥库密码从 macOS Keychain 读取。签名工具的编译产物放在 Git 忽略的 `.signing/`。

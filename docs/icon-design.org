@@ -10,7 +10,7 @@ Chrome 插件使用专用彩色母版，L 与气泡放大 45% 并上移居中，
 
 本版设计已确认保留，应用中文显示名称为“Loki的助理”。标准 AppIcon asset catalog 已接入 macOS 应用打包，菜单栏使用单色 template 图标，随系统外观自动调整颜色。
 
-各应用 SVG 母版统一维护在根目录 ~resources/icons/~ ，macOS 与 HarmonyOS 共用应用母版，Chrome 使用专用母版。HarmonyOS 的应用、Ability 与启动窗口均引用 ~AppScope/resources/base/media/app_icon.png~ ，Chrome action 图标导出到 ~chrome-plugin/extension/icons/~ 。
+各应用 SVG 母版统一维护在根目录 ~resources/icons/~ ，macOS 与 HarmonyOS 共用应用母版，Chrome 使用专用母版。HarmonyOS 应用和 Ability 引用分层图标，深绿背景铺满画布后由桌面统一裁切圆角，透明前景层将 L 与气泡放大 25%。启动窗口继续使用静态 ~app_icon.png~ 。Chrome action 图标导出到 ~chrome-plugin/extension/icons/~ 。
 
 * 设计资产
 
@@ -23,7 +23,8 @@ Chrome 插件使用专用彩色母版，L 与气泡放大 45% 并上移居中，
 - [[file:../apps/center/mac/Resources/AppIcon/loki-assistant-menu-v1.png][菜单栏 20 × 20 PNG（20 pt @1x）]]
 - [[file:../resources/icons/loki-assistant-menu-v1.svg][公共菜单栏单色 SVG 母版]]
 - [[file:../apps/center/mac/Resources/AppIcon/loki-assistant-menu-v1@2x.png][菜单栏 40 × 40 PNG（20 pt @2x）]]
-- [[file:../apps/harmony/AppScope/resources/base/media/app_icon.png][HarmonyOS 应用 1024 × 1024 PNG]]
+- [[file:../apps/harmony/AppScope/resources/base/media/app_layered_icon.json][HarmonyOS 桌面分层图标]]
+- [[file:../apps/harmony/AppScope/resources/base/media/app_icon.png][HarmonyOS 启动图标]]
 - [[file:../chrome-plugin/extension/icons/icon-128.png][Chrome 插件 128 × 128 PNG]]
 - [[file:../resources/icons/loki-assistant-chrome-v1.svg][Chrome 插件专用 SVG 母版]]
 
@@ -37,7 +38,7 @@ Chrome 插件使用专用彩色母版，L 与气泡放大 45% 并上移居中，
 
 原生 SVG 绘制，通过 ~rsvg-convert~ 导出 PNG，使用 ~iconutil~ 生成包含 16、32、128、256、512 pt 及各自 @2x 版本的 ICNS。未使用 AI 生图工具。
 
-导出入口为根目录 ~make export-icons~ ，调用 ~scripts/export-icons.py~ ，需要 Python 3、~rsvg-convert~ 和 macOS 自带的 ~iconutil~ 。脚本从公共 SVG 母版生成 macOS 的 PNG iconset、ICNS、asset catalog、菜单栏图标和 Chrome 插件的 16 至 128 像素 PNG，并将同一张应用图标导出为 HarmonyOS 的 1024 × 1024 PNG。全部格式生成成功后再更新各应用目录中的文件；构建直接使用仓库中导出的资源，无需在每次构建时安装导出工具。
+导出入口为根目录 ~make export-icons~ ，调用 ~scripts/export-icons.py~ ，需要 Python 3、~rsvg-convert~ 和 macOS 自带的 ~iconutil~ 。脚本生成 macOS 的 PNG iconset、ICNS、asset catalog 和菜单栏图标，生成 Chrome 插件的 16 至 128 像素 PNG，并导出 HarmonyOS 的桌面前景、背景和静态启动图标，尺寸均为 1024 × 1024。全部格式生成成功后再更新各应用目录中的文件。构建直接使用仓库中导出的资源。
 
 Xcode 将菜单栏 20/40 像素 PNG 合并为多倍率 TIFF。应用通过 ~Bundle.main.image(forResource:)~ 加载，设置 ~isTemplate~ 后交给 ~Image(nsImage:)~ 显示；资源缺失时回退到系统图标。
 

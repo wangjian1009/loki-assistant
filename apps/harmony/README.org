@@ -4,7 +4,7 @@
 
 这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS，Rust/NAPI 提供 iroh 设备通信。首页显示当前电脑的连接和设备信息。左侧菜单提供当前设备、设备管理和设置。手机辅助能力、跨设备同步与后台常驻仍在规划中。
 
-应用、Ability 和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。根目录 ~make export-icons~ 将图标导出为 ~AppScope/resources/base/media/app_icon.png~ 的 1024 × 1024 PNG；构建直接使用仓库中的导出资源。设计与导出说明见 [[file:../../docs/icon-design.org][图标设计]]。
+桌面和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。桌面使用系统裁切的分层图标，启动窗口使用静态 PNG。根目录 ~make export-icons~ 将资源导出到 ~AppScope/resources/base/media/~ ，构建直接使用仓库中的导出资源。 [[file:../../docs/icon-design.org][图标设计]]
 
 * 设备管理
 
