@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "cc.loki.assistant.mobile",
+    "bundleName": "cc.github.wangjian1009.assistant",
     "vendor": "loki-assistant",
     "versionCode": 1000000,
     "versionName": "1.0.0",

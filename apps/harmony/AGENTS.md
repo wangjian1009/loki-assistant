@@ -17,10 +17,10 @@
 - 界面只显示离线、绑定中、绑定失败、在线。只轮询当前选中电脑，绑定中每轮结束后间隔 1 秒读取 Service，其他情况每轮结束后 20 秒刷新；后台停止。失败错误来自 Service 的 ResponsError，提示删除后重新扫码绑定；删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
 
 - `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。
-- `bundleName` 为 `cc.loki.assistant.mobile`。
+- `bundleName` 为 `cc.github.wangjian1009.assistant`，由 `AppScope/app.json5` 定义。
 - 应用、Ability 和启动窗口图标统一引用 `$media:app_icon`；`AppScope/resources/base/media/app_icon.png` 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
 - 使用 DevEco Studio 内置 Hvigor 构建；常用操作统一维护在本目录 `Makefile` 和根目录 `Makefile` 中。
 - 构建产物、Hvigor 缓存和依赖目录不提交到仓库。
-- `signing/` 管理 `OrgTasksDebug` 公共证书、Loki 专用调试 Profile、密码保护的 PKCS#12 密钥库和签名配置。密钥库密码从 macOS Keychain 读取。签名工具的编译产物放在 Git 忽略的 `.signing/`。
+- `signing/` 管理调试与发布的公共证书和 Profile，以及密码保护的调试 PKCS#12 密钥库和签名配置。密钥库密码从 macOS Keychain 读取。签名工具的编译产物放在 Git 忽略的 `.signing/`。
 - `make build` 先检查 SDK 并安装 OHPM 依赖，显式指定 Debug 模式与可调试标记，通过 Hvigor 的 `PackingCheck` 和 `CollectDebugSymbol` 打包，再由 `scripts/sign-hap.cjs` 独立签名；安装入口只使用已签名 HAP。
 - `install`、`run`、`deploy` 统一通过 `scripts/select-hdc-target.sh` 选择设备；默认选择唯一已连接真机。`install` 和 `run` 可显式指定模拟器，`deploy` 始终要求真机并顺序完成构建、安装、启动。

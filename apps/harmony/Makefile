@@ -15,7 +15,7 @@ PAGE ?=
 HTTP_API_ENABLED ?=
 export PAGE HTTP_API_ENABLED
 HDC_DEVICE = device_target="$$(sh scripts/select-hdc-target.sh "$(HDC)" "$(HDC_TARGET)")" && "$(HDC)" -t "$$device_target"
-BUNDLE_NAME := cc.loki.assistant.mobile
+BUNDLE_NAME = $$("$(NODE)" -p "JSON.parse(require('node:fs').readFileSync('AppScope/app.json5', 'utf8')).app.bundleName")
 ABILITY_NAME := EntryAbility
 HAP_FILE := entry/build/default/outputs/default/entry-default-signed.hap
 
@@ -56,7 +56,7 @@ run:
 	    true|false) set -- "$$@" --pb httpApiEnabled "$$HTTP_API_ENABLED" ;; \
 	    *) echo 'HTTP_API_ENABLED 可指定 true 或 false' >&2; exit 1 ;; \
 	  esac; \
-	  $(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b $(BUNDLE_NAME) "$$@"
+	  bundle_name=$(BUNDLE_NAME) && $(HDC_DEVICE) shell aa start -a $(ABILITY_NAME) -b "$$bundle_name" "$$@"
 
 test:
 	"$(NODE)" scripts/test-application.cjs "$(DEVECO_HOME)"

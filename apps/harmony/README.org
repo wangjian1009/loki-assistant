@@ -80,10 +80,11 @@ GET 返回从根到当前页的完整 ~pages~ 。PUT 接收相同结构并设置
 
 * 调试签名
 
-项目复用 ~OrgTasksDebug~ 调试证书，配套的 ~LokiAssistantDebug~ Profile 绑定包名 ~cc.loki.assistant.mobile~ 和后台登记的手机，有效期至 2027-10-11。此配置用于调试构建。
+HarmonyOS 包名为 ~cc.github.wangjian1009.assistant~ 。项目复用 ~OrgTasksDebug~ 调试证书，配套的调试 Profile 绑定该包名及后台登记的手机，有效期至 2027-10-11。
 
 - ~signing/OrgTasksDebug.cer~ ：公共证书链，纳入版本管理。
 - ~signing/LokiAssistantDebug.p7b~ ：Loki 专用调试 Profile，纳入版本管理；增加调试设备时需在华为后台更新并重新下载。
+- ~signing/LokiAssistantRelease.p7b~ 和 ~signing/OrgTasksRelease.cer~ 是正式发布使用的 Profile 和证书链。
 - ~signing/config.json~ ：证书、Profile、私钥路径、keyAlias 和 Keychain 条目名称，纳入版本管理。
 - ~signing/org-tasks.p12~ ：与调试证书配套的密码保护 PKCS#12 密钥库，纳入版本管理。
 
