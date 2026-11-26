@@ -93,7 +93,10 @@ static CLIENT_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: MODULE,
     key: CLIENTS,
     options: || ConfigItemOptions {
-        notification_endpoint: Some(CLIENT_NOTIFICATION),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "client",
+            endpoint: CLIENT_NOTIFICATION,
+        }),
         structure: Some(StructureMetadata {
             id_field: Some("name".into()),
             label_field: Some("name".into()),
@@ -107,6 +110,7 @@ static CLIENT_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
                 },
                 StructureField {
                     required: true,
+                    monitor: Some("client".into()),
                     options: Some(FieldOptions {
                         path: "/llm/providers".into(),
                         items_field: "ids".into(),
@@ -128,7 +132,10 @@ static PROVIDER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: MODULE,
     key: PROVIDERS,
     options: || ConfigItemOptions {
-        notification_endpoint: Some(PROVIDER_NOTIFICATION),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "provider",
+            endpoint: PROVIDER_NOTIFICATION,
+        }),
         structure: Some(StructureMetadata {
             id_field: Some("id".into()),
             label_field: Some("id".into()),
@@ -145,16 +152,25 @@ static PROVIDER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
                     }),
                     ..field("id", "供应商 ID", ConfigDataType::Key)
                 },
-                field("codex_uri", "Codex 基础 URI", ConfigDataType::String),
-                field("claude_uri", "Claude 基础 URI", ConfigDataType::String),
-                field(
-                    PROVIDER_TOKEN,
-                    "供应商 Token",
-                    ConfigDataType::Password {
-                        path: "loki-assistant/llm/{key}.gpg".into(),
-                        key: None,
-                    },
-                ),
+                StructureField {
+                    monitor: Some("provider".into()),
+                    ..field("codex_uri", "Codex 基础 URI", ConfigDataType::String)
+                },
+                StructureField {
+                    monitor: Some("provider".into()),
+                    ..field("claude_uri", "Claude 基础 URI", ConfigDataType::String)
+                },
+                StructureField {
+                    monitor: Some("provider".into()),
+                    ..field(
+                        PROVIDER_TOKEN,
+                        "供应商 Token",
+                        ConfigDataType::Password {
+                            path: "loki-assistant/llm/{key}.gpg".into(),
+                            key: None,
+                        },
+                    )
+                },
             ],
         }),
         ..ConfigItemOptions::default()
@@ -165,6 +181,7 @@ fn field(key: &str, label: &str, data_type: ConfigDataType) -> StructureField {
     StructureField {
         key: key.into(),
         label: label.into(),
+        monitor: None,
         data_type,
         required: false,
         default_template: None,

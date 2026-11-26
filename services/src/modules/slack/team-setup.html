@@ -181,7 +181,7 @@
     const inputs = [...form.querySelectorAll("input")];
     const hints = inputs.map((input) => input.placeholder);
     const team = document.querySelector("main").dataset.team;
-    const collection = "/data/slack/teams";
+    const editingPath = "/editing/slack";
 
     function showStatus(message, kind = "") {
       status.dataset.kind = kind;
@@ -191,13 +191,16 @@
     let statusRevision = 0;
     async function refreshStatus() {
       const revision = ++statusRevision;
-      const response = await fetch(collection, { cache: "no-store", redirect: "error" });
+      const response = await fetch(editingPath, { cache: "no-store", redirect: "error" });
       if (!response.ok) throw new Error();
       const data = await response.json();
       if (revision !== statusRevision) return;
-      const draft = data.pending?.find((record) => record.key === team);
-      const confirmed = data.value?.find((record) => record.team_id === team);
-      const record = draft?.value ?? confirmed;
+      const draft = data.monitor_states?.find((state) => state.monitor === "team" && state.instance === team);
+      const record = data.data?.teams?.find((record) => record.team_id === team);
+      const configured = (field) => {
+        const versions = record?.[field];
+        return (versions?.editing ?? versions?.accepted)?.value?.configured;
+      };
       const invalidField = {
         "slack-invalid-web-user-token": "token",
         "slack-invalid-web-cookie": "d_cookie",
@@ -205,12 +208,12 @@
       for (const [index, input] of inputs.entries()) {
         const invalid = input.name === invalidField;
         input.setAttribute("aria-invalid", String(invalid));
-        input.placeholder = record?.[input.name] && !invalid ? "已保存，留空保留" : hints[index];
+        input.placeholder = configured(input.name) && !invalid ? "已保存，留空保留" : hints[index];
       }
       if (draft?.error) {
         showStatus(draft.error.message, "error");
       } else if (draft) {
-        const complete = inputs.every((input) => draft.value?.[input.name]);
+        const complete = inputs.every((input) => configured(input.name));
         showStatus(complete ? "凭据已保存，等待 Slack 校验。" : "可以分次保存，两项齐全后校验。");
       } else if (record) {
         showStatus("工作区已确认，可以返回 Loki Assistant。", "success");
@@ -237,7 +240,7 @@
       for (const input of inputs) input.disabled = true;
       showStatus("正在保存…");
       try {
-        const response = await fetch(collection + "/" + team, {
+        const response = await fetch(editingPath + "/teams/" + encodeURIComponent(team), {
           method: "PATCH",
           headers: { "Content-Type": "application/merge-patch+json" },
           body: JSON.stringify(fields),

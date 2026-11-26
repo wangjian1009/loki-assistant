@@ -18,6 +18,17 @@ pub struct ModuleMetaResponse {
     pub description: String,
     pub version: String,
     pub items: Vec<ItemMetaResponse>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<MonitorMetaResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MonitorMetaResponse {
+    pub id: &'static str,
+    pub name: String,
+    pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -26,16 +37,39 @@ pub struct ItemMetaResponse {
     pub metadata: ConfigItemMetadata,
     #[serde(flatten)]
     pub options: ConfigItemOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_monitor: Option<&'static str>,
 }
 
 impl From<ConfigModuleMetadata> for ModuleMetaResponse {
     fn from(module: ConfigModuleMetadata) -> Self {
+        let mut monitors = BTreeMap::new();
         let items = module
             .items
             .into_iter()
             .map(|metadata| {
                 let options = super::registry::item_options(&module.id, &metadata.key);
-                ItemMetaResponse { metadata, options }
+                let record = options
+                    .structure
+                    .as_ref()
+                    .is_some_and(|structure| structure.id_field.is_some());
+                let monitor = options.monitor.map(|monitor| monitor.id);
+                if let Some(id) = monitor {
+                    monitors.entry(id).or_insert_with(|| MonitorMetaResponse {
+                        id,
+                        name: metadata.name.clone(),
+                        scope: if record { "record" } else { "module" },
+                        item: record.then(|| metadata.key.clone()),
+                    });
+                }
+                ItemMetaResponse {
+                    metadata,
+                    options,
+                    monitor: if record { None } else { monitor },
+                    lifecycle_monitor: if record { monitor } else { None },
+                }
             })
             .collect();
         Self {
@@ -44,6 +78,7 @@ impl From<ConfigModuleMetadata> for ModuleMetaResponse {
             description: module.description,
             version: module.version,
             items,
+            monitors: monitors.into_values().collect(),
         }
     }
 }
@@ -52,8 +87,6 @@ impl From<ConfigModuleMetadata> for ModuleMetaResponse {
 pub struct ModuleDataResponse {
     pub module_id: String,
     pub values: BTreeMap<String, ConfigValue>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub pending: BTreeMap<String, Vec<Value>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -62,8 +95,6 @@ pub struct ValueResponse {
     pub key: String,
     #[serde(flatten)]
     pub data: ConfigValue,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub pending: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -92,4 +123,23 @@ pub struct ValidateResponse {
     pub value: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiError>,
+}
+
+#[derive(Deserialize)]
+pub struct EditBatchRequest {
+    pub changes: Vec<EditChange>,
+}
+
+#[derive(Deserialize)]
+pub struct EditChange {
+    pub path: Vec<String>,
+    #[serde(flatten)]
+    pub operation: EditOperation,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum EditOperation {
+    Set { value: Value },
+    Remove,
 }

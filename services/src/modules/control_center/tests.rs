@@ -189,7 +189,7 @@ async fn failed_handler_returns_http_error_without_modifying_config_or_notifying
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/data/control-center/center_auto_start")
+                .uri("/editing/control-center/center_auto_start")
                 .header("content-type", "application/json")
                 .body(Body::from("true"))
                 .unwrap(),
@@ -209,7 +209,7 @@ async fn failed_handler_returns_http_error_without_modifying_config_or_notifying
     assert!(
         fs::read_to_string(&path)
             .unwrap()
-            .contains("_pending_config_notifications")
+            .contains("monitor_states")
     );
     assert_eq!(
         module

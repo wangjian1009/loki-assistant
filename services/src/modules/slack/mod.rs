@@ -70,7 +70,10 @@ static RETENTION_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: "slack",
     key: CACHE_RETENTION_DAYS,
     options: || ConfigItemOptions {
-        notification_endpoint: Some(RETENTION_NOTIFICATION),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "cache-retention",
+            endpoint: RETENTION_NOTIFICATION,
+        }),
         ..ConfigItemOptions::default()
     },
 };
@@ -90,6 +93,7 @@ impl projects::SlackTeam {
                 StructureField {
                     key: "team_id".into(),
                     label: "Slack Team ID".into(),
+                    monitor: None,
                     data_type: ConfigDataType::Key,
                     required: true,
                     default_template: None,
@@ -102,6 +106,7 @@ impl projects::SlackTeam {
                     options: None,
                 },
                 StructureField {
+                    monitor: Some("team".into()),
                     key: "name".into(),
                     label: "本地显示名称".into(),
                     data_type: ConfigDataType::String,
@@ -125,6 +130,7 @@ impl projects::SlackTeam {
                     data_type: ConfigDataType::String,
                     required: false,
                     read_only: true,
+                    monitor: None,
                     default_template: None,
                     checker: None,
                     options: None,
@@ -139,6 +145,7 @@ impl projects::SlackTeam {
                 .map(|(key, label, password_key)| StructureField {
                     key: key.into(),
                     label: label.into(),
+                    monitor: Some("team".into()),
                     data_type: ConfigDataType::Password {
                         path: "loki-assistant/slack/{key}.gpg".into(),
                         key: password_key,
@@ -165,7 +172,10 @@ static TEAM_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     key: "teams",
     options: || ConfigItemOptions {
         structure: Some(projects::SlackTeam::metadata()),
-        notification_endpoint: Some(TEAM_NOTIFICATION_ENDPOINT),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "team",
+            endpoint: TEAM_NOTIFICATION_ENDPOINT,
+        }),
         create_fields: vec!["team_id"],
         save_timeout_seconds: Some(650),
         ..ConfigItemOptions::default()
@@ -191,6 +201,7 @@ static WATCH_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             .into_iter()
             .map(|(key, label, data_type)| StructureField {
                 key: key.into(),
+                monitor: None,
                 label: label.into(),
                 data_type,
                 required: true,
@@ -210,7 +221,10 @@ static NICKNAME_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: "slack",
     key: NICKNAMES,
     options: || ConfigItemOptions {
-        notification_endpoint: Some(NICKNAME_NOTIFICATION),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "nickname",
+            endpoint: NICKNAME_NOTIFICATION,
+        }),
         structure: Some(StructureMetadata {
             id_field: Some("id".into()),
             label_field: Some("nickname".into()),
@@ -224,6 +238,7 @@ static NICKNAME_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             .into_iter()
             .map(|(key, label, data_type)| StructureField {
                 key: key.into(),
+                monitor: (key == "nickname").then(|| "nickname".into()),
                 label: label.into(),
                 data_type,
                 required: true,

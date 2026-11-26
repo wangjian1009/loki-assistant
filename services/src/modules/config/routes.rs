@@ -21,8 +21,8 @@ use serde_json::Value;
 use super::{
     model::{ConfigValue, ConfigValueSource},
     protocol::{
-        MetaResponse, ModuleDataResponse, ModuleMetaResponse, RecordResponse, ValidateRequest,
-        ValidateResponse, ValueResponse,
+        EditBatchRequest, MetaResponse, ModuleDataResponse, ModuleMetaResponse, RecordResponse,
+        ValidateRequest, ValidateResponse, ValueResponse,
     },
     service::{ConfigService, ConfigServiceError},
 };
@@ -154,37 +154,12 @@ async fn module_data(
         .module_values_for(&module_id, remote)
         .await
         .map_err(error_response)?;
-    let mut pending = service.module_pending_notifications(&module_id).await;
-    if remote {
-        let metadata = service.metadata_for(true).await;
-        let module = metadata.iter().find(|module| module.id == module_id);
-        pending.retain(|key, _| module.is_some_and(|module| module.item(key).is_some()));
-    }
     for (key, value) in &mut values {
         service
-            .omit_missing_password_entries(
-                &module_id,
-                key,
-                Some(&mut value.value),
-                pending
-                    .get_mut(key)
-                    .map(Vec::as_mut_slice)
-                    .unwrap_or_default(),
-            )
+            .omit_missing_password_entries(&module_id, key, Some(&mut value.value), &mut [])
             .await;
     }
-    for (key, records) in &mut pending {
-        if !values.contains_key(key) {
-            service
-                .omit_missing_password_entries(&module_id, key, None, records)
-                .await;
-        }
-    }
-    Ok(Json(ModuleDataResponse {
-        module_id,
-        values,
-        pending,
-    }))
+    Ok(Json(ModuleDataResponse { module_id, values }))
 }
 
 #[loki_api(
@@ -202,30 +177,81 @@ async fn get_value(
     State(service): State<Arc<ConfigService>>,
     peer: Option<Extension<RemoteRequest>>,
 ) -> Result<Json<ValueResponse>, Response> {
-    let value = match service.value_for(&module_id, &key, peer.is_some()).await {
-        Err(error) if !matches!(error, ConfigServiceError::ValueNotSet { .. }) => {
-            return Err(error_response(error));
-        }
-        value => value,
-    };
-    let mut pending = service.pending_notifications(&module_id, &key).await;
-    let mut data = match value {
-        Ok(data) => data,
-        Err(ConfigServiceError::ValueNotSet { .. }) if !pending.is_empty() => ConfigValue {
-            value: Value::Null,
-            source: ConfigValueSource::User,
-        },
-        Err(error) => return Err(error_response(error)),
-    };
+    let mut data = service
+        .value_for(&module_id, &key, peer.is_some())
+        .await
+        .map_err(error_response)?;
     service
-        .omit_missing_password_entries(&module_id, &key, Some(&mut data.value), &mut pending)
+        .omit_missing_password_entries(&module_id, &key, Some(&mut data.value), &mut [])
         .await;
     Ok(Json(ValueResponse {
         module_id,
         key,
         data,
-        pending,
     }))
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "module-editing",
+    method = "GET",
+    path = "/editing/{module_id}",
+    summary = "获取模块的配置编辑快照",
+    description = "返回已确认值、候选值、版本以及业务监控错误。"
+)]
+async fn module_editing(
+    Path(module_id): Path<String>,
+    State(service): State<Arc<ConfigService>>,
+) -> Result<Json<Value>, Response> {
+    service
+        .editing_snapshot(&module_id)
+        .await
+        .map(Json)
+        .map_err(error_response)
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
+    id = "module-editing-batch",
+    method = "PATCH",
+    path = "/editing/{module_id}",
+    summary = "保存整个模块的配置编辑",
+    description = "校验并保存同一批编辑，合并同一记录的字段修改。"
+)]
+async fn edit_module(
+    Path(module_id): Path<String>,
+    State(service): State<Arc<ConfigService>>,
+    headers: HeaderMap,
+    Json(request): Json<EditBatchRequest>,
+) -> Result<Response, Response> {
+    for change in &request.changes {
+        let key = change.path.first().ok_or_else(|| {
+            error_response(ConfigServiceError::InvalidValue(
+                "配置路径不能为空。".into(),
+            ))
+        })?;
+        check_write_access(&service, false, &module_id, key).await?;
+        service
+            .authorize_secret_request(&module_id, key, bearer(&headers))
+            .await
+            .map_err(error_response)?;
+    }
+    let revisions = service
+        .edit_batch(module_id.clone(), request.changes)
+        .await
+        .map_err(error_response)?;
+    let status = if revisions.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((
+        status,
+        Json(serde_json::json!({"module_id": module_id, "revisions": revisions})),
+    )
+        .into_response())
 }
 
 #[loki_api(
@@ -233,7 +259,7 @@ async fn get_value(
     mount = "Arc<ConfigService>",
     id = "set-value",
     method = "PUT",
-    path = "/data/{module_id}/{key}",
+    path = "/editing/{module_id}/{key}",
     access = "paired",
     summary = "设置完整配置值",
     description = "替换一个配置项的完整值。"
@@ -280,7 +306,6 @@ async fn put_value(
                     value,
                     source: ConfigValueSource::User,
                 },
-                pending: Vec::new(),
             })
             .into_response()
         })
@@ -292,7 +317,7 @@ async fn put_value(
     mount = "Arc<ConfigService>",
     id = "patch-value",
     method = "POST",
-    path = "/data/{module_id}/{key}",
+    path = "/editing/{module_id}/{key}",
     access = "paired",
     summary = "部分更新配置值",
     description = "合并字典或追加列表项。"
@@ -325,7 +350,6 @@ async fn post_value(
                     value,
                     source: ConfigValueSource::User,
                 },
-                pending: Vec::new(),
             })
         })
         .map_err(error_response)
@@ -365,7 +389,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     mount = "Arc<ConfigService>",
     id = "delete-value",
     method = "DELETE",
-    path = "/data/{module_id}/{key}",
+    path = "/editing/{module_id}/{key}",
     access = "paired",
     summary = "删除通知型单值配置",
     description = "通过配置项的通知接入点确认删除。"
@@ -400,7 +424,7 @@ async fn delete_value(
     mount = "Arc<ConfigService>",
     id = "set-record",
     method = "PUT",
-    path = "/data/{module_id}/{key}/{instance}",
+    path = "/editing/{module_id}/{key}/{instance}",
     summary = "保存一条配置记录",
     description = "保存结构数组中的单条记录；携带 If-None-Match: * 时仅允许新增。"
 )]
@@ -484,7 +508,7 @@ async fn put_record(
     mount = "Arc<ConfigService>",
     id = "delete-record",
     method = "DELETE",
-    path = "/data/{module_id}/{key}/{instance}",
+    path = "/editing/{module_id}/{key}/{instance}",
     summary = "删除一条配置记录",
     description = "按结构数组元数据声明的主键删除记录。"
 )]
@@ -565,7 +589,7 @@ async fn retry_config(
     mount = "Arc<ConfigService>",
     id = "merge-structure",
     method = "PATCH",
-    path = "/data/{module_id}/{key}",
+    path = "/editing/{module_id}/{key}",
     access = "paired",
     summary = "修改配置对象字段",
     description = "合并 JSON 对象，对可选字段传 null 可清理。"
@@ -613,7 +637,7 @@ async fn patch_value(
     mount = "Arc<ConfigService>",
     id = "merge-record",
     method = "PATCH",
-    path = "/data/{module_id}/{key}/{instance}",
+    path = "/editing/{module_id}/{key}/{instance}",
     summary = "修改配置记录字段",
     description = "合并已有记录的字段，对可选字段传 null 可清理。"
 )]
@@ -818,7 +842,7 @@ mod tests {
         let body = json_request(
             config_service.clone(),
             "PUT",
-            "/data/module_a/config_a",
+            "/editing/module_a/config_a",
             json!("已设置"),
         )
         .await;
@@ -842,14 +866,14 @@ mod tests {
         json_request(
             config_service.clone(),
             "PUT",
-            "/data/module_a/config_b",
+            "/editing/module_a/config_b",
             json!({"a": 1}),
         )
         .await;
         let body = json_request(
             config_service,
             "POST",
-            "/data/module_a/config_b",
+            "/editing/module_a/config_b",
             json!({"b": 2}),
         )
         .await;
@@ -877,7 +901,7 @@ mod tests {
         json_request(
             service.clone(),
             "PUT",
-            "/data/module_a/config_a",
+            "/editing/module_a/config_a",
             json!("用户值"),
         )
         .await;
@@ -913,7 +937,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method(method)
-                        .uri("/data/network/relay_token")
+                        .uri("/editing/network/relay_token")
                         .header("content-type", "application/json")
                         .body(Body::from(r#""replacement""#))
                         .unwrap(),
@@ -988,7 +1012,7 @@ mod tests {
         json_request(
             service.clone(),
             "PUT",
-            "/data/emacs/emacsclient_path",
+            "/editing/emacs/emacsclient_path",
             json!(executable),
         )
         .await;
@@ -998,7 +1022,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/data/emacs/emacsclient_path")
+                    .uri("/editing/emacs/emacsclient_path")
                     .header("content-type", "application/json")
                     .body(Body::from(json!(directory.join("missing")).to_string()))
                     .unwrap(),

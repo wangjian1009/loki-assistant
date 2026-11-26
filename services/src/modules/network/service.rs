@@ -223,10 +223,42 @@ impl NetworkService {
         }
     }
 
-    pub(super) fn configured_relay_changed(&self) {
-        if self.settings_changed.send(()).is_err() {
-            log::warn!("中转任务已关闭，无法应用网络配置。");
-        }
+    pub(super) async fn prepare_relay_edit(
+        &self,
+        url: String,
+    ) -> Result<
+        impl FnOnce(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + use<>,
+        String,
+    > {
+        let token = relay_token(&self.context.config)
+            .await
+            .map_err(|error| error.to_string())?;
+        let settings = RelaySettings { url, token };
+        let configured = settings.configured();
+        let candidate = match self.context.register_candidate(settings).await {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.context
+                    .report_registration_failure(error.clone())
+                    .await;
+                return Err(error);
+            }
+        };
+        let context = self.context.clone();
+        let changes = self.settings_changed.subscribe();
+        Ok(
+            move |confirmed| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    if confirmed {
+                        let _ = context
+                            .finish_candidate(Ok(candidate), configured, &changes)
+                            .await;
+                    } else if let Candidate::Replace(Some(registration)) = candidate {
+                        let _ = registration.session.close().await;
+                    }
+                })
+            },
+        )
     }
 
     pub fn set_remote_dispatcher(&self, dispatcher: Arc<dyn super::remote::RequestDispatcher>) {
@@ -591,6 +623,15 @@ impl RelayContext {
             })
             .await;
         let candidate = self.register_candidate(settings).await;
+        self.finish_candidate(candidate, configured, changes).await
+    }
+
+    async fn finish_candidate(
+        &self,
+        candidate: Result<Candidate, String>,
+        configured: bool,
+        changes: &watch::Receiver<()>,
+    ) -> Result<(), String> {
         let status = self.status.clone();
         let pairings = self.pairings.clone();
         let pending_changes = changes.clone();

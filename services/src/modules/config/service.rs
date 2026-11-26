@@ -22,6 +22,7 @@ use super::{
 };
 
 mod notifications;
+pub(super) mod snapshot;
 mod system;
 pub use notifications::NotificationValidationError;
 use notifications::pending_password_id;
@@ -265,7 +266,11 @@ impl ConfigService {
         metadata: Vec<ConfigModuleMetadata>,
     ) -> Result<Self, ConfigServiceError> {
         let storage = FileStorage::new(path)?;
-        let mut values = storage.read()?;
+        let mut values = storage
+            .read()?
+            .map(snapshot::Snapshot::decode)
+            .transpose()?
+            .unwrap_or_default();
         let system_values = values.remove(system::SECTION).unwrap_or_default();
         for (module_id, entries) in &mut values {
             // 保留其他版本或插件的配置，仅校验当前已知配置项。
@@ -576,9 +581,7 @@ impl ConfigService {
                 key: key.to_owned(),
             })?;
         let value = self.normalize_value(module_id, item, &value).await?;
-        if self.notifications_attached()
-            && item_options(module_id, key).notification_endpoint.is_some()
-        {
+        if self.notifications_attached() && item_options(module_id, key).monitor.is_some() {
             return Err(ConfigServiceError::InvalidValue(
                 "请使用带通知的配置写入接口。".into(),
             ));
@@ -1300,7 +1303,7 @@ impl ConfigService {
             .await?
             .map(|data| data.value);
         let options = item_options(module_id, key);
-        if options.notification_endpoint.is_some()
+        if options.monitor.is_some()
             && self.notifications_attached()
             && value.is_array()
             && operation != ConfigChangeOperation::AuthorizedCreate
@@ -1627,8 +1630,7 @@ impl ConfigItemOptions {
         let Ok(base) = self.password_path(field, instance) else {
             return false;
         };
-        path == base
-            || (self.notification_endpoint.is_some() && pending_password_id(&base, path).is_some())
+        path == base || (self.monitor.is_some() && pending_password_id(&base, path).is_some())
     }
 
     fn password_path(&self, key: &str, instance: &str) -> Result<String, ConfigServiceError> {
@@ -2280,7 +2282,7 @@ mod tests {
             .unwrap();
         let stored: Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            stored,
+            stored["modules"],
             json!({"module_a":{"config_b":{"enabled":false,"count":0}}})
         );
         assert_eq!(

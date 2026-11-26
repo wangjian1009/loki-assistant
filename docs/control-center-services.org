@@ -136,9 +136,9 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 
 * 配置中心
 
-配置模型、数组操作、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
+业务读取使用 ~/data~ ，配置编辑和写入使用 ~/editing~ 。配置模型、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
-Slack HTTP 接口和 ~slack~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /data/slack/teams/{team_id}~ 保存凭据。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
+Slack HTTP 接口和 ~slack~ 配置仅限本机调用。本机请求可直接调用。Slack 工作区的待确认变更通过配置模块的内部通知接入点处理。缺少凭据时，Slack 模块打开 ~/slack/team-setup/{team_id}~ 。该页通过配置模块的 ~PATCH /editing/slack/teams/{team_id}~ 保存凭据。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
 
 Slack 顶层消息和线程回复通过同一会话订阅推送到 Emacs。Slack 模块管理本机订阅，Emacs gateway 连接已运行的 Emacs server，调用固定的消息分发函数并读取回执。 [[file:slack-services.org::*会话消息订阅][会话消息订阅接口]]
 

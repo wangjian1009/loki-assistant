@@ -269,7 +269,7 @@ async fn storage_failure_keeps_invitation_available_and_corrupt_records_are_pres
     assert_eq!(manager.list().await.unwrap().len(), 1);
     fs::remove_dir(&path).unwrap();
     fs::rename(backup, &path).unwrap();
-    let corrupt = "_system:\n  network_peers: 损坏的记录\n";
+    let corrupt = "format_version: 2\nmodules: {}\n_system:\n  network_peers: 损坏的记录\n";
     fs::write(&path, corrupt).unwrap();
     assert!(
         PairingService::new(fixture.stored_config())
@@ -1008,25 +1008,25 @@ async fn check_remote_metadata_and_permissions(
         ),
         (
             "PUT",
-            "/data/network/relay_url",
+            "/editing/network/relay_url",
             Some(json!("其他地址")),
             "remote-config-forbidden",
         ),
         (
             "POST",
-            "/data/network/relay_token",
+            "/editing/network/relay_token",
             Some(json!("其他令牌")),
             "remote-config-forbidden",
         ),
         (
             "PUT",
-            "/data/control-center/center_auto_start",
+            "/editing/control-center/center_auto_start",
             Some(json!(true)),
             "remote-config-forbidden",
         ),
         (
             "PATCH",
-            "/data/control-center/center_auto_start",
+            "/editing/control-center/center_auto_start",
             Some(json!(true)),
             "remote-config-forbidden",
         ),

@@ -1,6 +1,6 @@
 use axum::{
     Extension, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
@@ -22,7 +22,10 @@ static RELAY_URL_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: "network",
     key: "relay_url",
     options: || ConfigItemOptions {
-        notification_endpoint: Some(RELAY_NOTIFICATION),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "relay",
+            endpoint: RELAY_NOTIFICATION,
+        }),
         ..ConfigItemOptions::default()
     },
 };
@@ -39,14 +42,31 @@ pub(crate) fn notification_router(service: Arc<super::NetworkService>) -> Router
 async fn notify_relay_url(
     State(network): State<Arc<super::NetworkService>>,
     Extension(change): Extension<NotificationRequest>,
+    Path(url): Path<String>,
 ) -> Response {
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    change.settle_with(&mut response, move |confirmed| async move {
-        if confirmed {
-            network.configured_relay_changed();
+    let url = if change.deleted || url == "\0" {
+        String::new()
+    } else {
+        url
+    };
+    match network.prepare_relay_edit(url).await {
+        Ok(apply) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            change.settle_with(&mut response, apply);
+            response
         }
-    });
-    response
+        Err(message) => {
+            let mut response = StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            response.extensions_mut().insert(
+                crate::modules::config::service::NotificationValidationError {
+                    code: "network-relay-registration".into(),
+                    message,
+                    clear_password_fields: Vec::new(),
+                },
+            );
+            response
+        }
+    }
 }
 
 const RELAY_PASSWORD_PATH: &str = "loki-assistant/network/relay.gpg";

@@ -211,6 +211,10 @@ impl Services {
         self.llm.monitor.flush().await
     }
 
+    pub async fn resume_config_edits(&self) {
+        self.config.service().resume_edits().await;
+    }
+
     pub async fn configured_http_port(&self) -> Result<u16, config::service::ConfigServiceError> {
         service::http_port(&self.config.service()).await
     }
@@ -267,7 +271,7 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(
-                    Request::put("/data/service/http_port")
+                    Request::put("/editing/service/http_port")
                         .header("content-type", "application/json")
                         .body(Body::from(value))
                         .unwrap(),

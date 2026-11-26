@@ -257,7 +257,7 @@ async fn creates_private_identity_atomically_and_reuses_it_across_instances() {
 async fn corrupt_current_identity_is_not_overwritten() {
     let fixture = Fixture::new();
     let path = fixture.root.join("config.yml");
-    let corrupted = "_system:\n  network_identity: 损坏的身份\n";
+    let corrupted = "format_version: 2\nmodules: {}\n_system:\n  network_identity: 损坏的身份\n";
     fs::write(&path, corrupted).unwrap();
     assert!(identity::ensure(&fixture.stored_config()).await.is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), corrupted);
@@ -319,7 +319,7 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("config.yml"),
-        "network:\n  relay_url: https://saved.example\n",
+        "format_version: 2\nmodules:\n  network:\n    relay_url:\n      accepted: {revision: 00000000-0000-0000-0000-000000000000, value: https://saved.example}\n      editing: null\n",
     )
     .unwrap();
     super::config::relay_password()
@@ -369,7 +369,7 @@ async fn startup_registers_saved_relay_and_reports_failure_without_changing_conf
 }
 
 #[tokio::test]
-async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
+async fn failed_registration_preserves_old_connection_and_candidate_settings() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -398,18 +398,17 @@ async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/data/network/relay_url")
+                .uri("/editing/network/relay_url")
                 .header("content-type", "application/json")
                 .body(Body::from("\"https://failed.example\""))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 422);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["value"], "https://failed.example");
-    assert!(service.start().await.is_err());
+    assert_eq!(body["error"]["code"], "network-relay-registration");
     assert_eq!(
         module
             .service()
@@ -417,14 +416,20 @@ async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
             .await
             .unwrap()
             .value,
-        json!("https://failed.example")
+        json!("https://old.example")
     );
+    let editing = module.service().editing_snapshot("network").await.unwrap();
+    assert_eq!(
+        editing["data"]["relay_url"]["editing"]["value"],
+        "https://failed.example"
+    );
+    assert_eq!(editing["monitor_states"][0]["status"], "failed");
     assert!(
         !fixture.registrar.sessions.lock().unwrap()[0]
             .0
             .load(Ordering::SeqCst)
     );
-    assert_eq!(changes.try_recv().unwrap().key, "relay_url");
+    assert!(changes.try_recv().is_err());
     assert_eq!(fixture.alerts().await[0]["title"], "中转注册失败");
     service.shutdown().await;
 }
@@ -433,7 +438,7 @@ async fn failed_registration_preserves_old_connection_and_new_saved_settings() {
 async fn storage_failure_does_not_start_registration() {
     let fixture = Fixture::new();
     let path = fixture.root.join("config.yml");
-    fs::write(&path, "network:\n  relay_token: test-token\n").unwrap();
+    fs::write(&path, "format_version: 2\nmodules: {}\n").unwrap();
     let service = fixture.service();
     let config = fixture.config(service.clone());
     service.start().await.unwrap();
@@ -602,8 +607,13 @@ async fn incomplete_settings_are_saved_without_registration_on_startup_or_update
         let fixture = Fixture::new();
         fs::write(
             fixture.root.join("config.yml"),
-            serde_yaml_ng::to_string(&json!({"network":{"relay_url":url,"relay_token":token}}))
-                .unwrap(),
+            serde_yaml_ng::to_string(&json!({
+                "format_version":2,
+                "modules":{"network":{"relay_url":{
+                    "accepted":{"revision":uuid::Uuid::nil(),"value":url},"editing":null
+                }}}
+            }))
+            .unwrap(),
         )
         .unwrap();
         let service = fixture.service();

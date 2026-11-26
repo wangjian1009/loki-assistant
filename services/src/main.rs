@@ -11,6 +11,23 @@ use loki_services::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match env::args().nth(1).as_deref() {
         Some("--help") | Some("-h") => print_help(),
+        Some("migrate-config") => {
+            let path = env::args_os().nth(2).map(std::path::PathBuf::from);
+            let _lock = if path.is_none() {
+                Some(ServiceInstanceLock::acquire()?)
+            } else {
+                None
+            };
+            let path = match path {
+                Some(path) => path,
+                None => loki_services::modules::config::service::ConfigService::storage_path()?,
+            };
+            if loki_services::modules::config::service::ConfigService::migrate_storage(path)? {
+                println!("已转换配置文件并备份旧文件。");
+            } else {
+                println!("配置文件已使用当前格式或尚未创建。");
+            }
+        }
         Some(command) => {
             return Err(format!("未知命令：{command}，使用 --help 查看支持的命令").into());
         }
@@ -42,6 +59,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeState::new(Arc::clone(&services)));
     services.attach_remote(&runtime);
     let extensions = services.start_extensions(address.port());
+    let config_resume = Arc::clone(&services);
     let notification = Arc::clone(&services.notification);
     let notification_retry = tokio::spawn(async move { notification.retry_pending().await });
     let network = Arc::clone(&services.network);
@@ -49,6 +67,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(error) = network.start().await {
             log::error!("网络初始化失败：{error}");
         }
+        config_resume.resume_config_edits().await;
     });
 
     log::info!("services 开始监听 http://{address}");
@@ -107,6 +126,7 @@ async fn notify_port_conflict(address: SocketAddr) {
 }
 
 fn print_help() {
+    println!("loki-services migrate-config [路径]  一次性转换配置文件");
     println!("loki-services");
     println!("  无参数       启动本地 HTTP 服务");
     println!("  服务管理     使用 brew services 或根目录 Makefile");

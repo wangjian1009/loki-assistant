@@ -9,7 +9,10 @@ static AUTO_START: ConfigItemRegistration = ConfigItemRegistration {
     module_id: "control-center",
     key: "center_auto_start",
     options: || ConfigItemOptions {
-        notification_endpoint: Some(NOTIFICATION),
+        monitor: Some(crate::modules::config::model::ConfigMonitor {
+            id: "login-startup",
+            endpoint: NOTIFICATION,
+        }),
         ..ConfigItemOptions::default()
     },
 };

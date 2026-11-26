@@ -134,7 +134,7 @@ async fn provider(app: &Router, id: &str, record: Value) {
     let response = invoke(
         app,
         Method::PUT,
-        &format!("/data/llm/providers/{id}"),
+        &format!("/editing/llm/providers/{id}"),
         None,
         Some(record),
     )
@@ -574,14 +574,14 @@ async fn persists_bindings_and_partial_usage_without_leaking_credentials() {
     assert!(!stored.contains("shared-upstream-token"));
     let stored: Value = serde_yaml_ng::from_str(&stored).unwrap();
     assert_eq!(
-        stored["llm"]["providers"][0]["token"],
+        stored["modules"]["llm"]["providers"][0]["token"]["accepted"]["value"],
         "loki-assistant/llm/shared.gpg"
     );
     assert!(directory.0.join("loki-assistant/llm/shared.gpg").is_file());
     let updated = invoke(
         &app,
         Method::PATCH,
-        "/data/llm/providers/shared",
+        "/editing/llm/providers/shared",
         None,
         Some(json!({"codex_uri":"file:///tmp"})),
     )
@@ -1141,7 +1141,7 @@ async fn configured_client_issues_read_only_token_and_refreshes_its_route_after_
     provider(&app, "a", json!({"codex_uri":format!("{upstream}/a")})).await;
     provider(&app, "b", json!({"codex_uri":format!("{upstream}/b")})).await;
 
-    let path = "/data/llm/clients/editor";
+    let path = "/editing/llm/clients/editor";
     let response = invoke(&app, Method::PUT, path, None, Some(json!({"upstream":"a"}))).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");

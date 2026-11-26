@@ -2238,7 +2238,7 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
     let (status, _, _) = invoke(
         &app,
         "PATCH",
-        "/data/slack/teams/TINVALID",
+        "/editing/slack/teams/TINVALID",
         None,
         None,
         Some(json!({"token":"xoxc-expired","d_cookie":"wrong-cookie"})),
@@ -2252,7 +2252,7 @@ async fn credential_alerts_keep_the_reauthorization_callback_and_clear_after_rec
     let (status, _, _) = invoke(
         &app,
         "PATCH",
-        "/data/slack/teams/TINVALID",
+        "/editing/slack/teams/TINVALID",
         None,
         None,
         Some(json!({"token":"xoxc-renewed","d_cookie":"cookie"})),
@@ -2552,7 +2552,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let (_, _, blocked) = invoke(
         &app,
         "PUT",
-        "/data/slack/watches",
+        "/editing/slack/watches",
         None,
         None,
         Some(json!([])),
@@ -2568,10 +2568,26 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let path = "/data/slack/cache_retention_days";
     let (_, _, default) = invoke(&app, "GET", path, None, None, None).await;
     assert_eq!(default["value"], 30);
-    let (_, _, invalid) = invoke(&app, "PUT", path, None, None, Some(json!(0))).await;
+    let (_, _, invalid) = invoke(
+        &app,
+        "PUT",
+        "/editing/slack/cache_retention_days",
+        None,
+        None,
+        Some(json!(0)),
+    )
+    .await;
     assert_eq!(invalid["error"]["code"], "slack-invalid-config");
     assert!(old_path.is_file());
-    let (code, _, saved) = invoke(&app, "PUT", path, None, None, Some(json!(1))).await;
+    let (code, _, saved) = invoke(
+        &app,
+        "PUT",
+        "/editing/slack/cache_retention_days",
+        None,
+        None,
+        Some(json!(1)),
+    )
+    .await;
     assert_eq!(code, StatusCode::OK, "{saved}");
     assert_eq!(saved["value"], 1);
     timeout(Duration::from_secs(3), async {
@@ -2597,7 +2613,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let create = |team: &str, body: Value| {
         Request::builder()
             .method("PUT")
-            .uri(format!("/data/slack/teams/{team}"))
+            .uri(format!("/editing/slack/teams/{team}"))
             .header("if-none-match", "*")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
@@ -2617,7 +2633,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
         ("TALPHA", "d_cookie", "token"),
         ("TBETA", "token", "d_cookie"),
     ] {
-        let team_path = format!("/data/slack/teams/{team}");
+        let team_path = format!("/editing/slack/teams/{team}");
         let setup_url = format!("http://127.0.0.1:47321/slack/team-setup/{team}");
         let token = format!("xoxc-{team}");
         let cookie = "test-web-cookie";
@@ -2693,7 +2709,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let invalid = invoke(
         &app,
         "POST",
-        "/data/slack/teams",
+        "/editing/slack/teams",
         None,
         None,
         Some(json!([{"team_id":"wrong","name":"check"}])),
@@ -2869,7 +2885,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     .await;
     assert_eq!(code, StatusCode::OK);
     assert!(cleared["user"]["nickname"].is_null());
-    let config_nickname = "/data/slack/nicknames/TALPHA.U2";
+    let config_nickname = "/editing/slack/nicknames/TALPHA.U2";
     let (code, _, _) = invoke(
         &app,
         "PUT",
@@ -3116,8 +3132,15 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert_eq!(messages["conversation_id"], "TALPHA.DNEW");
 
     for _ in 0..2 {
-        let (status, _, _) =
-            invoke(&app, "DELETE", "/data/slack/teams/TALPHA", None, None, None).await;
+        let (status, _, _) = invoke(
+            &app,
+            "DELETE",
+            "/editing/slack/teams/TALPHA",
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
     let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
@@ -3126,7 +3149,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     assert!(projects.service("TALPHA").await.is_err());
     assert!(projects.service("TBETA").await.is_ok());
 
-    let pending_path = "/data/slack/teams/TPENDING";
+    let pending_path = "/editing/slack/teams/TPENDING";
     let created = app
         .clone()
         .oneshot(create("TPENDING", json!({})))
@@ -3158,8 +3181,9 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     );
     assert!(directory.0.join(reference).is_file());
     fs::remove_file(directory.0.join(reference)).unwrap();
-    let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
-    assert_eq!(config["pending"][0]["value"], json!({"team_id":"TPENDING"}));
+    let (_, _, config) = invoke(&app, "GET", "/editing/slack", None, None, None).await;
+    assert_eq!(config["monitor_states"][0]["instance"], "TPENDING");
+    assert_eq!(config["monitor_states"][0]["record_operation"], "create");
     let (status, _, retry) = invoke(&app, "PUT", pending_path, None, None, None).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(retry["status"], "pending");
@@ -3173,7 +3197,7 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
     let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
     assert!(config["pending"].is_null());
 
-    let team_path = "/data/slack/teams/TWEB";
+    let team_path = "/editing/slack/teams/TWEB";
     let created = app
         .clone()
         .oneshot(create("TWEB", json!({})))
@@ -3367,17 +3391,23 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             .await
             .unwrap();
         assert_eq!(saved.as_deref().map(str::trim_end), Some(expected));
-        let (_, _, current) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;
+        let (_, _, current) = invoke(&app, "GET", "/editing/slack", None, None, None).await;
         if token == expected {
-            assert!(current["pending"].is_null());
+            assert_eq!(current["monitor_states"], json!([]));
         } else {
-            assert_eq!(current["pending"][0]["status"], "invalid");
+            assert_eq!(current["monitor_states"][0]["status"], "failed");
             assert_eq!(
-                current["pending"][0]["error"]["code"],
+                current["monitor_states"][0]["error"]["code"],
                 "slack-team-mismatch"
             );
-            assert!(current["pending"][0]["value"].get("token").is_none());
-            assert!(current["pending"][0]["value"].get("d_cookie").is_none());
+            let record = current["data"]["teams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|team| team["team_id"] == "TWEB")
+                .unwrap();
+            assert_eq!(record["token"]["editing"]["remove"], true);
+            assert_eq!(record["d_cookie"]["editing"]["remove"], true);
             assert_eq!(
                 passwords.fetch(password_path).await.unwrap(),
                 "xoxc-TWEB\nd_cookie: refreshed-web-cookie\n"
@@ -3392,8 +3422,8 @@ async fn project_workflow_uses_metadata_isolated_passwords_and_team_validation()
             let restarted = ConfigService::load(&config_path).unwrap();
             let restarted_app = config::Module::from_service(restarted).router();
             let (_, _, after_restart) =
-                invoke(&restarted_app, "GET", "/data/slack/teams", None, None, None).await;
-            assert_eq!(after_restart["pending"], current["pending"]);
+                invoke(&restarted_app, "GET", "/editing/slack", None, None, None).await;
+            assert_eq!(after_restart, current);
         }
     }
     let (_, _, config) = invoke(&app, "GET", "/data/slack/teams", None, None, None).await;

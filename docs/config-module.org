@@ -1,9 +1,9 @@
 #+TITLE: 配置模块设计
 #+SETUPFILE: .setup.org
 
-配置中心维护数据结构、校验、通用读写接口和提交事务。配置界面按元数据填写并提交数据。业务模块可以在配置项元数据中声明通知接入点，由配置中心发出变更通知并确认处理结果。
+配置中心维护数据结构、校验、通用读写接口和提交事务。配置界面按元数据填写并提交数据。业务模块为监控点注册处理函数，由配置中心保存候选值和业务处理结果。
 
-下文记录当前实现。字段级监控、完整编辑状态及切换方案见 [[*字段级监控与完整编辑状态（设计）][字段级监控与完整编辑状态设计]]。
+配置接口和编辑流程见 [[*字段级监控与完整编辑状态][字段级监控与完整编辑状态]]。
 
 * 静态元数据
 
@@ -33,7 +33,7 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 
 没有用户设置和静态 ~default~ 时，配置模块按 services 启动时的 ~PATH~ 顺序搜索，再按 ~search_paths~ 的顺序补充查找。只接受实际可执行的普通文件（允许符号链接），返回绝对路径；不通过 shell，不执行待查找的程序，也不展开 ~ 和环境变量。每次读取重新查找，因此安装或移除程序后，下次读取即可反映变化。找不到程序时不生成默认值，Emacs 配置界面显示“未设置”并提供文件选择入口。
 
-配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取。写入须同时得到 API 的 ~paired~ 声明与配置项的 ~read_write~ 声明授权，预检同样需要写权限。配置中心依据 network 注入的 Axum 请求扩展判断请求来源。远端元数据、模块值和待确认记录只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 和 ~control-center/center_auto_start~ 对绑定设备只读，其余配置项仅限本机。
+配置项通过 ~remote_access~ 声明绑定设备的访问范围。~local~ 为默认值，~read~ 开放读取。写入须同时得到 API 的 ~paired~ 声明与配置项的 ~read_write~ 声明授权，预检同样需要写权限。配置中心依据 network 注入的 Axum 请求扩展判断请求来源。远端元数据和生效值只包含可读项，直接访问受限项返回 403 ~remote-config-forbidden~ 。目前 ~network/relay_url~ 和 ~control-center/center_auto_start~ 对绑定设备只读，其余配置项仅限本机。
 
 * 生效值与来源
 
@@ -75,34 +75,17 @@ fn emacs_config_metadata() -> ConfigModuleMetadata {
 {"module_id":"emacs","key":"emacsclient_path","valid":false,"error":{"source":"business","code":"invalid-config","message":"配置值无效：emacsclient 位置：文件不存在：/missing/emacsclient"}}
 #+end_src
 
-不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /data/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
+不存在的模块或配置项返回 404；内部错误使用对应 HTTP 错误码。预检不写入文件、不更新用户值，也不发出变化通知。~PUT /editing/{module_id}/{key}~ 与部分更新会在提交时重新校验；校验失败返回 400 ~invalid-config~，已有内存值、YAML 文件与变化通知均不受影响。~Executable~ 保存成功时使用规范化后的绝对路径。预检通过不保证提交时仍有效，例如文件可能在两次请求之间被移除。
 
 Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明、类型化编辑控件及来源状态，按服务端结果将错误标红并保留输入。校验、逐项保存、批量保存、撤销编辑和刷新行为见 [[file:emacs.org::*服务配置管理][服务配置管理]]。托盘“设置”调用 ~POST /emacs/apps/open?app=config~ ，由 services 的 Emacs 模块打开并聚焦配置界面。登录启动由控制中心的配置通知接入点处理。
 
-* 提交与配置通知
+* 文件写入
 
-普通配置完成校验后原子写入 YAML，再更新内存并广播变更。声明 ~notification_endpoint~ 的配置先写入待确认记录，由配置中心发送内部 HTTP 请求。业务可在独立任务中等待提交确认，再更新运行状态并通过通道告知配置中心。配置中心通过同一流程处理新增、修改和删除。
-
-配置事务在服务端任务中执行。HTTP 请求断开后，已接受的事务继续执行。读取、预检和手动修改 YAML 都只处理配置数据。手动修改 YAML 后由业务在下次启动时加载。
-
-* YAML 存储
-
-用户配置保存到 ~~/.assistant/config.yml~ ，文件内容按模块和键组织，仅存用户值：
-
-#+begin_src yaml
-emacs:
-  emacsclient_path: /opt/homebrew/bin/emacsclient
-control-center:
-  center_auto_start: false
-#+end_src
-
-文件缺失视为没有用户设置，首次成功写入时创建。保存使用权限为 ~0600~ 的同目录临时文件并原子替换目标文件；落盘成功后才更新内存和广播变化。并发写入按顺序处理，保存失败返回 HTTP 500 ~config-storage-error~ ，不覆盖已生效的内存配置。默认值、来源标签及静态元数据不写入 YAML。
-
-启动时读取文件并校验当前已知配置项；文件损坏或已知值类型错误会阻止启动。其他版本或插件的未知配置保留在文件中，但不出现在当前模块数据里。手动修改 YAML 后重启 services 生效；通过 HTTP 修改则立即生效。~ConfigService::new~ 与 ~from_registry~ 提供无文件存储的实例用于测试，进程入口通过 ~Services::load~ 加载用户文件。
+用户配置保存在 ~~/.assistant/config.yml~ 。首次成功写入时创建，后续写入用权限为 ~0600~ 的同目录临时文件原子替换。配置中心在落盘成功后更新内存和发布生效变更。写入失败返回 ~500 config-storage-error~ 。HTTP 请求断开后，已接受的事务继续执行。服务启动时校验已登记的值，并保留文件中其他版本或插件的未登记配置。
 
 * 结构化配置
 
-~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /data/{module}/{key}~ 追加元素。
+~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /editing/{module}/{key}~ 追加元素。
 
 结构可声明 ~show_all_fields~ ，让 Emacs 在一条记录下显示所有字段。缺少值时显示「未设置」，密码字段显示保存状态。
 
@@ -113,13 +96,13 @@ control-center:
 | 操作 | 请求 | 结果 |
 |------+-------+------|
 | 读取配置定义和值 | ~GET /meta~、~GET /data/{module}~ | 读取注册的结构和生效值 |
-| 新增带主键记录 | ~PUT /data/{module}/{key}/{instance}~ 配合 ~If-None-Match: *~ | 返回 ~200~ 和保存记录，主键已存在时返回 ~412 config-record-exists~ |
-| 修改带主键记录 | ~PATCH /data/{module}/{key}/{instance}~ | 合并指定字段，按通知结果返回 ~200~ 或 ~202~ |
-| 删除带主键记录 | ~DELETE /data/{module}/{key}/{instance}~ | 返回 ~204~ 。记录已不存在时同样返回 ~204~ |
-| 追加无主键元素 | ~POST /data/{module}/{key}~ ，请求体是数组 | 返回保存后的完整数组 |
-| 修改或删除无主键元素 | ~PUT /data/{module}/{key}~ ，请求体是替换后的数组 | 返回保存后的完整数组 |
+| 新增带主键记录 | ~PUT /editing/{module}/{key}/{instance}~ 配合 ~If-None-Match: *~ | 返回 ~200~ 和保存记录，主键已存在时返回 ~412 config-record-exists~ |
+| 修改带主键记录 | ~PATCH /editing/{module}/{key}/{instance}~ | 合并指定字段，按通知结果返回 ~200~ 或 ~202~ |
+| 删除带主键记录 | ~DELETE /editing/{module}/{key}/{instance}~ | 返回 ~204~ 。记录已不存在时同样返回 ~204~ |
+| 追加无主键元素 | ~POST /editing/{module}/{key}~ ，请求体是数组 | 返回保存后的完整数组 |
+| 修改或删除无主键元素 | ~PUT /editing/{module}/{key}~ ，请求体是替换后的数组 | 返回保存后的完整数组 |
 
-按字段修改和手动重试的契约见 [[*刷新配置与手动重试][刷新配置与手动重试]]。
+按字段修改和手动重试的契约见 [[*读取与提交][读取与提交]]。
 
 * 结构中的密码字段
 
@@ -134,58 +117,7 @@ control-center:
 
 配置模块将共享条目的候选凭据保存为一份加密条目。新记录可以按任意顺序填写字段，首次保存即使用按主键展开的文件名。正式条目已存在时，候选文件在独立目录中沿用同一文件名。业务确认后，配置模块更新正式条目和配置引用，并清理独立目录中的候选文件。修改一项时保留同一条目中未修改的字段。显式清除首行字段会删除整份共享条目和各字段的引用。配置写入失败时，配置模块尝试恢复原条目。
 
-* 配置项通知接入点
-
-需要触发业务处理的配置项通过 ~notification_endpoint~ 指定 services 内部 HTTP 路径。配置模块按元数据投递变更，业务模块负责处理及报告结果。
-
-通知接入点可配置在单个值或带主键的结构数组上。单值配置直接以该值作为 ~key~ 。结构数组的元素须指定一个必填的 ~Key~ 类型字段，元数据中表示为 ~"data_type": "key"~ 。字段值是记录主键，在数组内唯一且创建后固定。配置模块将 ~key~ 编码为一个路径段并追加到接入点，形成 ~{notification_endpoint}/{key}~ 。
-
-** 写入与确认
-
-1. 配置模块用通用写入接口校验并保存待确认的值或记录。状态由配置模块管理，业务读取使用已确认的数据。
-2. 配置模块发送 ~POST {notification_endpoint}/{key}~ 。单值的请求体为原始 JSON 值。结构数组的请求体为该记录的数据字段，例如 ~{"date1":1}~ 。~Password~ 字段由业务模块通过配置模块内部读取。
-3. 配置模块根据通知响应确认或回退这次写入。
-
-| POST 结果 | 配置模块处理 |
-|-----------+--------------|
-| ~200~ 或 ~204~ | 将待确认的值或记录切换为已确认。业务模块可返回结构数组记录的只读字段，配置模块校验后随记录一并保存。 |
-| ~202~ | 保留待确认状态，等待业务模块完成处理。 |
-| ~422~ 携带内部 ~NotificationValidationError~ | 持久化候选记录及错误，~pending[].status~ 为 ~invalid~ 。业务模块可要求清除候选记录的指定密码字段，响应头 ~X-Loki-Config-Cleared-Fields~ 列出这些字段。后续 ~PATCH~ 可重新提交。 |
-| 其他明确的错误响应 | 回退本次写入及对应的凭据变更。替换单值失败时保留原有已确认值。 |
-
-业务模块异步处理后更新本次写入的状态。确认落盘后，业务任务可通过确认通道刷新缓存。结果为处理中或未知时，配置模块保留待确认变更，供后续手动重试。
-
-** 删除通知
-
-配置模块标记删除待确认，向同一接入点发送 ~DELETE {notification_endpoint}/{key}~ 。单值使用删除前的值，结构数组使用待删除记录的 ~Key~ 字段。成功后移除数据，失败时保留原记录。返回 ~202~ 时保留待确认状态，等待手动重试。 [[file:slack-development.org::*Team 注册流程图][Slack 接入流程]]
-
-** 刷新配置与手动重试
-
-手动重试复用配置资源的 ~PUT~ 接口。单值使用 ~PUT /data/{module}/{key}~ ，带主键的记录使用 ~PUT /data/{module}/{key}/{instance}~ 。配置模块根据 ~module~ 和 ~key~ 找到配置项元数据中的 ~notification_endpoint~ ，并根据 ~instance~ 定位结构数组中的记录。发送业务通知时，结构数组用记录的主键作为通知路径中的键，单值用待确认变更保存的值作为键。
-
-| 请求 | 语义 |
-|------+------|
-| ~PUT~ ，请求体为零字节 | 重新触发该资源当前的待确认变更，复用其中保存的参数。 |
-| ~PUT~ ，请求体为 ~{}~ ，带 ~If-None-Match: *~ | 新增仅含路径主键的记录，按元数据校验必填字段。 |
-
-用 ~PATCH /data/{module}/{key}/{instance}~ 修改带主键记录的字段，单个结构对象使用 ~PATCH /data/{module}/{key}~ 。请求体为 ~application/merge-patch+json~ 的 JSON 对象。~{"name":"X-Tech"}~ 设置名称，~{"name":null}~ 清理可选名称，省略字段则保留原值。清理必填字段或修改主键返回校验错误。已有待确认变更时，以待确认数据为基础合并字段，否则以生效记录为基础。
-
-用 ~PATCH~ 明确表达局部修改，客户端只提交它拥有新值的字段，可减少覆盖其他字段和重新传输凭据的问题。~PUT~ 适合按已知主键创建记录或设置整个单值。代价是客户端需要按操作选择 HTTP 方法，服务端需要支持两种请求。单值配置的参数名由路径中的 ~key~ 指定，设置时提交 JSON 值，清理时使用该项的 ~DELETE~ 接口。
-
-手动触发沿用原配置项的写入权限与本机鉴权。配置模块按资源路径查找当前的待确认变更，使用已保存的数据和原通知接入点再发送一次通知。待确认的写入发送 ~POST~ ，待确认的删除发送 ~DELETE~ 。同一变更只允许一个通知请求在途，包括首次通知。变更 UUID 由配置模块内部传递，业务模块用它识别原变更。配置模块只应用与当前待确认变更 ID 匹配的结果。
-
-| HTTP 结果 | 处理 |
-|-----------+------|
-| ~200~ | 业务确认后提交变更，返回 ~{"api_version":"1","status":"confirmed"}~ 。 |
-| ~202~ | 业务仍在处理或响应结果未知，返回 ~{"api_version":"1","status":"pending"}~ 。 |
-| ~404 config-pending-not-found~ | 此资源没有待确认变更。 |
-| ~409 config-retry-in-progress~ | 同一次变更已有通知请求在途。 |
-| ~422~ | 业务报告明确的校验错误，候选数据和错误保留供后续编辑。 |
-| ~500 config-change-rejected~ | 业务明确拒绝，配置模块回退本次变更并返回错误。 |
-
-返回 ~202~ 后，下一次业务通知由手动重试触发。对于异步业务，接入点在收到相同 ID 的通知时返回该次处理的最新状态。Slack 的 ~POST~ 接入点在凭据齐全后校验，缺少凭据时打开工作区配置页。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
-
-* 字段级监控与完整编辑状态（设计）
+* 字段级监控与完整编辑状态
 
 配置中心负责按元数据校验、分组、保存编辑值、投递变更和记录业务处理结果。业务模块提供监控处理函数，决定何时确认编辑、报告错误以及清除错误。普通配置保存后立即生效。有监控点的字段先保存为待确认，业务读取和生效变更订阅使用已确认值。
 
@@ -203,9 +135,9 @@ control-center:
     {
       "key": "teams",
       "data_type": "list",
+      "lifecycle_monitor": "team",
       "structure": {
         "id_field": "team_id",
-        "lifecycle_monitor": "team",
         "fields": [
           {"key": "team_id", "data_type": "key", "required": true},
           {"key": "name", "data_type": "string", "monitor": "team"},
@@ -224,7 +156,7 @@ control-center:
 
 ** YAML 存储
 
-文件显式声明 ~format_version: 2~ 。~modules~ 按现有模块、配置项和记录结构组织。普通字段存原始值。有监控点的字段存 ~accepted~ 和 ~editing~ 。每个非空槽位用 ~{value: ...}~ 包装实际值，包括显式的 ~null~ 。空的 ~accepted~ 表示没有已确认的用户值，读取时按原规则使用默认值。空的 ~editing~ 表示没有待确认的编辑，~{remove: true}~ 表示候选操作为移除用户值。~_system~ 存放内部条目。
+文件显式声明 ~format_version: 2~ 。~modules~ 按现有模块、配置项和记录结构组织。普通字段存原始值。有监控点的字段存 ~accepted~ 和 ~editing~ 。两个槽位各自记录 ~revision~ 和 ~value~ ，其中 ~value~ 可以是显式的 ~null~ 。空的 ~accepted~ 表示没有已确认的用户值，读取时按原规则使用默认值。空的 ~editing~ 表示没有待确认的编辑，带 ~revision~ 的 ~{remove: true}~ 表示候选操作为移除用户值。~_system~ 存放内部条目。
 
 #+begin_src yaml
 format_version: 2
@@ -234,29 +166,29 @@ modules:
       - team_id: TDEMO
         team_name: 示例工作区
         name:
-          accepted: {value: 旧名称}
-          editing: {value: 新名称}
+          accepted: {revision: 7b217e7c-146c-45f7-95bc-56584179277e, value: 旧名称}
+          editing: {revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c, value: 新名称}
         token:
-          accepted: {value: loki-assistant/slack/TDEMO.gpg}
-          editing: {value: loki-assistant/slack/pending/509b6a1d-9fa6-41dc-9326-36b15f79ce7c/TDEMO.gpg}
+          accepted: {revision: 7b217e7c-146c-45f7-95bc-56584179277e, value: loki-assistant/slack/TDEMO.gpg}
+          editing: {revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c, value: loki-assistant/slack/pending/509b6a1d-9fa6-41dc-9326-36b15f79ce7c/TDEMO.gpg}
         d_cookie:
-          accepted: {value: loki-assistant/slack/TDEMO.gpg}
-          editing: {value: loki-assistant/slack/pending/509b6a1d-9fa6-41dc-9326-36b15f79ce7c/TDEMO.gpg}
+          accepted: {revision: 7b217e7c-146c-45f7-95bc-56584179277e, value: loki-assistant/slack/TDEMO.gpg}
+          editing: {revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c, value: loki-assistant/slack/pending/509b6a1d-9fa6-41dc-9326-36b15f79ce7c/TDEMO.gpg}
 monitor_states:
   slack:
     - monitor: team
       instance: TDEMO
+      item: teams
       revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c
       status: failed
+      error_revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c
       error:
-        revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c
         code: slack-auth-failed
         message: 工作区凭据校验失败，请更新令牌和 Cookie。
-        fields: [[teams, TDEMO, token], [teams, TDEMO, d_cookie]]
 _system: {}
 #+end_src
 
-监控状态的唯一键为 ~(module_id, monitor_id, instance)~ 。模块级监控没有 ~instance~ 。~revision~ 标识这批编辑。状态包含 ~pending~ 、 ~processing~ 、 ~failed~ 和 ~accepted~ 。候选记录新增或删除时在同组状态上记录 ~record_operation: create|delete~ ，用于控制两个视图的记录可见性。~error~ 保存业务模块提供的 ~code~ 、 ~message~ 、可选的字段路径及其所属版本，整组只存一份。新编辑可以先前进到新版本，再由业务明确处理上一版错误。
+监控状态的唯一键为 ~(module_id, monitor_id, instance)~ 。模块级监控没有 ~instance~ 。同组当前候选字段和监控状态共享本次处理的 ~revision~ 。业务确认后，已转入 ~accepted~ 的值保留该版本。状态包含 ~pending~ 、 ~processing~ 、 ~failed~ 和 ~accepted~ 。候选记录新增或删除时在同组状态上记录 ~record_operation: create|delete~ ，用于控制两个视图的记录可见性。~error~ 保存业务模块提供的 ~code~ 、 ~message~ 、可选的字段路径及其所属版本，整组只存一份。新编辑可以先前进到新版本，再由业务明确处理上一版错误。
 
 沿用现有密码库事务。密码槽位只保存加密条目引用，已确认与编辑中的凭据分别从各自的条目解析。共享同一密码条目的字段共同保存候选条目，保留未编辑的行。业务确认后切换正式条目及配置引用，失败后保留候选密文供后续编辑。业务可通过结果 API 明确撤销指定的候选凭据，已确认的凭据继续可用。HTTP 和 Emacs 仅展示设置状态及变更，凭据值和条目路径均留在服务内部。
 
@@ -264,38 +196,47 @@ _system: {}
 
 | 操作 | 响应或行为 |
 |------+------------|
-| ~GET /data/{module_id}~ 和 ~GET /data/{module_id}/{key}~ ，省略 ~view~ 或指定 ~view=accepted~ | 返回现有 ~value~ / ~source~ 结构，只解析已确认用户值或默认值。无生效单值时返回 ~404 config-not-set~ 。 |
-| 同一接口指定 ~view=editing~ | 返回同一快照中的已确认值、候选变更 ~edits~ 和监控状态 ~monitors~ 。单项查询只返回该项可见数据，只有候选值的配置也返回 ~200~ 。 |
-| ~PUT~ 、 ~POST~ 、 ~PATCH~ 和 ~DELETE~ 写单项或记录 | 保留各自的写入语义。同一请求内的字段先一起校验和落盘，受监控的编辑进入待确认。 |
-| ~PATCH /data/{module_id}~ | 在同一请求内提交跨项修改，保存模块的整体修改时由 Emacs 使用。 |
+| ~GET /data/{module_id}~ 和 ~GET /data/{module_id}/{key}~ | 返回原有的生效配置结构，配置值仍由 ~value~ 和 ~source~ 表示。 |
+| ~GET /editing/{module_id}~ | 返回一个模块的完整编辑快照，对应 YAML 中的模块数据和监控状态。 |
+| ~PUT~ 、 ~POST~ 、 ~PATCH~ 、 ~DELETE /editing/{module_id}/{key}~ | 沿用原有的单项写入语义。 |
+| ~PUT~ 、 ~PATCH~ 、 ~DELETE /editing/{module_id}/{key}/{instance}~ | 沿用原有的记录新增、修改和删除语义。 |
+| ~PATCH /editing/{module_id}~ | 在同一请求内提交跨项修改，保存模块的整体修改时由 Emacs 使用。 |
 
-编辑视图中的 ~edits~ 按字段路径返回候选操作和编辑值。以下示例是只修改工作区名称时的模块响应。单项响应保留原有 ~value~ 和 ~source~ ，并附加过滤后的 ~edits~ 和 ~monitors~ 。单项尚未生效时省略 ~value~ 和 ~source~ 。
+~GET /data~ 下的接口优先返回已确认的用户值，其次按原规则解析默认值，包括运行时查找可执行文件。模块读取省略没有生效值的配置项，单项读取返回 ~404 config-not-set~ 。配置值保持原有标量、字典或记录数组的形状。候选值、版本、处理状态及错误通过 ~GET /editing/{module_id}~ 查询。
+
+Rust 业务代码继续使用 ~ConfigService::value~ 、 ~module_values~ 、 ~read_record_with_passwords~ 和 ~read_record_passwords~ 。这些入口保留现有签名、返回结构、默认值解析和缺值行为。配置中心把持久化模型解析成原有 ~ConfigValue~ 和记录，普通业务调用读取已确认值和对应凭据。~subscribe_module~ 在生效值提交后发送原有结构的变更事件。监控处理函数通过该次请求的句柄获取候选快照。
+
+~GET /editing/{module_id}~ 的 ~data~ 对应 YAML 的 ~modules[module_id]~ ，~monitor_states~ 对应 ~monitor_states[module_id]~ 。普通字段返回原始值，受监控字段返回完整的 ~accepted~ 和 ~editing~ 槽位，含各自的版本。模块没有用户设置时返回空 ~data~ 。默认值由 ~GET /data/{module_id}~ 解析。响应范围是模块注册的配置，密码槽位保留版本和操作，值用设置状态表示。
 
 #+begin_src json
 {
   "module_id": "slack",
-  "values": {
-    "teams": {"value": [{"team_id": "TDEMO", "name": "旧名称"}], "source": "user"}
+  "data": {
+    "teams": [
+      {
+        "team_id": "TDEMO",
+        "name": {
+          "accepted": {"revision": "7b217e7c-146c-45f7-95bc-56584179277e", "value": "旧名称"},
+          "editing": {"revision": "509b6a1d-9fa6-41dc-9326-36b15f79ce7c", "value": "新名称"}
+        }
+      }
+    ]
   },
-  "edits": [
-    {"path": ["teams", "TDEMO", "name"], "monitor": "team", "instance": "TDEMO",
-     "operation": "set", "value": "新名称"}
-  ],
-  "monitors": [
-    {"monitor": "team", "instance": "TDEMO", "status": "pending",
+  "monitor_states": [
+    {"monitor": "team", "item": "teams", "instance": "TDEMO", "status": "pending",
      "revision": "509b6a1d-9fa6-41dc-9326-36b15f79ce7c"}
   ]
 }
 #+end_src
 
-记录新增或删除使用记录路径及对应操作。跨项 ~PATCH~ 请求体使用 ~changes~ 数组，每项包含 ~path~ 、 ~operation~ ，设置时另带 ~value~ 。结构字段路径为 ~[key, field]~ ，带主键记录的字段路径为 ~[key, instance, field]~ 。路径与操作按元数据校验。批量写入逐项执行现有写入权限和本机鉴权。编辑视图供本机使用，远端读取继续按现有字段权限过滤已确认值。
+配置写入统一使用 ~/editing~ 下的路径。跨项 ~PATCH~ 请求体使用 ~changes~ 数组，每项包含 ~path~ 、 ~operation~ ，设置时另带 ~value~ 。结构字段路径为 ~[key, field]~ ，带主键记录的字段路径为 ~[key, instance, field]~ 。记录新增或删除使用记录路径及对应操作。路径与操作按元数据校验。批量写入逐项执行现有写入权限和本机鉴权。编辑快照供本机查询，远端读取继续按现有字段权限过滤已确认值。
 
 一次请求中，每个监控组对修改后的完整候选快照执行一次处理，包括该组以前保存的编辑和未改动的有效值。局部更新基于已有编辑值，没有编辑值时使用生效值。完成格式、类型和权限校验后，配置中心在同一事务里写入普通字段和所有候选编辑，再入队处理。包含待确认编辑的请求返回 ~202~ 及相应版本，普通字段此时已生效。格式或类型校验错误沿用 HTTP 错误模型，写入前返回。业务处理成功或失败由后续编辑视图反映。
 
 ** 业务结果与重试
 
 - 处理函数收到监控点、实例、~revision~ 、本次变更字段、已确认和候选快照。业务只通过此处理请求携带的句柄调用结果 API，结果写入范围限定为对应监控组和版本。
-- ~accept(change, output, clear_error)~ 将该版本的编辑值原子转入 ~accepted~ ，清空 ~editing~ ，并校验和写入业务派生的只读字段。业务传入 ~clear_error: true~ 时在同一事务清除错误。~set_error(change, error)~ 保存错误及其字段范围，待用户修正。需要单独清理时，业务可通过该组当前版本的句柄调用 ~clear_error(change)~ 。配置中心在结果落盘后更新快照和订阅。
+- 业务通过内部响应确认当前版本。~200~ 或 ~204~ 将该版本的编辑值转入 ~accepted~ ，同时清理错误。业务也可返回 ~NotificationConfirmedFields~ ，配置中心校验并一并写入派生字段。业务通过 ~NotificationValidationError~ 报告失败，配置中心保留候选以及业务错误。~202~ 保留待确认状态。
 - ~set_error~ 之后，修改该组的配置会生成新版本并重新投递。若修改后的值碰巧等于生效值，只要与此前编辑值不同，也需要重新处理。旧错误保留到业务明确替换或清理。其他组的写入和界面刷新无需调度该组。
 - 同一组串行处理，新保存的编辑可在该组排队。旧版本的结果无法应用到新版本。有外部状态的处理器在确认落盘后切换活动状态，或在接受失败时回退处理期间的外部操作。不同组可并行处理。进程重启后恢复未完成的待确认和处理中版本，业务按版本识别重复投递。已报告失败的版本等待编辑。存储或投递失败按配置基础设施错误处理，由配置中心保持可恢复的待确认版本。
 
@@ -317,11 +258,11 @@ _system: {}
 
 错误按监控组展示一次，并按 ~error.fields~ 标记关联字段。密码用「已设置」「已更换」「待移除」等状态表达前后差异。本地格式错误标在相应输入上。重提期间若错误来自前一版，标为「上次处理失败」并同时显示当前处理进度。业务清理错误后，该信息随最新快照消失。
 
-保存一项、记录或模块时，收集相应范围的所有已修改字段并发出一次请求。保存中仍可继续输入，响应用于推进已提交基线。只要当前输入未随同该次请求提交，就保留为本地修改。刷新读取 ~view=editing~ ，从服务端重建生效值、已提交编辑和错误，并保留本地尚未提交的输入。编辑页可在有处理中版本且 buffer 可见时定期读取状态，收到确认后将新生效值显示在原位置。关闭页面停止查询。
+保存一项、记录或模块时，收集相应范围的所有已修改字段并向 ~/editing~ 发出一次请求。保存中仍可继续输入，响应用于推进已提交基线。只要当前输入未随同该次请求提交，就保留为本地修改。刷新读取 ~GET /editing/{module_id}~ ，从服务端重建已确认值、已提交编辑和错误，并保留本地尚未提交的输入。没有已确认值时，使用 ~GET /data/{module_id}~ 返回的 ~source: default~ 值作为显示基线。编辑页可在有处理中版本且 buffer 可见时定期读取状态，收到确认后将新生效值显示在原位置。关闭页面停止查询。
 
 ** 一次性转换与切换
 
-用新元数据逐项转换现有 YAML 中已保存的用户值。受监控字段的旧值直接进入 ~accepted: {value: ...}~ ，~editing~ 置空。普通字段、未知用户配置及 ~_system~ 内部数据原样带入对应位置，缺失的值继续由默认值规则解析。
+用新元数据逐项转换现有 YAML 中已保存的用户值。受监控字段的旧值直接进入带初始版本的 ~accepted~ ，~editing~ 置空。普通字段、未知用户配置及 ~_system~ 内部数据原样带入对应位置，缺失的值继续由默认值规则解析。
 
 | 现有配置 | 转换后的监控 |
 |----------+--------------|
@@ -333,4 +274,4 @@ _system: {}
 
 如有旧 ~_pending_config_notifications~ ，按记录及字段拆成候选槽位，保留请求操作、候选密码引用及错误。用旧记录的已确认值比较候选，输出到对应监控组；旧的整条记录新增或删除写入生命周期监控。快照中检查过的本机配置没有待确认记录。
 
-切换时先停止配置写入，备份旧文件，再离线转换到同目录临时文件。校验新文件及已确认值的投影与旧生效配置一致后，以 ~0600~ 权限原子替换，随后启用配套的 services 和 Emacs。正常启动只接受新格式。转换过程仅处理文件和加密引用，已迁入 ~accepted~ 的值直接作为启动配置加载。
+切换时先停止 services，执行新版 ~loki-services migrate-config~ 。该命令备份旧文件并将转换结果写入同目录临时文件。校验新文件及已确认值的投影与旧生效配置一致后，以 ~0600~ 权限原子替换，随后启用配套的 services 和 Emacs。Emacs、Slack 工作区配置页及其他配置写入调用方一并切换到 ~/editing~ 。正常启动只接受新格式。转换过程仅处理文件和加密引用，已迁入 ~accepted~ 的值直接作为启动配置加载。

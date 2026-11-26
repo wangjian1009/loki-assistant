@@ -75,7 +75,9 @@ impl StoredConfig {
             if !system.0.is_empty() {
                 snapshot.insert(SECTION.to_owned(), system.0.clone());
             }
-            storage.write(snapshot).await?;
+            storage
+                .write(super::snapshot::Snapshot::encode(snapshot))
+                .await?;
         }
         Ok(())
     }

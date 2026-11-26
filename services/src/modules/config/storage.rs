@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -9,7 +9,8 @@ use std::{
 
 use serde_json::{Map, Value};
 
-use super::service::ConfigServiceError;
+use super::service::{ConfigServiceError, snapshot::Snapshot};
+use serde::de::DeserializeOwned;
 
 pub(super) type StoredValues = HashMap<String, Map<String, Value>>;
 
@@ -25,35 +26,63 @@ impl FileStorage {
         })
     }
 
-    pub fn read(&self) -> Result<StoredValues, ConfigServiceError> {
+    pub fn read(&self) -> Result<Option<Snapshot>, ConfigServiceError> {
+        self.read_typed()
+    }
+
+    pub fn read_legacy(&self) -> Result<Option<StoredValues>, ConfigServiceError> {
+        match self.read() {
+            Ok(Some(snapshot)) => {
+                snapshot.decode()?;
+                Ok(None)
+            }
+            Ok(None) => Ok(None),
+            Err(_) => self.read_typed(),
+        }
+    }
+
+    fn read_typed<T: DeserializeOwned>(&self) -> Result<Option<T>, ConfigServiceError> {
         let mut file = match open_private_file(&self.path) {
             Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(StoredValues::new()),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(storage_error(error)),
         };
         let mut text = String::new();
         file.read_to_string(&mut text).map_err(storage_error)?;
-        serde_yaml_ng::from_str::<Option<StoredValues>>(&text)
-            .map(Option::unwrap_or_default)
-            .map_err(|error| {
-                let location = error.location().map_or_else(String::new, |location| {
-                    format!("（第 {} 行，第 {} 列）", location.line(), location.column())
-                });
-                ConfigServiceError::Storage(format!(
-                    "配置文件 {} 格式无效{location}。",
-                    self.path.display()
-                ))
-            })
+        serde_yaml_ng::from_str(&text).map(Some).map_err(|error| {
+            let location = error.location().map_or_else(String::new, |location| {
+                format!("（第 {} 行，第 {} 列）", location.line(), location.column())
+            });
+            ConfigServiceError::Storage(format!(
+                "配置文件 {} 格式无效{location}。",
+                self.path.display()
+            ))
+        })
     }
 
-    pub async fn write(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
+    pub async fn write(&self, snapshot: Snapshot) -> Result<(), ConfigServiceError> {
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || storage.write_atomic(values))
+        tokio::task::spawn_blocking(move || storage.write_atomic(snapshot))
             .await
             .map_err(storage_error)?
     }
 
-    pub(super) fn write_atomic(&self, values: StoredValues) -> Result<(), ConfigServiceError> {
+    pub fn back_up(&self) -> Result<(), ConfigServiceError> {
+        let backup = self
+            .path
+            .with_extension(format!("yml.v1.{}.bak", uuid::Uuid::new_v4()));
+        let mut source = open_private_file(&self.path).map_err(storage_error)?;
+        let mut target = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(backup)
+            .map_err(storage_error)?;
+        io::copy(&mut source, &mut target).map_err(storage_error)?;
+        target.sync_all().map_err(storage_error)
+    }
+
+    pub(super) fn write_atomic(&self, snapshot: Snapshot) -> Result<(), ConfigServiceError> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let parent = self.path.parent().expect("绝对配置路径应包含父目录");
         fs::DirBuilder::new()
@@ -73,8 +102,7 @@ impl FileStorage {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let text = serde_yaml_ng::to_string(&values.into_iter().collect::<BTreeMap<_, _>>())
-            .map_err(storage_error)?;
+        let text = serde_yaml_ng::to_string(&snapshot).map_err(storage_error)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
