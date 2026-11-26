@@ -392,7 +392,9 @@
       (switch-to-buffer (current-buffer))
       (loki-assistant-llm-usage-mode)
       (setq loki-assistant-llm-usage--current 'live)
-      (let ((filter '((protocols . ["codex"]) (clients . []) (upstreams . ["work"])))
+      (let ((filter '((protocols . ["codex"])
+                      (clients . ["1c30befd-aacd-419b-b0f3-8d72680d275b"])
+                      (upstreams . ["work" "personal"])))
             saved)
         (cl-letf (((symbol-function 'loki-assistant-request)
                    (lambda (method path &rest options)
@@ -400,8 +402,7 @@
                      (if (equal method "GET")
                          (funcall (plist-get options :callback)
                                   (list :ok t :data
-                                        (list '(enabled . :false)
-                                              (cons 'history (vector filter)))))
+                                        (list (cons 'history (vector filter)))))
                        (should (equal method "PATCH"))
                        (setq saved (plist-get options :body)))))
                   ((symbol-function 'completing-read)
@@ -409,7 +410,7 @@
                      (car (seq-find (lambda (choice)
                                       (string-prefix-p "最近 1 ·" (car choice))) choices)))))
           (call-interactively (key-binding (kbd "m")))
-          (should (equal saved (list '(enabled . t) (cons 'filter filter)))))))))
+          (should (equal saved (list (cons 'filter filter)))))))))
 
 (provide 'loki-assistant-llm-usage-tests)
 ;;; loki-assistant-llm-usage-tests.el ends here

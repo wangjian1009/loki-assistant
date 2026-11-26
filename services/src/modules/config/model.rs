@@ -83,6 +83,8 @@ pub struct ConfigItemMetadata {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ConfigItemOptions {
+    #[serde(skip)]
+    pub validate_value: Option<fn(&Value) -> Result<(), String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integer_range: Option<IntegerRange>,
     #[serde(skip)]

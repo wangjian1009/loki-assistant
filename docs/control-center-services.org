@@ -764,7 +764,7 @@ Codex 使用 Responses HTTP/SSE，客户端的自定义供应商可设置 ~wire_
 | GET | ~/llm/requests~ | 只读查询在途请求与最近结束的推理请求 |
 | GET | ~/llm/requests/{id}~ | 按 ID 从本机缓存查询请求详情 |
 | GET | ~/llm/requests/{id}/raw/{part}~ | 读取请求或响应原始正文 |
-| GET、PATCH | ~/llm/monitoring~ | 查询和修改详情监控的开关、范围和保留条数 |
+| GET、PATCH | ~/llm/monitoring~ | 查询当前过滤器和历史，设置或取消过滤器 |
 | GET | ~/llm/usage~ | 按客户端 ID 和供应商读取累计用量 |
 | GET | ~/llm/usage/sessions~ | 按客户端 ID、供应商和会话标识读取累计用量 |
 

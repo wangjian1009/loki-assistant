@@ -714,23 +714,30 @@
                                                  clients ",")))
                             (when (length> upstreams 0)
                               (concat "供应商 " (string-join upstreams ",")))))))
-    (if parts (string-join parts " · ") "全部请求")))
+    (if parts (string-join parts " · ") "未设置过滤条件")))
+
+(defun loki-assistant-llm-usage--monitoring-active-p (filter)
+  "判断 FILTER 是否包含监控条件。"
+  (seq-some (lambda (key) (length> (alist-get key filter) 0))
+            '(protocols clients upstreams)))
 
 (defun loki-assistant-llm-usage--read-monitoring-filter (filter)
   (cl-loop for (key label) in '((protocols "协议（codex 或 claude）")
                                (clients "客户端 UUID")
                                (upstreams "供应商 ID"))
-           for input = (read-string (concat label "，逗号分隔，空为全部：")
+           for input = (read-string (concat label "，逗号分隔，留空表示不限该维度：")
                                     (string-join (alist-get key filter) ","))
            collect (cons key (vconcat (split-string input "[,， \t]+" t)))))
 
-(defun loki-assistant-llm-usage--save-monitoring (patch)
+(defun loki-assistant-llm-usage--save-monitoring (filter)
   (loki-assistant-request
-   "PATCH" "/llm/monitoring" :body patch
+   "PATCH" "/llm/monitoring" :body (list (cons 'filter filter))
    :callback (lambda (reply)
                (if (plist-get reply :ok)
                    (message "请求监控已%s"
-                            (if (eq t (alist-get 'enabled (plist-get reply :data))) "开启" "关闭"))
+                            (if (loki-assistant-llm-usage--monitoring-active-p
+                                 (alist-get 'filter (plist-get reply :data)))
+                                "开启" "关闭"))
                  (message "%s" (or (plist-get reply :error-message) "保存请求监控配置失败"))))))
 
 (defun loki-assistant-llm-usage-monitoring ()
@@ -740,8 +747,7 @@
     (user-error "请在实时请求列表中设置监控"))
   (let* ((origin (current-buffer))
          (state (loki-assistant-llm-usage--state))
-         (names (alist-get 'client_names (loki-assistant-llm-usage--view-data state)))
-         (client (ignore-errors (alist-get 'client_id (loki-assistant-llm-usage--item)))))
+         (names (alist-get 'client_names (loki-assistant-llm-usage--view-data state))))
     (loki-assistant-request
      "GET" "/llm/monitoring"
      :callback
@@ -752,13 +758,11 @@
              (message "%s" (or (plist-get reply :error-message) "读取请求监控配置失败"))
            (let* ((settings (plist-get reply :data))
                   (filter (alist-get 'filter settings))
-                  (enabled (eq t (alist-get 'enabled settings)))
+                  (enabled (loki-assistant-llm-usage--monitoring-active-p filter))
                   (actions
                    (append
-                    (list (cons (if enabled "关闭监控" "开启当前范围") 'toggle)
-                          '("配置范围并开启" . configure)
-                          '("设置保留条数" . retention))
-                    (when client '(("仅监控选中请求的客户端" . client)))
+                    '(("设置过滤器" . configure))
+                    (when enabled '(("取消过滤器" . clear)))
                     (cl-loop for recent across (vconcat (alist-get 'history settings))
                              for index from 1
                              collect (cons (format "最近 %d · %s" index
@@ -772,14 +776,9 @@
                   (action (cdr (assoc choice actions))))
              (loki-assistant-llm-usage--save-monitoring
               (pcase action
-                ('toggle (list (cons 'enabled (if enabled :false t))))
-                ('configure (list '(enabled . t)
-                                  (cons 'filter (loki-assistant-llm-usage--read-monitoring-filter filter))))
-                ('retention (let ((count (read-number "保留条数：" (alist-get 'retention settings))))
-                              (unless (natnump count) (user-error "保留条数须为非负整数"))
-                              (list (cons 'retention count))))
-                ('client (list '(enabled . t) (list 'filter (cons 'clients (vector client)))))
-                (_ (list '(enabled . t) (cons 'filter action))))))))))))
+                ('configure (loki-assistant-llm-usage--read-monitoring-filter filter))
+                ('clear (make-hash-table :test #'equal))
+                (_ action))))))))))
 
 (defun loki-assistant-llm-usage--open-request (row state live)
   (let* ((origin (current-buffer))

@@ -77,22 +77,66 @@ async fn json_body(response: Response) -> Value {
 }
 
 #[tokio::test]
-async fn monitoring_settings_survive_restart_and_keep_ten_recent_filters() {
+async fn monitoring_filters_and_independent_settings_survive_restart() {
     let directory = Directory::new();
     let (app, _notifications) = persistent_router(&directory).await;
     let settings = json_body(invoke(&app, Method::GET, "/llm/monitoring", None, None).await).await;
-    assert_eq!(settings["retention"], 500);
+    assert_eq!(settings, json!({"filter":{},"history":[]}));
+    let client_id = Uuid::new_v4();
     for index in 0..12 {
-        let filter = json!({"upstreams":[format!("work-{index}"), format!("work-{index}")]});
+        let filter = json!({
+            "protocols":["codex"],
+            "clients":[client_id],
+            "upstreams":[format!("work-{index}"), format!("work-{index}")],
+        });
         let response = invoke(
             &app,
             Method::PATCH,
             "/llm/monitoring",
             None,
-            Some(json!({"enabled":true,"filter":filter})),
+            Some(json!({"filter":filter})),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+    for patch in [
+        json!({"enabled":true}),
+        json!({"retention":8}),
+        json!({"filter":null}),
+    ] {
+        assert_eq!(
+            invoke(&app, Method::PATCH, "/llm/monitoring", None, Some(patch))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for (key, body, status) in [
+        ("monitoring_retention", json!(-1), StatusCode::BAD_REQUEST),
+        (
+            "monitoring_filter",
+            json!({"protocols":["invalid"]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "monitoring_history",
+            json!([{"clients":["invalid"]}]),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("monitoring_retention", json!(8), StatusCode::OK),
+    ] {
+        assert_eq!(
+            invoke(
+                &app,
+                Method::PUT,
+                &format!("/editing/llm/{key}"),
+                None,
+                Some(body)
+            )
+            .await
+            .status(),
+            status
+        );
     }
     let disabled = json_body(
         invoke(
@@ -100,12 +144,12 @@ async fn monitoring_settings_survive_restart_and_keep_ten_recent_filters() {
             Method::PATCH,
             "/llm/monitoring",
             None,
-            Some(json!({"enabled":false,"retention":8})),
+            Some(json!({"filter":{}})),
         )
         .await,
     )
     .await;
-    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["filter"], json!({}));
     assert_eq!(disabled["history"].as_array().unwrap().len(), 10);
     assert_eq!(disabled["history"][0]["upstreams"], json!(["work-11"]));
     assert_eq!(disabled["history"][9]["upstreams"], json!(["work-2"]));
@@ -119,15 +163,36 @@ async fn monitoring_settings_survive_restart_and_keep_ten_recent_filters() {
             Method::PATCH,
             "/llm/monitoring",
             None,
-            Some(json!({"enabled":true,"filter":settings["history"][5]})),
+            Some(json!({"filter":settings["history"][5]})),
         )
         .await,
     )
     .await;
-    assert_eq!(restored["enabled"], true);
-    assert_eq!(restored["retention"], 8);
-    assert_eq!(restored["history"][0]["upstreams"], json!(["work-6"]));
+    assert_eq!(
+        restored["filter"],
+        json!({"protocols":["codex"],"clients":[client_id],"upstreams":["work-6"]})
+    );
+    assert_eq!(restored["history"][0], restored["filter"]);
     assert_eq!(restored["history"].as_array().unwrap().len(), 10);
+    let values = json_body(invoke(&restarted, Method::GET, "/data/llm", None, None).await).await;
+    assert_eq!(values["values"]["monitoring_retention"]["value"], 8);
+    let custom_history = json!([{"protocols":["claude"]}]);
+    assert_eq!(
+        invoke(
+            &restarted,
+            Method::PUT,
+            "/editing/llm/monitoring_history",
+            None,
+            Some(custom_history.clone())
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let edited =
+        json_body(invoke(&restarted, Method::GET, "/llm/monitoring", None, None).await).await;
+    assert_eq!(edited["filter"], restored["filter"]);
+    assert_eq!(edited["history"], custom_history);
 }
 
 async fn provider(app: &Router, id: &str, record: Value) {
@@ -223,6 +288,18 @@ async fn proxies_native_streams_and_accounts_to_the_binding_at_request_start() {
     .await;
 
     let app = crate::http::router(Arc::new(RuntimeState::default()));
+    assert_eq!(
+        invoke(
+            &app,
+            Method::PATCH,
+            "/llm/monitoring",
+            None,
+            Some(json!({"filter":{"protocols":["codex","claude"]}}))
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
     provider(
         &app,
         "a",
@@ -1228,6 +1305,18 @@ async fn chat_completions_records_the_model_with_or_without_upstream_metadata() 
     ))
     .await;
     let app = crate::http::router(Arc::new(RuntimeState::default()));
+    assert_eq!(
+        invoke(
+            &app,
+            Method::PATCH,
+            "/llm/monitoring",
+            None,
+            Some(json!({"filter":{"protocols":["codex","claude"]}}))
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
     provider(&app, "work", json!({"codex_uri":format!("{upstream}/v1")})).await;
     let (_, token) = issue(&app, "work").await;
     let bearer = format!("Bearer {token}");

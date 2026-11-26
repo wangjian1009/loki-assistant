@@ -8,8 +8,10 @@ use axum::{
     routing::post,
 };
 use loki_services_macros::loki_config;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use url::Url;
+use uuid::Uuid;
 
 use crate::modules::config::{
     model::{
@@ -17,7 +19,10 @@ use crate::modules::config::{
         ConfigModuleMetadata, FieldOptions, ListMetadata, StructureField, StructureMetadata,
     },
     registry::ConfigItemRegistration,
-    service::{NotificationConfirmedFields, NotificationRequest, NotificationValidationError},
+    service::{
+        ConfigService, ConfigServiceError, NotificationConfirmedFields, NotificationRequest,
+        NotificationValidationError,
+    },
 };
 
 pub(super) const MODULE: &str = "llm";
@@ -25,9 +30,13 @@ pub(super) const PROVIDERS: &str = "providers";
 pub(super) const CLIENTS: &str = "clients";
 pub(super) const PROVIDER_TOKEN: &str = "token";
 const CLIENT_NOTIFICATION: &str = "/llm/config/clients";
-use super::archive::Settings;
+use super::protocol::Protocol;
 use super::service::LlmService;
-pub(super) const MONITORING: &str = "monitoring";
+pub(super) const MONITORING_FILTER: &str = "monitoring_filter";
+const MONITORING_HISTORY: &str = "monitoring_history";
+pub(super) const MONITORING_RETENTION: &str = "monitoring_retention";
+const DEFAULT_RETENTION: usize = 500;
+const HISTORY_LIMIT: usize = 10;
 const PROVIDER_NOTIFICATION: &str = "/llm/config/providers";
 
 #[loki_config]
@@ -48,23 +57,235 @@ fn metadata() -> ConfigModuleMetadata {
                 "LLM 客户端",
                 "填写名称和供应商，保存时自动生成客户端令牌。",
             ),
+            setting(
+                MONITORING_FILTER,
+                "请求详情监控条件",
+                "填写 protocols、clients 或 upstreams 数组，条件为空时关闭详情采集。",
+                ConfigDataType::Dictionary,
+                json!({}),
+            ),
             ConfigItemMetadata {
-                key: MONITORING.into(),
-                name: "请求详情监控".into(),
-                description: "通过实时请求的监控设置修改范围、保留条数和最近使用的过滤条件。"
-                    .into(),
-                data_type: ConfigDataType::Dictionary,
-                default: Some(json!(Settings::default())),
-                dictionary: None,
-                remote_access: Default::default(),
-                required: false,
-                list: None,
-                checker: None,
-                file_path: None,
-                executable: None,
+                list: Some(ListMetadata {
+                    item_type: ConfigDataType::Dictionary,
+                    min_items: None,
+                    max_items: Some(HISTORY_LIMIT),
+                }),
+                ..setting(
+                    MONITORING_HISTORY,
+                    "请求监控过滤历史",
+                    "保存最近使用的过滤条件，可从实时请求列表恢复。",
+                    ConfigDataType::List,
+                    json!([]),
+                )
             },
+            setting(
+                MONITORING_RETENTION,
+                "请求详情保留条数",
+                "保留最近的请求详情缓存条数。设为 0 时清理已完成的缓存。",
+                ConfigDataType::Integer,
+                json!(DEFAULT_RETENTION),
+            ),
         ],
     }
+}
+
+fn setting(
+    key: &str,
+    name: &str,
+    description: &str,
+    data_type: ConfigDataType,
+    default: Value,
+) -> ConfigItemMetadata {
+    ConfigItemMetadata {
+        key: key.into(),
+        name: name.into(),
+        description: description.into(),
+        data_type,
+        remote_access: Default::default(),
+        required: false,
+        default: Some(default),
+        dictionary: None,
+        list: None,
+        checker: None,
+        file_path: None,
+        executable: None,
+    }
+}
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static FILTER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: MODULE,
+    key: MONITORING_FILTER,
+    options: || ConfigItemOptions {
+        validate_value: Some(|value| {
+            parse_filter(value.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }),
+        ..Default::default()
+    },
+};
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static HISTORY_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: MODULE,
+    key: MONITORING_HISTORY,
+    options: || ConfigItemOptions {
+        validate_value: Some(|value| {
+            parse_history(value.clone())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }),
+        ..Default::default()
+    },
+};
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
+static RETENTION_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
+    module_id: MODULE,
+    key: MONITORING_RETENTION,
+    options: || ConfigItemOptions {
+        validate_value: Some(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .map(|_| ())
+                .ok_or_else(|| "请求详情保留条数须为可表示的非负整数。".into())
+        }),
+        ..Default::default()
+    },
+};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct Filter {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    protocols: Vec<Protocol>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    clients: Vec<Uuid>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    upstreams: Vec<String>,
+}
+
+impl Filter {
+    fn normalize(&mut self) {
+        self.protocols.sort_unstable();
+        self.protocols.dedup();
+        self.clients.sort_unstable();
+        self.clients.dedup();
+        for upstream in &mut self.upstreams {
+            *upstream = upstream.trim().to_owned();
+        }
+        self.upstreams.retain(|upstream| !upstream.is_empty());
+        self.upstreams.sort_unstable();
+        self.upstreams.dedup();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.protocols.is_empty() && self.clients.is_empty() && self.upstreams.is_empty()
+    }
+
+    pub(super) fn matches(&self, request: &super::protocol::RequestStatus) -> bool {
+        !self.is_empty()
+            && (self.protocols.is_empty() || self.protocols.contains(&request.protocol))
+            && (self.clients.is_empty() || self.clients.contains(&request.client_id))
+            && (self.upstreams.is_empty() || self.upstreams.contains(&request.upstream))
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct MonitoringFilters {
+    filter: Filter,
+    history: Vec<Filter>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MonitoringPatch {
+    pub filter: Filter,
+}
+
+fn parse_filter(value: Value) -> Result<Filter, ConfigServiceError> {
+    let mut filter: Filter = serde_json::from_value(value)
+        .map_err(|_| ConfigServiceError::InvalidValue("请求监控条件格式无效。".into()))?;
+    filter.normalize();
+    Ok(filter)
+}
+
+fn parse_history(value: Value) -> Result<Vec<Filter>, ConfigServiceError> {
+    let filters: Vec<Filter> = serde_json::from_value(value)
+        .map_err(|_| ConfigServiceError::InvalidValue("请求监控过滤历史格式无效。".into()))?;
+    Ok(normalize_history(filters))
+}
+
+fn normalize_history(filters: impl IntoIterator<Item = Filter>) -> Vec<Filter> {
+    let mut history = Vec::new();
+    for mut filter in filters {
+        filter.normalize();
+        if !filter.is_empty() && !history.contains(&filter) {
+            history.push(filter);
+            if history.len() == HISTORY_LIMIT {
+                break;
+            }
+        }
+    }
+    history
+}
+
+pub(super) async fn monitoring_filter(
+    config: &ConfigService,
+) -> Result<Filter, ConfigServiceError> {
+    parse_filter(config.value(MODULE, MONITORING_FILTER).await?.value)
+}
+
+pub(super) async fn monitoring(
+    config: &ConfigService,
+) -> Result<MonitoringFilters, ConfigServiceError> {
+    let mut values = config.module_values(MODULE).await?;
+    Ok(MonitoringFilters {
+        filter: parse_filter(
+            values
+                .remove(MONITORING_FILTER)
+                .expect("监控条件有默认值")
+                .value,
+        )?,
+        history: parse_history(
+            values
+                .remove(MONITORING_HISTORY)
+                .expect("过滤历史有默认值")
+                .value,
+        )?,
+    })
+}
+
+pub(super) async fn set_monitoring_filter(
+    config: &ConfigService,
+    mut filter: Filter,
+) -> Result<MonitoringFilters, ConfigServiceError> {
+    filter.normalize();
+    config
+        .update_items(MODULE, move |items| {
+            let mut history = stored_history(items)?;
+            let mut updates = Map::new();
+            updates.insert(MONITORING_FILTER.into(), json!(filter));
+            if !filter.is_empty() {
+                history.retain(|item| item != &filter);
+                history.insert(0, filter.clone());
+                history.truncate(HISTORY_LIMIT);
+                updates.insert(MONITORING_HISTORY.into(), json!(history));
+            }
+            Ok((updates, MonitoringFilters { filter, history }))
+        })
+        .await
+}
+
+fn stored_history(items: &Map<String, Value>) -> Result<Vec<Filter>, ConfigServiceError> {
+    items
+        .get(MONITORING_HISTORY)
+        .cloned()
+        .map(parse_history)
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn collection(key: &str, name: &str, description: &str) -> ConfigItemMetadata {

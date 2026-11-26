@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, future::Future, pin::Pin};
 
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
 use crate::process::Process;
@@ -369,6 +369,78 @@ impl ConfigService {
         module_id: &str,
     ) -> Result<BTreeMap<String, ConfigValue>, ConfigServiceError> {
         self.module_values_for(module_id, false).await
+    }
+
+    /// 在配置写入队列中读取并原子更新模块的普通配置项。
+    pub(crate) async fn update_items<T: Send + 'static>(
+        &self,
+        module_id: &str,
+        update: impl FnOnce(&Map<String, Value>) -> Result<(Map<String, Value>, T), ConfigServiceError>
+        + Send
+        + 'static,
+    ) -> Result<T, ConfigServiceError> {
+        let metadata = self.module_metadata(module_id).await?;
+        let module_id = module_id.to_owned();
+        let service = self.clone();
+        self.commits
+            .run(async move {
+                let mut values = service.stored_values().await;
+                let items = values.entry(module_id.clone()).or_default();
+                let (updates, result) = update(items)?;
+                let mut changes = Vec::new();
+                for (key, value) in updates {
+                    let item =
+                        metadata
+                            .item(&key)
+                            .ok_or_else(|| ConfigServiceError::ItemNotFound {
+                                module_id: module_id.clone(),
+                                key: key.clone(),
+                            })?;
+                    if items.get(&key) == Some(&value) {
+                        continue;
+                    }
+                    let options = item_options(&module_id, &key);
+                    if options.monitor.is_some()
+                        || options.structure.is_some()
+                        || options.read_only
+                        || options.requires_local_auth
+                        || item.data_type.is_password()
+                    {
+                        return Err(ConfigServiceError::InvalidValue(format!(
+                            "配置项 {key} 需要专用写入流程。"
+                        )));
+                    }
+                    let normalized = service.normalize_value(&module_id, item, &value).await?;
+                    let previous_value = service
+                        .resolve_value(item, items.get(&key))
+                        .await?
+                        .map(|data| data.value);
+                    items.insert(key.clone(), normalized);
+                    changes.push((key, previous_value));
+                }
+                if changes.is_empty() {
+                    return Ok(result);
+                }
+                service.persist_values(values).await?;
+                if let Ok(effective) = service.module_values(&module_id).await {
+                    let effective: BTreeMap<_, _> = effective
+                        .into_iter()
+                        .map(|(key, data)| (key, data.value))
+                        .collect();
+                    for (key, previous_value) in changes {
+                        let _ = service.changes.send(ConfigChange {
+                            module_id: module_id.clone(),
+                            value: effective.get(&key).cloned().unwrap_or(Value::Null),
+                            key,
+                            operation: ConfigChangeOperation::Replace,
+                            previous_value,
+                            module_values: effective.clone(),
+                        });
+                    }
+                }
+                Ok(result)
+            })
+            .await
     }
 
     pub(super) async fn module_values_for(
@@ -1762,6 +1834,9 @@ impl ConfigItemMetadata {
                     self.key
                 )));
             }
+        }
+        if let Some(validate) = options.validate_value {
+            validate(value).map_err(ConfigServiceError::InvalidValue)?;
         }
         Ok(())
     }

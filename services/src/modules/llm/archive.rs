@@ -17,80 +17,23 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use super::{
-    config::{MODULE, MONITORING},
+    config::{Filter, MODULE, MONITORING_RETENTION},
     history::request_snapshot,
     instructions::{Capture, Format},
-    protocol::{Phase, Protocol, RequestStatus},
+    protocol::{Phase, RequestStatus},
     transcript::Input,
     usage::UsageReader,
 };
-use crate::{http::error::API_VERSION, modules::config::service::ConfigService, process::Process};
+use crate::{http::error::API_VERSION, modules::config::service::ConfigService};
 
 const REQUEST: u8 = 1;
 const RESPONSE: u8 = 2;
 const META: u8 = 3;
-const HISTORY_LIMIT: usize = 10;
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub(super) struct Filter {
-    protocols: Vec<Protocol>,
-    clients: Vec<Uuid>,
-    upstreams: Vec<String>,
-}
-
-impl Filter {
-    fn normalize(&mut self) {
-        self.protocols.sort_unstable();
-        self.protocols.dedup();
-        self.clients.sort_unstable();
-        self.clients.dedup();
-        self.upstreams.retain(|upstream| !upstream.is_empty());
-        self.upstreams.sort_unstable();
-        self.upstreams.dedup();
-    }
-
-    fn matches(&self, request: &RequestStatus) -> bool {
-        (self.protocols.is_empty() || self.protocols.contains(&request.protocol))
-            && (self.clients.is_empty() || self.clients.contains(&request.client_id))
-            && (self.upstreams.is_empty() || self.upstreams.contains(&request.upstream))
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub(super) struct Settings {
-    enabled: bool,
-    retention: usize,
-    filter: Filter,
-    history: Vec<Filter>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            retention: 500,
-            filter: Filter::default(),
-            history: Vec::new(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct SettingsPatch {
-    enabled: Option<bool>,
-    retention: Option<usize>,
-    filter: Option<Filter>,
-}
-
 #[derive(Debug)]
 pub(crate) struct Archive {
     directory: PathBuf,
     temporary: bool,
     active: Mutex<BTreeSet<Uuid>>,
-    changes: Process<()>,
 }
 
 impl Archive {
@@ -102,63 +45,7 @@ impl Archive {
             }),
             temporary,
             active: Mutex::new(BTreeSet::new()),
-            changes: Process::start(()),
         })
-    }
-
-    pub(super) async fn settings(config: &ConfigService) -> Result<Settings, String> {
-        let value = config
-            .value(MODULE, MONITORING)
-            .await
-            .map_err(|err| err.to_string())?;
-        let mut settings: Settings =
-            serde_json::from_value(value.value).map_err(|err| err.to_string())?;
-        settings.filter.normalize();
-        let mut history = Vec::new();
-        for mut filter in settings.history {
-            filter.normalize();
-            if !history.contains(&filter) {
-                history.push(filter);
-                if history.len() == HISTORY_LIMIT {
-                    break;
-                }
-            }
-        }
-        settings.history = history;
-        Ok(settings)
-    }
-
-    pub(super) async fn change(
-        &self,
-        config: Arc<ConfigService>,
-        patch: SettingsPatch,
-    ) -> Result<Settings, String> {
-        self.changes
-            .run(async move {
-                let mut settings = Self::settings(&config).await?;
-                let selected = patch.filter.is_some() || patch.enabled == Some(true);
-                if let Some(filter) = patch.filter {
-                    settings.filter = filter;
-                    settings.filter.normalize();
-                }
-                if let Some(enabled) = patch.enabled {
-                    settings.enabled = enabled;
-                }
-                if let Some(retention) = patch.retention {
-                    settings.retention = retention;
-                }
-                if settings.enabled && selected {
-                    settings.history.retain(|filter| filter != &settings.filter);
-                    settings.history.insert(0, settings.filter.clone());
-                    settings.history.truncate(HISTORY_LIMIT);
-                }
-                config
-                    .replace(MODULE, MONITORING, json!(settings))
-                    .await
-                    .map_err(|err| err.to_string())?;
-                Ok(settings)
-            })
-            .await
     }
 
     pub(super) fn schedule(self: &Arc<Self>, config: Arc<ConfigService>) {
@@ -171,9 +58,14 @@ impl Archive {
                 let Some(archive) = archive.upgrade() else {
                     break;
                 };
-                match Self::settings(&config).await {
-                    Ok(settings) => {
-                        if let Err(err) = archive.cleanup(settings.retention).await {
+                match config.value(MODULE, MONITORING_RETENTION).await {
+                    Ok(value) => {
+                        let retention = value
+                            .value
+                            .as_u64()
+                            .and_then(|value| usize::try_from(value).ok())
+                            .expect("保留条数已经校验");
+                        if let Err(err) = archive.cleanup(retention).await {
                             log::warn!("清理 LLM 请求缓存失败：{err}");
                         }
                     }
@@ -185,12 +77,12 @@ impl Archive {
 
     pub(super) async fn begin(
         self: &Arc<Self>,
-        settings: &Settings,
+        filter: &Filter,
         request: &RequestStatus,
         format: Format,
         identity: bool,
     ) -> io::Result<Option<Writer>> {
-        if !settings.enabled || !settings.filter.matches(request) {
+        if !filter.matches(request) {
             return Ok(None);
         }
         let path = self.path(request.id);
@@ -610,15 +502,21 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
+    use crate::modules::llm::protocol::Protocol;
 
     #[tokio::test]
     async fn cleanup_orders_by_start_time_and_preserves_active_files() {
         let archive = Archive::new(None);
-        let mut filter = Settings::default();
-        filter.filter.protocols.push(Protocol::Codex);
+        let client = Uuid::new_v4();
+        let filter: Filter = serde_json::from_value(json!({
+            "protocols": ["codex"],
+            "clients": [Uuid::new_v4(), client],
+            "upstreams": ["work", "personal"],
+        }))
+        .unwrap();
         let mut request = RequestStatus {
             id: Uuid::new_v4(),
-            client_id: Uuid::new_v4(),
+            client_id: client,
             session_id: None,
             upstream: "work".into(),
             protocol: Protocol::Claude,
@@ -631,12 +529,25 @@ mod tests {
         };
         assert!(
             archive
+                .begin(&Filter::default(), &request, Format::Messages, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            archive
                 .begin(&filter, &request, Format::Messages, true)
                 .await
                 .unwrap()
                 .is_none()
         );
         request.protocol = Protocol::Codex;
+        request.client_id = Uuid::new_v4();
+        assert!(!filter.matches(&request));
+        request.client_id = client;
+        request.upstream = "other".into();
+        assert!(!filter.matches(&request));
+        request.upstream = "work".into();
         let latest = request.id;
         let writer = archive
             .begin(&filter, &request, Format::Responses, true)

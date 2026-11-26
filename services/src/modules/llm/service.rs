@@ -20,8 +20,10 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use super::{
-    archive::{self, Archive, Settings, SettingsPatch, Update, Writer},
-    config::{CLIENTS, MODULE, PROVIDER_TOKEN, PROVIDERS, provider_uri},
+    archive::{self, Archive, Update, Writer},
+    config::{
+        self, CLIENTS, Filter, MODULE, MonitoringFilters, PROVIDER_TOKEN, PROVIDERS, provider_uri,
+    },
     instructions::Format,
     monitor::{Monitor, RequestGuard},
     protocol::{Binding, Client, IssuedClient, Phase, Protocol, error},
@@ -332,12 +334,15 @@ impl LlmService {
             .await
     }
 
-    pub(super) async fn monitoring(&self) -> Result<Settings, String> {
-        Archive::settings(&self.config).await
+    pub(super) async fn monitoring(&self) -> Result<MonitoringFilters, ConfigServiceError> {
+        config::monitoring(&self.config).await
     }
 
-    pub(super) async fn change_monitoring(&self, patch: SettingsPatch) -> Result<Settings, String> {
-        self.archive.change(self.config.clone(), patch).await
+    pub(super) async fn change_monitoring(
+        &self,
+        filter: Filter,
+    ) -> Result<MonitoringFilters, ConfigServiceError> {
+        config::set_monitoring_filter(&self.config, filter).await
     }
 
     pub(super) async fn forward(
@@ -380,15 +385,10 @@ impl LlmService {
             self.monitor
                 .start(client, protocol, &parts.headers, track_usage);
         let writer = if track_usage && let Some(format) = Format::for_endpoint(protocol, endpoint) {
-            match self.monitoring().await {
-                Ok(settings) => match self
+            match config::monitoring_filter(&self.config).await {
+                Ok(filter) => match self
                     .archive
-                    .begin(
-                        &settings,
-                        &request,
-                        format,
-                        identity_encoding(&parts.headers),
-                    )
+                    .begin(&filter, &request, format, identity_encoding(&parts.headers))
                     .await
                 {
                     Ok(writer) => writer,

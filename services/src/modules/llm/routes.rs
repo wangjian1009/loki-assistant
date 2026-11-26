@@ -15,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
-    archive::{Settings, SettingsPatch},
+    config::{MonitoringFilters, MonitoringPatch},
     history::{Dimension, Error as HistoryError, OptionsQuery, RequestsQuery, SummaryQuery},
     monitor::{SessionQuery, UsageReport},
     protocol::{Binding, Client, Protocol, SessionUsageRow, UsageRow, error},
@@ -265,11 +265,11 @@ fn detail_error(err: std::io::Error) -> Response {
     method = "GET",
     path = "/llm/monitoring",
     summary = "读取请求监控配置",
-    description = "返回监控开关、范围、保留条数和最近使用的过滤条件。"
+    description = "返回当前过滤条件和最近使用的过滤条件。"
 )]
 async fn get_monitoring(
     State(service): State<Arc<LlmService>>,
-) -> Result<Json<Settings>, Response> {
+) -> Result<Json<MonitoringFilters>, Response> {
     service.monitoring().await.map(Json).map_err(|_| {
         error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -286,12 +286,12 @@ async fn get_monitoring(
     method = "PATCH",
     path = "/llm/monitoring",
     summary = "修改请求监控配置",
-    description = "修改开关、过滤条件或保留条数，启用的过滤条件计入最近使用记录。"
+    description = "设置过滤条件，空条件关闭详情采集，非空条件计入最近使用记录。"
 )]
 async fn update_monitoring(
     State(service): State<Arc<LlmService>>,
-    body: Result<Json<SettingsPatch>, JsonRejection>,
-) -> Result<Json<Settings>, Response> {
+    body: Result<Json<MonitoringPatch>, JsonRejection>,
+) -> Result<Json<MonitoringFilters>, Response> {
     let Json(patch) = body.map_err(|_| {
         error(
             StatusCode::BAD_REQUEST,
@@ -300,7 +300,7 @@ async fn update_monitoring(
         )
     })?;
     service
-        .change_monitoring(patch)
+        .change_monitoring(patch.filter)
         .await
         .map(Json)
         .map_err(|_| {
