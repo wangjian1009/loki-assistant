@@ -80,6 +80,21 @@ async fn json_body(response: Response) -> Value {
 async fn monitoring_filters_and_independent_settings_survive_restart() {
     let directory = Directory::new();
     let (app, _notifications) = persistent_router(&directory).await;
+    let metadata = json_body(invoke(&app, Method::GET, "/meta/llm", None, None).await).await;
+    let items = metadata["items"].as_array().unwrap();
+    let filter = items
+        .iter()
+        .find(|item| item["key"] == "monitoring_filter")
+        .unwrap();
+    let history = items
+        .iter()
+        .find(|item| item["key"] == "monitoring_history")
+        .unwrap();
+    assert_eq!(filter["data_type"], "structure");
+    assert_eq!(history["data_type"], "list");
+    assert_eq!(history["list"]["item_type"], "structure");
+    assert_eq!(filter["structure"]["type_name"], "Monitor");
+    assert_eq!(filter["structure"], history["structure"]);
     let settings = json_body(invoke(&app, Method::GET, "/llm/monitoring", None, None).await).await;
     assert_eq!(settings, json!({"filter":{},"history":[]}));
     let client_id = Uuid::new_v4();
@@ -1218,13 +1233,21 @@ async fn configured_client_issues_read_only_token_and_refreshes_its_route_after_
     provider(&app, "a", json!({"codex_uri":format!("{upstream}/a")})).await;
     provider(&app, "b", json!({"codex_uri":format!("{upstream}/b")})).await;
 
-    let path = "/editing/llm/clients/editor";
-    let response = invoke(&app, Method::PUT, path, None, Some(json!({"upstream":"a"}))).await;
+    let response = invoke(
+        &app,
+        Method::POST,
+        "/editing/llm/clients",
+        None,
+        Some(json!({"name":"editor","upstream":"a"})),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let created = json_body(response).await;
     assert_eq!(created["status"], "confirmed");
     assert_eq!(created["value"]["name"], "editor");
+    let id = created["value"]["id"].as_str().unwrap();
+    let path = &format!("/editing/llm/clients/{id}");
     let token = created["value"]["token"].as_str().unwrap();
     assert!(token.starts_with("loki-llm-"));
     let bearer = format!("Bearer {token}");
@@ -1260,17 +1283,53 @@ async fn configured_client_issues_read_only_token_and_refreshes_its_route_after_
         Method::PATCH,
         path,
         None,
-        Some(json!({"upstream":"b"})),
+        Some(json!({"upstream":"b","name":"renamed"})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["value"]["token"], token);
+    let candidates = json_body(
+        invoke(
+            &app,
+            Method::GET,
+            "/config/options/llm/client_id",
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        candidates,
+        json!({"options":[{"key":id,"label":"renamed"}]})
+    );
+    let metadata = json_body(invoke(&app, Method::GET, "/meta/llm", None, None).await).await;
+    assert_eq!(
+        metadata["types"]["protocol"]["enum"],
+        json!(["codex", "claude"])
+    );
+    assert_eq!(
+        metadata["types"]["provider_id"]["reference"]["label_field"],
+        "id"
+    );
+    let filter = metadata["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["key"] == "monitoring_filter")
+        .unwrap();
+    assert_eq!(
+        filter["structure"]["fields"][0]["list"]["item_type"],
+        json!({"ref":"llm.protocol"})
+    );
     assert_eq!(request(&app).await, "B");
     let (restarted, _notifications) = persistent_router(&directory).await;
     assert_eq!(request(&restarted).await, "B");
     let records =
         json_body(invoke(&restarted, Method::GET, "/data/llm/clients", None, None).await).await;
     assert_eq!(records["value"][0]["token"], token);
+    assert_eq!(records["value"][0]["name"], "renamed");
+    assert_eq!(records["value"][0]["id"], id);
 
     let response = invoke(&restarted, Method::DELETE, path, None, None).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);

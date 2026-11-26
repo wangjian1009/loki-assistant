@@ -14,7 +14,7 @@ mod tests;
 
 use crate::modules::discover::registry::ModuleRegistration;
 
-pub(crate) use config::notification_router;
+pub(crate) use config::{migrate_client_keys, notification_router};
 pub(crate) use monitor::Monitor;
 pub(crate) use service::LlmService;
 

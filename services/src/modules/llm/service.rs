@@ -22,10 +22,10 @@ use uuid::Uuid;
 use super::{
     archive::{self, Archive, Update, Writer},
     config::{
-        self, CLIENTS, Filter, MODULE, MonitoringFilters, PROVIDER_TOKEN, PROVIDERS, provider_uri,
+        self, CLIENTS, MODULE, Monitor, MonitoringFilters, PROVIDER_TOKEN, PROVIDERS, provider_uri,
     },
     instructions::Format,
-    monitor::{Monitor, RequestGuard},
+    monitor::{Monitor as RequestMonitor, RequestGuard},
     protocol::{Binding, Client, IssuedClient, Phase, Protocol, error},
     usage::{RequestedModel, UsageReader},
 };
@@ -39,6 +39,7 @@ const API_KEY: &str = "x-api-key";
 
 #[derive(Clone, Deserialize)]
 struct StoredClient {
+    id: Uuid,
     name: String,
     token: String,
     #[serde(flatten)]
@@ -64,7 +65,7 @@ struct Upstream {
     credential: Option<HeaderValue>,
 }
 
-fn token_id(token: &str) -> Option<Uuid> {
+pub(super) fn token_id(token: &str) -> Option<Uuid> {
     let (id, secret) = token.strip_prefix(TOKEN_PREFIX)?.split_once('.')?;
     (secret.len() == 43).then_some(())?;
     Uuid::parse_str(id).ok()
@@ -83,7 +84,7 @@ pub(super) fn new_token(id: Uuid) -> Result<String, getrandom::Error> {
 pub(crate) struct LlmService {
     config: Arc<ConfigService>,
     authorization: Process<Authorization>,
-    pub(crate) monitor: Monitor,
+    pub(crate) monitor: RequestMonitor,
     pub(super) archive: Arc<Archive>,
     http: reqwest::Client,
 }
@@ -91,7 +92,7 @@ pub(crate) struct LlmService {
 impl LlmService {
     pub(crate) fn new(
         config: Arc<ConfigService>,
-        monitor: Monitor,
+        monitor: RequestMonitor,
         archive_directory: Option<PathBuf>,
     ) -> Self {
         let archive = Archive::new(archive_directory);
@@ -135,6 +136,11 @@ impl LlmService {
                         let id = token_id(&record.token).ok_or_else(|| {
                             ConfigServiceError::InvalidValue("LLM 客户端令牌格式无效。".into())
                         })?;
+                        if id != record.id {
+                            return Err(ConfigServiceError::InvalidValue(
+                                "LLM 客户端 UUID 与令牌不一致。".into(),
+                            ));
+                        }
                         if clients.insert(id, record).is_some() {
                             return Err(ConfigServiceError::InvalidValue(
                                 "LLM 客户端令牌重复。".into(),
@@ -216,20 +222,20 @@ impl LlmService {
         binding: Binding,
     ) -> Result<IssuedClient, Response> {
         let name = name.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let id = Uuid::new_v4();
         let (value, _) = self
             .config
             .notify_write(
                 MODULE.into(),
                 CLIENTS.into(),
-                Some(name),
-                Some(serde_json::json!({"upstream": binding.upstream})),
+                Some(id.to_string()),
+                Some(serde_json::json!({"name": name, "upstream": binding.upstream})),
                 true,
             )
             .await
             .map_err(config_change_error)?
             .ok_or_else(config_error)?;
         let token = value["token"].as_str().ok_or_else(config_error)?.to_owned();
-        let id = token_id(&token).ok_or_else(config_error)?;
         Ok(IssuedClient {
             client: Client { id, binding },
             token,
@@ -237,12 +243,12 @@ impl LlmService {
     }
 
     pub(super) async fn switch(&self, id: Uuid, binding: Binding) -> Result<Client, Response> {
-        let name = self.client_name(id).await?;
+        self.require_client(id).await?;
         self.config
             .notify_patch(
                 MODULE.into(),
                 CLIENTS.into(),
-                Some(name),
+                Some(id.to_string()),
                 serde_json::json!({"upstream": binding.upstream}),
             )
             .await
@@ -251,25 +257,34 @@ impl LlmService {
     }
 
     pub(super) async fn revoke(&self, id: Uuid) -> Result<(), Response> {
-        let name = self.client_name(id).await?;
+        self.require_client(id).await?;
         self.config
-            .notify_write(MODULE.into(), CLIENTS.into(), Some(name), None, false)
+            .notify_write(
+                MODULE.into(),
+                CLIENTS.into(),
+                Some(id.to_string()),
+                None,
+                false,
+            )
             .await
             .map_err(config_change_error)?;
         Ok(())
     }
 
-    async fn client_name(&self, id: Uuid) -> Result<String, Response> {
-        self.authorization
-            .call(move |state| state.clients.get(&id).map(|client| client.name.clone()))
+    async fn require_client(&self, id: Uuid) -> Result<(), Response> {
+        if self
+            .authorization
+            .call(move |state| state.clients.contains_key(&id))
             .await
-            .ok_or_else(|| {
-                error(
-                    StatusCode::NOT_FOUND,
-                    "llm-client-not-found",
-                    "客户端不存在。",
-                )
-            })
+        {
+            Ok(())
+        } else {
+            Err(error(
+                StatusCode::NOT_FOUND,
+                "llm-client-not-found",
+                "客户端不存在。",
+            ))
+        }
     }
 
     async fn authenticate(
@@ -340,7 +355,7 @@ impl LlmService {
 
     pub(super) async fn change_monitoring(
         &self,
-        filter: Filter,
+        filter: Monitor,
     ) -> Result<MonitoringFilters, ConfigServiceError> {
         config::set_monitoring_filter(&self.config, filter).await
     }

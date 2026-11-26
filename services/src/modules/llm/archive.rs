@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use super::{
-    config::{Filter, MODULE, MONITORING_RETENTION},
+    config::{MODULE, MONITORING_RETENTION, Monitor},
     history::request_snapshot,
     instructions::{Capture, Format},
     protocol::{Phase, RequestStatus},
@@ -77,7 +77,7 @@ impl Archive {
 
     pub(super) async fn begin(
         self: &Arc<Self>,
-        filter: &Filter,
+        filter: &Monitor,
         request: &RequestStatus,
         format: Format,
         identity: bool,
@@ -508,7 +508,7 @@ mod tests {
     async fn cleanup_orders_by_start_time_and_preserves_active_files() {
         let archive = Archive::new(None);
         let client = Uuid::new_v4();
-        let filter: Filter = serde_json::from_value(json!({
+        let filter: Monitor = serde_json::from_value(json!({
             "protocols": ["codex"],
             "clients": [Uuid::new_v4(), client],
             "upstreams": ["work", "personal"],
@@ -529,7 +529,7 @@ mod tests {
         };
         assert!(
             archive
-                .begin(&Filter::default(), &request, Format::Messages, true)
+                .begin(&Monitor::default(), &request, Format::Messages, true)
                 .await
                 .unwrap()
                 .is_none()

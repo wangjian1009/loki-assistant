@@ -14,6 +14,7 @@ pub(super) enum Protocol {
 }
 
 impl Protocol {
+    pub(super) const ALL: [Self; 2] = [Self::Codex, Self::Claude];
     pub(super) fn prefix(self) -> &'static str {
         match self {
             Self::Codex => "/llm/codex/v1",

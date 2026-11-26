@@ -412,5 +412,85 @@
           (call-interactively (key-binding (kbd "m")))
           (should (equal saved (list (cons 'filter filter)))))))))
 
+(ert-deftest loki-assistant-llm-usage-test-completes-monitoring-filter-names-and-saves-ids ()
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (loki-assistant-llm-usage-mode)
+      (setq loki-assistant-llm-usage--current 'live)
+      (let* ((editor "1c30befd-aacd-419b-b0f3-8d72680d275b")
+             (other "9536a94c-9bd7-43d9-95ed-4ecf90a091e5")
+             (old "fed8a270-b776-462c-94f1-6420e53c1f4e")
+             (filter `((protocols . ["codex"]) (clients . [,old]) (upstreams . ["old"])))
+             saved)
+        (cl-letf (((symbol-function 'loki-assistant-request)
+                   (lambda (method path &rest options)
+                     (if (equal method "PATCH")
+                         (progn
+                           (should (equal path "/llm/monitoring"))
+                           (setq saved (alist-get 'filter (plist-get options :body))))
+                       (should (equal method "GET"))
+                       (funcall (plist-get options :callback)
+                                (list :ok t :data
+                                      (pcase path
+                                        ("/llm/monitoring" (list (cons 'filter filter)))
+                                        ("/meta/llm"
+                                         '((id . "llm")
+                                           (types . ((protocol (enum . ["codex" "claude"]))
+                                                     (client_id (reference (target . "llm.clients")))
+                                                     (provider_id (reference (target . "llm.providers")))))
+                                           (items . [((key . "monitoring_filter")
+                                                      (structure
+                                                       (fields . [((key . "protocols") (label . "协议") (list (item_type (ref . "llm.protocol"))))
+                                                                  ((key . "clients") (label . "客户端") (list (item_type (ref . "llm.client_id"))))
+                                                                  ((key . "upstreams") (label . "供应商") (list (item_type (ref . "llm.provider_id"))))])))])))
+                                        ("/config/options/llm/client_id"
+                                         `((options . [((key . ,editor) (label . "Emacs Editor"))
+                                                       ((key . ,other) (label . "Code Client"))])))
+                                        ("/config/options/llm/provider_id"
+                                         '((options . [((key . "work") (label . "work"))
+                                                       ((key . "personal") (label . "personal"))])))
+                                        (_ (ert-fail path))))))))
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _) "设置过滤器"))
+                  ((symbol-function 'read-from-minibuffer)
+                   (lambda (prompt initial keymap)
+                     (should (eq (lookup-key keymap (kbd "TAB")) #'crm-complete))
+                     (cond
+                      ((string-prefix-p "协议" prompt)
+                       (should (equal initial "codex"))
+                       (should (string-match-p "codex、claude" prompt))
+                       "codex, claude")
+                      ((string-prefix-p "客户端" prompt)
+                       (should (equal initial old))
+                       (should (string-match-p "Emacs Editor" prompt))
+                       (should (string-match-p "Code Client" prompt))
+                       "Emacs Editor, Code Client")
+                      (t
+                       (should (equal initial "old"))
+                       (should (string-match-p "work、personal" prompt))
+                       "work, personal")))))
+          (call-interactively (key-binding (kbd "m")))
+          (should (equal saved `((protocols . ["codex" "claude"])
+                                 (clients . [,editor ,other])
+                                 (upstreams . ["work" "personal"])))))))))
+
+(ert-deftest loki-assistant-llm-usage-test-monitoring-input-ret-and-tab ()
+  (let ((choices '(("work" . "work") ("personal" . "personal"))))
+    (minibuffer-with-setup-hook
+        (lambda ()
+          (delete-minibuffer-contents)
+          (setq unread-command-events (list ?\r)))
+      (should (equal (loki-assistant-config--read-candidates
+                      "供应商" choices ["work"])
+                     [])))
+    (minibuffer-with-setup-hook
+        (lambda ()
+          (insert ", per")
+          (setq unread-command-events (list ?\t ?\r)))
+      (should (equal (loki-assistant-config--read-candidates
+                      "供应商" choices ["work"])
+                     ["work" "personal"])))))
+
 (provide 'loki-assistant-llm-usage-tests)
 ;;; loki-assistant-llm-usage-tests.el ends here

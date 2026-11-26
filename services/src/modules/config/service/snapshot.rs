@@ -12,7 +12,7 @@ use crate::modules::config::{registry::item_options, storage::FileStorage};
 const FORMAT_VERSION: u32 = 2;
 const REVISIONS: &str = "_accepted_config_revisions";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::modules::config) struct Snapshot {
     format_version: u32,
@@ -611,6 +611,26 @@ pub(super) fn record_acceptance(values: &mut StoredValues, entry: &Pending) {
 }
 
 impl ConfigService {
+    pub(crate) fn update_storage(
+        path: impl AsRef<std::path::Path>,
+        update: impl FnOnce(&mut Value) -> Result<bool, ConfigServiceError>,
+    ) -> Result<bool, ConfigServiceError> {
+        let storage = FileStorage::new(path)?;
+        let Some(snapshot) = storage.read()? else {
+            return Ok(false);
+        };
+        let mut document = json!(snapshot);
+        if !update(&mut document)? {
+            return Ok(false);
+        }
+        let snapshot: Snapshot =
+            serde_json::from_value(document).map_err(|_| invalid_snapshot())?;
+        snapshot.clone().decode()?;
+        storage.back_up()?;
+        storage.write_atomic(snapshot)?;
+        Ok(true)
+    }
+
     pub fn migrate_storage(path: impl AsRef<std::path::Path>) -> Result<bool, ConfigServiceError> {
         let storage = FileStorage::new(path)?;
         let Some(legacy) = storage.read_legacy()? else {

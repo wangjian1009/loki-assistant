@@ -16,9 +16,10 @@ use uuid::Uuid;
 use crate::modules::config::{
     model::{
         CheckerMetadata, ConfigDataType, ConfigItemMetadata, ConfigItemOptions,
-        ConfigModuleMetadata, FieldOptions, ListMetadata, StructureField, StructureMetadata,
+        ConfigModuleMetadata, ListMetadata, NamedType, RecordReference, StructureField,
+        StructureMetadata,
     },
-    registry::ConfigItemRegistration,
+    registry::{ConfigItemRegistration, ConfigTypeRegistration},
     service::{
         ConfigService, ConfigServiceError, NotificationConfirmedFields, NotificationRequest,
         NotificationValidationError,
@@ -61,12 +62,12 @@ fn metadata() -> ConfigModuleMetadata {
                 MONITORING_FILTER,
                 "请求详情监控条件",
                 "填写 protocols、clients 或 upstreams 数组，条件为空时关闭详情采集。",
-                ConfigDataType::Dictionary,
+                ConfigDataType::Structure,
                 json!({}),
             ),
             ConfigItemMetadata {
                 list: Some(ListMetadata {
-                    item_type: ConfigDataType::Dictionary,
+                    item_type: ConfigDataType::Structure,
                     min_items: None,
                     max_items: Some(HISTORY_LIMIT),
                 }),
@@ -112,11 +113,61 @@ fn setting(
     }
 }
 
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_TYPES)]
+static PROTOCOL_TYPE: ConfigTypeRegistration = ConfigTypeRegistration {
+    module_id: MODULE,
+    name: "protocol",
+    definition: || NamedType {
+        data_type: ConfigDataType::String,
+        values: Protocol::ALL
+            .into_iter()
+            .map(|protocol| {
+                json!(protocol)
+                    .as_str()
+                    .expect("协议序列化为字符串")
+                    .to_owned()
+            })
+            .collect(),
+        reference: None,
+    },
+};
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_TYPES)]
+static CLIENT_ID_TYPE: ConfigTypeRegistration = ConfigTypeRegistration {
+    module_id: MODULE,
+    name: "client_id",
+    definition: || NamedType {
+        data_type: ConfigDataType::String,
+        values: Vec::new(),
+        reference: Some(RecordReference {
+            target: "llm.clients",
+            key_field: "id",
+            label_field: "name",
+        }),
+    },
+};
+
+#[linkme::distributed_slice(crate::modules::config::registry::CONFIG_TYPES)]
+static PROVIDER_ID_TYPE: ConfigTypeRegistration = ConfigTypeRegistration {
+    module_id: MODULE,
+    name: "provider_id",
+    definition: || NamedType {
+        data_type: ConfigDataType::String,
+        values: Vec::new(),
+        reference: Some(RecordReference {
+            target: "llm.providers",
+            key_field: "id",
+            label_field: "id",
+        }),
+    },
+};
+
 #[linkme::distributed_slice(crate::modules::config::registry::CONFIG_ITEMS)]
 static FILTER_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: MODULE,
     key: MONITORING_FILTER,
     options: || ConfigItemOptions {
+        structure: Some(Monitor::structure()),
         validate_value: Some(|value| {
             parse_filter(value.clone())
                 .map(|_| ())
@@ -131,6 +182,7 @@ static HISTORY_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
     module_id: MODULE,
     key: MONITORING_HISTORY,
     options: || ConfigItemOptions {
+        structure: Some(Monitor::structure()),
         validate_value: Some(|value| {
             parse_history(value.clone())
                 .map(|_| ())
@@ -158,7 +210,7 @@ static RETENTION_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub(super) struct Filter {
+pub(super) struct Monitor {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     protocols: Vec<Protocol>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -167,7 +219,32 @@ pub(super) struct Filter {
     upstreams: Vec<String>,
 }
 
-impl Filter {
+impl Monitor {
+    fn structure() -> StructureMetadata {
+        StructureMetadata {
+            id_field: None,
+            label_field: None,
+            add_label: None,
+            type_name: "Monitor".into(),
+            show_all_fields: true,
+            fields: [
+                ("protocols", "协议", "llm.protocol"),
+                ("clients", "客户端", "llm.client_id"),
+                ("upstreams", "供应商", "llm.provider_id"),
+            ]
+            .into_iter()
+            .map(|(key, label, reference)| StructureField {
+                list: Some(ListMetadata {
+                    item_type: ConfigDataType::Ref(reference.into()),
+                    min_items: None,
+                    max_items: None,
+                }),
+                ..field(key, label, ConfigDataType::List)
+            })
+            .collect(),
+        }
+    }
+
     fn normalize(&mut self) {
         self.protocols.sort_unstable();
         self.protocols.dedup();
@@ -195,30 +272,30 @@ impl Filter {
 
 #[derive(Serialize)]
 pub(super) struct MonitoringFilters {
-    filter: Filter,
-    history: Vec<Filter>,
+    filter: Monitor,
+    history: Vec<Monitor>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MonitoringPatch {
-    pub filter: Filter,
+    pub filter: Monitor,
 }
 
-fn parse_filter(value: Value) -> Result<Filter, ConfigServiceError> {
-    let mut filter: Filter = serde_json::from_value(value)
+fn parse_filter(value: Value) -> Result<Monitor, ConfigServiceError> {
+    let mut filter: Monitor = serde_json::from_value(value)
         .map_err(|_| ConfigServiceError::InvalidValue("请求监控条件格式无效。".into()))?;
     filter.normalize();
     Ok(filter)
 }
 
-fn parse_history(value: Value) -> Result<Vec<Filter>, ConfigServiceError> {
-    let filters: Vec<Filter> = serde_json::from_value(value)
+fn parse_history(value: Value) -> Result<Vec<Monitor>, ConfigServiceError> {
+    let filters: Vec<Monitor> = serde_json::from_value(value)
         .map_err(|_| ConfigServiceError::InvalidValue("请求监控过滤历史格式无效。".into()))?;
     Ok(normalize_history(filters))
 }
 
-fn normalize_history(filters: impl IntoIterator<Item = Filter>) -> Vec<Filter> {
+fn normalize_history(filters: impl IntoIterator<Item = Monitor>) -> Vec<Monitor> {
     let mut history = Vec::new();
     for mut filter in filters {
         filter.normalize();
@@ -234,7 +311,7 @@ fn normalize_history(filters: impl IntoIterator<Item = Filter>) -> Vec<Filter> {
 
 pub(super) async fn monitoring_filter(
     config: &ConfigService,
-) -> Result<Filter, ConfigServiceError> {
+) -> Result<Monitor, ConfigServiceError> {
     parse_filter(config.value(MODULE, MONITORING_FILTER).await?.value)
 }
 
@@ -260,7 +337,7 @@ pub(super) async fn monitoring(
 
 pub(super) async fn set_monitoring_filter(
     config: &ConfigService,
-    mut filter: Filter,
+    mut filter: Monitor,
 ) -> Result<MonitoringFilters, ConfigServiceError> {
     filter.normalize();
     config
@@ -279,7 +356,7 @@ pub(super) async fn set_monitoring_filter(
         .await
 }
 
-fn stored_history(items: &Map<String, Value>) -> Result<Vec<Filter>, ConfigServiceError> {
+fn stored_history(items: &Map<String, Value>) -> Result<Vec<Monitor>, ConfigServiceError> {
     items
         .get(MONITORING_HISTORY)
         .cloned()
@@ -318,8 +395,10 @@ static CLIENT_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             id: "client",
             endpoint: CLIENT_NOTIFICATION,
         }),
+        generate_id: true,
+        create_fields: vec!["name", "upstream"],
         structure: Some(StructureMetadata {
-            id_field: Some("name".into()),
+            id_field: Some("id".into()),
             label_field: Some("name".into()),
             add_label: Some("新增 LLM 客户端".into()),
             type_name: "LLMClient".into(),
@@ -327,16 +406,21 @@ static CLIENT_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             fields: vec![
                 StructureField {
                     required: true,
-                    ..field("name", "客户端名称", ConfigDataType::Key)
+                    ..field("id", "客户端 UUID", ConfigDataType::Key)
                 },
                 StructureField {
                     required: true,
                     monitor: Some("client".into()),
-                    options: Some(FieldOptions {
-                        path: "/llm/providers".into(),
-                        items_field: "ids".into(),
-                    }),
-                    ..field("upstream", "供应商", ConfigDataType::String)
+                    ..field("name", "客户端名称", ConfigDataType::String)
+                },
+                StructureField {
+                    required: true,
+                    monitor: Some("client".into()),
+                    ..field(
+                        "upstream",
+                        "供应商",
+                        ConfigDataType::Ref("llm.provider_id".into()),
+                    )
                 },
                 StructureField {
                     read_only: true,
@@ -404,6 +488,7 @@ fn field(key: &str, label: &str, data_type: ConfigDataType) -> StructureField {
         label: label.into(),
         monitor: None,
         data_type,
+        list: None,
         required: false,
         default_template: None,
         checker: None,
@@ -474,8 +559,14 @@ async fn prepare_client(
     let Some(upstream) = record["upstream"].as_str() else {
         return invalid("llm-provider-not-found", "请选择供应商。".into());
     };
+    let Some(id) = record["id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return invalid("llm-client-id", "客户端 UUID 无效。".into());
+    };
     let generated = match service
-        .prepare_client(upstream.to_owned(), change.created.then_some(change.id))
+        .prepare_client(upstream.to_owned(), change.created.then_some(id))
         .await
     {
         Ok(token) => token,
@@ -515,4 +606,60 @@ fn invalid(code: &str, message: String) -> Response {
             clear_password_fields: Vec::new(),
         });
     response
+}
+
+/// 仅在离线转换时为旧客户端记录补齐 UUID。
+pub(crate) fn migrate_client_keys(document: &mut Value) -> Result<bool, ConfigServiceError> {
+    let invalid = || ConfigServiceError::Storage("无法确认旧 LLM 客户端的 UUID。".into());
+    let mut instances = std::collections::BTreeMap::new();
+    let states = document["monitor_states"][MODULE]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let Some(records) = document["modules"][MODULE][CLIENTS].as_array_mut() else {
+        return Ok(false);
+    };
+    for record in records {
+        if record.get("id").is_some() {
+            continue;
+        }
+        let name = record["name"].as_str().ok_or_else(invalid)?.to_owned();
+        let pending = states
+            .iter()
+            .find(|state| state["item"] == CLIENTS && state["instance"] == name);
+        let id = record["token"]
+            .as_str()
+            .and_then(super::service::token_id)
+            .or_else(|| {
+                pending
+                    .filter(|state| state["record_operation"] == "create")
+                    .and_then(|state| state["revision"].as_str())
+                    .and_then(|revision| Uuid::parse_str(revision).ok())
+            })
+            .ok_or_else(invalid)?;
+        let initial_name =
+            if let Some(state) = pending.filter(|state| state["record_operation"] == "create") {
+                json!({"accepted":null,"editing":{"revision":state["revision"],"value":name}})
+            } else {
+                json!({"accepted":{"revision":Uuid::nil(),"value":name},"editing":null})
+            };
+        instances.insert(name, id.to_string());
+        record["id"] = json!(id);
+        record["name"] = initial_name;
+    }
+    if let Some(states) = document
+        .get_mut("monitor_states")
+        .and_then(|states| states.get_mut(MODULE))
+        .and_then(Value::as_array_mut)
+    {
+        for state in states.iter_mut().filter(|state| state["item"] == CLIENTS) {
+            if let Some(id) = state["instance"]
+                .as_str()
+                .and_then(|name| instances.get(name))
+            {
+                state["instance"] = json!(id);
+            }
+        }
+    }
+    Ok(!instances.is_empty())
 }

@@ -167,6 +167,8 @@ modules/<module>
 
 配置元数据通过 `#[loki_config]` 修饰无参数同步函数，在编译期注册到 `CONFIG_MODULES`。`Executable` 的默认程序名和补充搜索目录由所属模块元数据声明，查找和 `value`/`source` 解析由配置模块实现，客户端不复制路径发现规则。用户设置保存于 `~/.assistant/config.yml`，静态默认值与发现结果不落盘。网络身份和设备绑定写入同一文件的 `_system`，使用配置模块内部的 `Password` 引用。中转令牌、身份私钥和设备绑定凭据由 GPG 加密存储。网络专用条目仅供服务内部调用。配置元数据和 HTTP 接口只提供已登记的用户设置。
 
+配置中心 `modules/config` 只按元数据执行类型校验、引用解析、读写权限、持久化和监控分发。业务模块负责声明结构、数组元素类型、引用及监控处理器，并在本模块实现业务校验和副作用。业务模块 ID、配置键和监控点 ID 只用于查找对应元数据或处理器。禁止在配置中心按具体模块、字段或业务值编写特判。
+
 Emacs 模块的配置集中在 `config.rs` 的 `EmacsConfig`，构造时接收 `Arc<ConfigService>`，每个配置项对应独立异步方法，例如 `emacsclient_path()`。方法每次调用配置中心并返回带 `value`、`source` 的 `ConfigValue`，不缓存属性值；`EmacsService` 持有 `EmacsConfig` 并通过这些方法读取。配置项键、默认值和搜索目录均由该文件维护。`EmacsConfig::metadata()` 是不依赖实例的静态函数，经 `#[loki_config]` 注册，配置中心与 API 发现一样通过编译期目录获取元数据。配置项声明 `remote_access`，配置中心对远端请求按项限制读取、写入和预检，列表过滤本机专用项。
 
 `POST /config/validate` 提供只读配置预检，与保存共用 `ConfigService::validate_value`。`Executable` 必须解析到存在且具有执行权限的普通文件，成功后规范化为绝对路径。校验失败禁止更新内存、YAML 与变化订阅；界面只消费服务端结果。文件系统校验测试使用临时文件，不执行待检查的程序。

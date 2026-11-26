@@ -8,6 +8,7 @@
 
 (require 'loki-assistant)
 (require 'cus-edit)
+(require 'crm)
 (require 'wid-edit)
 (require 'seq)
 
@@ -34,6 +35,7 @@
 (defvar-local loki-assistant-config--message nil)
 (defvar-local loki-assistant-config--buttons nil)
 (defvar-local loki-assistant-config--wait-timer nil)
+(defvar-local loki-assistant-config--type-labels nil)
 
 (defvar loki-assistant-config-mode-map
   (let ((map (make-sparse-keymap)))
@@ -80,10 +82,110 @@
   "将 VALUE 编码为 JSON，保留 false 和 null。"
   (let ((json-null :null) (json-false :false)) (json-encode value)))
 
+(defun loki-assistant-config--field-reference (field)
+  "返回 FIELD 的命名类型引用。"
+  (let ((type (or (alist-get 'item_type (alist-get 'list field))
+                  (alist-get 'data_type field))))
+    (when (consp type) (alist-get 'ref type))))
+
+(defun loki-assistant-config--type-definition (modules reference)
+  "查找 MODULES 中 REFERENCE 的命名类型定义。"
+  (pcase (split-string (or reference "") "\\.")
+    (`(,module ,type)
+     (when-let* ((model (seq-find (lambda (model) (equal (alist-get 'id model) module)) modules)))
+       (alist-get (intern type) (alist-get 'types model))))))
+
+(defun loki-assistant-config--candidate-labels (options selected)
+  "从 OPTIONS 生成候选显示值和键，保留 SELECTED 中已有的键。"
+  (let ((choices (mapcar (lambda (option)
+                           (let ((key (alist-get 'key option))
+                                 (label (alist-get 'label option)))
+                             (cons (string-replace "," "，" (string-trim label)) key)))
+                         (append options nil)))
+        (counts (make-hash-table :test #'equal)))
+    (dolist (key (append selected nil))
+      (unless (rassoc key choices) (push (cons key key) choices)))
+    (dolist (choice choices)
+      (cl-incf (gethash (downcase (car choice)) counts 0)))
+    (mapcar (lambda (choice)
+              (if (> (gethash (downcase (car choice)) counts) 1)
+                  (cons (format "%s [%s]" (car choice) (cdr choice)) (cdr choice))
+                choice))
+            choices)))
+
+(defun loki-assistant-config--enum-choices (definition)
+  "读取 DEFINITION 声明的枚举候选。"
+  (mapcar (lambda (value) (cons value value)) (append (alist-get 'enum definition) nil)))
+
+(defun loki-assistant-config--type-choices (model reference selected callback)
+  "从 MODEL 读取 REFERENCE 的候选，并在 CALLBACK 中处理。"
+  (let* ((parts (split-string (or reference "") "\\."))
+         (module (car parts))
+         (definition (loki-assistant-config--type-definition (list model) reference)))
+    (cond
+     ((alist-get 'reference definition)
+      (loki-assistant-request
+       "GET" (format "/config/options/%s/%s"
+                     (url-hexify-string module) (url-hexify-string (cadr parts)))
+       :callback
+       (lambda (response)
+         (if (plist-get response :ok)
+             (funcall callback
+                      (loki-assistant-config--candidate-labels
+                       (alist-get 'options (plist-get response :data)) selected))
+           (message "%s" (loki-assistant-config--error response))))))
+     (definition (funcall callback (loki-assistant-config--enum-choices definition)))
+     ((and (= (length parts) 2) (not (equal module (alist-get 'id model))))
+      (loki-assistant-request
+       "GET" (concat "/meta/" (url-hexify-string module))
+       :callback (lambda (response)
+                   (let ((target (plist-get response :data)))
+                     (if (and (plist-get response :ok) (equal module (alist-get 'id target)))
+                         (loki-assistant-config--type-choices target reference selected callback)
+                       (message "无法读取配置类型 %s" reference))))))
+     (t (message "未找到配置类型 %s" reference)))))
+
+(defun loki-assistant-config--read-candidates (label choices selected)
+  "显示 LABEL 的候选 CHOICES，并预填 SELECTED 对应的名称。"
+  (let* ((crm-separator "[ \t]*,[ \t]*")
+         (completion-ignore-case t)
+         (completion-styles (append completion-styles '(substring)))
+         (completion-in-region-function #'completion--in-region)
+         (initial (mapconcat (lambda (value) (car (rassoc value choices))) selected ", "))
+         (candidates (if choices (mapconcat #'car choices "、") "当前无候选"))
+         (prompt (format "%s候选　%s\n%s（TAB 补全，逗号多选，留空不限）：" label candidates label))
+         (keymap (make-sparse-keymap))
+         input)
+    (set-keymap-parent keymap minibuffer-local-map)
+    (define-key keymap (kbd "TAB") #'crm-complete)
+    (define-key keymap (kbd "<tab>") #'crm-complete)
+    (setq input
+          (minibuffer-with-setup-hook
+              (lambda () (setq-local minibuffer-completion-table choices))
+            (read-from-minibuffer prompt initial keymap)))
+    (vconcat
+     (delete-dups
+      (mapcar (lambda (choice)
+                (or (cdr (or (assoc choice choices) (assoc-string choice choices t)))
+                    (user-error "无效的%s候选：%s" label choice)))
+              (split-string input crm-separator t "[ \t]+"))))))
+
 (defun loki-assistant-config--data-type (metadata)
   "读取 METADATA 的类型名称。"
   (let ((type (alist-get 'data_type metadata)))
-    (if (and (consp type) (assq 'password type)) "password" type)))
+    (cond ((and (consp type) (assq 'password type)) "password")
+          ((and (consp type) (assq 'ref type)) "string")
+          (t type))))
+
+(defun loki-assistant-config--structure-metadata (item)
+  "返回 ITEM 声明的结构元数据。"
+  (let ((type (loki-assistant-config--data-type item))
+        (structure (alist-get 'structure item)))
+    (when (and (consp structure)
+               (or (equal type "structure")
+                   (and (equal type "list")
+                        (equal (alist-get 'item_type (alist-get 'list item)) "structure"))))
+      structure)))
 
 (defun loki-assistant-config--display-value (item value)
   "将 ITEM 的 JSON VALUE 转为控件值。"
@@ -108,11 +210,12 @@
 
 (defun loki-assistant-config--parse-input (item value)
   "读取 ITEM 的 VALUE，无法解析的 JSON 按原字符串提交。"
-  (if (loki-assistant-config--json-input-p item value)
+  (if (and (not (string-empty-p value))
+           (loki-assistant-config--json-input-p item value))
       (condition-case nil
           (json-parse-string value :object-type 'hash-table :array-type 'array
                              :null-object :null :false-object :false)
-        (json-parse-error value))
+        ((json-parse-error json-end-of-file) value))
     value))
 
 (defun loki-assistant-config--input-face (item value)
@@ -412,6 +515,7 @@
 (defun loki-assistant-config--render (module values &optional error-text)
   "显示 MODULE 的配置 VALUES，或 ERROR-TEXT。"
   (loki-assistant-config--clear)
+  (setq loki-assistant-config--type-labels (make-hash-table :test #'equal))
   (widget-insert
    (propertize (format "Loki Assistant 配置 · %s\n\n"
                        (or (alist-get 'name module) loki-assistant-config--module-id))
@@ -432,8 +536,8 @@
         (widget-insert description "\n\n"))
       (dolist (item (append (alist-get 'items module) nil))
         (cond
-         ((consp (alist-get 'structure item))
-          (loki-assistant-config--record-insert id item values))
+         ((loki-assistant-config--structure-metadata item)
+          (loki-assistant-config--record-insert id item values module))
          ((eq (alist-get 'read_only item) t)
           (loki-assistant-config--render-read-only-entry item values))
          (t (loki-assistant-config--render-entry id item values))))))
@@ -507,8 +611,9 @@
       (let* ((key (intern (alist-get 'key item)))
              (raw (alist-get key (alist-get 'data body)))
              (stored (or (alist-get key values) (list '(value . :null))))
-             (structure (alist-get 'structure item))
-             (id-key (alist-get 'id_field structure))
+             (structure (loki-assistant-config--structure-metadata item))
+             (id-key (let ((key (alist-get 'id_field structure)))
+                       (when (stringp key) key)))
              (states (seq-filter (lambda (state)
                                    (or (equal (alist-get 'item state) (symbol-name key))
                                        (seq-contains-p (alist-get 'related_items state) (symbol-name key))))
@@ -516,8 +621,9 @@
              pending)
         (cond
          (structure
-          (dolist (row (cond ((vectorp raw) (append raw nil))
-                             ((and (consp raw) (null id-key)) (list raw))))
+          (dolist (row (if (equal (loki-assistant-config--data-type item) "structure")
+                           (when (consp raw) (list raw))
+                         (when (vectorp raw) (append raw nil))))
             (let* ((id (and id-key (alist-get (intern id-key) row)))
                    (state (seq-find (lambda (state) (equal (alist-get 'instance state) id)) states))
                    (record (copy-tree row))
@@ -794,19 +900,24 @@
           (when (alist-get 'requires_local_auth item) (setq requires-auth t)))))
     (dolist (section loki-assistant-config--record-sections)
       (let* ((meta (loki-assistant-config--record-section-metadata section))
-             (key (alist-get 'key (alist-get 'record meta))))
+             (key (alist-get 'key (alist-get 'record meta)))
+             (list-update (when (loki-assistant-config--unkeyed-list-p section)
+                            (loki-assistant-config--list-update section))))
+        (when (cdr list-update)
+          (push `((path . [,key]) (operation . "set") (value . ,(car list-update))) changes))
         (maphash
          (lambda (id fields)
            (let ((patch (loki-assistant-config--row-patch section id)))
              (when (and (> (hash-table-count patch) 0) (alist-get 'requires_local_auth meta))
                (setq requires-auth t))
-             (maphash (lambda (field value)
-                        (push (append
-                               `((path . ,(if (string-empty-p id) (vector key field) (vector key id field)))
-                                 (operation . ,(if (eq value :null) "remove" "set")))
-                               (unless (eq value :null) `((value . ,value))))
-                              changes))
-                      patch)
+             (unless list-update
+               (maphash (lambda (field value)
+                          (push (append
+                                 `((path . ,(if (string-empty-p id) (vector key field) (vector key id field)))
+                                   (operation . ,(if (eq value :null) "remove" "set")))
+                                 (unless (eq value :null) `((value . ,value))))
+                                changes))
+                        patch))
              (when (> (hash-table-count patch) 0)
                (push (list section id
                            (cl-loop for (field widget _) in fields
@@ -879,14 +990,13 @@
              (with-selected-window window
                (let ((choices
                       (mapcar (lambda (module)
-                                (cons (format "%s · %s" (alist-get 'name module)
+                                (list (format "%s · %s" (alist-get 'name module)
                                                        (alist-get 'id module))
                                       module))
                               (loki-assistant-config--modules response))))
                  (unless choices (user-error "没有可配置的模块"))
-                 (let ((selected (completing-read "选择配置模块：" choices nil t)))
-                   (when-let* ((module (cdr (assoc selected choices))))
-                     (loki-assistant-config--open-module module)))))
+                 (when-let* ((module (loki-assistant--read-menu "选择配置模块：" choices)))
+                   (loki-assistant-config--open-module module))))
            (quit nil)
            (error (message "%s" (error-message-string err)))))))))
 
@@ -975,7 +1085,7 @@
 
 (cl-defstruct (loki-assistant-config--record-section
                (:constructor loki-assistant-config--record-create))
-  buffer module metadata start end widgets records
+  buffer module model metadata start end widgets records
   (row-inputs (make-hash-table :test #'equal))
   (drafts (make-hash-table :test #'equal))
   form form-baseline form-id form-generation inputs saving notice)
@@ -1053,8 +1163,73 @@
 (defun loki-assistant-config--record-display-value (field value show-all)
   "返回 FIELD 的可显示文本，密码字段只显示保存状态。"
   (cond ((and show-all (or (null value) (equal value ""))) "未设置")
+        ((loki-assistant-config--field-reference field)
+         (loki-assistant-config--type-display field value))
         ((equal (loki-assistant-config--data-type field) "password") "已保存")
         (t (format "%s" value))))
+
+(defun loki-assistant-config--type-display (field value)
+  "将 FIELD 中的引用 VALUE 显示成候选名称。"
+  (let* ((reference (loki-assistant-config--field-reference field))
+         (choices (and loki-assistant-config--type-labels
+                       (gethash reference loki-assistant-config--type-labels)))
+         (multi (equal (loki-assistant-config--data-type field) "list"))
+         (keys (cond ((and multi (vectorp value)) (append value nil))
+                     ((and (stringp value) (not (string-empty-p value))) (list value)))))
+    (if keys
+        (mapconcat (lambda (key) (or (car (and (listp choices) (rassoc key choices))) key))
+                   keys "、")
+      "未设置")))
+
+(defun loki-assistant-config--update-type-widget (widget field input)
+  "更新 WIDGET 中 FIELD 的 INPUT 和显示名称。"
+  (let* ((value (loki-assistant-config--parse-input field input))
+         (label (loki-assistant-config--type-display field value)))
+    (unless (and (equal label (widget-get widget :tag)) (equal input (widget-value widget)))
+      (let ((inactive (widget-get widget :inactive))
+            (inhibit-read-only t))
+        (widget-put widget :tag label)
+        (widget-value-set widget input)
+        (when inactive (widget-apply widget :deactivate))))))
+
+(defun loki-assistant-config--request-type-labels (section reference)
+  "加载 SECTION 中 REFERENCE 的候选名称，并刷新相关控件。"
+  (unless loki-assistant-config--type-labels
+    (setq loki-assistant-config--type-labels (make-hash-table :test #'equal)))
+  (let ((buffer (current-buffer))
+        (cache loki-assistant-config--type-labels))
+    (when (eq (gethash reference cache :missing) :missing)
+      (puthash reference :loading cache)
+      (loki-assistant-config--type-choices
+       (loki-assistant-config--record-section-model section) reference nil
+       (lambda (choices)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (eq cache loki-assistant-config--type-labels)
+               (puthash reference choices cache)
+               (with-silent-modifications
+                 (dolist (current loki-assistant-config--record-sections)
+                   (dolist (widget (loki-assistant-config--record-section-widgets current))
+                     (when-let* ((field (widget-get widget :loki-reference-field))
+                                 ((equal reference (loki-assistant-config--field-reference field))))
+                       (loki-assistant-config--update-type-widget widget field (widget-value widget))
+                       (when-let* ((update (widget-get widget :loki-edited)))
+                         (funcall update))))))))))))))
+
+(defun loki-assistant-config--reference-widget (section field input &optional read-only)
+  "显示 SECTION 中 FIELD 的引用 INPUT，支持按名称编辑。"
+  (let* ((value (loki-assistant-config--parse-input field input))
+         (widget (widget-create
+                  (if read-only 'item 'push-button)
+                  :format (if read-only "%t" "%[%v%]")
+                  :tag (loki-assistant-config--type-display field value)
+                  :loki-reference-field field
+                  :notify (lambda (widget &rest _)
+                            (loki-assistant-config--choose-typed-field section field widget))
+                  input)))
+    (push widget (loki-assistant-config--record-section-widgets section))
+    (loki-assistant-config--request-type-labels section (loki-assistant-config--field-reference field))
+    widget))
 
 (defun loki-assistant-config--row-input-value (widget)
   "读取 WIDGET 的输入，并保留用户输入的掩码字符。"
@@ -1076,35 +1251,45 @@
                      (if (stringp value) value (loki-assistant-config--json value))))
          (draft (assoc key (gethash id (loki-assistant-config--record-section-drafts section))))
          (input (if draft (cdr draft) baseline))
+         (reference (loki-assistant-config--field-reference field))
          (previous (if (or (null before) (eq before :null)) "未设置"
                      (loki-assistant-config--record-display-value field before t)))
          (prefix (propertize (format "%s → " previous) 'face 'shadow))
          (anchor (copy-marker (point)))
          (widget (progn
-                   (when changed (widget-insert prefix))
-                   (widget-create 'editable-field :format "%v"
+                   (when (and changed (not reference)) (widget-insert prefix))
+                   (if reference
+                       (loki-assistant-config--reference-widget section field input)
+                     (widget-create 'editable-field :format "%v"
                                   :keymap loki-assistant-config--field-keymap
                                   :size 40 :value input :secret (and password ?*)
-                                  :value-face (loki-assistant-config--input-face field input))))
+                                  :value-face (loki-assistant-config--input-face field input)))))
          (difference (make-overlay anchor anchor)))
     (set-marker anchor nil)
     (overlay-put difference 'loki-config-difference t)
-    (unless (or changed (equal baseline input))
-      (overlay-put difference 'before-string prefix))
-    (widget-put widget :notify
-                (lambda (&rest _)
-                  (loki-assistant-config--mark-field widget field)
-                  (overlay-put difference 'before-string
-                               (unless (or changed
-                                           (equal baseline (loki-assistant-config--row-input-value widget)))
-                                 prefix))))
-    (push widget (loki-assistant-config--record-section-widgets section))
+    (if reference
+        (let ((update
+               (lambda ()
+                 (overlay-put difference 'before-string
+                              (when (or changed (not (equal baseline (widget-value widget))))
+                                (propertize
+                                 (format "%s → " (loki-assistant-config--type-display field before))
+                                 'face 'shadow))))))
+          (widget-put widget :loki-edited update)
+          (funcall update))
+      (unless (or changed (equal baseline input))
+        (overlay-put difference 'before-string prefix))
+      (widget-put widget :notify
+                  (lambda (&rest _)
+                    (loki-assistant-config--mark-field widget field)
+                    (overlay-put difference 'before-string
+                                 (unless (or changed
+                                             (equal baseline (loki-assistant-config--row-input-value widget)))
+                                   prefix))))
+      (push widget (loki-assistant-config--record-section-widgets section))
+      (loki-assistant-config--record-candidate-button section field widget))
     (push (list key widget baseline)
-          (gethash id (loki-assistant-config--record-section-row-inputs section)))
-    (when-let* ((options (alist-get 'options field)))
-      (loki-assistant-config--record-button
-       section "选择已有条目"
-       (lambda () (loki-assistant-config--record-choose section key options widget))))))
+          (gethash id (loki-assistant-config--record-section-row-inputs section)))))
 
 (defun loki-assistant-config--record-remember-rows (section)
   "按记录主键保存 SECTION 中未提交的控件输入。"
@@ -1129,6 +1314,59 @@
               (puthash key (if (string-empty-p input) :null
                              (loki-assistant-config--parse-input field input)) body))))))
     body))
+
+(defun loki-assistant-config--unkeyed-list-p (section)
+  "判断 SECTION 是否编辑无主键结构列表。"
+  (let ((metadata (loki-assistant-config--record-section-metadata section)))
+    (and (not (alist-get 'single metadata))
+         (not (alist-get 'id_field (alist-get 'record metadata))))))
+
+(defun loki-assistant-config--list-update (section &optional omit)
+  "返回 SECTION 的修改后列表及修改条目。OMIT 是要删除的条目。"
+  (let (records changed)
+    (dolist (entry (loki-assistant-config--record-section-records section))
+      (unless (equal omit (car entry))
+        (let* ((record (copy-tree (cdr entry)))
+               (patch (loki-assistant-config--row-patch section (car entry))))
+          (when (> (hash-table-count patch) 0) (push (car entry) changed))
+          (maphash (lambda (field value)
+                     (let ((key (intern field)))
+                       (if (eq value :null)
+                           (setq record (assq-delete-all key record))
+                         (setf (alist-get key record) value))))
+                   patch)
+          (push (or record (make-hash-table :test #'equal)) records))))
+    (cons (vconcat (nreverse records)) changed)))
+
+(defun loki-assistant-config--save-unkeyed-list (section &optional omit)
+  "保存 SECTION 的列表修改，或删除其中的 OMIT。"
+  (when (loki-assistant-config--record-section-saving section)
+    (user-error "请等待当前请求完成"))
+  (pcase-let* ((`(,value . ,changed) (loki-assistant-config--list-update section omit))
+               (buffer (loki-assistant-config--record-section-buffer section))
+               (key (alist-get 'key (loki-assistant-config--record-record-meta section))))
+    (unless (or omit changed) (user-error "没有修改的字段"))
+    (when (or (null omit) (yes-or-no-p "删除这条记录？"))
+      (setf (loki-assistant-config--record-section-saving section) t)
+      (loki-assistant-config--record-render section)
+      (loki-assistant-request
+       "PUT" (loki-assistant-config--record-data-path section key) :body value
+       :timeout (loki-assistant-config--record-timeout section)
+       :headers (when (alist-get 'requires_local_auth (loki-assistant-config--record-section-metadata section))
+                  (loki-assistant-config--record-header section))
+       :callback
+       (lambda (response)
+         (when (loki-assistant-config--record-alive-p section)
+           (with-current-buffer buffer
+             (setf (loki-assistant-config--record-section-saving section) nil)
+             (if (plist-get response :ok)
+                 (progn
+                   (clrhash (loki-assistant-config--record-section-row-inputs section))
+                   (clrhash (loki-assistant-config--record-section-drafts section))
+                   (loki-assistant-config--load))
+               (setf (loki-assistant-config--record-section-notice section)
+                     (loki-assistant-config--error response))
+               (loki-assistant-config--record-render section)))))))))
 
 (defun loki-assistant-config--row-save (section id)
   "提交 SECTION 中 ID 的原地编辑。"
@@ -1173,23 +1411,29 @@
          (record-meta (alist-get 'record metadata))
          (id-field (alist-get 'id_field record-meta))
          (single (alist-get 'single metadata))
-         (saving (loki-assistant-config--record-section-saving section)))
+         (saving (loki-assistant-config--record-section-saving section))
+         (unkeyed (loki-assistant-config--unkeyed-list-p section))
+         (read-only (eq (alist-get 'read_only metadata) t)))
     (dolist (entry (loki-assistant-config--record-section-records section))
       (let* ((id (car entry))
              (record (cdr entry))
              (accepted (or (alist-get 'accepted record) record))
-             (editable (and (or single id-field) (not (alist-get 'delete_pending record))))
+             (editable (and (not read-only) (not (alist-get 'delete_pending record))))
+             (key (loki-assistant-config--record-field id-field accepted))
              (title (or (loki-assistant-config--record-field
                          (alist-get 'label_field record-meta) accepted)
-                        (unless (string-empty-p id) id)
-                        (alist-get 'title metadata))))
-        (insert (propertize title 'face 'bold)
-                (if (or (string-empty-p id) (equal title id))
-                    "" (concat " [" id "]"))
-                (cond ((alist-get 'delete_pending record) "  待删除")
-                      ((alist-get 'validation_error record) "  处理失败")
-                      ((alist-get 'pending record) "  待确认")
-                      (t "")) "\n")
+                        key))
+             (status (cond ((alist-get 'delete_pending record) "待删除")
+                           ((alist-get 'validation_error record) "处理失败")
+                           ((alist-get 'pending record) "待确认"))))
+        (when (or title status)
+          (when title
+            (insert (propertize title 'face 'bold))
+            (when (and key (not (equal title key))) (insert " [" key "]")))
+          (when status
+            (when title (insert "  "))
+            (insert status))
+          (insert "\n"))
         (dolist (field (append (alist-get 'fields record-meta) nil))
           (let* ((key (alist-get 'key field))
                  (value (loki-assistant-config--record-field key record))
@@ -1202,12 +1446,18 @@
                     (insert (if changed "已更换  " "已设置  ")))
                   (loki-assistant-config--row-input
                    section id field value
-                   (loki-assistant-config--record-field key accepted) changed))
-              (insert (loki-assistant-config--record-display-value field value t)))
+                   (loki-assistant-config--record-field key accepted) changed)
+                  (when (and unkeyed saving)
+                    (widget-apply (cadar (gethash id (loki-assistant-config--record-section-row-inputs section)))
+                                  :deactivate)))
+              (if (loki-assistant-config--field-reference field)
+                  (loki-assistant-config--reference-widget
+                   section field (if (vectorp value) (loki-assistant-config--json value) (or value "")) t)
+                (insert (loki-assistant-config--record-display-value field value t))))
             (insert "\n")))
         (when-let* ((reason (alist-get 'validation_error record)))
           (insert "  " (propertize reason 'face 'error) "\n"))
-        (when editable
+        (when (and editable (not unkeyed))
           (insert "  ")
           (loki-assistant-config--record-button
            section "保存修改" (lambda () (loki-assistant-config--row-save section id)) saving)
@@ -1215,6 +1465,10 @@
             (insert "  ")
             (loki-assistant-config--record-button
              section "删除" (lambda () (loki-assistant-config--record-delete section id)) saving)))
+        (when (and editable unkeyed)
+          (insert "  ")
+          (loki-assistant-config--record-button
+           section "删除" (lambda () (loki-assistant-config--save-unkeyed-list section id)) saving))
         (insert "\n\n")))))
 
 (defun loki-assistant-config--record-allowed-field-p (section field existing)
@@ -1248,21 +1502,21 @@
                  (not (and id (equal key (alist-get 'id_field record)))))
             (insert "  " (alist-get 'label field) "  ")
             (let* ((value (or (cdr (assoc key form)) ""))
-                   (widget (widget-create 'editable-field :format "%v"
-                                          :keymap loki-assistant-config--field-keymap
-                                          :size 45 :value value
-                                          :value-face (loki-assistant-config--input-face field value)
-                                          :notify (lambda (input &rest _)
-                                                    (loki-assistant-config--mark-field input field))
-                                          :secret (when (equal (loki-assistant-config--data-type field) "password") ?*))))
-              (push widget (loki-assistant-config--record-section-widgets section))
+                   (reference (loki-assistant-config--field-reference field))
+                   (widget (if reference
+                               (loki-assistant-config--reference-widget section field value)
+                             (widget-create 'editable-field :format "%v"
+                                            :keymap loki-assistant-config--field-keymap
+                                            :size 45 :value value
+                                            :value-face (loki-assistant-config--input-face field value)
+                                            :notify (lambda (input &rest _)
+                                                      (loki-assistant-config--mark-field input field))
+                                            :secret (when (equal (loki-assistant-config--data-type field) "password") ?*)))))
               (push (cons key widget) (loki-assistant-config--record-section-inputs section))
               (when saving (widget-apply widget :deactivate))
-              (when-let* ((options (loki-assistant-config--record-field "options" field)))
-                (insert "  ")
-                (loki-assistant-config--record-button
-                 section "选择已有条目"
-                 (lambda () (loki-assistant-config--record-choose section key options)) saving)))
+              (unless reference
+                (push widget (loki-assistant-config--record-section-widgets section))
+                (loki-assistant-config--record-candidate-button section field widget saving)))
             (when-let* ((help (alist-get 'description (loki-assistant-config--record-field "checker" field))))
               (when (stringp help) (insert "  " help)))
             (when (stringp (alist-get 'default_template field))
@@ -1299,13 +1553,22 @@
           (delete-region start end)
           (goto-char start)
           (let* ((metadata (loki-assistant-config--record-section-metadata section))
-                 (record (alist-get 'record metadata)))
+                 (record (alist-get 'record metadata))
+                 (read-only (eq (alist-get 'read_only metadata) t)))
             (insert (propertize (alist-get 'title metadata) 'face 'bold) "\n")
-            (unless (and (alist-get 'single metadata)
-                         (loki-assistant-config--record-section-records section))
+            (unless (or read-only
+                        (and (alist-get 'single metadata)
+                             (loki-assistant-config--record-section-records section)))
               (loki-assistant-config--record-button
                section (or (alist-get 'add_label record) (if (alist-get 'single metadata) "设置" "新增"))
                (lambda () (loki-assistant-config--record-edit section nil))
+               (loki-assistant-config--record-section-saving section)))
+            (when (and (not read-only)
+                       (loki-assistant-config--unkeyed-list-p section)
+                       (loki-assistant-config--record-section-records section))
+              (widget-insert " ")
+              (loki-assistant-config--record-button
+               section "保存列表修改" (lambda () (loki-assistant-config--save-unkeyed-list section))
                (loki-assistant-config--record-section-saving section)))
             (insert "\n\n"))
           (when-let* ((notice (loki-assistant-config--record-section-notice section)))
@@ -1337,6 +1600,47 @@
   (setf (loki-assistant-config--record-section-form-baseline section)
         (copy-tree (loki-assistant-config--record-section-form section)))
   (loki-assistant-config--record-render section))
+
+(defun loki-assistant-config--record-candidate-button (section field widget &optional disabled)
+  "为 SECTION 中的 FIELD 提供已有条目选择按钮。"
+  (when-let* ((options (alist-get 'options field)))
+    (widget-insert " ")
+    (loki-assistant-config--record-button
+     section "选择已有条目"
+     (lambda () (loki-assistant-config--record-choose
+                 section (alist-get 'key field) options widget))
+     disabled)))
+
+(defun loki-assistant-config--choose-typed-field (section field widget)
+  "编辑 SECTION 中 FIELD 对应的 WIDGET，写入候选的键。"
+  (let* ((buffer (current-buffer))
+         (marker (widget-get widget :from))
+         (input (widget-value widget))
+         (multi (equal (loki-assistant-config--data-type field) "list"))
+         (value (loki-assistant-config--parse-input field input))
+         (selected (cond ((and multi (vectorp value)) value)
+                         ((and (not multi) (not (string-empty-p input))) (list input)))))
+    (loki-assistant-config--type-choices
+     (loki-assistant-config--record-section-model section)
+     (loki-assistant-config--field-reference field)
+     selected
+     (lambda (choices)
+       (when (and (buffer-live-p buffer) (eq (marker-buffer marker) buffer))
+         (with-current-buffer buffer
+           (when (equal (widget-value widget) input)
+             (let* ((label (alist-get 'label field))
+                    (result (if multi
+                                (loki-assistant-config--json
+                                 (loki-assistant-config--read-candidates label choices selected))
+                              (let ((choice (completing-read
+                                             (concat label "：") choices nil t nil nil
+                                             (car (rassoc (car selected) choices)))))
+                                (or (cdr (assoc choice choices)) "")))))
+               (loki-assistant-config--update-type-widget widget field result)
+               (widget-setup)
+               (when-let* ((update (widget-get widget :loki-edited)))
+                 (funcall update))))))))))
+
 
 (defun loki-assistant-config--record-choose (section key options &optional inline)
   "读取 OPTIONS 中的已有条目，设置 SECTION 的字段 KEY。"
@@ -1492,6 +1796,7 @@
     (when (and existing (zerop (hash-table-count body)))
       (user-error "没有修改的字段"))
     (let* ((id (and (not single) (or existing (cdr (assoc id-field fields)))))
+           (generate-id (and (not existing) (alist-get 'generate_id meta)))
            (append-item (and (not single) (not id)))
            (path (loki-assistant-config--record-data-path section (alist-get 'key record) id))
            (headers (append
@@ -1507,13 +1812,14 @@
        (cond (existing "PATCH") (append-item "POST") (t "PUT")) path
        :headers headers
        :timeout (loki-assistant-config--record-timeout section)
-       :body (if append-item (vector body) body)
+       :body (if (and append-item (not generate-id)) (vector body) body)
        :callback
        (lambda (response)
          (when (loki-assistant-config--record-alive-p section)
            (setf (loki-assistant-config--record-section-saving section) nil)
            (let* ((stored (plist-get response :data))
-                  (value (alist-get 'value stored)))
+                  (value (alist-get 'value stored))
+                  (id (if generate-id (alist-get 'instance stored) id)))
              (if (and (plist-get response :ok)
                       (if id
                           (and (equal (alist-get 'instance stored) id) (listp value))
@@ -1540,10 +1846,12 @@
   (or (alist-get 'save_timeout_seconds (loki-assistant-config--record-section-metadata section))
       loki-assistant-config-save-timeout))
 
-(defun loki-assistant-config--record-insert (module item values)
+(defun loki-assistant-config--record-insert (module item values &optional model)
   "按 ITEM 的结构元数据在当前页面渲染 MODULE 的配置记录。"
   (let* ((key (alist-get 'key item))
-         (record (cons (cons 'key key) (alist-get 'structure item)))
+         (record (cons (cons 'key key)
+                       (seq-remove (lambda (entry) (eq (cdr entry) :null))
+                                   (loki-assistant-config--structure-metadata item))))
          (single (equal (loki-assistant-config--data-type item) "structure"))
          (data (loki-assistant-config--record-field key values))
          (section (cl-find-if
@@ -1559,11 +1867,14 @@
     (unless (loki-assistant-config--record-section-saving section)
       (setf (loki-assistant-config--record-section-notice section) nil))
     (widget-insert "\n")
-    (setf (loki-assistant-config--record-section-metadata section)
+    (setf (loki-assistant-config--record-section-model section) model
+          (loki-assistant-config--record-section-metadata section)
           `((title . ,(alist-get 'name item)) (record . ,record) (single . ,single)
             (save_timeout_seconds . ,(alist-get 'save_timeout_seconds item))
             (requires_local_auth . ,(alist-get 'requires_local_auth item))
-            (create_fields . ,(alist-get 'create_fields item)))
+            (read_only . ,(alist-get 'read_only item))
+            (create_fields . ,(alist-get 'create_fields item))
+            (generate_id . ,(alist-get 'generate_id item)))
           (loki-assistant-config--record-section-start section) (copy-marker position)
           (loki-assistant-config--record-section-end section) (copy-marker position))
     (loki-assistant-config--record-set-data section data)
@@ -1587,6 +1898,161 @@
                           (list '(delete_pending . t)))
                         (cons '(pending . t) value))))))
     (setf (loki-assistant-config--record-section-records section) records)))
+
+(defvar-local loki-assistant-config--yaml-models nil)
+
+(defun loki-assistant-config--yaml-key ()
+  "返回当前 YAML 块行的键和其有效缩进。"
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^\\([ ]*\\)\\(-[ ]+\\)?\\([[:alnum:]_-]+\\):\\(?:[ ]\\|$\\)")
+      (list (match-string-no-properties 3)
+            (+ (length (match-string 1)) (length (match-string 2)))))))
+
+(defun loki-assistant-config--yaml-path ()
+  "从 YAML 块结构定位当前行的配置路径。"
+  (save-excursion
+    (beginning-of-line)
+    (let* ((current (loki-assistant-config--yaml-key))
+           (limit (if current (cadr current) (1+ (current-indentation))))
+           (path (when current (list (car current)))))
+      (while (and (> limit 0) (= (forward-line -1) 0))
+        (when-let* ((key (loki-assistant-config--yaml-key))
+                    ((< (cadr key) limit)))
+          (push (car key) path)
+          (setq limit (cadr key))))
+      path)))
+
+(defun loki-assistant-config--yaml-reference (path models)
+  "根据 YAML PATH 和 MODELS 返回命名类型引用。"
+  (when (equal (car path) "modules")
+    (let* ((model (seq-find (lambda (entry) (equal (alist-get 'id entry) (nth 1 path))) models))
+           (item (seq-find (lambda (entry) (equal (alist-get 'key entry) (nth 2 path)))
+                           (alist-get 'items model)))
+           (field (seq-find (lambda (entry) (equal (alist-get 'key entry) (nth 3 path)))
+                            (alist-get 'fields (loki-assistant-config--structure-metadata item)))))
+      (loki-assistant-config--field-reference (or field item)))))
+
+(defun loki-assistant-config--yaml-scalar ()
+  "读取当前行的简单 YAML 标量。"
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^[ ]*\\(?:-[ ]+\\)?[[:alnum:]_-]+:[ ]*\\(.+\\)$")
+      (let ((text (string-trim (match-string-no-properties 1))))
+        (cond
+         ((string-match "^'\\(.*\\)'[ ]*\\(?:#.*\\)?$" text)
+          (string-replace "''" "'" (match-string 1 text)))
+         ((string-prefix-p "\"" text) (ignore-errors (json-parse-string text)))
+         ((and (not (string-prefix-p "{" text)) (not (equal text "null")))
+          (string-trim-right (replace-regexp-in-string "[ ]+#.*$" "" text))))))))
+
+(defun loki-assistant-config--yaml-reference-options (reference)
+  "从当前 YAML 缓冲区读取 REFERENCE 的记录候选。"
+  (let* ((target (cons "modules" (split-string (alist-get 'target reference) "\\.")))
+         (item (car (last target)))
+         (key-field (alist-get 'key_field reference))
+         (label-field (alist-get 'label_field reference))
+         (heading (concat "^[ ]*" (regexp-quote item) ":[ ]*\\(?:#.*\\)?$"))
+         records)
+    (save-excursion
+      (goto-char (point-min))
+      (while (and (re-search-forward heading nil t)
+                  (not (equal (loki-assistant-config--yaml-path) target))))
+      (when (equal (loki-assistant-config--yaml-path) target)
+        (let ((indent (current-indentation)) key label)
+          (forward-line 1)
+          (while (and (not (eobp))
+                      (or (> (current-indentation) indent)
+                          (looking-at (concat (make-string indent ?\s) "\\(?:-[ ]\\|#\\|$\\)"))))
+            (when (looking-at "^[ ]*-[ ]+")
+              (when key (push (list (cons 'key key) (cons 'label (or label key))) records))
+              (setq key nil label nil))
+            (let* ((path (loki-assistant-config--yaml-path))
+                   (field (nth 3 path))
+                   (suffix (nthcdr 4 path))
+                   (value (loki-assistant-config--yaml-scalar)))
+              (when (and (stringp value)
+                         (or (null suffix) (equal suffix '("accepted" "value"))))
+                (when (equal field key-field) (setq key value))
+                (when (equal field label-field) (setq label value))))
+            (forward-line 1))
+          (when key (push (list (cons 'key key) (cons 'label (or label key))) records)))))
+    (nreverse records)))
+
+(defun loki-assistant-config--yaml-completion ()
+  "为本机 YAML 配置中的命名类型提供光标补全。"
+  (when-let* ((reference (loki-assistant-config--yaml-reference
+                          (loki-assistant-config--yaml-path)
+                          loki-assistant-config--yaml-models))
+              (definition (loki-assistant-config--type-definition
+                           loki-assistant-config--yaml-models reference))
+              (line-start (line-beginning-position))
+              (start (save-excursion
+                       (when (re-search-backward "[][,:]\\|^[ ]*-[ ]+" line-start t)
+                         (goto-char (match-end 0))
+                         (skip-chars-forward " \t" (line-end-position))
+                         (point))))
+              ((<= start (point))))
+    (let* ((records (alist-get 'reference definition))
+           (choices (if records
+                        (loki-assistant-config--candidate-labels
+                         (loki-assistant-config--yaml-reference-options records) nil)
+                      (loki-assistant-config--enum-choices definition)))
+           (marker (copy-marker start))
+           (end (save-excursion
+                  (skip-chars-forward "^,]#\n")
+                  (skip-chars-backward " \t" start)
+                  (point))))
+      (when choices
+        (list start end choices :exclusive 'no
+              :exit-function
+              (lambda (label status)
+                (when (eq status 'finished)
+                  (when-let* ((key (cdr (assoc label choices)))
+                              ((marker-position marker)))
+                    (unless (equal label key)
+                      (let ((finish (+ marker (length label))))
+                        (when (and (<= finish (point-max))
+                                   (equal label (buffer-substring-no-properties marker finish)))
+                          (delete-region marker finish)
+                          (goto-char marker)
+                          (insert (if (string-match-p "^[[:alnum:]_-]+$" key)
+                                      key (json-encode-string key)))))))
+                (set-marker marker nil))))))))
+
+(defun loki-assistant-config--yaml-tab ()
+  "在已声明的 YAML 值位置补全，否则缩进。"
+  (interactive)
+  (unless (and (loki-assistant-config--yaml-completion) (completion-at-point))
+    (indent-for-tab-command)))
+
+(define-minor-mode loki-assistant-config-yaml-completion-mode
+  "为 Loki Assistant 的 YAML 配置提供模型补全。"
+  :lighter nil
+  :keymap (let ((map (make-sparse-keymap)))
+            (define-key map (kbd "TAB") #'loki-assistant-config--yaml-tab)
+            (define-key map (kbd "<tab>") #'loki-assistant-config--yaml-tab)
+            map)
+  (if loki-assistant-config-yaml-completion-mode
+      (let ((buffer (current-buffer)))
+        (add-hook 'completion-at-point-functions #'loki-assistant-config--yaml-completion nil t)
+        (loki-assistant-request
+         "GET" "/meta"
+         :callback (lambda (response)
+                     (when (and (buffer-live-p buffer) (plist-get response :ok))
+                       (with-current-buffer buffer
+                         (when loki-assistant-config-yaml-completion-mode
+                           (setq loki-assistant-config--yaml-models
+                                 (append (alist-get 'modules (plist-get response :data)) nil))))))))
+    (remove-hook 'completion-at-point-functions #'loki-assistant-config--yaml-completion t)))
+
+(defun loki-assistant-config--maybe-enable-yaml-completion ()
+  "在打开 Loki Assistant 配置文件时启用模型补全。"
+  (when (and buffer-file-name
+             (equal (expand-file-name buffer-file-name) (expand-file-name "~/.assistant/config.yml")))
+    (loki-assistant-config-yaml-completion-mode 1)))
+
+(add-hook 'find-file-hook #'loki-assistant-config--maybe-enable-yaml-completion)
 
 (provide 'loki-assistant-config)
 ;;; loki-assistant-config.el ends here

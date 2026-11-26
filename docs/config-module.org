@@ -85,7 +85,7 @@ Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明�
 
 * 结构化配置
 
-~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示一个 JSON 对象。~data_type: list~ 配合 ~list.item_type: structure~ 表示一个结构数组。~structure.fields~ 声明每个字段的 ~data_type~、~required~、可选默认值模板、校验器和候选项。Emacs 在统一配置页按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /editing/{module}/{key}~ 追加元素。
+~GET /meta~ 的 ~modules[].items~ 描述配置值。~data_type: structure~ 表示单个结构。~data_type: list~ 表示数组，~list.item_type~ 声明数组元素类型。元素类型为 ~structure~ 时，~structure.fields~ 声明每个元素的字段类型、必填项、候选、校验器和可选默认值模板。配置界面按这些定义生成表单。~id_field~ 可指定数组元素的主键，以便单独保存元素。没有主键的数组通过通用 ~POST /editing/{module}/{key}~ 追加元素，界面按 ~label_field~ 显示条目标题。
 
 结构可声明 ~show_all_fields~ ，让 Emacs 在一条记录下显示所有字段。缺少值时显示「未设置」，密码字段显示保存状态。
 
@@ -103,6 +103,71 @@ Emacs 配置界面以 Customize 风格的 widget 按模块展示名称、说明�
 | 修改或删除无主键元素 | ~PUT /editing/{module}/{key}~ ，请求体是替换后的数组 | 返回保存后的完整数组 |
 
 按字段修改和手动重试的契约见 [[*读取与提交][读取与提交]]。
+
+* 命名类型、引用与补全
+
+模块通过 ~types~ 声明可复用的值类型。标量字段在 ~data_type~ 中使用 ~{ref: module.type}~ 引用类型，列表在 ~list.item_type~ 中使用同样的引用。枚举类型由 ~enum~ 声明固定候选。记录引用类型通过 ~reference.target~ 指定目标集合，通过 ~key_field~ 指定保存的键，通过 ~label_field~ 指定搜索和显示的字段。目标字段在集合元数据中分别对应 ~id_field~ 和 ~label_field~ ，两者可以指向同一个字段。
+
+#+begin_src yaml
+id: llm
+types:
+  protocol:
+    data_type: string
+    enum: [codex, claude]
+  client_id:
+    data_type: string
+    reference:
+      target: llm.clients
+      key_field: id
+      label_field: name
+  provider_id:
+    data_type: string
+    reference:
+      target: llm.providers
+      key_field: id
+      label_field: id
+#+end_src
+
+~monitoring_filter~ 中三个列表分别引用 ~llm.protocol~ 、 ~llm.client_id~ 和 ~llm.provider_id~ 。客户端绑定中的标量 ~upstream~ 也引用 ~llm.provider_id~ 。
+
+#+begin_src yaml
+# monitoring_filter.structure.fields
+- key: protocols
+  data_type: list
+  list:
+    item_type: {ref: llm.protocol}
+- key: clients
+  data_type: list
+  list:
+    item_type: {ref: llm.client_id}
+- key: upstreams
+  data_type: list
+  list:
+    item_type: {ref: llm.provider_id}
+
+# clients.structure 中的绑定字段
+- key: upstream
+  data_type: {ref: llm.provider_id}
+#+end_src
+
+LLM 客户端的 ~id~ 使用现有令牌携带的 UUID，以可编辑的 ~name~ 为显示名称。重名候选附带对应的 UUID。客户端改名后，历史用量和监控过滤器继续按原 UUID 关联。现有客户端记录由令牌提取 ~id~ 。
+
+供应商以 ~id~ 作为主键和显示值，创建时填写，创建后固定。客户端绑定和监控过滤器都保存供应商 ID。
+
+配置中心、快捷设置和 YAML 编辑器共用同一份模型。枚举补全取 ~enum~ 的值，记录引用补全按 ~label_field~ 搜索、插入 ~key_field~ 。~GET /config/options/{module_id}/{type_name}~ 返回已生效记录的 ~key~ 和 ~label~ 。配置中心显示引用对应的名称，点击字段值可重新选择。找不到对应记录时，以原键作为显示值。直接编辑 ~~/.assistant/config.yml~ 时，Emacs 自动启用 ~loki-assistant-config-yaml-completion-mode~ ，在 YAML 块字段及行内列表的命名类型值上按 ~TAB~ 补全。同文件的记录候选从当前缓冲区提取。
+
+客户端集合声明 ~generate_id~ 。~POST /editing/llm/clients~ 接受 ~name~ 和 ~upstream~ ，配置中心生成 UUID 后返回新记录。已有记录通过 ~PATCH /editing/llm/clients/{id}~ 更新。旧版 v2 配置可在 services 停止后用新版 ~loki-services migrate-llm-client-keys~ 一次性补齐 UUID，命令会在写入前备份原文件。
+
+例如在 ~modules.llm.monitoring_filter.upstreams~ 下输入供应商 ID 的一部分，补全后写入完整 ID。YAML 中实际保存的过滤条件形如
+
+#+begin_src yaml
+modules:
+  llm:
+    monitoring_filter:
+      protocols: [codex, claude]
+      clients: [1c30befd-aacd-419b-b0f3-8d72680d275b]
+      upstreams: [work]
+#+end_src
 
 * 结构中的密码字段
 

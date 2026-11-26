@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::model::{ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata, ConfigValue};
+use super::model::{
+    ConfigItemMetadata, ConfigItemOptions, ConfigModuleMetadata, ConfigValue, NamedType,
+};
 use crate::http::error::ApiError;
 
 #[derive(Clone, Debug, Serialize)]
@@ -18,6 +20,8 @@ pub struct ModuleMetaResponse {
     pub description: String,
     pub version: String,
     pub items: Vec<ItemMetaResponse>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<&'static str, NamedType>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub monitors: Vec<MonitorMetaResponse>,
 }
@@ -72,12 +76,14 @@ impl From<ConfigModuleMetadata> for ModuleMetaResponse {
                 }
             })
             .collect();
+        let types = super::registry::named_types(&module.id);
         Self {
             id: module.id,
             name: module.name,
             description: module.description,
             version: module.version,
             items,
+            types,
             monitors: monitors.into_values().collect(),
         }
     }

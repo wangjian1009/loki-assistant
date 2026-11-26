@@ -19,6 +19,9 @@
 (defvar url-http-response-status)
 (defvar url-http-end-of-headers)
 
+(declare-function consult--read "consult")
+(declare-function consult--lookup-cdr "consult")
+
 (defgroup loki-assistant nil
   "Loki Assistant 的 Emacs 集成。"
   :group 'applications
@@ -28,6 +31,32 @@
   "格式化状态栏快捷键 SHORTCUTS，HELP-KEY 默认为问号。"
   (concat " · C-c C-q 退出  " (or help-key "?") " 帮助"
           (when shortcuts (concat "  " shortcuts))))
+
+(defun loki-assistant--read-menu (prompt entries)
+  "用 PROMPT 从 ENTRIES 中选择并返回值。
+每个条目为 (显示名称 值 [搜索别名])，搜索别名在候选中隐藏。"
+  (let ((candidates
+         (mapcar (lambda (entry)
+                   (let ((label (nth 0 entry))
+                         (aliases (nth 2 entry)))
+                     (cons (if aliases
+                               (concat label (propertize (concat " " aliases) 'invisible t))
+                             label)
+                           (nth 1 entry))))
+                 entries))
+        (keymap (make-sparse-keymap))
+        ;; 单字母前缀优先，拼音片段仍可匹配。
+        (completion-styles (delete-dups (append '(basic) completion-styles '(substring)))))
+    (keymap-set keymap "C-c C-q" #'abort-recursive-edit)
+    (if (require 'consult nil t)
+        (consult--read candidates :prompt prompt :keymap keymap :sort nil
+                       :require-match t :lookup #'consult--lookup-cdr :default "")
+      (cdr (assoc (minibuffer-with-setup-hook
+                      (lambda ()
+                        (set-keymap-parent keymap (current-local-map))
+                        (use-local-map keymap))
+                    (completing-read prompt candidates nil t))
+                  candidates)))))
 
 (autoload 'loki-assistant-logs "loki-assistant-log" "浏览 Loki Assistant 日志。" t)
 (autoload 'loki-assistant-config "loki-assistant-config"
@@ -51,7 +80,7 @@
 
 ;;;###autoload
 (autoload 'loki-assistant-command-map "loki-assistant-command-menu"
-  "打开 Loki Assistant 的 Hydra 命令菜单。" t)
+  "通过 Consult 选择并执行 Loki Assistant 命令。" t)
 
 (defcustom loki-assistant-service-file "~/.assistant/service"
   "services 地址信息文件；每次请求重新读取。"

@@ -21,6 +21,7 @@ pub enum ConfigDataType {
     List,
     FilePath,
     Executable,
+    Ref(String),
 }
 
 impl ConfigDataType {
@@ -91,6 +92,8 @@ pub struct ConfigItemOptions {
     pub monitor: Option<ConfigMonitor>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub create_fields: Vec<&'static str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub generate_id: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<StructureMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +155,22 @@ pub struct ListMetadata {
     pub max_items: Option<usize>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct NamedType {
+    pub data_type: ConfigDataType,
+    #[serde(rename = "enum", skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<RecordReference>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordReference {
+    pub target: &'static str,
+    pub key_field: &'static str,
+    pub label_field: &'static str,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckerMetadata {
     pub pattern: String,
@@ -193,6 +212,8 @@ pub struct StructureField {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor: Option<String>,
     pub data_type: ConfigDataType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<ListMetadata>,
     pub required: bool,
     pub default_template: Option<String>,
     pub checker: Option<CheckerMetadata>,

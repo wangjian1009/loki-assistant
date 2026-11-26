@@ -101,11 +101,12 @@
          requests alpha-buffer beta-buffer beta-updated)
     (save-window-excursion
       (unwind-protect
-          (cl-letf (((symbol-function 'completing-read)
-                     (lambda (_prompt choices &rest _)
+          (cl-letf (((symbol-function 'loki-assistant--read-menu)
+                     (lambda (prompt choices)
+                       (should (equal prompt "选择配置模块："))
                        (should (equal (mapcar #'car choices)
                                       '("甲 · config-test-alpha" "乙 · config-test-beta")))
-                       (pop selections)))
+                       (cadr (assoc (pop selections) choices))))
                     ((symbol-function 'loki-assistant-request)
                      (lambda (_method path &rest args)
                        (push path requests)
@@ -591,6 +592,7 @@
 (ert-deftest loki-assistant-config-test-record-form-uses-declared-fields ()
   (let ((item
          '((key . "records") (data_type . "list") (name . "设置")
+           (list (item_type . "structure"))
            (requires_local_auth . t) (save_timeout_seconds . 650)
            (actions . [((id . "old-action") (label . "旧业务操作"))])
            (structure . ((id_field . "slug") (label_field . "name")
@@ -641,6 +643,7 @@
   (loki-assistant-config-test--with-buffer
     (let* ((module '((id . "test")
                      (items . [((key . "teams") (name . "工作区") (data_type . "list")
+                                (list (item_type . "structure"))
                                 (structure . ((id_field . "team_id")
                                               (fields . [((key . "team_id") (label . "Team ID") (data_type . "key"))
                                                          ((key . "name") (label . "名称") (data_type . "string") (monitor . "team"))
@@ -679,6 +682,7 @@
                  (lambda (method path &rest args) (setq request (list method path args)))))
         (loki-assistant-config--record-insert
          "slack" '((key . "teams") (name . "工作区") (data_type . "list")
+                   (list (item_type . "structure"))
                    (structure . ((id_field . "team_id") (show_all_fields . t)
                                  (fields . [((key . "team_id") (label . "Team ID") (data_type . "key"))
                                             ((key . "name") (label . "名称") (data_type . "string"))
@@ -715,6 +719,7 @@
                  (lambda (method path &rest args) (setq request (list method path args)))))
         (loki-assistant-config--record-insert
          "slack" '((key . "teams") (name . "工作区") (data_type . "list")
+                   (list (item_type . "structure"))
                    (structure . ((id_field . "team_id"))))
          '((teams . ((value . [((team_id . "TKEEP"))])
                      (pending . [((key . "TTEAM") (value . ((team_id . "TTEAM"))))])))))
@@ -757,6 +762,105 @@
           (should-not (loki-assistant-config--entry-retry-button entry))
           (should (equal (widget-value (loki-assistant-config--entry-field entry)) "3"))
           (should (equal (loki-assistant-config--entry-baseline entry) "2")))))))
+
+(ert-deftest loki-assistant-config-test-file-completion-uses-type-and-inserts-reference-key ()
+  (with-temp-buffer
+    (setq loki-assistant-config--yaml-models
+          '(((id . "llm")
+             (types . ((protocol (enum . ["codex" "claude"]))
+                       (client_id (reference (target . "llm.clients")
+                                             (key_field . "id") (label_field . "name")))))
+             (items . [((key . "monitoring_filter") (data_type . "structure")
+                        (structure
+                         (fields . [((key . "protocols") (list (item_type (ref . "llm.protocol"))))
+                                    ((key . "clients") (list (item_type (ref . "llm.client_id"))))])))]))))
+    (insert "format_version: 2\nmodules:\n  llm:\n    clients:\n"
+            "    - id: 1c30befd-aacd-419b-b0f3-8d72680d275b\n"
+            "      name:\n        accepted:\n          value: Emacs Editor\n"
+            "    monitoring_filter:\n      protocols: [co]\n      clients:\n      - Emac\n")
+    (goto-char (point-min))
+    (search-forward "[co")
+    (let ((capf (loki-assistant-config--yaml-completion)))
+      (should (equal (all-completions "co" (nth 2 capf)) '("codex"))))
+    (search-forward "- Emac")
+    (add-hook 'completion-at-point-functions #'loki-assistant-config--yaml-completion nil t)
+    (let ((completion-in-region-function #'completion--in-region)
+          (completion-auto-help nil))
+      (loki-assistant-config--yaml-tab))
+    (should (string-suffix-p "- 1c30befd-aacd-419b-b0f3-8d72680d275b\n" (buffer-string)))))
+
+(ert-deftest loki-assistant-config-test-history-list-resolves-names-and-saves-keys ()
+  (with-temp-buffer
+    (loki-assistant-config-mode)
+    (let* ((field '((key . "clients")
+                    (label . "客户端")
+                    (data_type . "list")
+                    (list (item_type (ref . "llm.client_id")))))
+           (item (list '(key . "monitoring_history")
+                       '(name . "请求监控过滤历史")
+                       '(data_type . "list")
+                       '(list (item_type . "structure"))
+                       (cons 'structure (list '(id_field . :null) '(label_field . :null)
+                                              '(add_label . :null) (cons 'fields (vector field))))))
+           (model (list '(id . "llm")
+                        '(types (client_id (reference (target . "llm.clients"))))))
+           (values '((monitoring_history (value . [((clients . ["original-key"]))
+                                                   ((clients . ["removed-key"]))]))))
+           links
+           saved)
+      (should (equal (loki-assistant-config--merge-editing
+                      (cons (cons 'items (vector item)) model) values
+                      '(:ok t :data ((module_id . "llm")
+                                     (data . ((monitoring_history . [((clients . ["original-key"]))])))
+                                     (monitor_states . []))))
+                     values))
+      (cl-letf (((symbol-function 'loki-assistant-request)
+                 (lambda (method path &rest args)
+                   (cond
+                    ((equal path "/config/options/llm/client_id")
+                     (should (equal method "GET"))
+                     (push (plist-get args :callback) links))
+                    ((equal path "/editing/llm/monitoring_history")
+                     (should (equal method "PUT"))
+                     (setq saved (plist-get args :body)))
+                    (t (ert-fail path))))))
+        (loki-assistant-config--record-insert "llm" item values model)
+        (should (= (length links) 1))
+        (let* ((section (car loki-assistant-config--record-sections))
+               (row (car (gethash "1" (loki-assistant-config--record-section-row-inputs section))))
+               (widget (cadr row)))
+          (funcall (pop links)
+                   '(:ok t :data ((options . [((key . "original-key") (label . "原客户端"))
+                                              ((key . "new-key") (label . "新客户端"))]))))
+          (should-not (string-match-p "^[0-9]+$" (buffer-string)))
+          (should (string-match-p "原客户端" (buffer-string)))
+          (should (string-match-p "removed-key" (buffer-string)))
+          (should-not (string-match-p "original-key" (buffer-string)))
+          (should (equal (widget-value widget) "[\"original-key\"]"))
+          (should (zerop (hash-table-count (loki-assistant-config--row-patch section "1"))))
+          (loki-assistant-config--update-type-widget widget field "[\"new-key\"]")
+          (should (string-match-p "新客户端" (buffer-string)))
+          (loki-assistant-config--save-unkeyed-list section)
+          (should (equal saved [((clients . ["new-key"])) ((clients . ["removed-key"]))])))))))
+
+(ert-deftest loki-assistant-config-test-renders-arrays-and-read-only-structures-from-metadata ()
+  (with-temp-buffer
+    (loki-assistant-config-mode)
+    (let ((model '((id . "test")
+                   (items . [((key . "words") (name . "普通数组") (data_type . "list")
+                              (list (item_type . "string")))
+                             ((key . "records") (name . "结构数组") (data_type . "list")
+                              (list (item_type . "structure")) (read_only . t)
+                              (structure (id_field . :null) (label_field . :null)
+                                         (fields . [((key . "name") (label . "名称") (data_type . "string"))])))]))))
+      (loki-assistant-config--render
+       model '((words (value . ["词条"]) (source . "user"))
+               (records (value . [((name . "记录内容"))]) (source . "user"))))
+      (should (= (length loki-assistant-config--entries) 1))
+      (should (= (length loki-assistant-config--record-sections) 1))
+      (should (string-match-p "记录内容" (buffer-string)))
+      (should-not (string-match-p "^[0-9]+$" (buffer-string)))
+      (should-not (string-match-p "新增\\|删除\\|保存列表修改" (buffer-string))))))
 
 (provide 'loki-assistant-config-tests)
 ;;; loki-assistant-config-tests.el ends here

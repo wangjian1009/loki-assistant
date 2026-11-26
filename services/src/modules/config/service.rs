@@ -401,7 +401,13 @@ impl ConfigService {
                     }
                     let options = item_options(&module_id, &key);
                     if options.monitor.is_some()
-                        || options.structure.is_some()
+                        || options.structure.as_ref().is_some_and(|structure| {
+                            structure.id_field.is_some()
+                                || structure
+                                    .fields
+                                    .iter()
+                                    .any(|field| field.read_only || field.data_type.is_password())
+                        })
                         || options.read_only
                         || options.requires_local_auth
                         || item.data_type.is_password()
@@ -1765,7 +1771,7 @@ impl ConfigItemMetadata {
                 for field in &structure.fields {
                     match record.get(&field.key) {
                         Some(value)
-                            if matches_type(&field.data_type, value, None)
+                            if matches_type(&field.data_type, value, field.list.as_ref())
                                 && (!field.required
                                     || !value
                                         .as_str()
@@ -1864,6 +1870,16 @@ fn matches_type(
     list: Option<&super::model::ListMetadata>,
 ) -> bool {
     match data_type {
+        ConfigDataType::Ref(reference) => reference
+            .split_once('.')
+            .and_then(|(module, name)| super::registry::named_type(module, name))
+            .is_some_and(|definition| {
+                definition.data_type == ConfigDataType::String
+                    && value.as_str().is_some_and(|text| {
+                        definition.values.is_empty()
+                            || definition.values.iter().any(|item| item == text)
+                    })
+            }),
         ConfigDataType::Password { .. } => value.is_string() || value.is_object(),
         ConfigDataType::String
         | ConfigDataType::Key

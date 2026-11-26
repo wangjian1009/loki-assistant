@@ -11,7 +11,7 @@ use loki_services::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match env::args().nth(1).as_deref() {
         Some("--help") | Some("-h") => print_help(),
-        Some("migrate-config") => {
+        Some(command @ ("migrate-config" | "migrate-llm-client-keys")) => {
             let path = env::args_os().nth(2).map(std::path::PathBuf::from);
             let _lock = if path.is_none() {
                 Some(ServiceInstanceLock::acquire()?)
@@ -22,7 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(path) => path,
                 None => loki_services::modules::config::service::ConfigService::storage_path()?,
             };
-            if loki_services::modules::config::service::ConfigService::migrate_storage(path)? {
+            let migrated = if command == "migrate-llm-client-keys" {
+                Services::migrate_llm_client_keys(path)?
+            } else {
+                loki_services::modules::config::service::ConfigService::migrate_storage(path)?
+            };
+            if migrated {
                 println!("已转换配置文件并备份旧文件。");
             } else {
                 println!("配置文件已使用当前格式或尚未创建。");
@@ -127,6 +132,7 @@ async fn notify_port_conflict(address: SocketAddr) {
 
 fn print_help() {
     println!("loki-services migrate-config [路径]  一次性转换配置文件");
+    println!("loki-services migrate-llm-client-keys [路径]  为旧客户端补齐 UUID");
     println!("loki-services");
     println!("  无参数       启动本地 HTTP 服务");
     println!("  服务管理     使用 brew services 或根目录 Makefile");

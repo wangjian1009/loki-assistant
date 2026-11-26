@@ -9,6 +9,7 @@
 (require 'tabulated-list)
 (require 'parse-time)
 (require 'loki-assistant)
+(require 'loki-assistant-config)
 
 (declare-function agent-shell-markdown-replace-markup "agent-shell-markdown")
 (declare-function agent-shell-chat-boxed-label "agent-shell-chat-mode")
@@ -721,13 +722,44 @@
   (seq-some (lambda (key) (length> (alist-get key filter) 0))
             '(protocols clients upstreams)))
 
-(defun loki-assistant-llm-usage--read-monitoring-filter (filter)
-  (cl-loop for (key label) in '((protocols "协议（codex 或 claude）")
-                               (clients "客户端 UUID")
-                               (upstreams "供应商 ID"))
-           for input = (read-string (concat label "，逗号分隔，留空表示不限该维度：")
-                                    (string-join (alist-get key filter) ","))
-           collect (cons key (vconcat (split-string input "[,， \t]+" t)))))
+(defun loki-assistant-llm-usage--monitoring-origin-p (origin)
+  "判断 ORIGIN 是否仍是当前窗口的实时请求列表。"
+  (and (buffer-live-p origin) (eq (window-buffer) origin)
+       (eq (buffer-local-value 'loki-assistant-llm-usage--current origin) 'live)))
+
+(defun loki-assistant-llm-usage--configure-monitoring (origin filter)
+  "按配置中心模型在 ORIGIN 编辑 FILTER。"
+  (loki-assistant-request
+   "GET" "/meta/llm"
+   :callback
+   (lambda (response)
+     (when (loki-assistant-llm-usage--monitoring-origin-p origin)
+       (if (not (plist-get response :ok))
+           (message "%s" (or (plist-get response :error-message) "读取请求监控模型失败"))
+         (let* ((model (plist-get response :data))
+                (item (seq-find (lambda (item) (equal (alist-get 'key item) "monitoring_filter"))
+                                (alist-get 'items model)))
+                (fields (append (alist-get 'fields (alist-get 'structure item)) nil)))
+           (if fields
+               (loki-assistant-llm-usage--configure-fields origin model fields filter nil)
+             (message "请求监控模型缺少过滤字段"))))))))
+
+(defun loki-assistant-llm-usage--configure-fields (origin model fields filter values)
+  "逐项按 MODEL 编辑 FIELDS，将结果累积到 VALUES。"
+  (when (loki-assistant-llm-usage--monitoring-origin-p origin)
+    (if-let* ((field (car fields)))
+        (let* ((key (intern (alist-get 'key field)))
+               (reference (loki-assistant-config--field-reference field))
+               (selected (alist-get key filter)))
+          (loki-assistant-config--type-choices
+           model reference selected
+           (lambda (choices)
+             (when (loki-assistant-llm-usage--monitoring-origin-p origin)
+               (let ((value (loki-assistant-config--read-candidates
+                             (alist-get 'label field) choices selected)))
+                 (loki-assistant-llm-usage--configure-fields
+                  origin model (cdr fields) filter (cons (cons key value) values)))))))
+      (loki-assistant-llm-usage--save-monitoring (nreverse values)))))
 
 (defun loki-assistant-llm-usage--save-monitoring (filter)
   (loki-assistant-request
@@ -752,8 +784,7 @@
      "GET" "/llm/monitoring"
      :callback
      (lambda (reply)
-       (when (and (buffer-live-p origin) (eq (window-buffer) origin)
-                  (eq (buffer-local-value 'loki-assistant-llm-usage--current origin) 'live))
+       (when (loki-assistant-llm-usage--monitoring-origin-p origin)
          (if (not (plist-get reply :ok))
              (message "%s" (or (plist-get reply :error-message) "读取请求监控配置失败"))
            (let* ((settings (plist-get reply :data))
@@ -774,11 +805,10 @@
                                    (loki-assistant-llm-usage--monitoring-label filter names))
                            actions nil t))
                   (action (cdr (assoc choice actions))))
-             (loki-assistant-llm-usage--save-monitoring
-              (pcase action
-                ('configure (loki-assistant-llm-usage--read-monitoring-filter filter))
-                ('clear (make-hash-table :test #'equal))
-                (_ action))))))))))
+             (pcase action
+               ('configure (loki-assistant-llm-usage--configure-monitoring origin filter))
+               ('clear (loki-assistant-llm-usage--save-monitoring (make-hash-table :test #'equal)))
+               (_ (loki-assistant-llm-usage--save-monitoring action))))))))))
 
 (defun loki-assistant-llm-usage--open-request (row state live)
   (let* ((origin (current-buffer))
@@ -1381,7 +1411,7 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
 
 按 1 至 5 切换视图，g 刷新。按 RET 查看选中行的请求或详情。
 在概览中按 t 切换表格和用量图，按 e 导出 PNG。
-在实时请求中按 m 切换监控、配置范围或恢复最近的过滤条件。
+在实时请求中按 m 设置、取消或恢复过滤器。设置时可用 TAB 补全候选。
 概览、历史和会话支持 f 筛选和 F 清除筛选。列表有下一页时按 l。
 下钻后按 b 返回上一视图。按 C-c C-q 退出，按 ? 查看模式帮助。"
   (setq-local loki-assistant-llm-usage--views-state (make-hash-table :test #'eq))

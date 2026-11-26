@@ -91,6 +91,7 @@ impl projects::SlackTeam {
             show_all_fields: true,
             fields: vec![
                 StructureField {
+                    list: None,
                     key: "team_id".into(),
                     label: "Slack Team ID".into(),
                     monitor: None,
@@ -106,6 +107,7 @@ impl projects::SlackTeam {
                     options: None,
                 },
                 StructureField {
+                    list: None,
                     monitor: Some("team".into()),
                     key: "name".into(),
                     label: "本地显示名称".into(),
@@ -125,6 +127,7 @@ impl projects::SlackTeam {
                 ]
                 .into_iter()
                 .map(|(key, label)| StructureField {
+                    list: None,
                     key: key.into(),
                     label: label.into(),
                     data_type: ConfigDataType::String,
@@ -143,6 +146,7 @@ impl projects::SlackTeam {
                 ]
                 .into_iter()
                 .map(|(key, label, password_key)| StructureField {
+                    list: None,
                     key: key.into(),
                     label: label.into(),
                     monitor: Some("team".into()),
@@ -200,6 +204,7 @@ static WATCH_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             ]
             .into_iter()
             .map(|(key, label, data_type)| StructureField {
+                list: None,
                 key: key.into(),
                 monitor: None,
                 label: label.into(),
@@ -237,6 +242,7 @@ static NICKNAME_CONFIG: ConfigItemRegistration = ConfigItemRegistration {
             ]
             .into_iter()
             .map(|(key, label, data_type)| StructureField {
+                list: None,
                 key: key.into(),
                 monitor: (key == "nickname").then(|| "nickname".into()),
                 label: label.into(),

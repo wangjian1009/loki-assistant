@@ -214,6 +214,62 @@ async fn module_editing(
 #[loki_api(
     module = "config",
     mount = "Arc<ConfigService>",
+    id = "type-candidates",
+    method = "GET",
+    path = "/config/options/{module_id}/{type_name}",
+    summary = "读取命名类型候选",
+    description = "从已确认的记录中返回引用键和显示值。"
+)]
+async fn type_candidates(
+    Path((module_id, type_name)): Path<(String, String)>,
+    State(service): State<Arc<ConfigService>>,
+) -> Result<Json<Value>, Response> {
+    use super::registry::{item_options, named_type};
+    let Some(reference) = named_type(&module_id, &type_name).and_then(|kind| kind.reference) else {
+        return Err(error_response(ConfigServiceError::ActionNotFound));
+    };
+    let (target_module, target_item) = reference
+        .target
+        .split_once('.')
+        .ok_or_else(|| error_response(ConfigServiceError::ActionNotFound))?;
+    let structure = item_options(target_module, target_item)
+        .structure
+        .filter(|structure| {
+            structure.id_field.as_deref() == Some(reference.key_field)
+                && structure.label_field.as_deref() == Some(reference.label_field)
+                && structure.fields.iter().any(|field| {
+                    field.key == reference.label_field
+                        && matches!(
+                            field.data_type,
+                            super::model::ConfigDataType::String
+                                | super::model::ConfigDataType::Key
+                        )
+                })
+        })
+        .ok_or_else(|| error_response(ConfigServiceError::ActionNotFound))?;
+    let _ = structure;
+    let data = service
+        .value(target_module, target_item)
+        .await
+        .map_err(error_response)?;
+    let records = data
+        .value
+        .as_array()
+        .ok_or_else(|| error_response(ConfigServiceError::ActionNotFound))?;
+    let options: Vec<_> = records
+        .iter()
+        .filter_map(|record| {
+            let key = record[reference.key_field].as_str()?;
+            let label = record[reference.label_field].as_str().unwrap_or(key);
+            Some(serde_json::json!({"key": key, "label": label}))
+        })
+        .collect();
+    Ok(Json(serde_json::json!({"options": options})))
+}
+
+#[loki_api(
+    module = "config",
+    mount = "Arc<ConfigService>",
     id = "module-editing-batch",
     method = "PATCH",
     path = "/editing/{module_id}",
@@ -320,7 +376,7 @@ async fn put_value(
     path = "/editing/{module_id}/{key}",
     access = "paired",
     summary = "部分更新配置值",
-    description = "合并字典或追加列表项。"
+    description = "合并字典、追加列表项或为新记录生成 UUID。"
 )]
 async fn post_value(
     Path((module_id, key)): Path<(String, String)>,
@@ -328,12 +384,37 @@ async fn post_value(
     peer: Option<Extension<RemoteRequest>>,
     headers: HeaderMap,
     Json(value): Json<Value>,
-) -> Result<Json<ValueResponse>, Response> {
+) -> Result<Response, Response> {
     check_write_access(&service, peer.is_some(), &module_id, &key).await?;
     service
         .authorize_secret_request(&module_id, &key, bearer(&headers))
         .await
         .map_err(error_response)?;
+    if super::registry::item_options(&module_id, &key).generate_id {
+        let instance = uuid::Uuid::new_v4().to_string();
+        let (value, pending) = service
+            .notify_write(
+                module_id.clone(),
+                key.clone(),
+                Some(instance.clone()),
+                Some(value),
+                true,
+            )
+            .await
+            .map_err(error_response)?
+            .ok_or_else(|| error_response(ConfigServiceError::ActionNotFound))?;
+        return Ok((
+            write_status(pending),
+            Json(RecordResponse {
+                module_id,
+                key,
+                instance,
+                value,
+                status: Some(if pending { "pending" } else { "confirmed" }),
+            }),
+        )
+            .into_response());
+    }
     if service.has_notification(&module_id, &key) && service.notifications_attached() {
         return Err(error_response(ConfigServiceError::InvalidValue(
             "请逐条提交带通知的配置记录。".into(),
@@ -351,6 +432,7 @@ async fn post_value(
                     source: ConfigValueSource::User,
                 },
             })
+            .into_response()
         })
         .map_err(error_response)
 }

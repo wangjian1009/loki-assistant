@@ -70,6 +70,12 @@ impl Services {
         )
     }
 
+    pub fn migrate_llm_client_keys(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<bool, config::service::ConfigServiceError> {
+        config::service::ConfigService::update_storage(path, llm::migrate_client_keys)
+    }
+
     pub async fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let password_environment = password::service::PasswordEnvironment::from_env()?;
         let config_path = config::service::ConfigService::storage_path()?;
