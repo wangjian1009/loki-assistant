@@ -69,7 +69,7 @@
     (unless (memq value '(nil :null :false)) value)))
 
 (defun loki-assistant-llm-usage--cell (key row &optional missing)
-  (if-let ((value (loki-assistant-llm-usage--value key row)))
+  (if-let* ((value (loki-assistant-llm-usage--value key row)))
       (format "%s" value)
     (or missing "—")))
 
@@ -191,7 +191,7 @@
                          (if more (append (loki-assistant-llm-usage--view-items state) items) items)
                          (loki-assistant-llm-usage--view-cursor state)
                          (loki-assistant-llm-usage--value 'next_cursor data))
-                   (when-let ((zone (loki-assistant-llm-usage--value 'time_zone data)))
+                   (when-let* ((zone (loki-assistant-llm-usage--value 'time_zone data)))
                      (setq loki-assistant-llm-usage--zone zone)))
                (setf (loki-assistant-llm-usage--view-error state)
                      (or (plist-get reply :error-message) "读取用量失败")))
@@ -207,7 +207,7 @@
           (vector (if (equal (alist-get 'bucket data) "month")
                       (substring (cell 'period_start) 0 7)
                     (cell 'period_start)))
-          (when-let ((label (loki-assistant-llm-usage--group-label group-by)))
+          (when-let* ((label (loki-assistant-llm-usage--group-label group-by)))
             (vector (loki-assistant-llm-usage--group-value item data label)))
           (if chart-maximum
               (vector (loki-assistant-llm-usage--chart-bar item chart-maximum)
@@ -276,7 +276,7 @@
 (defun loki-assistant-llm-usage--insert-overview (data filters has-rows chart-maximum)
   (let ((start (loki-assistant-llm-usage--value 'data_from data))
         (totals (alist-get 'totals data)))
-    (when-let ((range (loki-assistant-llm-usage--report-range data)))
+    (when-let* ((range (loki-assistant-llm-usage--report-range data)))
         (insert (propertize "统计范围  " 'face 'bold)
                 range "  ·  " loki-assistant-llm-usage--zone "\n")
       (when (and start (time-less-p (date-to-time (loki-assistant-llm-usage--date-time
@@ -333,7 +333,7 @@
              (vconcat
               (vector (list (if (equal (alist-get 'bucket data) "month") "月份" "日期")
                             (if chart-maximum 10 12) nil :pad-right (if chart-maximum 1 4)))
-              (when-let ((label (loki-assistant-llm-usage--group-label (alist-get 'group_by data))))
+              (when-let* ((label (loki-assistant-llm-usage--group-label (alist-get 'group_by data))))
                 (vector (list label (if chart-maximum 14 20) nil
                               :pad-right (if chart-maximum 1 4))))
               (if chart-maximum
@@ -556,7 +556,7 @@
   (let ((result (cl-remove-if-not (lambda (pair) (memq (car pair)
       '(client_id upstream protocol model session_id from to))) (copy-tree filters))))
     (dolist (bound '((from_date . from) (to_date . to)))
-      (when-let ((date (alist-get (car bound) filters)))
+      (when-let* ((date (alist-get (car bound) filters)))
         (push (cons (cdr bound) (loki-assistant-llm-usage--date-time date)) result)))
     result))
 
@@ -693,7 +693,7 @@
 (defun loki-assistant-llm-usage-back ()
   "返回下钻前的视图和筛选条件。"
   (interactive)
-  (if-let ((context loki-assistant-llm-usage--context))
+  (if-let* ((context loki-assistant-llm-usage--context))
       (progn
         (setq loki-assistant-llm-usage--context nil)
         (when (cdr context)
@@ -826,7 +826,7 @@
               (filters (loki-assistant-llm-usage--history-filters
                         (loki-assistant-llm-usage--view-filters state))))
          (setq filters (assq-delete-all 'from (assq-delete-all 'to filters)))
-         (when-let ((name (loki-assistant-llm-usage--value 'group_by data))
+         (when-let* ((name (loki-assistant-llm-usage--value 'group_by data))
                     (value (loki-assistant-llm-usage--value 'group row)))
            (setf (alist-get (intern name) filters) value))
          (loki-assistant-llm-usage--drill
@@ -927,7 +927,7 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
                  (search (if forward #'text-property-search-forward
                            #'text-property-search-backward))
                  match)
-             (when-let ((body (get-text-property (point) property)))
+             (when-let* ((body (get-text-property (point) property)))
                (let ((heading (overlay-get body 'heading)))
                  (goto-char (if forward (overlay-end heading) (overlay-start heading)))))
              (while (and (setq match (funcall search property nil (lambda (_ value) value)))
@@ -948,14 +948,14 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
 (defun loki-assistant-llm-usage-parent-item ()
   "跳到当前项目的上一级。"
   (interactive)
-  (if-let ((parent (overlay-get (loki-assistant-llm-usage--instruction-at-point) 'parent-fold)))
+  (if-let* ((parent (overlay-get (loki-assistant-llm-usage--instruction-at-point) 'parent-fold)))
       (goto-char (overlay-start (overlay-get parent 'heading)))
     (user-error "当前项目已经在顶层")))
 
 (defun loki-assistant-llm-usage-close-detail ()
   "返回请求列表并恢复原窗口布局。"
   (interactive)
-  (if-let ((windows loki-assistant-llm-usage--detail-windows))
+  (if-let* ((windows loki-assistant-llm-usage--detail-windows))
       (progn
         (setq loki-assistant-llm-usage--detail-windows nil
               loki-assistant-llm-usage--detail-request nil)
@@ -1206,7 +1206,7 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
   (interactive)
   (let ((position (point-min)) sections)
     (while (< position (point-max))
-      (when-let ((section (get-text-property position 'loki-assistant-llm-section)))
+      (when-let* ((section (get-text-property position 'loki-assistant-llm-section)))
         (push (cons section position) sections))
       (setq position (next-single-property-change
                       position 'loki-assistant-llm-section nil (point-max))))
@@ -1324,7 +1324,7 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
                                       (upstream_status . "HTTP 状态") (first_byte_ms . "首包 ms")
                                       (duration_ms . "耗时 ms"))
                    do (insert (format "%s  %s\n" label (loki-assistant-llm-usage--cell key item)))))
-        (when-let ((usage (loki-assistant-llm-usage--value 'usage item)))
+        (when-let* ((usage (loki-assistant-llm-usage--value 'usage item)))
           (insert "\n用量  " (loki-assistant-llm-usage--usage-label usage) "\n")
           (cl-loop for (key . label) in '((input_reported_tokens . "上游输入")
                                           (input_tokens . "输入") (input_uncached_tokens . "未缓存输入")
@@ -1342,13 +1342,13 @@ RET 折叠或展开当前项目，C-s 搜索，w 复制当前内容。
                  "q 返回  g 刷新  j 章节  Tab/n 下项  S-Tab/p 上项  RET 展开或折叠  C-M-u 上一级  C-s 搜索  w 复制")))
         (when (assq 'raw_usage data)
           (insert "\n原始用量\n")
-          (if-let ((raw (loki-assistant-llm-usage--value 'raw_usage data)))
+          (if-let* ((raw (loki-assistant-llm-usage--value 'raw_usage data)))
               (insert (json-encode raw))
             (insert "未上报"))
           (insert "\n"))
         (goto-char (point-min))))
     (cond (live
-           (when-let ((side (get-buffer-window buffer)))
+           (when-let* ((side (get-buffer-window buffer)))
              (when (and (not (eq side (selected-window))) (window-parameter side 'window-side))
                (delete-window side)))
            (delete-other-windows)

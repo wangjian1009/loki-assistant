@@ -72,7 +72,7 @@
   "读取 macOS 剪贴板中的文件路径（例如从 Finder 复制），没有则返回 nil。"
   (when (eq (window-system) 'ns)
     (condition-case nil
-        (when-let ((output (with-temp-buffer
+        (when-let* ((output (with-temp-buffer
                              (when (zerop
                                     (call-process
                                      "osascript" nil t nil
@@ -235,7 +235,7 @@ Finder 文件、表示现有文件的文本路径会作为文件上下文插入�
 (defun loki-assistant-agent-shell--dnd-handler (url _action)
   "处理拖入 `agent-shell' 缓冲区的单个文件 URL。"
   (require 'dnd)
-  (when-let ((file (dnd-get-local-file-name url t)))
+  (when-let* ((file (dnd-get-local-file-name url t)))
     (loki-assistant-agent-shell--insert-files (list file))
     'private))
 

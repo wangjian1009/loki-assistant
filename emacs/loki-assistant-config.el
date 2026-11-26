@@ -343,7 +343,7 @@
                           (if (eq value :false) "未设置" "已保存"))
                          (t (format "%s" value)))
                    "  只读\n")
-    (when-let ((description (alist-get 'description item)))
+    (when-let* ((description (alist-get 'description item)))
       (unless (string-empty-p description)
         (widget-insert "    " description "\n")))
     (widget-insert "\n")))
@@ -720,7 +720,7 @@
                               (loki-assistant-config--modules response))))
                  (unless choices (user-error "没有可配置的模块"))
                  (let ((selected (completing-read "选择配置模块：" choices nil t)))
-                   (when-let ((module (cdr (assoc selected choices))))
+                   (when-let* ((module (cdr (assoc selected choices))))
                      (loki-assistant-config--open-module module)))))
            (quit nil)
            (error (message "%s" (error-message-string err)))))))))
@@ -858,7 +858,7 @@
 
 (defun loki-assistant-config--record-remember-form (section)
   "保存 SECTION 上的输入，供重绘时恢复。"
-  (when-let ((inputs (loki-assistant-config--record-section-inputs section)))
+  (when-let* ((inputs (loki-assistant-config--record-section-inputs section)))
     (setf (loki-assistant-config--record-section-form section)
           (mapcar (lambda (entry) (cons (car entry) (widget-value (cdr entry)))) inputs))))
 
@@ -866,7 +866,7 @@
   "刷新配置页时暂存记录表单。"
   (dolist (section loki-assistant-config--record-sections)
     (loki-assistant-config--record-remember-form section)
-    (when-let ((start (loki-assistant-config--record-section-start section)))
+    (when-let* ((start (loki-assistant-config--record-section-start section)))
       (set-marker start nil)
       (set-marker (loki-assistant-config--record-section-end section) nil))
     (setf (loki-assistant-config--record-section-start section) nil
@@ -904,7 +904,7 @@
                       ((alist-get 'validation_error record) "  校验失败")
                       ((alist-get 'pending record) "  待确认")
                       (t "")) "\n")
-        (when-let ((reason (alist-get 'validation_error record)))
+        (when-let* ((reason (alist-get 'validation_error record)))
           (insert "  " (propertize reason 'face 'error) "\n"))
         (dolist (field (append (alist-get 'fields record-meta) nil))
           (let* ((key (alist-get 'key field))
@@ -945,7 +945,7 @@
 
 (defun loki-assistant-config--record-form (section)
   "在 SECTION 中显示当前记录的内嵌表单。"
-  (when-let ((form (loki-assistant-config--record-section-form section)))
+  (when-let* ((form (loki-assistant-config--record-section-form section)))
     (let* ((record (loki-assistant-config--record-record-meta section))
            (id (loki-assistant-config--record-section-form-id section))
            (row (and id (cdr (assoc id (loki-assistant-config--record-section-records section)))))
@@ -976,12 +976,12 @@
               (push widget (loki-assistant-config--record-section-widgets section))
               (push (cons key widget) (loki-assistant-config--record-section-inputs section))
               (when saving (widget-apply widget :deactivate))
-              (when-let ((options (loki-assistant-config--record-field "options" field)))
+              (when-let* ((options (loki-assistant-config--record-field "options" field)))
                 (insert "  ")
                 (loki-assistant-config--record-button
                  section "选择已有条目"
                  (lambda () (loki-assistant-config--record-choose section key options)) saving)))
-            (when-let ((help (alist-get 'description (loki-assistant-config--record-field "checker" field))))
+            (when-let* ((help (alist-get 'description (loki-assistant-config--record-field "checker" field))))
               (when (stringp help) (insert "  " help)))
             (when (stringp (alist-get 'default_template field))
               (insert "  留空使用默认值"))
@@ -1023,7 +1023,7 @@
                (lambda () (loki-assistant-config--record-edit section nil))
                (loki-assistant-config--record-section-saving section)))
             (insert "\n\n"))
-          (when-let ((notice (loki-assistant-config--record-section-notice section)))
+          (when-let* ((notice (loki-assistant-config--record-section-notice section)))
             (insert notice "\n\n"))
           (loki-assistant-config--record-form section)
           (loki-assistant-config--record-rows section)
@@ -1067,7 +1067,7 @@
            (let ((items (loki-assistant-config--record-field
                          (alist-get 'items_field options) (plist-get response :data))))
              (if (and (plist-get response :ok) (vectorp items))
-                 (when-let ((widget (cdr (assoc key (loki-assistant-config--record-section-inputs section))))
+                 (when-let* ((widget (cdr (assoc key (loki-assistant-config--record-section-inputs section))))
                             ((> (length items) 0)))
                    (let ((selected (completing-read "选择已有条目：" (append items nil) nil t)))
                      (when (and (not (string-empty-p selected))
@@ -1127,7 +1127,7 @@
                 (alist-get 'validation_error (cdr row)) (loki-assistant-config--error response)))
         (when (equal id (loki-assistant-config--record-section-form-id section))
           (dolist (key keys)
-            (when-let ((input (cdr (assoc key (loki-assistant-config--record-section-inputs section)))))
+            (when-let* ((input (cdr (assoc key (loki-assistant-config--record-section-inputs section)))))
               (widget-apply input :activate)
               (widget-value-set input ""))))))))
 
@@ -1156,7 +1156,7 @@
               (cond
                ((not (plist-get response :ok)) (loki-assistant-config--error response))
                ((eq (plist-get response :status) 202)
-                (when-let ((record (assoc id records)))
+                (when-let* ((record (assoc id records)))
                   (setf (alist-get 'pending (cdr record)) t
                         (alist-get 'delete_pending (cdr record)) t
                         (alist-get 'validation_error (cdr record)) nil))
@@ -1289,7 +1289,7 @@
          (records (loki-assistant-config--record-records
                    (alist-get 'value data) (alist-get 'record meta) single)))
     (dolist (pending (append (alist-get 'pending data) nil))
-      (when-let ((id (if single "" (alist-get 'key pending)))
+      (when-let* ((id (if single "" (alist-get 'key pending)))
                  (value (alist-get 'value pending)))
         (let ((error (alist-get 'message (alist-get 'error pending))))
           (setf (alist-get id records nil nil #'equal)

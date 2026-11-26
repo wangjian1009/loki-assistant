@@ -110,7 +110,7 @@
   "通过 services 发起 Slack 请求。"
   (loki-assistant-request
    method path :params params :body body :timeout 20
-   :headers (append (when-let ((session (alist-get 'session_id room)))
+   :headers (append (when-let* ((session (alist-get 'session_id room)))
                       (list (cons "X-Loki-Slack-Session" session)))
                     (when key (list (cons "Idempotency-Key" key))))
    :callback callback))
@@ -129,7 +129,7 @@
 (defun loki-assistant-slack--nickname (user)
   "返回 USER 在当前会话中的昵称。"
   (if (car loki-assistant-slack--nicknames)
-      (when-let ((id (alist-get 'id user)))
+      (when-let* ((id (alist-get 'id user)))
         (cdr (assoc-string id (cdr loki-assistant-slack--nicknames))))
     (loki-assistant-slack--non-null (alist-get 'nickname user))))
 
@@ -146,7 +146,7 @@
 (defun loki-assistant-slack--cached-record (entry key expected fields)
   "用 ENTRY 对应的缓存记录更新 FIELDS，核对 KEY 等于 EXPECTED。"
   (condition-case nil
-      (if-let ((path (loki-assistant-slack--local-file (alist-get 'cache_path entry))))
+      (if-let* ((path (loki-assistant-slack--local-file (alist-get 'cache_path entry))))
           (with-temp-buffer
             (let ((coding-system-for-read 'utf-8-unix)
                   (read-circle nil))
@@ -157,7 +157,7 @@
                 (if (and (eobp) (equal (alist-get key record) expected))
                     (let ((result (copy-sequence entry)))
                       (dolist (field fields)
-                        (when-let ((value (assq field record)))
+                        (when-let* ((value (assq field record)))
                           (setq result (cons value (assq-delete-all field result)))))
                       result)
                   entry))))
@@ -184,7 +184,7 @@
      :title title
      :search (nconc (delq nil (list (downcase title)
                                    (downcase (loki-assistant-slack--label room))
-                                   (when-let ((team (loki-assistant-slack--single-line (alist-get 'team_name room))))
+                                   (when-let* ((team (loki-assistant-slack--single-line (alist-get 'team_name room))))
                                      (downcase team))))
                     (append (alist-get 'search_terms room) nil))
      :avatars (append (alist-get 'participants room) nil)
@@ -219,7 +219,7 @@
          (pattern (mapconcat (lambda (char) (regexp-quote (char-to-string char))) query ".*?"))
          matches)
     (dolist (candidate (all-completions "" table pred))
-      (when-let ((choice (gethash candidate loki-assistant-slack--completion-choices)))
+      (when-let* ((choice (gethash candidate loki-assistant-slack--completion-choices)))
         (let* ((fields (loki-assistant-slack--choice-search choice))
                (exact (or (string-empty-p query) (equal candidate input) (member query fields))))
           (when (or exact (seq-some (lambda (field) (string-match-p pattern field)) fields))
@@ -242,18 +242,18 @@
 
 (defun loki-assistant-slack--all-completions (input table pred _point)
   "返回 INPUT 在 TABLE 和 PRED 下的全部匹配。"
-  (when-let ((matches (loki-assistant-slack--matches input table pred)))
+  (when-let* ((matches (loki-assistant-slack--matches input table pred)))
     (nconc matches 0)))
 
 (defun loki-assistant-slack--file-image (path width height)
   "以 WIDTH 和 HEIGHT 为上限读取 PATH 中的图片。"
   (when (display-graphic-p)
-    (when-let ((path (loki-assistant-slack--local-file path)))
+    (when-let* ((path (loki-assistant-slack--local-file path)))
       (ignore-errors (create-image path nil nil :max-width width :max-height height :ascent 'center)))))
 
 (defun loki-assistant-slack--profile-avatar (profile)
   "显示 PROFILE 已缓存的本机头像。"
-  (when-let ((image (loki-assistant-slack--file-image (alist-get 'avatar_path profile) 20 20)))
+  (when-let* ((image (loki-assistant-slack--file-image (alist-get 'avatar_path profile) 20 20)))
     (propertize "○" 'display image)))
 
 (defun loki-assistant-slack--align-to (column)
@@ -329,7 +329,7 @@
                         (when (and (sequencep translations) translations (not (string-empty-p key)))
                           (let ((reading (replace-regexp-in-string "u:" "v" key t t)))
                             (seq-do (lambda (text)
-                                      (when-let ((char (cond ((characterp text) text)
+                                      (when-let* ((char (cond ((characterp text) text)
                                                              ((and (stringp text) (= (length text) 1))
                                                               (aref text 0)))))
                                         (cl-pushnew reading (gethash char table) :test #'equal)))
@@ -484,11 +484,11 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                      (let ((data (plist-get response :data)))
                        (setq status (unless (seq-empty-p (alist-get 'issues data))
                                       "部分 Slack 工作区的用户目录暂不可用"))
-                       (when-let ((keys (loki-assistant-slack--user-choices
+                       (when-let* ((keys (loki-assistant-slack--user-choices
                                          (alist-get 'items data) choices-table title-width)))
                          (funcall sink keys)))
                    (setq status (or (plist-get response :error-message) "Slack 用户目录暂不可用")))
-                 (when-let ((active (active-minibuffer-window)))
+                 (when-let* ((active (active-minibuffer-window)))
                    (when (eq (window-buffer active) minibuffer)
                      (with-selected-window active
                        (funcall sink 'refresh)
@@ -507,7 +507,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
           (when keymap
             (define-key keymap (kbd "S-<return>") #'open-selected-dm)
             (define-key keymap (kbd "S-RET") #'open-selected-dm))
-          (when-let ((choice
+          (when-let* ((choice
                       (with-selected-window window
                         (consult--read
                          #'source
@@ -545,7 +545,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
           (loki-assistant-slack--choose
            (selected-window) selection nil nil
            (lambda (user open-dm)
-             (when-let ((buffer (marker-buffer trigger)))
+             (when-let* ((buffer (marker-buffer trigger)))
                (with-current-buffer buffer
                  (when (eq (char-after trigger) ?@)
                    (goto-char (1+ trigger))
@@ -601,7 +601,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
      "PUT" (concat "/slack/users/" (url-hexify-string id) "/nickname")
      (lambda (response)
        (if (plist-get response :ok)
-           (if-let ((saved (loki-assistant-slack--non-null
+           (if-let* ((saved (loki-assistant-slack--non-null
                             (alist-get 'nickname (alist-get 'user (plist-get response :data))))))
                (message "已将 %s 的昵称设为 %s" name saved)
              (message "已清除 %s 的昵称" name))
@@ -819,7 +819,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
               loki-assistant-slack--profiles (make-hash-table :test #'equal)))
       (if loki-assistant-slack--room
           (dolist (key '(team_id team_name title kind participant_ids))
-            (when-let ((value (loki-assistant-slack--non-null (alist-get key room))))
+            (when-let* ((value (loki-assistant-slack--non-null (alist-get key room))))
               (setf (alist-get key loki-assistant-slack--room) value)))
         (setq loki-assistant-slack--room (copy-tree room))))
     (let* ((existing (get-buffer-window buffer t))
@@ -851,7 +851,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
 (defun loki-assistant-slack-activate ()
   "激活最近使用的聊天，或在图形窗口中打开聊天选择器。"
   (let* ((buffer (seq-find #'loki-assistant-slack--chat-buffer-p (buffer-list)))
-         (frame (or (when-let ((window (and buffer (get-buffer-window buffer t))))
+         (frame (or (when-let* ((window (and buffer (get-buffer-window buffer t))))
                       (window-frame window))
                     (loki-assistant-slack--graphical-frame))))
     (make-frame-visible frame)
@@ -900,7 +900,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
       (loki-assistant-slack--render)
       (let ((message-position (loki-assistant-slack--message-position message))
             (thread-position (loki-assistant-slack--message-position thread)))
-        (when-let ((position (or message-position thread-position)))
+        (when-let* ((position (or message-position thread-position)))
           (goto-char position)
           (recenter))
         (setq result (cond (message-position 'message) (thread-position 'thread) (t 'conversation))))
@@ -1199,7 +1199,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
 (defun loki-assistant-slack--cancel-subscription (subscription)
   "清理本地 SUBSCRIPTION 并通知 services。"
   (when subscription
-    (when-let ((timer (loki-assistant-slack--subscription-timeout subscription)))
+    (when-let* ((timer (loki-assistant-slack--subscription-timeout subscription)))
       (cancel-timer timer))
     (let ((id (loki-assistant-slack--subscription-id subscription)))
       (when (gethash id loki-assistant-slack--subscription-buffers)
@@ -1262,7 +1262,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                          (loki-assistant-slack--subscription-room subscription) room
                          (loki-assistant-slack--subscription-self-id subscription)
                          (loki-assistant-slack--non-null (alist-get 'user_id connection)))
-                   (when-let ((name (loki-assistant-slack--non-null (alist-get 'team_name connection))))
+                   (when-let* ((name (loki-assistant-slack--non-null (alist-get 'team_name connection))))
                      (setf (alist-get 'team_name room) name))
                    (puthash (loki-assistant-slack--subscription-id subscription)
                             buffer loki-assistant-slack--subscription-buffers)
@@ -1318,7 +1318,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
       (when-let* ((root (alist-get 'thread_ts item)) ((stringp root)))
         (push (alist-get 'ts item) (gethash root deleted))))
     (maphash (lambda (root timestamps)
-               (when-let ((page (and loki-assistant-slack--threads
+               (when-let* ((page (and loki-assistant-slack--threads
                                      (gethash root loki-assistant-slack--threads))))
                  (setf (loki-assistant-slack--page-items page)
                        (seq-remove (lambda (item) (member (alist-get 'ts item) timestamps))
@@ -1335,7 +1335,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
   "将 DATA 提供的昵称和标题应用于 ROOM。"
   (when (assq 'nicknames data)
     (setq loki-assistant-slack--nicknames (cons t (alist-get 'nicknames data))))
-  (if-let ((title (alist-get 'title data)))
+  (if-let* ((title (alist-get 'title data)))
       (cons (cons 'title title) (assq-delete-all 'title (copy-sequence room)))
     room))
 
@@ -1369,7 +1369,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
           loki-assistant-slack--room (loki-assistant-slack--apply-nicknames snapshot room)
           loki-assistant-slack--self-id (loki-assistant-slack--subscription-self-id subscription))
     (when (eq subscription loki-assistant-slack--pending-subscription)
-      (when-let ((timer (loki-assistant-slack--subscription-timeout subscription)))
+      (when-let* ((timer (loki-assistant-slack--subscription-timeout subscription)))
         (cancel-timer timer)
         (setf (loki-assistant-slack--subscription-timeout subscription) nil))
       (setq loki-assistant-slack--subscription subscription
@@ -1431,7 +1431,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                    (push data loki-assistant-slack--page-changes))
                  (when loki-assistant-slack--threads
                    (seq-doseq (root (alist-get 'deleted_ts data))
-                     (when-let ((child (loki-assistant-slack--thread-buffer root)))
+                     (when-let* ((child (loki-assistant-slack--thread-buffer root)))
                        (with-current-buffer child (setq loki-assistant-slack--thread-message nil)))
                      (remhash root loki-assistant-slack--threads)))
                  (loki-assistant-slack--apply-thread-push data)
@@ -1485,7 +1485,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
                 (if (or (string-prefix-p "```" token) (equal token "'''"))
                     (unless (or (loki-assistant-slack--search-code-fence-end token) (equal token "'''"))
                       (goto-char (point-max)))
-                  (when-let ((tag (match-string 1)))
+                  (when-let* ((tag (match-string 1)))
                     (when (string-match "\\`@\\([UW][A-Z0-9]+\\)\\(?:|.*\\)?\\'" tag)
                       (push (concat team "." (match-string 1 tag)) users))))))))))
     users))
@@ -1532,7 +1532,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
 
 (defun loki-assistant-slack--draft-start ()
   "返回当前会话输入的开始位置。"
-  (if-let ((process (get-buffer-process (current-buffer))))
+  (if-let* ((process (get-buffer-process (current-buffer))))
       (marker-position (process-mark process))
     (user-error "请重新打开此 Slack 会话")))
 
@@ -1594,7 +1594,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
   "在鼠标 EVENT 指向的根消息处展开或折叠线程。"
   (interactive "e")
   (mouse-set-point event)
-  (when-let ((root (get-text-property (point) 'loki-slack-thread-toggle)))
+  (when-let* ((root (get-text-property (point) 'loki-slack-thread-toggle)))
     (loki-assistant-slack--toggle-thread root)))
 
 (defvar loki-assistant-slack--thread-map
@@ -1627,7 +1627,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
         (save-match-data
           (when (require 'emojify nil t)
             (emojify-create-emojify-emojis)
-            (when-let ((data (emojify-get-emoji code)))
+            (when-let* ((data (emojify-get-emoji code)))
               (gethash "unicode" data)))))))
 
 (defun loki-assistant-slack--link (label url)
@@ -1717,7 +1717,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
               ((match-string 2)
                (replace-match (loki-assistant-slack--decode-entity (match-string 2)) t t))
               ((match-string 3)
-               (when-let ((emoji (loki-assistant-slack--emoji (match-string 3))))
+               (when-let* ((emoji (loki-assistant-slack--emoji (match-string 3))))
                  (replace-match emoji t t)))
               ((match-string 1)
                (let* ((markup (match-string 1))
@@ -1832,7 +1832,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
         (loki-assistant-slack--markdown text (alist-get 'team_id room)
                                        (or profiles (make-hash-table :test #'equal)) nil nil mentions)
         (add-text-properties start (point) '(face shadow))))
-    (when-let ((image (loki-assistant-slack--file-image (alist-get 'preview_path attachment) 560 320)))
+    (when-let* ((image (loki-assistant-slack--file-image (alist-get 'preview_path attachment) 560 320)))
       (insert (propertize title 'display image) "\n"))))
 
 (defun loki-assistant-slack--open-attachment (attachment endpoint room)
@@ -1862,7 +1862,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
 
 (defun loki-assistant-slack--display-attachment (path)
   "打开 PATH 指向的本机附件。"
-  (when-let ((path (loki-assistant-slack--local-file path)))
+  (when-let* ((path (loki-assistant-slack--local-file path)))
     (let ((enable-local-variables nil)
           (enable-local-eval nil))
       (find-file path))
@@ -1952,10 +1952,10 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
          (time (seconds-to-time (string-to-number ts)))
          (timestamp (format-time-string "%Y-%m-%d %H:%M" time))
          (help (if (eq (alist-get 'edited message) t) (concat timestamp "（已编辑）") timestamp)))
-    (when-let ((icon (or (when-let ((image (loki-assistant-slack--file-image
+    (when-let* ((icon (or (when-let* ((image (loki-assistant-slack--file-image
                                           (alist-get 'icon_path message) 20 20)))
                            (propertize " " 'display image))
-                         (when-let ((emoji (alist-get 'icon_emoji message)))
+                         (when-let* ((emoji (alist-get 'icon_emoji message)))
                            (loki-assistant-slack--emoji emoji)))))
       (insert icon " "))
     (loki-assistant-slack--message-body message (alist-get 'team_id room) profiles)
@@ -1977,7 +1977,7 @@ USER-PROMPT 为其他用户操作指定提示，并关闭打开私聊的快捷�
 
 (defun loki-assistant-slack--pagination (page)
   "为主时间线 PAGE 插入错误或翻页按钮。"
-  (when-let ((error (loki-assistant-slack--page-error page)))
+  (when-let* ((error (loki-assistant-slack--page-error page)))
     (insert (propertize (concat error "\n") 'face 'error)))
   (when (loki-assistant-slack--page-cursor page)
     (insert-text-button "更早的消息" 'face 'loki-assistant-slack-action 'follow-link t
@@ -2072,7 +2072,7 @@ INLINE-THREADS 非空时内嵌回复。"
                                                  room profiles t))
          (root
           (loki-assistant-slack--insert-messages (list root) room profiles)
-          (when-let ((page (gethash thread loki-assistant-slack--threads)))
+          (when-let* ((page (gethash thread loki-assistant-slack--threads)))
             (loki-assistant-slack--insert-messages (loki-assistant-slack--page-items page) room profiles)))
          (t (insert (propertize "线程已不可用\n\n" 'face 'shadow))))
       (loki-assistant-slack--insert-label (if loki-assistant-slack--reply "我 · 线程回复" "我")
@@ -2149,7 +2149,7 @@ INLINE-THREADS 非空时内嵌回复。"
     (when loki-assistant-slack--thread-buffers
       (if roots
           (maphash (lambda (root _)
-                     (when-let ((buffer (loki-assistant-slack--thread-buffer root)))
+                     (when-let* ((buffer (loki-assistant-slack--thread-buffer root)))
                        (loki-assistant-slack--render-thread buffer)))
                    roots)
         (maphash (lambda (_ buffer)
@@ -2266,7 +2266,7 @@ ROOTS 含本批次影响的顶层消息。"
       (add-text-properties (point-min) (point)
                            '(read-only t front-sticky (read-only) rear-nonsticky t))
       (set-marker loki-assistant-slack--history-end (point)))
-    (when-let ((process (get-buffer-process (current-buffer))))
+    (when-let* ((process (get-buffer-process (current-buffer))))
       (let ((start (marker-position loki-assistant-slack--history-end))
             (end (marker-position (process-mark process))))
         (when (and (markerp (car-safe comint-last-prompt)) (markerp (cdr-safe comint-last-prompt)))
@@ -2281,7 +2281,7 @@ ROOTS 含本批次影响的顶层消息。"
                       (text-property-search-forward 'loki-slack-message message t)))))
       (if (and anchor (not (invisible-p (prop-match-beginning anchor))))
           (goto-char (max (prop-match-beginning anchor) (- (prop-match-end anchor) offset)))
-        (when-let ((position (loki-assistant-slack--message-position root)))
+        (when-let* ((position (loki-assistant-slack--message-position root)))
           (goto-char position))))
     (restore-buffer-modified-p modified)
     (unless thread
