@@ -3,6 +3,8 @@
 
 配置中心维护数据结构、校验、通用读写接口和提交事务。配置界面按元数据填写并提交数据。业务模块可以在配置项元数据中声明通知接入点，由配置中心发出变更通知并确认处理结果。
 
+下文记录当前实现。字段级监控、完整编辑状态及切换方案见 [[*字段级监控与完整编辑状态（设计）][字段级监控与完整编辑状态设计]]。
+
 * 静态元数据
 
 配置元数据函数通过 ~#[loki_config]~ 声明。该过程宏与 ~#[loki_api]~ 一样在编译期生成 ~linkme~ 注册项，服务组合根不执行运行时注册。元数据函数须为无参数、无泛型的同步函数，返回 ~ConfigModuleMetadata~ ；当前配置中心、控制中心、Emacs 和网络模块均采用这一方式。
@@ -182,3 +184,153 @@ control-center:
 | ~500 config-change-rejected~ | 业务明确拒绝，配置模块回退本次变更并返回错误。 |
 
 返回 ~202~ 后，下一次业务通知由手动重试触发。对于异步业务，接入点在收到相同 ID 的通知时返回该次处理的最新状态。Slack 的 ~POST~ 接入点在凭据齐全后校验，缺少凭据时打开工作区配置页。 [[file:slack-services.org::*Team 配置][Slack 工作区配置]]
+
+* 字段级监控与完整编辑状态（设计）
+
+配置中心负责按元数据校验、分组、保存编辑值、投递变更和记录业务处理结果。业务模块提供监控处理函数，决定何时确认编辑、报告错误以及清除错误。普通配置保存后立即生效。有监控点的字段先保存为待确认，业务读取和生效变更订阅使用已确认值。
+
+** 元数据与分组
+
+模块元数据声明 ~monitors~ 。配置项和结构字段分别通过可选的 ~monitor~ 引用所属模块内的一个监控点。多个字段引用同一个 ID 时合并提交。模块级监控点可以横跨顶层配置项及单个结构的字段。记录级监控点归属于一个配置项，按记录主键分组。同一监控点在两个工作区上的编辑分别处理。
+
+#+begin_src json
+{
+  "id": "slack",
+  "monitors": [
+    {"id": "team", "name": "Slack 工作区", "scope": "record", "item": "teams"}
+  ],
+  "items": [
+    {
+      "key": "teams",
+      "data_type": "list",
+      "structure": {
+        "id_field": "team_id",
+        "lifecycle_monitor": "team",
+        "fields": [
+          {"key": "team_id", "data_type": "key", "required": true},
+          {"key": "name", "data_type": "string", "monitor": "team"},
+          {"key": "token", "monitor": "team"},
+          {"key": "d_cookie", "monitor": "team"}
+        ]
+      }
+    }
+  ]
+}
+#+end_src
+
+示例省略部分已有属性。Rust 模块沿用静态配置注册，处理函数在服务组合时按 ~(module_id, monitor_id)~ 注入，元数据向客户端公开 ID、名称和作用范围。构造配置中心时检查引用、处理器和作用范围是否匹配。主键用来定位记录，创建后固定。需要按元素字段监控的列表声明稳定主键。无主键列表可以作为整项监控。
+
+记录新增和删除由 ~lifecycle_monitor~ 负责，创建时该处理器收到完整候选记录，删除时收到已生效记录和删除意图。新增待确认时整条记录仅出现在编辑视图，继续填写字段会提交同一记录的完整候选。待删除记录保留在生效视图，编辑视图标记为「待删除」。生命周期确认提交整条记录的新增或删除，日常修改按各字段的 ~monitor~ 分组。
+
+** YAML 存储
+
+文件显式声明 ~format_version: 2~ 。~modules~ 按现有模块、配置项和记录结构组织。普通字段存原始值。有监控点的字段存 ~accepted~ 和 ~editing~ 。每个非空槽位用 ~{value: ...}~ 包装实际值，包括显式的 ~null~ 。空的 ~accepted~ 表示没有已确认的用户值，读取时按原规则使用默认值。空的 ~editing~ 表示没有待确认的编辑，~{remove: true}~ 表示候选操作为移除用户值。~_system~ 存放内部条目。
+
+#+begin_src yaml
+format_version: 2
+modules:
+  slack:
+    teams:
+      - team_id: TDEMO
+        team_name: 示例工作区
+        name:
+          accepted: {value: 旧名称}
+          editing: {value: 新名称}
+        token:
+          accepted: {value: loki-assistant/slack/TDEMO.gpg}
+          editing: {value: loki-assistant/slack/pending/509b6a1d-9fa6-41dc-9326-36b15f79ce7c/TDEMO.gpg}
+        d_cookie:
+          accepted: {value: loki-assistant/slack/TDEMO.gpg}
+          editing: {value: loki-assistant/slack/pending/509b6a1d-9fa6-41dc-9326-36b15f79ce7c/TDEMO.gpg}
+monitor_states:
+  slack:
+    - monitor: team
+      instance: TDEMO
+      revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c
+      status: failed
+      error:
+        revision: 509b6a1d-9fa6-41dc-9326-36b15f79ce7c
+        code: slack-auth-failed
+        message: 工作区凭据校验失败，请更新令牌和 Cookie。
+        fields: [[teams, TDEMO, token], [teams, TDEMO, d_cookie]]
+_system: {}
+#+end_src
+
+监控状态的唯一键为 ~(module_id, monitor_id, instance)~ 。模块级监控没有 ~instance~ 。~revision~ 标识这批编辑。状态包含 ~pending~ 、 ~processing~ 、 ~failed~ 和 ~accepted~ 。候选记录新增或删除时在同组状态上记录 ~record_operation: create|delete~ ，用于控制两个视图的记录可见性。~error~ 保存业务模块提供的 ~code~ 、 ~message~ 、可选的字段路径及其所属版本，整组只存一份。新编辑可以先前进到新版本，再由业务明确处理上一版错误。
+
+沿用现有密码库事务。密码槽位只保存加密条目引用，已确认与编辑中的凭据分别从各自的条目解析。共享同一密码条目的字段共同保存候选条目，保留未编辑的行。业务确认后切换正式条目及配置引用，失败后保留候选密文供后续编辑。业务可通过结果 API 明确撤销指定的候选凭据，已确认的凭据继续可用。HTTP 和 Emacs 仅展示设置状态及变更，凭据值和条目路径均留在服务内部。
+
+** 读取与提交
+
+| 操作 | 响应或行为 |
+|------+------------|
+| ~GET /data/{module_id}~ 和 ~GET /data/{module_id}/{key}~ ，省略 ~view~ 或指定 ~view=accepted~ | 返回现有 ~value~ / ~source~ 结构，只解析已确认用户值或默认值。无生效单值时返回 ~404 config-not-set~ 。 |
+| 同一接口指定 ~view=editing~ | 返回同一快照中的已确认值、候选变更 ~edits~ 和监控状态 ~monitors~ 。单项查询只返回该项可见数据，只有候选值的配置也返回 ~200~ 。 |
+| ~PUT~ 、 ~POST~ 、 ~PATCH~ 和 ~DELETE~ 写单项或记录 | 保留各自的写入语义。同一请求内的字段先一起校验和落盘，受监控的编辑进入待确认。 |
+| ~PATCH /data/{module_id}~ | 在同一请求内提交跨项修改，保存模块的整体修改时由 Emacs 使用。 |
+
+编辑视图中的 ~edits~ 按字段路径返回候选操作和编辑值。以下示例是只修改工作区名称时的模块响应。单项响应保留原有 ~value~ 和 ~source~ ，并附加过滤后的 ~edits~ 和 ~monitors~ 。单项尚未生效时省略 ~value~ 和 ~source~ 。
+
+#+begin_src json
+{
+  "module_id": "slack",
+  "values": {
+    "teams": {"value": [{"team_id": "TDEMO", "name": "旧名称"}], "source": "user"}
+  },
+  "edits": [
+    {"path": ["teams", "TDEMO", "name"], "monitor": "team", "instance": "TDEMO",
+     "operation": "set", "value": "新名称"}
+  ],
+  "monitors": [
+    {"monitor": "team", "instance": "TDEMO", "status": "pending",
+     "revision": "509b6a1d-9fa6-41dc-9326-36b15f79ce7c"}
+  ]
+}
+#+end_src
+
+记录新增或删除使用记录路径及对应操作。跨项 ~PATCH~ 请求体使用 ~changes~ 数组，每项包含 ~path~ 、 ~operation~ ，设置时另带 ~value~ 。结构字段路径为 ~[key, field]~ ，带主键记录的字段路径为 ~[key, instance, field]~ 。路径与操作按元数据校验。批量写入逐项执行现有写入权限和本机鉴权。编辑视图供本机使用，远端读取继续按现有字段权限过滤已确认值。
+
+一次请求中，每个监控组对修改后的完整候选快照执行一次处理，包括该组以前保存的编辑和未改动的有效值。局部更新基于已有编辑值，没有编辑值时使用生效值。完成格式、类型和权限校验后，配置中心在同一事务里写入普通字段和所有候选编辑，再入队处理。包含待确认编辑的请求返回 ~202~ 及相应版本，普通字段此时已生效。格式或类型校验错误沿用 HTTP 错误模型，写入前返回。业务处理成功或失败由后续编辑视图反映。
+
+** 业务结果与重试
+
+- 处理函数收到监控点、实例、~revision~ 、本次变更字段、已确认和候选快照。业务只通过此处理请求携带的句柄调用结果 API，结果写入范围限定为对应监控组和版本。
+- ~accept(change, output, clear_error)~ 将该版本的编辑值原子转入 ~accepted~ ，清空 ~editing~ ，并校验和写入业务派生的只读字段。业务传入 ~clear_error: true~ 时在同一事务清除错误。~set_error(change, error)~ 保存错误及其字段范围，待用户修正。需要单独清理时，业务可通过该组当前版本的句柄调用 ~clear_error(change)~ 。配置中心在结果落盘后更新快照和订阅。
+- ~set_error~ 之后，修改该组的配置会生成新版本并重新投递。若修改后的值碰巧等于生效值，只要与此前编辑值不同，也需要重新处理。旧错误保留到业务明确替换或清理。其他组的写入和界面刷新无需调度该组。
+- 同一组串行处理，新保存的编辑可在该组排队。旧版本的结果无法应用到新版本。有外部状态的处理器在确认落盘后切换活动状态，或在接受失败时回退处理期间的外部操作。不同组可并行处理。进程重启后恢复未完成的待确认和处理中版本，业务按版本识别重复投递。已报告失败的版本等待编辑。存储或投递失败按配置基础设施错误处理，由配置中心保持可恢复的待确认版本。
+
+控制中心模块处理 LaunchAgent 并报告失败。网络模块用候选地址验证中转配置，成功确认后切换活动连接，注册失败时保留原连接并报告监控错误。Slack 和 LLM 模块各自决定凭据、工作区和供应商是否有效，以及写入哪些业务派生字段。配置中心只执行上述通用事务。
+
+** Emacs 原地编辑
+
+每条记录直接在配置页显示可编辑 widget，同一个字段位置用于浏览、录入、保存和修正。未修改时显示有效值，修改后在字段所在行显示「生效值 → 当前输入」及状态。没有当前生效值时显示「未设置」。本地输入尚未保存时显示「未保存」，服务器已存候选后显示「待确认」或「处理中」。输入与服务器候选不同且两者都存在时，同时显示「已提交」和「当前输入」。记录新增在原列表中插入可编辑行，记录删除在原行展示状态。
+
+#+begin_example
+示例工作区 [TDEMO]
+  本地显示名称   旧名称 → [新名称             ]
+  用户令牌       已设置 → 已更换  [           ]
+  Cookie d       已设置 → 已更换  [           ]
+  处理失败 · Slack 工作区
+  工作区凭据校验失败，请更新令牌和 Cookie。
+  [保存修改]  [撤销未保存输入]
+#+end_example
+
+错误按监控组展示一次，并按 ~error.fields~ 标记关联字段。密码用「已设置」「已更换」「待移除」等状态表达前后差异。本地格式错误标在相应输入上。重提期间若错误来自前一版，标为「上次处理失败」并同时显示当前处理进度。业务清理错误后，该信息随最新快照消失。
+
+保存一项、记录或模块时，收集相应范围的所有已修改字段并发出一次请求。保存中仍可继续输入，响应用于推进已提交基线。只要当前输入未随同该次请求提交，就保留为本地修改。刷新读取 ~view=editing~ ，从服务端重建生效值、已提交编辑和错误，并保留本地尚未提交的输入。编辑页可在有处理中版本且 buffer 可见时定期读取状态，收到确认后将新生效值显示在原位置。关闭页面停止查询。
+
+** 一次性转换与切换
+
+用新元数据逐项转换现有 YAML 中已保存的用户值。受监控字段的旧值直接进入 ~accepted: {value: ...}~ ，~editing~ 置空。普通字段、未知用户配置及 ~_system~ 内部数据原样带入对应位置，缺失的值继续由默认值规则解析。
+
+| 现有配置 | 转换后的监控 |
+|----------+--------------|
+| ~control-center/center_auto_start~ | 模块级 ~login-startup~ |
+| ~network/relay_url~ | 模块级 ~relay~ 。中转令牌继续从现有密码库读取。 |
+| ~slack/cache_retention_days~ | 模块级 ~cache-retention~ |
+| ~slack/teams~ 和 ~slack/nicknames~ | 分别为记录级 ~team~ 和 ~nickname~ ，按各自读写字段的声明包装。 |
+| ~llm/providers~ 和 ~llm/clients~ | 分别为记录级 ~provider~ 和 ~client~ ，按各自读写字段的声明包装。 |
+
+如有旧 ~_pending_config_notifications~ ，按记录及字段拆成候选槽位，保留请求操作、候选密码引用及错误。用旧记录的已确认值比较候选，输出到对应监控组；旧的整条记录新增或删除写入生命周期监控。快照中检查过的本机配置没有待确认记录。
+
+切换时先停止配置写入，备份旧文件，再离线转换到同目录临时文件。校验新文件及已确认值的投影与旧生效配置一致后，以 ~0600~ 权限原子替换，随后启用配套的 services 和 Emacs。正常启动只接受新格式。转换过程仅处理文件和加密引用，已迁入 ~accepted~ 的值直接作为启动配置加载。
