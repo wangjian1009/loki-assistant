@@ -31,6 +31,7 @@ export struct AppPage {
   @Prop page: PageName
   @Link sidebarOpen: boolean
   @BuilderParam content: () => void
+  @BuilderParam header: () => void = this.sectionTitle
 
   private async goTo(page: PageName): Promise<void> {
     this.sidebarOpen = false
@@ -49,6 +50,11 @@ export struct AppPage {
       Row().width(18).height(2).borderRadius(1).backgroundColor(ACCENT)
       Row().width(18).height(2).borderRadius(1).backgroundColor(ACCENT)
     }
+  }
+
+  @Builder
+  private sectionTitle() {
+    Text(SECTION_TITLES[this.page]).fontSize(28).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
   }
 
   @Builder
@@ -71,14 +77,20 @@ export struct AppPage {
   build() {
     Stack({ alignContent: Alignment.Start }) {
       Column() {
-        Row({ space: 12 }) {
+        Row({ space: this.page === PageName.Index ? 4 : 12 }) {
           Button({ type: ButtonType.Normal }) {
             this.menuIcon()
-          }.width(44).height(44).padding(0).borderRadius(14).backgroundColor(SURFACE)
+          }.width(this.page === PageName.Index ? 48 : 44).height(this.page === PageName.Index ? 48 : 44)
+            .padding(0).borderRadius(14).backgroundColor(this.page === PageName.Index ? Color.Transparent : SURFACE)
             .accessibilityText('打开侧边栏').onClick(() => { this.sidebarOpen = true })
-          Text(SECTION_TITLES[this.page]).fontSize(28).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
+          this.header()
         }.width('100%').constraintSize({ maxWidth: 560 })
-          .padding({ left: 24, right: 24, top: 16, bottom: 16 })
+          .height(this.page === PageName.Index ? 64 : 76)
+          .padding(this.page === PageName.Index ? { left: 4, right: 4 } : { left: 24, right: 24 })
+          .backgroundColor(this.page === PageName.Index ? SURFACE : Color.Transparent)
+        if (this.page === PageName.Index) {
+          Divider().color(BORDER).strokeWidth(0.5).width('100%').constraintSize({ maxWidth: 560 })
+        }
 
         this.content()
       }.width('100%').height('100%')

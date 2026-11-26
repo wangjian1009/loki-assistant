@@ -214,9 +214,7 @@ struct Devices {
 
   build() {
     Stack() {
-      AppPage({ page: PageName.Devices, sidebarOpen: $sidebarOpen }) {
-        this.pageContent()
-      }
+      AppPage({ page: PageName.Devices, sidebarOpen: $sidebarOpen, content: () => { this.pageContent() } })
     }.width('100%').height('100%')
   }
 }

@@ -8,8 +8,9 @@ import { ACCENT, ACCENT_TEXT, AppPage, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDA
 @Component
 struct Index {
   @StorageLink('lokiForeground') @Watch('onForegroundChanged') private foreground: boolean = true
-  @State private current: ComputerDevice[] = []
+  @State private current: ComputerDevice | undefined = undefined
   @State private sidebarOpen: boolean = false
+  @State private detailsOpen: boolean = false
   @State private working: boolean = false
   @State private loaded: boolean = false
   @State private errorMessage: string = ''
@@ -36,12 +37,17 @@ struct Index {
   onPageHide(): void {
     this.visible = false
     this.sidebarOpen = false
+    this.detailsOpen = false
     this.stopTimer()
   }
 
   onBackPress(): boolean {
     if (this.sidebarOpen) {
       this.sidebarOpen = false
+      return true
+    }
+    if (this.detailsOpen) {
+      this.detailsOpen = false
       return true
     }
     const navigator = AppStorage.get<NavigatorManager>('lokiNavigator')
@@ -64,8 +70,8 @@ struct Index {
 
   private scheduleRefresh(): void {
     this.stopTimer()
-    if (this.visible && this.foreground && this.current.length > 0) {
-      this.timer = setTimeout(() => { this.refreshDevices() }, this.current[0].status === 'binding' ? 1000 : 20000)
+    if (this.visible && this.foreground && this.current) {
+      this.timer = setTimeout(() => { this.refreshDevices() }, this.current.status === 'binding' ? 1000 : 20000)
     }
   }
 
@@ -73,7 +79,8 @@ struct Index {
     if (this.working || !this.application) { return }
     this.working = true
     try {
-      this.current = (await this.application.list()).filter((computer: ComputerDevice) => computer.active)
+      this.current = (await this.application.list()).find((computer: ComputerDevice) => computer.active)
+      if (!this.current) { this.detailsOpen = false }
       this.loaded = true
       this.errorMessage = ''
     } catch (error) {
@@ -81,7 +88,7 @@ struct Index {
     } finally {
       this.working = false
     }
-    if (this.current.length > 0) { await this.refreshDevices() }
+    if (this.current) { await this.refreshDevices() }
   }
 
   private async refreshDevices(): Promise<void> {
@@ -90,7 +97,8 @@ struct Index {
     this.working = true
     this.refreshing = true
     try {
-      this.current = (await this.application.refresh()).filter((computer: ComputerDevice) => computer.active)
+      this.current = (await this.application.refresh()).find((computer: ComputerDevice) => computer.active)
+      if (!this.current) { this.detailsOpen = false }
       this.errorMessage = ''
     } catch (error) {
       this.errorMessage = (error as Error).message
@@ -129,71 +137,78 @@ struct Index {
   }
 
   @Builder
-  private deviceSummary(computer: ComputerDevice) {
-    Row({ space: 14 }) {
-      Stack() {
-        Image($r('sys.media.ohos_ic_public_device_matebook')).width(28).height(28).fillColor(ACCENT)
-      }.width(52).height(52).borderRadius(16).backgroundColor('#303951')
-
-      Column({ space: 8 }) {
-        Text(computer.name).fontSize(22).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
-          .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-        Row({ space: 6 }) {
-          Circle().width(6).height(6).fill(this.statusColor(computer))
-          Text(this.statusText(computer)).fontSize(13).fontColor(this.statusColor(computer))
+  private pageHeader() {
+    if (this.current) {
+      Button({ type: ButtonType.Normal }) {
+        Row({ space: 8 }) {
+          Text(this.current.name).fontSize(22).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
+          if (this.current.status === 'online' || this.current.status === 'offline') {
+            Row({ space: 4 }) {
+              Circle().width(6).height(6).fill(this.statusColor(this.current))
+              Text(this.statusText(this.current)).fontSize(11).fontColor(this.statusColor(this.current))
+            }.flexShrink(0)
+          }
+          SymbolGlyph(this.detailsOpen ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+            .fontSize(12).fontColor([SECONDARY_TEXT]).flexShrink(0).accessibilityLevel('no')
         }
-      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-    }.width('100%').padding(16).backgroundColor('#222735').borderRadius(22)
-      .border({ width: 1, color: '#363F53' })
+      }.layoutWeight(1).height(48).padding({ left: 4, right: 8 }).align(Alignment.Start)
+        .borderRadius(12).backgroundColor(this.detailsOpen ? BORDER : Color.Transparent)
+        .accessibilityDescription(this.detailsOpen ? '收起设备详情' : '展开设备详情')
+        .onClick(() => { this.detailsOpen = !this.detailsOpen })
+
+      Button({ type: ButtonType.Normal }) {
+        if (this.refreshing) {
+          LoadingProgress().width(20).height(20).color(ACCENT)
+        } else {
+          SymbolGlyph($r('sys.symbol.arrow_clockwise')).fontSize(24).fontColor([ACCENT])
+        }
+      }.width(48).height(48).padding(0).borderRadius(8).backgroundColor(Color.Transparent)
+        .enabled(!this.working).onClick(() => { this.refreshDevices() })
+        .accessibilityText(this.refreshing ? '正在检查电脑状态' : '刷新连接状态')
+    } else {
+      Text('当前设备').fontSize(22).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+        .padding({ left: 4 })
+    }
   }
 
   @Builder
   private detailRow(label: string, value: string) {
     Row({ space: 16 }) {
-      Text(label).fontSize(15).fontColor(SECONDARY_TEXT).layoutWeight(1)
-      Text(value).fontSize(15).fontColor(PRIMARY_TEXT).textAlign(TextAlign.End)
+      Text(label).fontSize(16).fontColor(SECONDARY_TEXT).layoutWeight(1)
+      Text(value).fontSize(16).fontColor(PRIMARY_TEXT).textAlign(TextAlign.End)
         .constraintSize({ maxWidth: '64%' })
-    }.width('100%').constraintSize({ minHeight: 54 })
-      .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+    }.width('100%').constraintSize({ minHeight: 44 }).padding({ top: 8, bottom: 8 })
   }
 
   @Builder
   private deviceDetails(computer: ComputerDevice) {
-    Column({ space: 10 }) {
-      Row() {
-        Text('连接').fontSize(18).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT).layoutWeight(1)
-        Button({ type: ButtonType.Normal }) {
-          if (this.refreshing) {
-            LoadingProgress().width(16).height(16).color(ACCENT)
-          } else {
-            Text('刷新').fontSize(14).fontColor(ACCENT)
-          }
-        }.height(44).width(56).borderRadius(12).backgroundColor(SURFACE)
-          .enabled(!this.working).onClick(() => { this.refreshDevices() })
-          .accessibilityText(this.refreshing ? '正在检查电脑状态' : '刷新连接状态')
-      }.width('100%')
-
+    Column({ space: 12 }) {
       Column() {
+        Row() {
+          Text('连接').fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT).layoutWeight(1)
+          if (computer.status === 'binding' || computer.status === 'binding_failed') {
+            Text(this.statusText(computer)).fontSize(14).fontColor(this.statusColor(computer))
+          }
+        }.width('100%')
         this.detailRow('最近检查', this.checkedTime(computer))
         if (computer.status !== 'online') {
-          Divider().color(BORDER).margin({ left: 16, right: 16 })
-          Text(computer.detail).width('100%').fontSize(14).lineHeight(22).fontColor(SECONDARY_TEXT)
-            .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+          Text(computer.detail).width('100%').fontSize(15).lineHeight(22).fontColor(SECONDARY_TEXT)
         }
-      }.width('100%').backgroundColor(SURFACE).borderRadius(16).border({ width: 1, color: BORDER })
+      }.width('100%').alignItems(HorizontalAlign.Start)
 
-      Text('设备信息').fontSize(18).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
-        .margin({ top: 14 })
+      Divider().color(BORDER).strokeWidth(0.5)
       Column() {
+        Text('设备信息').fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
         this.detailRow('设备类型', computer.device_type === 'computer' ? '电脑' : '移动端')
         if (computer.bound_at !== null) {
-          Divider().color(BORDER).margin({ left: 16, right: 16 })
+          Divider().color(BORDER).strokeWidth(0.5)
           this.detailRow('绑定时间', new Date(computer.bound_at * 1000).toLocaleString())
         }
-        Divider().color(BORDER).margin({ left: 16, right: 16 })
+        Divider().color(BORDER).strokeWidth(0.5)
         this.detailRow('设备标识', `${computer.endpoint_id.slice(0, 8)}…${computer.endpoint_id.slice(-8)}`)
-      }.width('100%').backgroundColor(SURFACE).borderRadius(16).border({ width: 1, color: BORDER })
-    }.width('100%').alignItems(HorizontalAlign.Start)
+      }.width('100%').alignItems(HorizontalAlign.Start)
+    }.width('100%').padding(12).backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
   }
 
   @Builder
@@ -234,34 +249,25 @@ struct Index {
 
   @Builder
   private pageContent() {
-    if (this.current.length > 0) {
-      Column() {
-        ForEach(this.current, (computer: ComputerDevice) => {
-          this.deviceSummary(computer)
-        }, (computer: ComputerDevice) => JSON.stringify([computer.endpoint_id, computer.name, computer.status]))
-      }.width('100%').constraintSize({ maxWidth: 560 }).padding({ left: 24, right: 24, bottom: 16 })
-    }
-
     Scroll() {
       Column({ space: 12 }) {
-        this.feedback()
-        if (this.loaded && this.current.length === 0) {
-          this.emptyDevices()
-        } else {
-          ForEach(this.current, (computer: ComputerDevice) => {
-            this.deviceDetails(computer)
-          }, (computer: ComputerDevice) => JSON.stringify(computer))
+        if (this.current && this.detailsOpen) {
+          this.deviceDetails(this.current)
         }
-      }.width('100%').padding({ left: 24, right: 24, top: 8, bottom: 24 })
+        this.feedback()
+        if (this.loaded && !this.current) {
+          this.emptyDevices()
+        }
+      }.width('100%').padding({ left: this.current ? 12 : 24, right: this.current ? 12 : 24,
+        top: this.current ? 6 : 16, bottom: 24 })
     }.width('100%').constraintSize({ maxWidth: 560 }).layoutWeight(1).align(Alignment.Top)
       .scrollBar(BarState.Auto).scrollBarColor('#4D576B').scrollBarWidth(3)
   }
 
   build() {
     Stack() {
-      AppPage({ page: PageName.Index, sidebarOpen: $sidebarOpen }) {
-        this.pageContent()
-      }
+      AppPage({ page: PageName.Index, sidebarOpen: $sidebarOpen,
+        header: () => { this.pageHeader() }, content: () => { this.pageContent() } })
     }.width('100%').height('100%')
   }
 }

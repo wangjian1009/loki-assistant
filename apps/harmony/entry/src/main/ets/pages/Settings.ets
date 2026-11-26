@@ -179,9 +179,7 @@ struct Settings {
 
   build() {
     Stack() {
-      AppPage({ page: PageName.Settings, sidebarOpen: $sidebarOpen }) {
-        this.pageContent()
-      }
+      AppPage({ page: PageName.Settings, sidebarOpen: $sidebarOpen, content: () => { this.pageContent() } })
     }.width('100%').height('100%')
       .bindSheet($$this.editing, this.nameEditor(), {
         height: SheetSize.MEDIUM, backgroundColor: SURFACE,
