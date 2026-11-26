@@ -6,6 +6,7 @@ struct DashboardView: View {
     let idleSleep: IdleSleepController
     let openAlert: @MainActor (String, String) -> Void
     let openMailInbox: @MainActor () -> Void
+    let syncMail: @MainActor () -> Void
     @State private var openingSettings = false
     @State private var appOpenError: String?
 
@@ -71,6 +72,9 @@ struct DashboardView: View {
                     } else {
                         Label("收件箱", systemImage: "tray")
                     }
+                }
+                Button(action: syncMail) {
+                    Label("立即同步邮件", systemImage: "arrow.clockwise")
                 }
             }
             Button {

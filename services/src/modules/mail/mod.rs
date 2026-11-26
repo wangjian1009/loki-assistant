@@ -1,4 +1,5 @@
 mod diagnostic;
+mod progress;
 mod routes;
 mod status;
 mod sync;
@@ -34,7 +35,7 @@ const UNREAD_QUERY: &str = "maildir:/inbox/ AND flag:unread AND NOT flag:trashed
 static MAIL_MODULE: ModuleRegistration = ModuleRegistration {
     id: MODULE_ID,
     name: "邮件",
-    description: "自动同步 Maildir、索引新邮件，并在 Emacs 中打开邮件或撰写草稿。",
+    description: "同步 Maildir、索引新邮件，并在 Emacs 中打开邮件或撰写草稿。",
     version: env!("CARGO_PKG_VERSION"),
 };
 
@@ -95,6 +96,7 @@ struct MailService {
     notification: Arc<NotificationService>,
     emacs: Arc<EmacsService>,
     status: Arc<StatusService>,
+    sync_progress: progress::SyncProgress,
     refresh_requested: Notify,
     stopping: Notify,
 }
@@ -111,6 +113,7 @@ static EXTENSION: ExtensionRegistration = ExtensionRegistration {
             notification: Arc::clone(context.notification),
             emacs: context.emacs.service(),
             status: Arc::clone(context.status),
+            sync_progress: progress::SyncProgress::new(),
             refresh_requested: Notify::new(),
             stopping: Notify::new(),
         })))

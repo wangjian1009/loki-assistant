@@ -6,9 +6,16 @@ use std::{
 
 use futures_util::FutureExt;
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, process::Command, time};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time,
+};
 
-use super::{ENABLED, MODULE_ID, MailService, diagnostic};
+use super::{
+    ENABLED, MODULE_ID, MailService, diagnostic,
+    progress::{Phase, SyncProgress},
+};
 use crate::modules::alert::{AlertInput, AlertLevel};
 
 const INTERVAL: Duration = Duration::from_secs(300);
@@ -24,14 +31,44 @@ const CONFIG_CALLBACK: &str = "/mail/config/open";
 pub(super) struct MuDatabase {
     pub(super) program: PathBuf,
     pub(super) home: PathBuf,
+    index: Option<IndexCounts>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IndexReply {
+    Complete(MuDatabase),
+    Running(IndexCounts),
+}
+
+#[derive(Deserialize)]
+struct IndexCounts {
+    checked: u64,
+    updated: u64,
+    cleaned_up: Option<u64>,
+}
+
+impl IndexCounts {
+    fn message(&self) -> String {
+        let counts = format!(
+            "mu server 已检查 {} 封，更新 {} 封",
+            self.checked, self.updated
+        );
+        match self.cleaned_up {
+            Some(removed) => format!("{counts}，清理 {removed} 封。"),
+            None => format!("{counts}。"),
+        }
+    }
 }
 
 impl MuDatabase {
     pub(super) fn from_emacs(result: &str) -> Result<Self, String> {
-        serde_json::from_str::<String>(result)
-            .and_then(|json| serde_json::from_str(&json))
-            .map_err(|_| "无法读取 mu4e 返回的索引位置。".into())
+        decode_emacs_json(result).map_err(|_| "无法读取 mu4e 返回的索引位置。".into())
     }
+}
+
+fn decode_emacs_json<T: serde::de::DeserializeOwned>(result: &str) -> serde_json::Result<T> {
+    serde_json::from_str::<String>(result).and_then(|json| serde_json::from_str(&json))
 }
 
 impl MailService {
@@ -59,12 +96,14 @@ impl MailService {
                     next_sync.as_mut().reset(time::Instant::now());
                     continue;
                 }
+                _ = self.sync_progress.requested.notified() => true,
                 _ = &mut next_sync, if enabled => true,
                 _ = &mut next_retry, if retry_pending => false,
                 _ = self.refresh_requested.notified(), if !retry_pending => false,
             };
 
             let (sync_error, database) = if sync_due {
+                self.sync_progress.begin().await;
                 self.sync_and_index().await
             } else {
                 (None, self.emacs_database_for_refresh().await.map(Some))
@@ -72,6 +111,9 @@ impl MailService {
             let mut requested = !sync_due || retry_pending;
             let refresh_error = match database {
                 Ok(database) => {
+                    if sync_due {
+                        self.sync_progress.phase(Phase::Refreshing);
+                    }
                     // 本次查询覆盖此前到达的请求。查询开始后到达的请求留给下一轮。
                     requested |= self.refresh_requested.notified().now_or_never().is_some();
                     self.refresh_unread(&mut seen, database.as_ref())
@@ -97,12 +139,14 @@ impl MailService {
 
             if sync_due {
                 let errors: Vec<_> = [sync_error, refresh_error].into_iter().flatten().collect();
-                if errors.is_empty() {
+                let error = (!errors.is_empty()).then(|| errors.join("\n"));
+                if let Some(error) = &error {
+                    self.report_failure(error.clone()).await;
+                } else {
                     self.clear_sync_alert().await;
                     log::info!("邮件同步和索引已完成，未读数已刷新");
-                } else {
-                    self.report_failure(errors.join("\n")).await;
                 }
+                self.sync_progress.finish(error).await;
                 next_sync.as_mut().reset(time::Instant::now() + INTERVAL);
             }
         }
@@ -127,6 +171,7 @@ impl MailService {
                 .arg("loki-auto"),
             "mbsync",
             SYNC_DEADLINE,
+            None,
         )
         .await
         {
@@ -136,6 +181,7 @@ impl MailService {
         };
 
         // 某个邮箱同步失败时，其他邮箱可能已经写入 Maildir。
+        self.sync_progress.phase(Phase::Indexing);
         (sync_error, self.update_index().await)
     }
 
@@ -162,7 +208,14 @@ impl MailService {
         if let Some(database) = self.index_in_emacs().await? {
             return Ok(Some(database));
         }
-        let output = run_mu("index", ["--quiet", "--nocolor"], INDEX_DEADLINE, None).await?;
+        let output = run_mu(
+            "index",
+            ["--nocolor"],
+            INDEX_DEADLINE,
+            None,
+            Some(&self.sync_progress),
+        )
+        .await?;
         if output.status.success() {
             return Ok(None);
         }
@@ -185,7 +238,9 @@ impl MailService {
                     r#"(if (and (fboundp 'mu4e-running-p) (mu4e-running-p))
     (progn
       (require 'loki-assistant-mail)
-      (loki-assistant-mail-index "{request}" {check_only}))
+      (if (fboundp 'loki-assistant-mail-index-progress)
+          (loki-assistant-mail-index-progress "{request}" {check_only})
+        (loki-assistant-mail-index "{request}" {check_only})))
   'unavailable)"#
                 );
                 let result = self
@@ -198,9 +253,25 @@ impl MailService {
                     None | Some("unavailable") => {
                         return Err("mu4e 已退出，无法确认索引结果。".into());
                     }
-                    Some("busy") if !started => {}
+                    Some("busy") if !started => self
+                        .sync_progress
+                        .message("等待 mu4e 完成正在运行的索引。".into()),
                     Some("running") => started = true,
-                    Some(result) if started => return MuDatabase::from_emacs(result).map(Some),
+                    Some(result) if started => {
+                        match decode_emacs_json(result)
+                            .map_err(|_| "无法读取 mu4e 返回的索引进度。")?
+                        {
+                            IndexReply::Complete(database) => {
+                                if let Some(counts) = &database.index {
+                                    self.sync_progress.message(counts.message());
+                                }
+                                return Ok(Some(database));
+                            }
+                            IndexReply::Running(counts) => {
+                                self.sync_progress.message(counts.message())
+                            }
+                        }
+                    }
                     _ => return Err("mu4e 返回的索引状态无效。".into()),
                 }
                 time::sleep(INDEX_POLL_INTERVAL).await;
@@ -242,6 +313,7 @@ pub(super) async fn run_mu<const N: usize>(
     args: [&str; N],
     deadline: Duration,
     database: Option<&MuDatabase>,
+    progress: Option<&SyncProgress>,
 ) -> Result<Output, String> {
     let name = format!("mu {subcommand}");
     let mut backoff = MU_LOCK_BACKOFF.into_iter();
@@ -254,7 +326,7 @@ pub(super) async fn run_mu<const N: usize>(
         if let Some(database) = database {
             command.arg("--muhome").arg(&database.home);
         }
-        let output = run(command.args(args), &name, deadline).await?;
+        let output = run(command.args(args), &name, deadline, progress).await?;
         if !database_locked(&output) {
             return Ok(output);
         }
@@ -270,7 +342,12 @@ fn database_locked(output: &Output) -> bool {
         && String::from_utf8_lossy(&output.stderr).contains("database locked")
 }
 
-async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Output, String> {
+async fn run(
+    command: &mut Command,
+    name: &str,
+    deadline: Duration,
+    progress: Option<&SyncProgress>,
+) -> Result<Output, String> {
     let mut child = command
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -293,8 +370,8 @@ async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Ou
     let result = time::timeout(deadline, async {
         let (status, _, _) = tokio::try_join!(
             child.wait(),
-            stdout_pipe.read_to_end(&mut stdout),
-            stderr_pipe.read_to_end(&mut stderr),
+            read_output(&mut stdout_pipe, &mut stdout, progress),
+            read_output(&mut stderr_pipe, &mut stderr, progress),
         )?;
         Ok::<_, std::io::Error>(status)
     })
@@ -320,6 +397,50 @@ async fn run(command: &mut Command, name: &str, deadline: Duration) -> Result<Ou
     Err(message)
 }
 
+async fn read_output(
+    pipe: &mut (impl AsyncRead + Unpin),
+    output: &mut Vec<u8>,
+    progress: Option<&SyncProgress>,
+) -> std::io::Result<()> {
+    let Some(progress) = progress else {
+        return pipe.read_to_end(output).await.map(|_| ());
+    };
+    const MAX_MESSAGE_BYTES: usize = 2048;
+    let mut message = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            publish_output(progress, &message);
+            return Ok(());
+        }
+        let bytes = &buffer[..count];
+        output.extend_from_slice(bytes);
+        // mu 使用回车在终端原地更新同一行进度。
+        for byte in bytes {
+            if matches!(byte, b'\r' | b'\n') {
+                publish_output(progress, &message);
+                message.clear();
+            } else if message.len() < MAX_MESSAGE_BYTES {
+                message.push(*byte);
+            }
+        }
+    }
+}
+
+fn publish_output(progress: &SyncProgress, bytes: &[u8]) {
+    let message = String::from_utf8_lossy(bytes);
+    let message = match message.as_bytes().first() {
+        Some(b'\\' | b'|' | b'/' | b'-') if message[1..].starts_with(" indexing messages") => {
+            &message[2..]
+        }
+        _ => message.trim(),
+    };
+    if !message.is_empty() {
+        progress.message(message.into());
+    }
+}
+
 pub(super) fn exit_message(name: &str, output: &Output) -> String {
     if database_locked(output) {
         return format!("{name} 重试后仍无法打开已锁定的数据库。");
@@ -336,7 +457,7 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
     use serde_json::json;
-    use tokio::sync::Notify;
+    use tokio::{io::AsyncWriteExt, sync::Notify};
 
     use super::*;
     use crate::modules::{
@@ -346,6 +467,50 @@ mod tests {
         notification::NotificationService,
         status::StatusService,
     };
+
+    #[tokio::test]
+    async fn active_sync_shares_id_and_publishes_carriage_return_output_before_eof() {
+        let progress = SyncProgress::new();
+        let id = progress.request().await;
+        progress.begin().await;
+        progress.phase(Phase::Indexing);
+        assert_eq!(progress.request().await, id);
+        assert!(progress.requested.notified().now_or_never().is_none());
+
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let mut output = Vec::new();
+        let read = read_output(&mut reader, &mut output, Some(&progress));
+        let observe = async {
+            writer
+                .write_all(b"\\ indexing messages; checked: 2\r")
+                .await
+                .unwrap();
+            loop {
+                let current = json!(progress.snapshot(id).await.unwrap());
+                assert_eq!(current["phase"], "indexing");
+                if current["messages"] == json!(["indexing messages; checked: 2"]) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            writer.write_all(b"indexing finished").await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let (result, ()) = time::timeout(Duration::from_secs(2), async {
+            tokio::join!(read, observe)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        progress.finish(None).await;
+        assert_ne!(progress.request().await, id);
+        let completed = json!(progress.snapshot(id).await.unwrap());
+        assert_eq!(completed["phase"], "completed");
+        assert_eq!(
+            completed["messages"],
+            json!(["indexing messages; checked: 2", "indexing finished"])
+        );
+    }
 
     #[tokio::test]
     async fn refresh_coalesces_requests_while_indexing() {
@@ -404,6 +569,7 @@ printf 'eval\n' >> "$0.calls"
             config,
             notification,
             status,
+            sync_progress: SyncProgress::new(),
             refresh_requested: Notify::new(),
             stopping: Notify::new(),
         });
@@ -454,6 +620,7 @@ printf 'eval\n' >> "$0.calls"
             ]),
             "mbsync",
             Duration::from_secs(1),
+            None,
         )
         .await
         .unwrap_err();

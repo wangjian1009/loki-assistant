@@ -39,6 +39,7 @@ set(LOKI_APP_SOURCES
     Sources/App/NotificationReceiptClient.swift
     Sources/App/ServiceAPIError.swift
     Sources/Features/Dashboard/DashboardView.swift
+    Sources/Features/MailSync/MailSyncWindow.swift
 )
 list(TRANSFORM LOKI_APP_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 

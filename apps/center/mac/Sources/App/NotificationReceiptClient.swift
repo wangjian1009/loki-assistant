@@ -117,7 +117,7 @@ struct NotificationReceiptClient: Sendable {
         }
     }
 
-    private func healthyEndpoint() async throws -> ServiceEndpoint {
+    func healthyEndpoint() async throws -> ServiceEndpoint {
         let endpoint = try discover()
         let request = URLRequest(url: try Self.url(endpoint: endpoint, path: "/healthz"), cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         let (data, response) = try await transport(request)

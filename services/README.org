@@ -199,7 +199,7 @@ Chrome 通过 ~POST /doc/article~ 发送 Org 全文，services 转交给目标 E
 
 稍后阅读的捕获和列表共用 ~/doc/read-later/entries~ 。客户端以 ~POST /doc/read-later/entries/{id}/read~ 标记已读，以 ~DELETE /doc/read-later/entries/{id}~ 移除节点 ID。services 将操作交给目标 Emacs 的 ~loki-assistant-read-later~ 模块。 [[file:../docs/control-center-services.org::*稍后阅读][稍后阅读协议]]
 
-* 邮件自动同步
+* 邮件同步
 
 安装 ~mbsync~ 与 ~mu~ ，准备好 Maildir 和 ~mu init~ 所用的索引。在 mbsync 配置中加入 ~loki-auto~ 组，例如：
 
@@ -210,7 +210,7 @@ Channels personal-inbox work-inbox
 
 把示例中的 Channel 名替换为配置中要自动同步的 Channel。迁移现有定时任务时，停止旧的 ~brew services~ isync 任务，将 Emacs 的 ~mu4e-update-interval~ 设为 ~nil~ 并重启 mu4e 后，可继续使用 mu4e 的手动同步命令。
 
-在 Emacs 的 services 设置中打开“邮件 → 自动同步”。默认使用 ~~/.mbsyncrc~ ，也可在同一界面指定配置路径。若在 Emacs 中使用 ~mu4e~ ，请在该实例启用 ~server-start~ ，并在 services 的 Emacs 设置中选择对应的 server socket。services 会复用正在运行的 ~mu4e~ 更新索引。没有可用的 ~mu4e~ 时，services 直接运行 ~mu index~ 。
+在 macOS 托盘点击「立即同步邮件」可手动同步。需要定期同步时，在 Emacs 的 services 设置中打开「邮件 → 自动同步」。两种方式默认使用 ~~/.mbsyncrc~ ，可在同一设置界面指定配置路径。若在 Emacs 中使用 ~mu4e~ ，请在该实例启用 ~server-start~ ，并在 services 的 Emacs 设置中选择对应的 server socket。services 会复用正在运行的 ~mu4e~ 更新索引。没有可用的 ~mu4e~ 时，services 直接运行 ~mu index~ 。
 
 每轮同步完成索引后刷新未读数。同步失败时可从告警查看具体阶段和原因，点击告警通知可打开配置。整轮成功后自动清理告警。点击新邮件通知会打开 mu4e 中的邮件。 [[file:../docs/control-center-services.org::*邮件模块][邮件模块协议]]
 

@@ -85,6 +85,7 @@ async fn unread_mail(database: Option<&MuDatabase>) -> Result<Vec<IndexedMail>, 
         ["--nocolor", "--format=json2", "--skip-dups", UNREAD_QUERY],
         QUERY_DEADLINE,
         database,
+        None,
     )
     .await?;
     if output.status.code() == Some(2)

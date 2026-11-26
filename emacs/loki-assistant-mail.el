@@ -22,6 +22,7 @@
 (defvar mu4e--server-indexing)
 (defvar mu4e--server-process)
 (defvar mu4e-index-update-status)
+(defvar mu4e-info-func)
 (defvar mu4e-remove-func)
 (defvar mu4e-update-func)
 (defvar mu4e-view-auto-mark-as-read)
@@ -35,14 +36,37 @@
 (defvar loki-assistant-mail--index-request nil
   "最近一次 services 索引请求的标识、mu 进程及发起前的完成状态。")
 
+(defvar loki-assistant-mail--index-info nil
+  "最近一次 services 索引请求收到的 mu 进度消息。")
+
 (defvar loki-assistant-mail--refresh-timer nil
   "合并连续邮件变更回执的定时器。")
 
-(defun loki-assistant-mail-database ()
-  "返回当前 mu4e 数据库位置和 mu 可执行文件的 JSON。"
+(defun loki-assistant-mail-database (&optional index-info)
+  "返回当前 mu4e 数据库位置和 mu 可执行文件的 JSON。
+INDEX-INFO 非空时附带索引计数。"
   (let ((database (mu4e-database-path)))
     (json-serialize `((program . ,(car (process-command mu4e--server-process)))
-                      (home . ,(directory-file-name (file-name-directory database)))))))
+                      (home . ,(directory-file-name (file-name-directory database)))
+                      ,@(when index-info
+                          `((index . ,(loki-assistant-mail--index-counts index-info))))))))
+
+(defun loki-assistant-mail--index-counts (info)
+  "将 mu 索引回执 INFO 中的计数转为 JSON 对象可用的 alist。"
+  `((checked . ,(plist-get info :checked))
+    (updated . ,(plist-get info :updated))
+    ,@(when-let* ((removed (plist-get info :cleaned-up)))
+        `((cleaned_up . ,removed)))))
+
+(defun loki-assistant-mail--observe-index (info)
+  "记录当前 services 索引对应的 mu 回执 INFO。"
+  (pcase-let ((`(,_ ,process ,previous-status) loki-assistant-mail--index-request))
+    (when (and process (eq process mu4e--server-process)
+               (eq previous-status mu4e-index-update-status)
+               (eq (plist-get info :info) 'index)
+               (numberp (plist-get info :checked))
+               (numberp (plist-get info :updated)))
+      (setq loki-assistant-mail--index-info info))))
 
 (defun loki-assistant-mail--request-refresh ()
   "异步通知 services 刷新本机邮件状态。"
@@ -70,6 +94,9 @@
 
 (defun loki-assistant-mail--observe-replies ()
   "在 mu4e 的邮件操作回执处理完成后安排刷新。"
+  (when (default-value 'mu4e-info-func)
+    (add-function :before (default-value 'mu4e-info-func)
+                  #'loki-assistant-mail--observe-index))
   ;; 打开邮件的回执也可能包含打开时自动标记已读的结果。
   (dolist (handler '(mu4e-update-func mu4e-remove-func mu4e-view-func))
     (when (default-value handler)
@@ -91,14 +118,23 @@ CHECK-ONLY 非空时只查询已发起的索引。"
         (error "mu4e 进程已退出，无法确认索引结果"))
       (if (eq previous-status mu4e-index-update-status)
           'running
-        (loki-assistant-mail-database)))
+        (loki-assistant-mail-database mu4e-index-update-status)))
      (check-only (error "找不到此前发起的 mu4e 索引请求"))
      (mu4e--server-indexing 'busy)
      (t
       (let ((status mu4e-index-update-status))
+        (setq loki-assistant-mail--index-info nil)
         (mu4e-update-index-nonlazy)
         (setq loki-assistant-mail--index-request (list request-id mu4e--server-process status))
         'running)))))
+
+(defun loki-assistant-mail-index-progress (request-id check-only)
+  "发起或查询 REQUEST-ID，并在运行期间返回已收到的索引计数。
+CHECK-ONLY 非空时只查询已发起的索引。"
+  (let ((result (loki-assistant-mail-index request-id check-only)))
+    (if (and (eq result 'running) loki-assistant-mail--index-info)
+        (json-serialize (loki-assistant-mail--index-counts loki-assistant-mail--index-info))
+      result)))
 
 (defun loki-assistant-mail--focus ()
   "选中可用于显示邮件的图形 frame。"

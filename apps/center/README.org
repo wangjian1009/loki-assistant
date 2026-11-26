@@ -26,6 +26,8 @@
 
 点击托盘菜单中的「收件箱」，即可打开 mu4e 中快捷键 ~i~ 对应的收件箱书签。同步完成后，菜单项也会显示未读邮件数量。 [[file:../../docs/control-center-services.org::*邮件跳转][邮件跳转协议]]
 
+点击「立即同步邮件」可启动同步或查看当前正在运行的一轮。窗口显示下载邮件、更新索引、刷新未读数三个阶段和实时 ~mu~ 索引消息。关掉窗口后，已受理的同步继续运行。 [[file:../../docs/control-center-services.org::*手动同步与进度][手动同步协议]]
+
 * 应用图标
 
 应用显示名称为“Loki的助理”，采用已确认的“对话中的 L”图标：深绿底板、薄荷色字母 L 与回应气泡。SVG 母版与设计预览统一放在仓库根目录 ~resources/icons/~ ，由根目录 ~scripts/export-icons.py~ 同时生成 macOS 与 HarmonyOS 图标。Mac 应用的完整 PNG iconset、ICNS、1024 像素 PNG 及菜单栏 20/40 像素透明图标位于 ~mac/Resources/AppIcon/~ 。顶部菜单栏保持单色 template 渲染并保留休眠月牙标记；红、黄、绿仅用于展开菜单后的第一项状态圆点；设计说明与导出文件见 [[file:../../docs/icon-design.org][图标设计]]。

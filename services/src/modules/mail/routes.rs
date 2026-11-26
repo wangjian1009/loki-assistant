@@ -2,19 +2,70 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::Response,
+    extract::{Path, State, rejection::JsonRejection},
+    http::{StatusCode, header::CACHE_CONTROL},
+    response::{IntoResponse, Response},
 };
 use loki_services_macros::loki_api;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::MailService;
 use crate::{
     http::error::{API_VERSION, ErrorSource, response},
     modules::emacs::error_response,
 };
+
+#[loki_api(
+    module = "mail",
+    mount = "Arc<MailService>",
+    id = "sync",
+    method = "POST",
+    path = "/mail/sync",
+    summary = "立即同步邮件",
+    description = "开始一轮同步，或返回当前同步任务的 ID。"
+)]
+async fn start_sync(State(service): State<Arc<MailService>>) -> Response {
+    let id = service.sync_progress.request().await;
+    (
+        StatusCode::ACCEPTED,
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({"api_version": API_VERSION, "id": id})),
+    )
+        .into_response()
+}
+
+#[loki_api(
+    module = "mail",
+    mount = "Arc<MailService>",
+    id = "sync-progress",
+    method = "GET",
+    path = "/mail/sync/{id}",
+    summary = "查询邮件同步进度",
+    description = "返回同步阶段、最近的 mu 索引消息和失败原因。"
+)]
+async fn sync_progress(
+    State(service): State<Arc<MailService>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return invalid("邮件同步任务 ID 无效。");
+    };
+    let Some(sync) = service.sync_progress.snapshot(id).await else {
+        return response(
+            StatusCode::NOT_FOUND,
+            ErrorSource::Business,
+            "mail-sync-not-found",
+            "找不到该邮件同步任务。",
+        );
+    };
+    (
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({"api_version": API_VERSION, "sync": sync})),
+    )
+        .into_response()
+}
 
 #[loki_api(
     module = "mail",

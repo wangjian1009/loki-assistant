@@ -33,6 +33,7 @@ private final class MenuTrackingObserver {
 struct LokiAssistantApp: App {
     @NSApplicationDelegateAdaptor(CenterAppDelegate.self) private var appDelegate
     private let menuTrackingObserver: MenuTrackingObserver
+    private let mailSyncWindow = MailSyncWindow()
     @State private var status: ServiceStatusModel
     @State private var idleSleep: IdleSleepController
 
@@ -65,7 +66,7 @@ struct LokiAssistantApp: App {
         MenuBarExtra {
             DashboardView(
                 status: status, idleSleep: idleSleep, openAlert: appDelegate.openAlert,
-                openMailInbox: appDelegate.openMailInbox
+                openMailInbox: appDelegate.openMailInbox, syncMail: mailSyncWindow.show
             )
         } label: {
             Image(nsImage: idleSleep.isEnabled ? Self.menuBarSleepIcon : Self.menuBarIcon)
