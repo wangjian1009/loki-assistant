@@ -26,16 +26,25 @@
                :target (file+head+olp "%<%Y>/%<%m>/%<%F>.org" "#+TITLE: 日记\n"
                                       ("冲煮记录")))))
            (library (expand-file-name "recipes.org" root))
+           (other (expand-file-name "other.org" root))
            (daily (expand-file-name (format-time-string "journal/%Y/%m/%F.org") root))
            (request #'loki-assistant-xbloom-service-test--request))
       (with-temp-file library
-        (insert "* [[https://example.org/r][官方咖啡]] :15克:\n:PROPERTIES:\n"
+        (insert ":PROPERTIES:\n:ID: library-file\n:END:\n"
+                "#+TITLE: 配方库\n#+FILETAGS: :xbloom-lib:\n\n"
+                "* [[https://example.org/r][官方咖啡]] :15克:\n:PROPERTIES:\n"
                 ":ID: official\n:TABLE_ID: 123\n:MODEL: Studio\n:END:\n\n"
                 "- 产地 :: 埃塞俄比亚\n\n** 冲煮参数\n"
                 "| 参数 | 值 |\n|-\n| 粉量 (g) | 15.0 |\n| 粉水比 | 1:17 |\n"
                 "** 分段注水\n"
                 "| 段 | 段前振动 | 水量 (mL) | 轨迹 |\n|-\n"
                 "| 1 | 关闭 | 50 | 螺旋 |\n| 2 | 开启 | 100 | 中心 |\n"))
+      (with-temp-file other
+        (insert ":PROPERTIES:\n:ID: other-file\n:END:\n#+TITLE: 其他笔记\n\n"
+                "* 其他咖啡 :xbloom-lib:\n:PROPERTIES:\n:ID: other\n:END:\n"
+                "** 冲煮参数\n** 分段注水\n"))
+      (org-roam-db-update-file library)
+      (org-roam-db-update-file other)
       (let* ((official (alist-get 'result (funcall request "{\"operation\":\"get\",\"id\":\"official\"}")))
              (data (alist-get 'data official))
              (pours (alist-get 'pours data)))
@@ -90,14 +99,17 @@
             (insert-file-contents daily)
             (goto-char (point-min))
             (should (search-forward "风味笔记保留。" nil t))))
-        (let ((page (alist-get 'result
-                               (funcall request "{\"operation\":\"list\",\"q\":\"咖啡\",\"limit\":1,\"offset\":0}")))
-              (next (alist-get 'result
-                               (funcall request "{\"operation\":\"list\",\"q\":\"咖啡\",\"limit\":1,\"offset\":1}"))))
-          (should (equal (alist-get 'id (aref (alist-get 'recipes page) 0)) id))
-          (should (= (alist-get 'next_offset page) 1))
-          (should (equal (alist-get 'id (aref (alist-get 'recipes next) 0)) "official"))
-          (should-not (alist-get 'next_offset next)))))))
+        (let ((all (alist-get 'result (funcall request "{\"operation\":\"list\"}")))
+              (filtered (alist-get 'result
+                                   (funcall request "{\"operation\":\"list\",\"q\":\"埃塞俄比亚\"}")))
+              (empty (alist-get 'result
+                                (funcall request "{\"operation\":\"list\",\"q\":\"云南\"}"))))
+          (should (equal (mapcar (lambda (entry) (alist-get 'id entry)) (alist-get 'recipes all))
+                         (list id "official")))
+          (should-not (assq 'next_offset all))
+          (should (equal (mapcar (lambda (entry) (alist-get 'id entry)) (alist-get 'recipes filtered))
+                         '("official")))
+          (should (equal (alist-get 'recipes empty) [])))))))
 
 (provide 'loki-assistant-xbloom-service-tests)
 ;;; loki-assistant-xbloom-service-tests.el ends here

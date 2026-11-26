@@ -40,7 +40,9 @@
 
 * 日记配方与服务查询
 
-可以通过 ~POST /xbloom/recipes~ 新建当天的日记配方，或用 ~PUT /xbloom/recipes/{id}~ 修改日记里的配方。Emacs 用上面的 Org 格式保存配方。~GET /xbloom/recipes~ 同时查询已保存的配方库与日记，并把属性、冲煮参数和分段注水解析为有类型的 JSON 字段。 [[file:control-center-services.org::*xBloom 模块][xBloom HTTP 接口]]
+配方库文件需要文件级 Org ~ID~ 和 ~#+FILETAGS: :xbloom-lib:~ ，并纳入 Org-roam 索引。~GET /xbloom/recipes~ 一次返回全部匹配的配方库和日记配方，并将属性、冲煮参数和分段注水解析为有类型的 JSON 字段。
+
+可以通过 ~POST /xbloom/recipes~ 新建当天的日记配方，或用 ~PUT /xbloom/recipes/{id}~ 修改日记里的配方。Emacs 用上面的 Org 格式保存配方。 [[file:control-center-services.org::*xBloom 模块][xBloom HTTP 接口]]
 
 * 从日记链接配方
 

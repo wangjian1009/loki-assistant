@@ -60,26 +60,22 @@ impl XbloomService {
     path = "/xbloom/recipes",
     access = "local",
     summary = "查询 xBloom 咖啡配方",
-    description = "协议版本 1，合并 Org 配方库和日记配方，支持 q、limit 和 offset。"
+    description = "协议版本 1，一次返回 Org 配方库和日记中符合 q 的全部配方。"
 )]
 async fn list(
     State(service): State<XbloomService>,
     query: Result<Query<protocol::Query>, QueryRejection>,
 ) -> Result<Json<protocol::Response<List>>, Response> {
     let Query(query) = query.map_err(|_| invalid_request())?;
-    let limit = query.limit.unwrap_or(50);
     let q = query.q.map(|value| value.trim().to_owned());
-    if !(1..=200).contains(&limit)
-        || q.as_ref()
-            .is_some_and(|value| value.len() > 512 || value.chars().any(char::is_control))
+    if q.as_ref()
+        .is_some_and(|value| value.len() > 512 || value.chars().any(char::is_control))
     {
         return Err(invalid_request());
     }
     let result = service
         .reply(Request::List {
             q: q.filter(|value| !value.is_empty()),
-            limit,
-            offset: query.offset.unwrap_or_default(),
         })
         .await?;
     Ok(reply(result))

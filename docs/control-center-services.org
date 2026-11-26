@@ -577,11 +577,11 @@ HTTP 200 返回 UTF-8 JSON。响应使用 ~application/json~ 并携带 ~Cache-Co
 
 * xBloom 模块
 
-四个接口均通过本机 loopback 调用。services 定义版本化 JSON 协议，并通过 Emacs gateway 将请求转交 ~loki-assistant-xbloom-service~ 。Emacs 扫描已保存的 Org-roam 文件，解析带 ~ID~ 及“冲煮参数”和“分段注水”子标题的条目。日记范围来自 ~org-roam-dailies-directory~ ，配方库使用一级标题。带 ~noexport~ 标签的模板条目会被跳过。 [[file:xbloom-recipes.org][Org 配方格式]]
+四个接口均通过本机 loopback 调用。services 定义版本化 JSON 协议，并通过 Emacs gateway 将请求转交 ~loki-assistant-xbloom-service~ 。Emacs 从 Org-roam 索引按文件级标签 ~xbloom-lib~ 找到配方库文件，并从 ~org-roam-dailies-directory~ 枚举日记文件。Emacs 读取磁盘上已保存的 Org 内容，解析带 ~ID~ 及“冲煮参数”和“分段注水”子标题的条目。配方库使用一级标题，带 ~noexport~ 标签的模板条目会被跳过。 [[file:xbloom-recipes.org][Org 配方格式]]
 
 ** 查询
 
-- ~GET /xbloom/recipes~ 返回 ~api_version~ 、 ~recipes~ 和 ~next_offset~ 。日记配方排在前面，随后为库配方。可用 ~q~ 在标题、标签、咖啡豆、烘焙商、产地、处理法和风味中查找子串。~limit~ 默认为 50，可填 1 至 200。~offset~ 默认为 0，最后一页的 ~next_offset~ 为 ~null~ 。
+- ~GET /xbloom/recipes~ 在一次响应中返回 ~api_version~ 和包含全部匹配项的 ~recipes~ 数组。日记配方排在前面，随后为库配方。可用 ~q~ 在标题、标签、咖啡豆、烘焙商、产地、处理法和风味中查找子串。
 - ~GET /xbloom/recipes/{id}~ 返回 ~api_version~ 和 ~recipe~ 。~id~ 为 Org ID。
 
 每条 ~recipe~ 含以下字段。

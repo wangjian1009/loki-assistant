@@ -106,34 +106,20 @@ pub(super) struct Update {
 #[serde(deny_unknown_fields)]
 pub(super) struct Query {
     pub q: Option<String>,
-    pub limit: Option<u16>,
-    pub offset: Option<u32>,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(super) enum Request {
-    List {
-        q: Option<String>,
-        limit: u16,
-        offset: u32,
-    },
-    Get {
-        id: String,
-    },
-    Create {
-        info: Create,
-    },
-    Update {
-        id: String,
-        recipe: RecipeData,
-    },
+    List { q: Option<String> },
+    Get { id: String },
+    Create { info: Create },
+    Update { id: String, recipe: RecipeData },
 }
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct List {
     recipes: Vec<Recipe>,
-    next_offset: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]

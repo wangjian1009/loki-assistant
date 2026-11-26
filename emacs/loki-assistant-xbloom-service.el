@@ -4,7 +4,9 @@
 
 (defvar org-roam-dailies-directory)
 (defvar org-roam-db-update-on-save)
-(declare-function org-roam-list-files "org-roam")
+(declare-function org-roam-db-query "org-roam-db" (sql &rest args))
+(declare-function org-roam-file-p "org-roam" (&optional file))
+(declare-function org-roam-dailies--list-files "org-roam-dailies" (&rest extra-files))
 (declare-function loki-assistant-daily-capture "loki-assistant-daily" (key prepare fail))
 (declare-function loki-assistant-daily-check-buffer "loki-assistant-daily" (buffer fail))
 
@@ -137,12 +139,21 @@
        (loki-assistant-xbloom--child headline "分段注水")))
 
 (defun loki-assistant-xbloom-service--scan (visit &optional id)
-  "在已保存的 Org-roam 文件中调用 VISIT 处理配方标题。
+  "在标记为 xbloom-lib 的 Org-roam 文件和日记中调用 VISIT 处理配方标题。
 给定 ID 时只处理匹配的标题。"
-  (let ((daily-root (expand-file-name org-roam-dailies-directory org-roam-directory)))
-    (dolist (file (sort (delete-dups (org-roam-list-files)) #'string<))
+  (let* ((daily-root (expand-file-name org-roam-dailies-directory org-roam-directory))
+         (library-files (mapcar #'car
+                                (org-roam-db-query
+                                 [:select :distinct [nodes:file] :from tags
+                                  :inner-join nodes :on (= tags:node-id nodes:id)
+                                  :where (and (= tags:tag $s1) (= nodes:level 0))]
+                                 "xbloom-lib")))
+         (daily-files (when (file-directory-p daily-root)
+                        (org-roam-dailies--list-files))))
+    (dolist (file (sort (delete-dups (append library-files daily-files)) #'string<))
       (when (and (not (file-remote-p file))
-                 (string-suffix-p ".org" file t) (file-regular-p file))
+                 (string-suffix-p ".org" file t) (file-regular-p file)
+                 (org-roam-file-p file))
         (with-temp-buffer
           (insert-file-contents file)
           (when (and (or (null id)
@@ -169,10 +180,8 @@
     (or found (loki-assistant-xbloom-service--fail "recipe-not-found"))))
 
 (defun loki-assistant-xbloom-service--list (request)
-  "按 REQUEST 搜索配方并分页。"
+  "返回符合 REQUEST 查询条件的所有配方。"
   (let ((q (plist-get request :q))
-        (offset (plist-get request :offset))
-        (limit (plist-get request :limit))
         (ids (make-hash-table :test #'equal))
         daily library)
     (loki-assistant-xbloom-service--scan
@@ -191,11 +200,7 @@
                    (seq-some (lambda (tag) (string-match-p (regexp-quote q) tag))
                              (alist-get 'tags data)))
            (if in-daily (push recipe daily) (push recipe library))))))
-    (let* ((all (nconc daily (nreverse library)))
-           (end (+ offset limit))
-           (page (seq-take (nthcdr offset all) limit)))
-      `((recipes . ,(vconcat page))
-        (next_offset . ,(if (nthcdr end all) end :null))))))
+    `((recipes . ,(vconcat daily (nreverse library))))))
 
 (defun loki-assistant-xbloom-service--table-text (recipe &optional pours)
   "生成 RECIPE 的整杯参数表，POURS 非空时生成分段表。"

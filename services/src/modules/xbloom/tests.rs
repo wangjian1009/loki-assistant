@@ -43,11 +43,11 @@ impl CommandRunner for Runner {
             });
             let result = match request["operation"].as_str().unwrap() {
                 "list" => {
-                    assert_eq!(
-                        request,
-                        json!({"operation":"list","q":"咖啡","limit":1,"offset":0})
-                    );
-                    json!({"recipes":[recipe],"next_offset":null})
+                    assert_eq!(request, json!({"operation":"list","q":"咖啡"}));
+                    let library_recipe = json!({
+                        "id": "库配方", "storage": "library", "data": {"title": "官方咖啡"}
+                    });
+                    json!({"recipes":[recipe, library_recipe]})
                 }
                 "create" => {
                     assert_eq!(request["info"]["based_on_id"], "库配方");
@@ -104,7 +104,7 @@ async fn recipe_routes_forward_structured_data_to_emacs() {
     for (method, uri, body, status) in [
         (
             "GET",
-            "/xbloom/recipes?q=%E5%92%96%E5%95%A1&limit=1",
+            "/xbloom/recipes?q=%E5%92%96%E5%95%A1",
             Value::Null,
             StatusCode::OK,
         ),
@@ -135,6 +135,9 @@ async fn recipe_routes_forward_structured_data_to_emacs() {
         let response: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response["api_version"], "1");
         let recipe = if uri.contains('?') {
+            assert_eq!(response["recipes"].as_array().unwrap().len(), 2);
+            assert_eq!(response["recipes"][1]["id"], "库配方");
+            assert!(response.get("next_offset").is_none());
             &response["recipes"][0]
         } else {
             &response["recipe"]
