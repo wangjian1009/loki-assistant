@@ -17,6 +17,7 @@
 | [[file:config-module.org][modules/config]] | 配置模型、数据读写和变更通知 | 已实现基础能力及元数据通知接入点 |
 | ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
 | ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
+| ~modules/xbloom~ | 通过 Emacs 查询 Org 配方库与日记，保存日记配方 | 已实现 |
 | ~modules/doc~ | 提交网页全文、按 Org ID 查询文档和管理稍后阅读 | 已实现 |
 | ~modules/llm~ | 转发 Codex 和 Claude HTTP 请求，管理本机客户端绑定及用量 | 已实现 |
 | ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
@@ -115,6 +116,10 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/doc/read-later/entries~ | 查询未读网页链接 |
 | POST | ~/doc/read-later/entries/{id}/read~ | 按稍后阅读标识标记已读 |
 | DELETE | ~/doc/read-later/entries/{id}~ | 删除整个稍后阅读条目 |
+| GET | ~/xbloom/recipes~ | 查询 Org 配方库和日记中的配方 |
+| GET | ~/xbloom/recipes/{id}~ | 按 Org ID 查询结构化配方 |
+| POST | ~/xbloom/recipes~ | 在当天日记中新建配方 |
+| PUT | ~/xbloom/recipes/{id}~ | 修改日记配方 |
 | GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
 | GET | ~/status~ | 读取全部模块发布的状态 |
 | GET | ~/status/{module_id}~ | 读取模块完整状态对象 |
@@ -569,6 +574,56 @@ HTTP 200 返回 UTF-8 JSON。响应使用 ~application/json~ 并携带 ~Cache-Co
 | 502 | ~read-later-index-failed~ | 日记索引更新失败 |
 | 503 | ~read-later-template-unavailable~ | 日记模板缺失或目标超出日记目录 |
 | 503 | ~doc-unavailable~ | 目标 Emacs 缺少文档模块、org-roam 或 Dailies |
+
+* xBloom 模块
+
+四个接口均通过本机 loopback 调用。services 定义版本化 JSON 协议，并通过 Emacs gateway 将请求转交 ~loki-assistant-xbloom-service~ 。Emacs 扫描已保存的 Org-roam 文件，解析带 ~ID~ 及“冲煮参数”和“分段注水”子标题的条目。日记范围来自 ~org-roam-dailies-directory~ ，配方库使用一级标题。带 ~noexport~ 标签的模板条目会被跳过。 [[file:xbloom-recipes.org][Org 配方格式]]
+
+** 查询
+
+- ~GET /xbloom/recipes~ 返回 ~api_version~ 、 ~recipes~ 和 ~next_offset~ 。日记配方排在前面，随后为库配方。可用 ~q~ 在标题、标签、咖啡豆、烘焙商、产地、处理法和风味中查找子串。~limit~ 默认为 50，可填 1 至 200。~offset~ 默认为 0，最后一页的 ~next_offset~ 为 ~null~ 。
+- ~GET /xbloom/recipes/{id}~ 返回 ~api_version~ 和 ~recipe~ 。~id~ 为 Org ID。
+
+每条 ~recipe~ 含以下字段。
+
+| 字段 | 类型与含义 |
+|------+------------|
+| ~id~ | 字符串，Org ID |
+| ~storage~ | ~library~ 或 ~daily~ |
+| ~table_id~ 、 ~region~ 、 ~source~ | 字符串或 ~null~ ，来自 Org 属性 |
+| ~saved_on~ | ~YYYY-MM-DD~ 或 ~null~ |
+| ~based_on_id~ | 来源配方的 Org ID 或 ~null~ |
+| ~data~ | 下述可编辑的配方内容 |
+
+** 新建与修改
+
+~POST /xbloom/recipes~ 和 ~PUT /xbloom/recipes/{id}~ 的请求体为 ~{"recipe": {...}}~ 。~recipe~ 对应查询返回的 ~data~ 。新建可另传 ~based_on_id~ ，在日记条目属性中记录已有配方的 Org ID。新建返回 HTTP 201，使用目标 Emacs 的本地日期及 ~loki-assistant-xbloom-daily-template-key~ 选中的 Org-roam 日记模板，键默认为 ~d~ 。修改返回 HTTP 200，完整替换同一日记条目的配方字段，保留 Org ID 和其他日记正文。库里的原配方可作为新建日记配方的来源。
+
+成功响应包含 ~api_version~ 、 ~recipe~ 和 ~indexed~ 。~indexed~ 表示本次是否成功更新 Org-roam 索引。保存后查询直接读取 Org 文件。Org ID 不存在时返回 HTTP 404 和 ~recipe-not-found~ 。重复的 Org ID、修改库条目、目标日记有未保存或未加载的更改时返回 HTTP 409，错误码分别为 ~recipe-conflict~ 、 ~recipe-read-only~ 和 ~daily-conflict~ 。
+
+| ~data~ 中的字段 | 类型 |
+|-----------------+------|
+| ~title~ | 必填字符串 |
+| ~url~ | HTTP(S) 分享 URL 或 ~null~ |
+| ~tags~ | 字符串数组，默认为空数组 |
+| ~model~ | ~studio~ 、 ~original~ 或 ~null~ |
+| ~coffee~ 、 ~roaster~ 、 ~origin~ 、 ~process~ 、 ~flavor_notes~ | 字符串或 ~null~ |
+| ~brewing~ | 整杯参数对象，其字段可为 ~null~ |
+| ~pours~ | 按注水顺序排列的对象数组，默认为空数组 |
+
+- ~brewing~ 的 ~cup_type~ 可为 ~xpod~ 、 ~omni~ 或 ~other~ 。~dose_g~ 、 ~water_ratio~ 、 ~water_ml~ 、 ~grind_size~ 、 ~rpm~ 、 ~bypass_ml~ 、 ~bypass_temp_c~ 为数值。~water_ratio~ 填写粉水比 ~1:n~ 中的 ~n~ 。~grinder_enabled~ 、 ~bypass_enabled~ 为布尔值。
+- ~pours~ 的每段可含 ~volume_ml~ 、 ~temperature_c~ 、 ~flow_ml_s~ 、 ~pause_s~ 数值， ~vibrate_before~ 、 ~vibrate_after~ 布尔值，以及 ~center~ 、 ~spiral~ 或 ~circle~ 枚举值 ~pattern~ 。空白单元格返回 ~null~ 。
+
+#+begin_src json
+{
+  "recipe": {
+    "title": "日记手冲",
+    "model": "studio",
+    "brewing": {"dose_g": 15, "water_ratio": 17, "water_ml": 255},
+    "pours": [{"volume_ml": 255, "temperature_c": 93, "pattern": "spiral"}]
+  }
+}
+#+end_src
 
 * 密码管理模块
 

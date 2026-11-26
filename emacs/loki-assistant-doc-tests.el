@@ -31,7 +31,8 @@
            (when (and file (file-in-directory-p file root))
              (with-current-buffer buffer (set-buffer-modified-p nil))
              (kill-buffer buffer))))
-       (delete-directory root t))))
+       (let ((org-roam-file-exclude-regexp '(".")))
+         (delete-directory root t)))))
 
 (ert-deftest loki-assistant-doc-test-read-later-daily-roundtrip ()
   (loki-assistant-doc-test--with-library

@@ -56,8 +56,9 @@
     (unless (= (point) start)
       (insert "\n"))))
 
-(defun loki-assistant-xbloom--body-profile (section)
-  "从配方的 SECTION 读取正文描述列表。"
+(defun loki-assistant-xbloom--body-profile (section &optional positions)
+  "从配方的 SECTION 读取正文描述列表。
+POSITIONS 非空时返回匹配行的起点。"
   (let (profile)
     (when (eq (org-element-type section) 'section)
       (dolist (element (org-element-contents section))
@@ -68,7 +69,7 @@
               (dolist (field loki-assistant-xbloom--profile-fields)
                 (when (and (not (assoc (car field) profile))
                            (looking-at (concat "[ \t]*- " (nth 2 field) " :: \\(.*\\)$")))
-                  (push (cons (car field) (match-string-no-properties 1)) profile))))))))
+                  (push (cons (car field) (if positions (point) (match-string-no-properties 1))) profile))))))))
     (nreverse profile)))
 
 (defun loki-assistant-xbloom--headline ()
@@ -86,45 +87,54 @@
     (car (org-element-contents (loki-assistant-xbloom--headline))))))
 
 (defun loki-assistant-xbloom-read-recipe ()
-  "从当前配方读回标题、URL、标签、属性、描述字段和两张 Org 表。"
+  "从当前库配方读回标题、URL、标签、属性、描述字段和两张 Org 表。"
   (org-with-wide-buffer
    (org-back-to-heading t)
    (while (org-up-heading-safe))
-   (let* ((headline (loki-assistant-xbloom--headline))
-          (section (car (org-element-contents headline)))
-          (heading (org-element-property :raw-value headline))
-          (link (string-match (concat (rx string-start) org-link-bracket-re (rx string-end)) heading))
-          (title (if link (match-string 2 heading) heading))
-          (url (when link (org-link-unescape (match-string 1 heading))))
-          (drawer (org-element-map section 'property-drawer #'identity nil t))
-          (profile (loki-assistant-xbloom--body-profile section)))
-     (list
-      (cons 'title title)
-      (cons 'url url)
-      (cons 'tags (org-element-property :tags headline))
-      (cons 'properties
-            (sort (org-element-map drawer 'node-property
-                    (lambda (entry)
-                      (cons (org-element-property :key entry)
-                            (org-element-property :value entry))))
-                  (lambda (left right) (string< (car left) (car right)))))
-      (cons 'profile
-            (mapcar (lambda (field) (assoc (car field) profile))
-                    loki-assistant-xbloom--profile-fields))
-      (cons 'tables
-            (mapcar
-             (lambda (name)
-               (let* ((child (seq-find (lambda (element)
-                                         (and (eq (org-element-type element) 'headline)
-                                              (equal name (org-element-property :raw-value element))))
-                                       (org-element-contents headline)))
-                      (table (org-element-map (car (org-element-contents child))
-                                 'table #'identity nil t)))
-                 (when table
-                   (save-excursion
-                     (goto-char (org-element-property :begin table))
-                     (remq 'hline (org-table-to-lisp))))))
-             '("冲煮参数" "分段注水")))))))
+   (loki-assistant-xbloom--read-headline (loki-assistant-xbloom--headline))))
+
+(defun loki-assistant-xbloom--child (headline name)
+  "查找 HEADLINE 的直接子标题 NAME。"
+  (seq-find (lambda (element)
+              (and (eq (org-element-type element) 'headline)
+                   (equal name (org-element-property :raw-value element))))
+            (org-element-contents headline)))
+
+(defun loki-assistant-xbloom--table (headline)
+  "查找 HEADLINE 正文的第一张 Org 表。"
+  (org-element-map (car (org-element-contents headline)) 'table #'identity nil t))
+
+(defun loki-assistant-xbloom--read-headline (headline)
+  "从解析后的配方 HEADLINE 读取 Org 字段。"
+  (let* ((section (car (org-element-contents headline)))
+         (heading (org-element-property :raw-value headline))
+         (link (string-match (concat (rx string-start) org-link-bracket-re (rx string-end)) heading))
+         (title (if link (match-string 2 heading) heading))
+         (url (when link (org-link-unescape (match-string 1 heading))))
+         (drawer (org-element-map section 'property-drawer #'identity nil t))
+         (profile (loki-assistant-xbloom--body-profile section)))
+    (list
+     (cons 'title title)
+     (cons 'url url)
+     (cons 'tags (org-element-property :tags headline))
+     (cons 'properties
+           (sort (org-element-map drawer 'node-property
+                   (lambda (entry)
+                     (cons (org-element-property :key entry)
+                           (org-element-property :value entry))))
+                 (lambda (left right) (string< (car left) (car right)))))
+     (cons 'profile
+           (mapcar (lambda (field) (assoc (car field) profile))
+                   loki-assistant-xbloom--profile-fields))
+     (cons 'tables
+           (mapcar
+            (lambda (name)
+              (when-let* ((child (loki-assistant-xbloom--child headline name))
+                          (table (loki-assistant-xbloom--table child)))
+                (save-excursion
+                  (goto-char (org-element-property :begin table))
+                  (remq 'hline (org-table-to-lisp)))))
+            '("冲煮参数" "分段注水"))))))
 
 (defun loki-assistant-xbloom--dose-tag (dose)
   "将 DOSE 转为 Org 粉量标签。"
@@ -429,16 +439,16 @@
            (signal (car err) (cdr err))))
         (message "正在下载 xBloom 配方")))))
 
-(defvar-keymap loki-assistant-xbloom-mode-map
+(defvar-keymap loki-assistant-xbloom-sync-mode-map
   "C-c x r" #'loki-assistant-xbloom-sync
-  "C-c C-q" (lambda () (interactive) (loki-assistant-xbloom-mode -1))
+  "C-c C-q" (lambda () (interactive) (loki-assistant-xbloom-sync-mode -1))
   "C-c ?" #'describe-mode)
 
-(define-minor-mode loki-assistant-xbloom-mode
+(define-minor-mode loki-assistant-xbloom-sync-mode
   "在配置了 xBloom 同步参数的 Org 缓冲区提供配方同步。"
   :init-value nil
   :lighter (:eval (loki-assistant--mode-line-keys "C-c x r 刷新配方" "C-c ?"))
-  :keymap loki-assistant-xbloom-mode-map)
+  :keymap loki-assistant-xbloom-sync-mode-map)
 
 (provide 'loki-assistant-xbloom)
 ;;; loki-assistant-xbloom.el ends here

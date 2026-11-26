@@ -9,7 +9,7 @@
 (require 'rx)
 (require 'tabulated-list)
 
-(declare-function org-roam-dailies-capture-today "org-roam-dailies" (&optional goto keys))
+(declare-function loki-assistant-daily-capture "loki-assistant-daily" (key prepare fail))
 (declare-function org-roam-db-clear-file "org-roam-db" (&optional file))
 (defvar org-roam-dailies-capture-templates)
 (defvar org-roam-db-location)
@@ -248,65 +248,22 @@
 
 (defun loki-assistant-read-later--capture (title url)
   "通过日记捕获保存 TITLE 和 URL，返回新记录的摘要。"
-  (let* ((template (assoc loki-assistant-read-later-daily-template-key
-                          org-roam-dailies-capture-templates))
-         (target (plist-get (nthcdr 4 template) :target))
-         (root (file-name-as-directory (file-truename (loki-assistant-read-later--daily-root))))
-         (created (loki-assistant-read-later--new-created))
+  (require 'loki-assistant-daily)
+  (let* ((created (loki-assistant-read-later--new-created))
          (id (loki-assistant-read-later--record-id created nil))
-         (get-buffer (symbol-function 'org-capture-target-buffer))
-         (org-capture-entry nil)
-         (org-capture-plist nil)
-         (org-capture-after-finalize-hook org-capture-after-finalize-hook)
-         (org-capture-link-is-already-stored t)
-         (org-store-link-plist nil)
-         (org-roam-db-update-on-save nil)
-         (enable-local-variables nil)
-         (enable-local-eval nil)
-         file buffer visiting capture-buffer change-group prepared saved)
-    (unless (memq (car-safe target) '(file file+head file+olp file+head+olp file+datetree))
-      (loki-assistant-doc--fail "read-later-template-unavailable"))
-    (let ((org-roam-dailies-capture-templates
-           `(("r" "稍后阅读" entry ,(concat "* 网页 :" loki-assistant-read-later--tag ":")
-              :target ,(copy-tree target) :empty-lines-before 1 :immediate-finish t :no-save t
-              :prepare-finalize
-              ,(lambda ()
-                 (setq capture-buffer (current-buffer))
-                 (save-excursion
-                   (goto-char (point-min))
-                   (org-back-to-heading t)
-                   ;; 在模板展开之后写入网页数据。
-                   (org-edit-headline (org-link-make-string url title))
-                   (org-entry-put nil "CREATED" created)
-                   (setq prepared t)))))))
-      (save-window-excursion
-        (unwind-protect
-            (progn
-              (cl-letf (((symbol-function 'org-capture-target-buffer)
-                         (lambda (path)
-                           (unless (string-prefix-p root (file-truename path))
-                             (loki-assistant-doc--fail "read-later-template-unavailable"))
-                           (setq visiting (org-find-base-buffer-visiting path))
-                           (loki-assistant-read-later--check-buffer visiting)
-                           (make-directory (file-name-directory path) t)
-                           (setq file path
-                                 buffer (funcall get-buffer path)
-                                 change-group (prepare-change-group buffer))
-                           (activate-change-group change-group)
-                           buffer)))
-                (org-roam-dailies-capture-today nil "r"))
-              (with-current-buffer buffer
-                (unless prepared
-                  (loki-assistant-doc--fail "read-later-save-failed"))
-                (save-buffer))
-              (accept-change-group change-group)
-              (setq saved t))
-          (unless saved
-            (when (buffer-live-p capture-buffer) (kill-buffer capture-buffer))
-            (when change-group (cancel-change-group change-group))
-            (when (and (buffer-live-p buffer) (not visiting)) (kill-buffer buffer))))))
-    (unless (and file (file-regular-p file))
-      (loki-assistant-doc--fail "read-later-save-failed"))
+         (file
+          (loki-assistant-daily-capture
+           loki-assistant-read-later-daily-template-key
+           (lambda ()
+             (org-edit-headline (org-link-make-string url title))
+             (org-set-tags (list loki-assistant-read-later--tag))
+             (org-entry-put nil "CREATED" created))
+           (lambda (reason)
+             (loki-assistant-doc--fail
+              (pcase reason
+                ('template "read-later-template-unavailable")
+                ('conflict "read-later-daily-conflict")
+                ('save "read-later-save-failed")))))))
     (loki-assistant-read-later--index file)
     `((id . ,id) (title . ,title) (url . ,url)
       (captured_at . ,(loki-assistant-read-later--captured-at created)))))

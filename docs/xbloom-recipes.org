@@ -29,14 +29,18 @@
 #+begin_src emacs-lisp
 :init
 (add-to-list 'loki/org-header-mode-rules
-             '(:mode loki-assistant-xbloom-mode
+             '(:mode loki-assistant-xbloom-sync-mode
                :property "XBLOOM_SCOPE"
                :values ("official" "personal" "all")))
 #+end_src
 
-打开或保存 Org 文件时，Emacs 根据文件头的 ~XBLOOM_SCOPE~ 启用 ~loki-assistant-xbloom-mode~ ，并在底部状态栏显示刷新快捷键 ~C-c x r~ 。刷新使用 ~xbloom export --json-lines -o -~ 逐条处理。Emacs 显示累计处理数量，配方库窗口跟随当前条目。
+打开或保存 Org 文件时，Emacs 根据文件头的 ~XBLOOM_SCOPE~ 启用 ~loki-assistant-xbloom-sync-mode~ ，并在底部状态栏显示刷新快捷键 ~C-c x r~ 。刷新使用 ~xbloom export --json-lines -o -~ 逐条处理。Emacs 显示累计处理数量，配方库窗口跟随当前条目。
 
 同步以 ~REGION~ 和 ~TABLE_ID~ 匹配配方，逐项比较字段和表格。字段或模板格式有变化时按当前模板重写条目，清理多余属性并沿用已有的 Org ~ID~ 。文件位于 ~org-roam-directory~ 下时，同步会更新 Org-roam 索引。
+
+* 日记配方与服务查询
+
+可以通过 ~POST /xbloom/recipes~ 新建当天的日记配方，或用 ~PUT /xbloom/recipes/{id}~ 修改日记里的配方。Emacs 用上面的 Org 格式保存配方。~GET /xbloom/recipes~ 同时查询已保存的配方库与日记，并把属性、冲煮参数和分段注水解析为有类型的 JSON 字段。 [[file:control-center-services.org::*xBloom 模块][xBloom HTTP 接口]]
 
 * 从日记链接配方
 

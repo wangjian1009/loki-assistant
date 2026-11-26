@@ -101,14 +101,13 @@ emacs-load: emacs-deps
 	"$(EMACSCLIENT)" --eval "(progn \
 	  (let ((directory \"$(PROJECT_ROOT)/emacs\")) \
 	    (setq load-path (cons directory (delete directory load-path)))) \
-	  (dolist (feature '(loki-assistant-llm-usage-tests loki-assistant-llm-usage loki-assistant-slack-chat-tests loki-assistant-devices-tests loki-assistant-devices loki-assistant-doc-tests loki-assistant-read-later loki-assistant-doc loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant-command-menu loki-assistant)) \
+	  (dolist (feature '(loki-assistant-llm-usage-tests loki-assistant-llm-usage loki-assistant-slack-chat-tests loki-assistant-devices-tests loki-assistant-devices loki-assistant-xbloom-service-tests loki-assistant-xbloom-service loki-assistant-xbloom loki-assistant-daily loki-assistant-doc-tests loki-assistant-read-later loki-assistant-doc loki-assistant-capture-tests loki-assistant-capture loki-assistant-edna-tests loki-assistant-edna loki-assistant-monitor-tests loki-assistant-config-tests loki-assistant-config loki-assistant-monitor loki-assistant-command-menu loki-assistant)) \
 	    (when (featurep feature) (unload-feature feature t))) \
 	  (require 'loki-assistant) \
 	  (require 'loki-assistant-config) \
 	  (require 'loki-assistant-doc) \
 	  (require 'loki-assistant-read-later) \
-	  (when (featurep 'loki-assistant-xbloom) \
-	    (load \"$(PROJECT_ROOT)/emacs/loki-assistant-xbloom.el\" nil t)) \
+	  (require 'loki-assistant-xbloom-service) \
 	  (require 'loki-assistant-devices) \
 	  (require 'loki-assistant-llm-usage) \
 	  (when (featurep 'loki-assistant-mail) \
@@ -133,13 +132,14 @@ emacs-test: org-daily-build emacs-load
 	      (progn \
 	        (loki-assistant-monitor-mode -1) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-doc-tests.el\" nil t) \
+	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-xbloom-service-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-config-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-devices-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-monitor-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-llm-usage-tests.el\" nil t) \
 	        (load \"$(PROJECT_ROOT)/emacs/loki-assistant-slack-chat-tests.el\" nil t) \
-	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-llm-usage-test-\" \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-devices-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-doc-test-\" \"^loki-assistant-slack-chat-test-\"))) \
+	        (let ((stats (ert-run-tests-batch '(or \"^loki-assistant-llm-usage-test-\" \"^loki-assistant-test-\" \"^loki-assistant-config-test-\" \"^loki-assistant-devices-test-\" \"^loki-assistant-monitor-test-\" \"^loki-assistant-doc-test-\" \"^loki-assistant-xbloom-service-test-\" \"^loki-assistant-slack-chat-test-\"))) \
 	              (edna-stats \
 	               (when (require 'org-edna nil t) \
 	                 (load \"$(PROJECT_ROOT)/emacs/loki-assistant-edna-tests.el\" nil t) \

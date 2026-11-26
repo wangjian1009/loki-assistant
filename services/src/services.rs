@@ -5,7 +5,7 @@ use axum::Router;
 use crate::{
     modules::{
         alert::AlertService, config, control_center, discover, doc, emacs, health, llm, network,
-        notification::NotificationService, password, service, status::StatusService,
+        notification::NotificationService, password, service, status::StatusService, xbloom,
     },
     runtime::RuntimeState,
 };
@@ -49,6 +49,7 @@ pub struct Services {
     pub alert: Arc<AlertService>,
     pub emacs: emacs::Module,
     pub doc: doc::DocService,
+    pub xbloom: xbloom::XbloomService,
     llm: Arc<llm::LlmService>,
     pub network: Arc<network::NetworkService>,
     pub password: password::Module,
@@ -131,6 +132,7 @@ impl Services {
             Arc::clone(&status),
         );
         let doc = doc::DocService::new(emacs.service());
+        let xbloom = xbloom::XbloomService::new(emacs.service());
         let llm = Arc::new(llm::LlmService::new(
             Arc::clone(&base_config),
             llm_monitor,
@@ -171,6 +173,7 @@ impl Services {
             alert,
             emacs,
             doc,
+            xbloom,
             llm,
             network,
             password,
@@ -190,6 +193,7 @@ impl Services {
             .merge(self.network.router())
             .merge(self.emacs.router())
             .merge(self.doc.router())
+            .merge(self.xbloom.router())
             .merge(self.llm.router())
             .merge(self.password.router());
         self.extensions
