@@ -119,7 +119,7 @@ http://127.0.0.1:47321/doc/article
 
 * services HTTP 接口
 
-Chrome 插件向 ~POST /doc/article~ 提交包含 ~title~ 、 ~url~ 、 ~captured_at~ 和 ~body~ 的 JSON。新文档保存并完成索引后返回 HTTP 201。命中已有来源时返回 HTTP 200 和原文档摘要。错误在原请求上返回，弹窗显示 ~error.message~ 。正文通过响应中的 ~document.id~ 请求 ~GET /doc/{id}~ 。 [[file:control-center-services.org::*全文捕获接入][文档模块全文捕获协议]]
+Chrome 插件向 ~POST /doc/article~ 提交网页全文，并将 ~open_after_capture~ 设为 ~true~ 。新文档保存并完成索引后返回 HTTP 201。命中已有来源时返回 HTTP 200 和原文档摘要。Emacs 会打开对应文章，弹窗根据 ~opened~ 显示打开结果。保存错误在原请求上返回，弹窗显示 ~error.message~ 。正文通过响应中的 ~document.id~ 请求 ~GET /doc/{id}~ 。 [[file:control-center-services.org::*全文捕获接入][文档模块全文捕获协议]]
 
 ** 稍后阅读
 

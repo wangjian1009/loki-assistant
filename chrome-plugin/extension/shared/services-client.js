@@ -6,7 +6,7 @@ export async function captureFull(page, timeout = 35000) {
     response = await fetch(SERVICES_CAPTURE_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(page),
+      body: JSON.stringify({ ...page, open_after_capture: true }),
       signal: AbortSignal.timeout(timeout),
     });
   } catch (error) {
@@ -31,13 +31,15 @@ export async function captureFull(page, timeout = 35000) {
   } catch (error) {
     throw new Error("保存返回了无法识别的结果，请稍后重试。", { cause: error });
   }
-  if (response.status === 201 && data?.status === "saved" && data.document?.id) {
-    return "网页全文已保存。";
+  const saved = response.status === 201 && data?.status === "saved";
+  const existing = response.status === 200 && data?.status === "existing";
+  if (!data?.document?.id || (!saved && !existing)) {
+    throw new Error("保存返回了无法识别的结果。");
   }
-  if (response.status === 200 && data?.status === "existing" && data.document?.id) {
-    return "此页面已有文档。";
-  }
-  throw new Error("保存返回了无法识别的结果。");
+  const status = saved ? "网页全文已保存" : "此页面已有文档";
+  if (data.opened === true) return `${status}，已在 Emacs 中打开。`;
+  if (data.opened === false) return `${status}，但无法在 Emacs 中打开。`;
+  return `${status}。`;
 }
 
 export { SERVICES_CAPTURE_URL };

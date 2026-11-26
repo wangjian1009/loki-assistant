@@ -239,6 +239,47 @@
       (write-region (concat head other) nil file nil 'silent)
       (should (equal (alist-get 'error (loki-assistant-doc-get "article")) "document-not-found")))))
 
+(ert-deftest loki-assistant-doc-test-capture-opens-new-and-existing-article ()
+  (loki-assistant-doc-test--with-library
+    (let* ((payload (expand-file-name "request.json" root))
+           (request '((operation . "capture")
+                      (target . "article")
+                      (info (title . "捕获打开测试")
+                            (url . "https://example.com/article/open")
+                            (captured_at . "2026-11-18T12:30:00Z")
+                            (body . "* 测试正文")
+                            (open_after_capture . t)))))
+      (write-region (json-serialize request) nil payload nil 'silent)
+      (cl-labels ((capture ()
+                    (alist-get 'result
+                               (json-parse-string
+                                (decode-coding-string
+                                 (base64-decode-string (loki-assistant-doc-request payload))
+                                 'utf-8)
+                                :object-type 'alist))))
+        (cl-letf (((symbol-function 'select-frame-set-input-focus) #'ignore))
+          (save-window-excursion
+            (let* ((saved (capture))
+                   (id (alist-get 'id (alist-get 'document saved)))
+                   (buffer (window-buffer)))
+              (should (equal (alist-get 'status saved) "saved"))
+              (should (eq (alist-get 'opened saved) t))
+              (with-current-buffer buffer
+                (should (file-in-directory-p buffer-file-name root))
+                (should (equal (org-entry-get (point-min) "ID") id)))
+              (should (eq (marker-buffer org-capture-last-stored-marker) buffer))
+              (switch-to-buffer (get-buffer-create "*scratch*"))
+              (let ((existing (capture)))
+                (should (equal (alist-get 'status existing) "existing"))
+                (should (eq (alist-get 'opened existing) t))
+                (should (eq (window-buffer) buffer)))
+              (cl-letf (((symbol-function 'org-roam-node-visit)
+                         (lambda (&rest _) (error "模拟打开失败"))))
+                (let ((existing (capture)))
+                  (should (equal (alist-get 'status existing) "existing"))
+                  (should (eq (alist-get 'opened existing) :false))
+                  (should (equal (alist-get 'id (alist-get 'document existing)) id)))))))))))
+
 (ert-deftest loki-assistant-doc-test-retry-reindexes-the-saved-file ()
   (loki-assistant-doc-test--with-library
     (let ((loki-assistant-doc-capture-templates

@@ -7,6 +7,8 @@ pub(super) struct CaptureInfo {
     pub url: String,
     pub captured_at: String,
     pub body: String,
+    #[serde(default)]
+    pub open_after_capture: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -99,6 +101,8 @@ pub(super) struct CaptureResult {
     pub status: CaptureStatus,
     pub url: String,
     pub document: DocumentSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<bool>,
 }
 
 #[derive(Serialize)]

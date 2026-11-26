@@ -57,9 +57,15 @@ impl CommandRunner for Runner {
                         2 * 1024 * 1024
                     );
                     assert!(script.len() < 8192);
-                    json!({"result":{
+                    let mut result = json!({
                         "status":"saved", "url": request["info"]["url"], "document":document
-                    }})
+                    });
+                    let open = request["info"]["url"] == "https://example.com/open";
+                    assert_eq!(request["info"]["open_after_capture"], open);
+                    if open {
+                        result["opened"] = json!(false);
+                    }
+                    json!({"result":result})
                 }
                 Some("capture") => {
                     assert_eq!(request["target"], "unregistered");
@@ -155,25 +161,45 @@ async fn get_and_post_share_the_path_and_forward_opaque_targets_to_emacs() {
     let page = json!({
         "title": "中文标题", "url": "https://example.com/a",
         "captured_at": "2026-11-18T12:30:00Z", "body": "x".repeat(2 * 1024 * 1024)
-    })
-    .to_string();
+    });
     let (status, headers, body) = request(
         router.clone(),
         "POST",
         "/doc/article",
-        Body::from(page.clone()),
+        Body::from(page.to_string()),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(headers[header::LOCATION], "/doc/article");
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     assert_eq!(body["document"]["id"], "article");
+    assert!(body.get("opened").is_none());
+
+    let mut open_page = page.clone();
+    open_page["url"] = json!("https://example.com/open");
+    open_page["open_after_capture"] = json!(true);
+    let (status, headers, body) = request(
+        router.clone(),
+        "POST",
+        "/doc/article",
+        Body::from(open_page.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers[header::LOCATION], "/doc/article");
+    assert_eq!(body["opened"], false);
 
     let (status, _, body) = request(router.clone(), "GET", "/doc/article", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["document"]["content"], "中文\n\"引号\" \\ 路径");
 
-    let (status, _, body) = request(router, "POST", "/doc/unregistered", Body::from(page)).await;
+    let (status, _, body) = request(
+        router,
+        "POST",
+        "/doc/unregistered",
+        Body::from(page.to_string()),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "capture-target-not-found");
     assert!(

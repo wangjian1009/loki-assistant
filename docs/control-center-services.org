@@ -413,7 +413,7 @@ Emacs 的 ~loki-assistant-doc~ 管理文档业务，包括解析提交目标、�
 
 *** 直接提交
 
-~POST /doc/article~ 仅供本机调用，接收 ~title~ 、 ~url~ 、 ~captured_at~ 和 ~body~ 。services 从路径读取目标名，将 ~article~ 和这四个字段转交给 Emacs 的统一全文捕获入口 ~loki-assistant-doc-capture-full~ 。该入口接收 ~target~ 和 ~info~ 。
+~POST /doc/article~ 仅供本机调用，接收 ~title~ 、 ~url~ 、 ~captured_at~ 、 ~body~ 和可选布尔字段 ~open_after_capture~ 。services 从路径读取目标名，将 ~article~ 和捕获参数转交给 Emacs 的统一全文捕获入口 ~loki-assistant-doc-capture-full~ 。该入口接收 ~target~ 和 ~info~ ，以 ~:open-after-capture~ 接收打开选项。
 
 #+begin_src emacs-lisp
 (loki-assistant-doc-capture-full
@@ -427,6 +427,8 @@ Emacs 的 ~loki-assistant-doc~ 管理文档业务，包括解析提交目标、�
 Emacs 将已注册的目标 ~article~ 映射到模块自己的模板 ~p~ ，再用 ~:keys "p"~ 调用 ~org-roam-capture-~ 。~p~ 使用 ~file+head~ ，默认保存到 ~article/YYYY/<时间戳>-<slug>.org~ 。遇到未知目标时，Emacs 在选择模板或创建文件前返回 ~capture-target-not-found~ 。
 
 ~p~ 模板启用 ~:immediate-finish t~ ，在同一次调用里完成保存。Emacs 使用 ~:before-finalize~ 写入字面的 Org 正文和 ~ROAM_REFS~ ，保存后更新索引。模板关闭跳转，整个操作由 Emacs 的 doc 入口完成。
+
+~open_after_capture~ 为 ~true~ 时，Emacs 在保存并索引后打开文章。命中已保存来源时打开已有文章。响应中的 ~opened~ 表示打开成功与否，打开失败时仍返回保存结果和文档摘要。省略该字段或传入 ~false~ 时只执行保存，响应中省略 ~opened~ 。
 
 在临时 org-roam 库中已验证该流程。捕获完成后文件可按 Org ID 和来源 URL 查到，中文正文及其中的模板标记按字面保存，整个过程无需选择模板或确认保存。
 

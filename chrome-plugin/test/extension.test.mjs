@@ -24,8 +24,25 @@ test("services client 使用固定地址并解释 saved 响应", async () => {
     assert.equal(request.url, SERVICES_CAPTURE_URL);
     assert.equal(request.options.method, "POST");
     assert.equal(JSON.parse(request.options.body).title, "标题");
+    assert.equal(JSON.parse(request.options.body).open_after_capture, true);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("services client 区分 Emacs 已打开与保存后打开失败", async (t) => {
+  for (const [opened, message] of [
+    [true, "此页面已有文档，已在 Emacs 中打开。"],
+    [false, "此页面已有文档，但无法在 Emacs 中打开。"],
+  ]) {
+    const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({
+      status: "existing", document: { id: "example-id" }, opened,
+    }));
+    try {
+      assert.equal(await captureFull({}), message);
+    } finally {
+      fetch.mock.restore();
+    }
   }
 });
 

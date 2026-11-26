@@ -70,7 +70,7 @@ async fn get_document(
     path = "/doc/{id}",
     access = "local",
     summary = "按目标保存网页全文",
-    description = "协议版本 1，路径段为 Emacs 提交目标，当前支持 article。"
+    description = "协议版本 1，当前支持 article，可选 open_after_capture 请求在 Emacs 打开文档。"
 )]
 async fn capture(
     State(service): State<DocService>,

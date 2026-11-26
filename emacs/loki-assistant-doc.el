@@ -30,6 +30,7 @@
 (declare-function org-roam-node-properties "org-roam-node" (node))
 (declare-function org-roam-node-tags "org-roam-node" (node))
 (declare-function org-roam-node-title "org-roam-node" (node))
+(declare-function org-roam-node-visit "org-roam-node" (node &optional other-window force))
 (declare-function epa-file-insert-file-contents "epa-file" (file &optional visit beg end replace))
 (defvar org-roam-directory)
 (defvar org-roam-dailies-directory)
@@ -293,8 +294,24 @@
       (loki-assistant-doc--fail "capture-save-failed"))
     (loki-assistant-doc--index key file (org-roam-node-id node))))
 
+(defun loki-assistant-doc--open-captured (node)
+  "打开已入索引的 NODE，返回 JSON 布尔值。"
+  (condition-case nil
+      (let ((frame (or (and (display-graphic-p) (selected-frame))
+                       (seq-find #'display-graphic-p (frame-list))
+                       (selected-frame)))
+            (enable-local-variables nil)
+            (enable-local-eval nil))
+        (with-selected-frame frame
+          (org-roam-node-visit node))
+        (make-frame-visible frame)
+        (select-frame-set-input-focus frame)
+        t)
+    ((error quit) :false)))
+
 (defun loki-assistant-doc-capture-full (target info)
-  "将 INFO 中的网页全文保存到 TARGET，返回含 result 或 error 的结果。"
+  "将 INFO 中的网页全文保存到 TARGET。
+当 INFO 的 :open-after-capture 为 t 时，保存并索引后打开文章。"
   (catch 'loki-assistant-doc-error
     (let ((key (cdr (assoc target loki-assistant-doc--targets))))
       (unless key (loki-assistant-doc--fail "capture-target-not-found"))
@@ -319,10 +336,14 @@
                              (unless (and (eq (nth 2 template) 'plain)
                                           (eq (car (plist-get (nthcdr 4 template) :target)) 'file+head))
                                (loki-assistant-doc--fail "capture-template-unavailable"))
-                             (loki-assistant-doc--write-article template info source-key)))))
-            (list (cons 'result (list (cons 'status (if existing "existing" "saved"))
-                                      (cons 'url url)
-                                      (cons 'document (loki-assistant-doc--summary node))))))
+                             (loki-assistant-doc--write-article template info source-key))))
+                 (result (list (cons 'status (if existing "existing" "saved"))
+                               (cons 'url url)
+                               (cons 'document (loki-assistant-doc--summary node)))))
+            (when (eq (plist-get info :open-after-capture) t)
+              (setq result (append result
+                                   (list (cons 'opened (loki-assistant-doc--open-captured node))))))
+            (list (cons 'result result)))
         (error (loki-assistant-doc--fail "capture-index-failed"))))))
 
 (defun loki-assistant-doc-request (file)
@@ -341,7 +362,8 @@
                        (list :title (plist-get info :title)
                              :url (plist-get info :url)
                              :captured-at (plist-get info :captured_at)
-                             :body (plist-get info :body)))))
+                             :body (plist-get info :body)
+                             :open-after-capture (plist-get info :open_after_capture)))))
                    ("capture_read_later"
                     (loki-assistant-read-later-capture (plist-get request :info)))
                    ("list_read_later" (loki-assistant-read-later-list))
