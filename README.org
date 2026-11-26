@@ -76,6 +76,8 @@ make stop-service
 
 ~org-daily~ 支持按日期、标题、正文、标签和属性查询 Org-roam 日记。使用 ~make install~ 构建 ~dist/org-daily~ ，并在 =~/.local/bin/org-daily= 建立符号链接。 [[file:docs/org-daily.org][查询与文本分析]]
 
+同一个 ~make install~ 还会构建并安装 ~xbloom~ ，用于导出 xBloom 配方和通过 BLE 控制 Studio 咖啡机。 [[file:docs/xbloom.org][安装路径、用法与共享库]]
+
 跨应用图标的 SVG 母版与设计预览集中在 ~resources/icons/~ ，通过根目录 ~make export-icons~ 同步生成 macOS 的 iconset、ICNS、asset catalog、菜单栏图标、Chrome 插件图标，以及 HarmonyOS 的应用 PNG。各应用构建直接使用已导出的资源，详见 [[file:docs/icon-design.org][图标设计]]。
 
 加载 Emacs 包前，需有正在运行且已启动 ~server-start~ 的 Emacs。从仓库根目录执行：
@@ -99,8 +101,10 @@ make emacs-test
 | make chrome-build | 构建 Chrome 插件 |
 | make chrome-test | 构建并执行 Chrome 插件测试 |
 | make org-daily-build | 构建 Org-roam 日记查询命令行程序 |
-| make install | 构建 dist/org-daily 并链接到 ~/.local/bin/org-daily |
+| make install | 构建并安装 org-daily 和 xbloom 命令行程序 |
 | make org-daily-test | 执行 Org-roam 日记查询测试 |
+| make xbloom-build | 构建 xBloom 命令行程序 |
+| make xbloom-test | 执行 xBloom 配方导出和设备控制测试 |
 | make emacs-config | 打开 Emacs 服务配置管理界面 |
 | make export-icons | 从公共 SVG 母版导出 macOS 和 HarmonyOS 图标 |
 | make services-test | 执行 services workspace 测试 |

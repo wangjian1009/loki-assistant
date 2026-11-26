@@ -14,9 +14,13 @@ EMACSCLIENT ?= emacsclient
 LOCAL_BIN ?= $(HOME)/.local/bin
 ORG_DAILY_TARGET := $(PROJECT_ROOT)/apps/org-daily/target
 ORG_DAILY_DIST := $(PROJECT_ROOT)/dist/org-daily
+XBLOOM_MANIFEST := $(PROJECT_ROOT)/apps/xbloom/Cargo.toml
+XBLOOM_TARGET := $(PROJECT_ROOT)/apps/xbloom/target
+XBLOOM_APP_DIR ?= $(HOME)/app/xbloom
+XBLOOM_LIBRARY_DIR ?= $(HOME)/library/xbloom
 
 .PHONY: emacs-deps emacs-load emacs-test emacs-config emacs-devices chrome-build chrome-test export-icons
-.PHONY: relay-image harmony-test install org-daily-build org-daily-test
+.PHONY: relay-image harmony-test install org-daily-build org-daily-test xbloom-build xbloom-test
 
 .PHONY: help configure build test test-mac services-test services-fmt services-run install-service uninstall-service start-service stop-service restart-service service-status run restart-center xcode release deploy harmony-help harmony-deps harmony-check-sdk harmony-build harmony-install harmony-run harmony-deploy harmony-devices harmony-clean clean
 
@@ -34,8 +38,10 @@ help:
 	  'make chrome-build    构建 Chrome 插件' \
 	  'make chrome-test     构建并执行 Chrome 插件测试' \
 	  'make org-daily-build 构建 Org-roam 日记查询命令行程序' \
-	  'make install         将 dist/org-daily 链接到 ~/.local/bin/org-daily' \
+	  'make install         构建并安装 org-daily 和 xbloom 命令行程序' \
 	  'make org-daily-test  执行 Org-roam 日记查询测试' \
+	  'make xbloom-build    构建 xBloom 命令行程序' \
+	  'make xbloom-test     执行 xBloom 配方导出和设备控制测试' \
 	  'make export-icons    从公共 SVG 母版导出 macOS、HarmonyOS 和 Chrome 图标' \
 	  'make services-test   执行 services Rust 测试' \
 	  'make services-fmt    检查 services Rust 格式' \
@@ -63,7 +69,7 @@ help:
 	  'make harmony-clean   清理 HarmonyOS 构建产物' \
 	  'make clean           清理构建产物' \
 	  '' \
-	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR TEST_BUILD_DIR CMAKE CTEST CARGO BREW OPEN EMACSCLIENT LOCAL_BIN DEVECO_HOME HDC_TARGET'
+	  '可覆盖变量：CONFIG BUILD_DIR RELEASE_BUILD_DIR TEST_BUILD_DIR CMAKE CTEST CARGO BREW OPEN EMACSCLIENT LOCAL_BIN XBLOOM_APP_DIR XBLOOM_LIBRARY_DIR DEVECO_HOME HDC_TARGET'
 
 emacs-deps:
 	"$(EMACSCLIENT)" --eval "(progn \
@@ -101,6 +107,8 @@ emacs-load: emacs-deps
 	  (require 'loki-assistant-config) \
 	  (require 'loki-assistant-doc) \
 	  (require 'loki-assistant-read-later) \
+	  (when (featurep 'loki-assistant-xbloom) \
+	    (load \"$(PROJECT_ROOT)/emacs/loki-assistant-xbloom.el\" nil t)) \
 	  (require 'loki-assistant-devices) \
 	  (require 'loki-assistant-llm-usage) \
 	  (when (featurep 'loki-assistant-mail) \
@@ -163,15 +171,35 @@ org-daily-build:
 	  install -m 755 "$(ORG_DAILY_TARGET)/release/org-daily" "$$temporary"; \
 	  mv -f "$$temporary" "$(ORG_DAILY_DIST)"
 
-install: org-daily-build
-	@mkdir -p "$(LOCAL_BIN)"
-	@test ! -e "$(LOCAL_BIN)/org-daily" || test -L "$(LOCAL_BIN)/org-daily" || { \
-	  printf '%s\n' "$(LOCAL_BIN)/org-daily 已存在且不是符号链接" >&2; exit 1; \
-	}
-	ln -sfn "$(ORG_DAILY_DIST)" "$(LOCAL_BIN)/org-daily"
+xbloom-build:
+	"$(CARGO)" build --locked --release --manifest-path "$(XBLOOM_MANIFEST)" --target-dir "$(XBLOOM_TARGET)"
+
+install: org-daily-build xbloom-build
+	@set -eu; \
+	  for link in "$(LOCAL_BIN)/org-daily" "$(LOCAL_BIN)/xbloom" "$(XBLOOM_LIBRARY_DIR)"; do \
+	    if [ -e "$$link" ] && [ ! -L "$$link" ]; then \
+	      printf '%s\n' "$$link 已存在且不是符号链接" >&2; exit 1; \
+	    fi; \
+	  done; \
+	  executable="$(XBLOOM_APP_DIR)/xbloom"; \
+	  if [ -L "$$executable" ] || { [ -e "$$executable" ] && [ ! -f "$$executable" ]; }; then \
+	    printf '%s\n' "$$executable 已存在且不是普通文件" >&2; exit 1; \
+	  fi; \
+	  mkdir -p "$(LOCAL_BIN)" "$(XBLOOM_APP_DIR)" "$$(dirname "$(XBLOOM_LIBRARY_DIR)")"; \
+	  temporary=$$(mktemp "$(XBLOOM_APP_DIR)/.xbloom.XXXXXX"); \
+	  trap 'rm -f "$$temporary"' EXIT; \
+	  install -m 755 "$(XBLOOM_TARGET)/release/xbloom" "$$temporary"; \
+	  mv -f "$$temporary" "$$executable"; \
+	  app_dir=$$(cd "$(XBLOOM_APP_DIR)" && pwd -P); \
+	  ln -sfn "$(ORG_DAILY_DIST)" "$(LOCAL_BIN)/org-daily"; \
+	  ln -sfn "$$app_dir/xbloom" "$(LOCAL_BIN)/xbloom"; \
+	  ln -sfn "$(PROJECT_ROOT)/library/xbloom" "$(XBLOOM_LIBRARY_DIR)"
 
 org-daily-test:
 	"$(CARGO)" test --locked --manifest-path "$(PROJECT_ROOT)/apps/org-daily/Cargo.toml"
+
+xbloom-test:
+	"$(CARGO)" test --locked --manifest-path "$(XBLOOM_MANIFEST)" --target-dir "$(XBLOOM_TARGET)"
 
 export-icons:
 	python3 "$(PROJECT_ROOT)/scripts/export-icons.py"

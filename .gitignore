@@ -3,6 +3,8 @@
 .build/
 services/target/
 apps/org-daily/target/
+apps/xbloom/target/
+library/xbloom/*/target/
 DerivedData/
 *.xcuserstate
 xcuserdata/

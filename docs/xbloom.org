@@ -1,0 +1,32 @@
+#+TITLE: xBloom 命令行工具
+
+* 安装
+
+需要 Rust 1.92 或更新版本。在仓库根目录执行 ~make install~ ，可执行文件安装到 =~/app/xbloom/xbloom= ，命令入口 =~/.local/bin/xbloom= 指向该文件。Linux 蓝牙适配依赖 BlueZ 和 D-Bus。
+
+* 使用
+
+以下示例假定 =~/.local/bin= 已加入 ~PATH~ 。
+
+#+begin_src sh
+xbloom export --region cn --email user@example.com --source all --output recipes.json
+xbloom share 'https://share-h5.xbloom.com/?id=配方分享标识'
+xbloom scan
+xbloom connect --device 设备标识
+xbloom brew recipes.json --id 配方编号 --dry-run
+xbloom brew recipes.json --id 配方编号 --device 设备标识
+xbloom cancel --device 设备标识
+#+end_src
+
+~export~ 默认使用国际站。登录邮箱可通过 ~--email~ 或 ~XBLOOM_EMAIL~ 提供。~--password~ 接收 ~pass~ 条目名，取首行作为密码。省略时先读取 ~XBLOOM_PASSWORD~ ，再提示输入。~--source personal~ 导出自建和已保存的分享配方，~official~ 导出官方产品配方，~all~ 导出两者。导出会遍历 Studio 和 Original 分区并保留服务端的 JSON 字段。省略 ~--output~ 或使用 ~-o -~ 时，配方数据写入标准输出。~export --json-lines -o -~ 逐条输出，每行一条 JSON 记录。诊断及错误写入标准错误。
+
+~brew~ 支持单条配方 JSON 和导出的配方数组。~--dry-run~ 在本地校验和编码配方。加载后默认等待机身确认，~--start~ 从命令行启动冲煮。附近只有一台 Studio 时可省略 ~--device~ 。
+
+在设置了 ~XBLOOM_SCOPE~ 的 Org 文件里按 ~C-c x r~ ，按文件头配置的范围同步配方。 [[file:xbloom-recipes.org::*同步配方库][同步与日记链接]]
+
+* 共享库
+
+~make install~ 将 =~/library/xbloom= 链接到仓库中的共享库目录。其他 Rust 项目可以通过 Cargo 路径依赖使用其中的两个 crate。
+
+- ~xbloom-recipes~ 提供邮箱登录、账号配方导出和公开分享读取。 [[file:../library/xbloom/recipes/Cargo.toml][Cargo.toml]]
+- ~xbloom-device~ 提供 Studio（J15）的 BLE 会话、咖啡配方编码、加载与冲煮指令。 [[file:../library/xbloom/device/Cargo.toml][Cargo.toml]]

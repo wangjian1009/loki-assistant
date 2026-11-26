@@ -1,0 +1,20 @@
+[package]
+name = "xbloom"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[dependencies]
+anyhow = "1"
+btleplug = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = "1"
+xbloom-device = { path = "../../library/xbloom/device" }
+xbloom-recipes = { path = "../../library/xbloom/recipes" }

@@ -15,7 +15,8 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 
 ## 顶层目录职责
 
-- `apps/`：可独立运行的客户端应用，目前为 macOS 菜单栏入口。
+- `apps/`：可独立运行的客户端应用与命令行程序。
+- `library/`：可由多个应用复用的库。
 - `chrome-plugin/`：Chrome Manifest V3 插件，按功能提供浏览器入口。
 - `center/`：预留的应用编排与唤起层。
 - `services/`：控制中心核心服务及 macOS LaunchAgent 管理。

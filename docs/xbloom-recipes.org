@@ -1,0 +1,80 @@
+#+TITLE: xBloom 配方库
+
+配方库记录咖啡配方的展示信息和冲煮配置。每条配方使用一个一级标题，标题填写配方名称 (~theName~)。手工录入时复制下面的模板子树，替换标题并去掉 ~noexport~ 标签，在配方标题上执行 ~M-x org-id-get-create~ 。未知字段留空。
+
+- 属性抽屉记录机型和来源等信息。~MODEL~ 填 ~Studio~ (~adaptedModel=1~) 或 ~Original~ (~adaptedModel=2~)。产地、处理法和风味以描述列表写在正文中，对应 ~ORIGIN~ 、 ~PROCESS~ 和 ~FLAVOR_NOTES~ 。Emacs Lisp 可用 ~loki-assistant-xbloom-read-recipe~ 读回标题、链接、标签、描述字段和两张表。
+- 有分享链接 (~shareRecipeLink~) 时，将配方标题设为链接。粉量用 ~15克~ 、 ~18克~ 等标签显示。小数粉量使用下划线，如 ~15_5克~ 。烘焙度分为“浅烘”“中烘”“深烘”。同步将官方五级烘焙度的 1–2 级归为浅烘，3 级归为中烘，4–5 级归为深烘。缺少等级时采用配方名里明确标注的烘焙度。
+- ~TABLE_ID~ 对应 ~tableId~ 。~REGION~ 填 ~cn~ 或 ~intl~ 。~SOURCE~ 可填 ~personal~ （个人库）、 ~official~ （官方产品配方）或 ~share~ （公开分享）。~SAVED_ON~ 使用 Org 的非活动日期，如 ~[2026-11-26]~ 。
+- 表格中的单位写在行名或表头里，单元格直接填数值。粉水比写成 ~1:17~ 这样的形式，其中 ~17~ 对应 ~grandWater~ 。计划总水量由粉量和粉水比计算，旁路水量单独记录。
+- 分段注水按 ~pourList~ 顺序记录，每段一行。杯型可填 xPod、Omni 或 Other。注水轨迹可填中心、螺旋或环绕。开关填“开启”或“关闭”。 [[file:xbloom-app-analysis.org::*配方数据模型][配方字段参考]]
+
+* 同步配方库
+
+自行创建一个 Org 文件，在首个标题之前填写文件头。
+
+#+begin_example
+#+TITLE: xBloom 官方咖啡配方库
+#+PROPERTY: XBLOOM_SCOPE official
+#+PROPERTY: XBLOOM_REGION cn
+#+PROPERTY: XBLOOM_USER user@example.com
+#+PROPERTY: XBLOOM_PASS xbloom/account
+#+end_example
+
+~XBLOOM_SCOPE~ 取 ~official~ （官方产品配方）、 ~personal~ （个人库和已保存的分享配方）或 ~all~ （两者）。~XBLOOM_REGION~ 默认为 ~cn~ ，国际站填写 ~intl~ 。
+
+~XBLOOM_USER~ 填写登录邮箱，~XBLOOM_PASS~ 填写 ~pass show~ 使用的密码条目名，例如 ~xbloom/account~ 。~xbloom~ 读取该条目的首行作为密码。所有同步设置也可放在文件顶部的 ~:PROPERTIES:~ 抽屉。
+
+使用按文件头启用次生模式的 Emacs 配置时，将 xBloom 规则放在 ~use-package loki-assistant~ 的 ~:init~ 中。
+
+#+begin_src emacs-lisp
+:init
+(add-to-list 'loki/org-header-mode-rules
+             '(:mode loki-assistant-xbloom-mode
+               :property "XBLOOM_SCOPE"
+               :values ("official" "personal" "all")))
+#+end_src
+
+打开或保存 Org 文件时，Emacs 根据文件头的 ~XBLOOM_SCOPE~ 启用 ~loki-assistant-xbloom-mode~ ，并在底部状态栏显示刷新快捷键 ~C-c x r~ 。刷新使用 ~xbloom export --json-lines -o -~ 逐条处理。Emacs 显示累计处理数量，配方库窗口跟随当前条目。
+
+同步以 ~REGION~ 和 ~TABLE_ID~ 匹配配方，逐项比较字段和表格。字段或模板格式有变化时按当前模板重写条目，清理多余属性并沿用已有的 Org ~ID~ 。文件位于 ~org-roam-directory~ 下时，同步会更新 Org-roam 索引。
+
+* 从日记链接配方
+
+将每次冲煮的时间、实际调整和风味记录写在当天的 Org-roam 日记里。用 ~M-x org-roam-node-insert~ 选择配方标题，插入形如 ~[[id:配方的Org-ID][配方名称]]~ 的链接。保存日记后，可从配方的 Org-roam 反向链接查看关联记录。
+
+* 配方名称                                                         :noexport:
+:PROPERTIES:
+:ID:
+:TABLE_ID:
+:MODEL:
+:COFFEE:
+:ROASTER:
+:SOURCE:
+:REGION:
+:SAVED_ON:
+:END:
+
+- 产地 :: （填写产地）
+- 处理法 :: （填写处理法）
+- 风味 :: （填写风味）
+
+** 冲煮参数
+
+| 参数             | 值 |
+|------------------+----|
+| 杯型             |    |
+| 粉量 (g)         |    |
+| 粉水比           |    |
+| 计划总水量 (mL)  |    |
+| 研磨开关         |    |
+| 研磨档位         |    |
+| 研磨转速 (RPM)   |    |
+| 旁路开关         |    |
+| 旁路水量 (mL)    |    |
+| 旁路水温 (°C)    |    |
+
+** 分段注水
+
+| 段 | 水量 (mL) | 水温 (°C) | 流速 (mL/s) | 轨迹 | 驻留时间 (s) | 段前振动 | 段后振动 |
+|----+-----------+-----------+-------------+------+--------------+----------+----------|
+|  1 |           |           |             |      |              |          |          |

@@ -36,6 +36,10 @@
   "打开已绑定设备管理界面。" t)
 (autoload 'loki-assistant-read-later "loki-assistant-read-later"
   "打开稍后阅读列表。" t)
+(autoload 'loki-assistant-xbloom-sync "loki-assistant-xbloom"
+  "按照当前 Org 文件头的设置同步 xBloom 咖啡配方。" t)
+(autoload 'loki-assistant-xbloom-mode "loki-assistant-xbloom"
+  "在当前 Org 文件中启用 xBloom 配方同步。" t)
 (autoload 'loki-assistant-llm-usage "loki-assistant-llm-usage"
   "打开 LLM 用量查询界面。" t)
 (autoload 'loki-assistant-mail-open-inbox "loki-assistant-mail"
