@@ -144,7 +144,7 @@ async fn capture_read_later(
     path = "/doc/read-later/entries",
     access = "paired",
     summary = "查询稍后阅读列表",
-    description = "协议版本 1，从 Emacs 获取尚未标记已读的节点。"
+    description = "协议版本 1，从 Emacs 获取尚未标记已读的日记记录。"
 )]
 async fn list_read_later(
     State(service): State<DocService>,
@@ -167,7 +167,7 @@ async fn list_read_later(
     path = "/doc/read-later/entries/{id}/read",
     access = "local",
     summary = "标记稍后阅读为已读",
-    description = "协议版本 1，将 Org ID 交给 Emacs 保存已读状态。"
+    description = "协议版本 1，将稍后阅读记录的标识交给 Emacs 保存已读状态。"
 )]
 async fn mark_read_later_read(
     State(service): State<DocService>,
@@ -191,8 +191,8 @@ async fn mark_read_later_read(
     method = "DELETE",
     path = "/doc/read-later/entries/{id}",
     access = "local",
-    summary = "删除稍后阅读索引节点",
-    description = "协议版本 1，将 Org ID 交给 Emacs 移除该标题的 ID 属性并更新索引。"
+    summary = "删除稍后阅读记录",
+    description = "协议版本 1，由 Emacs 删除对应的日记标题、正文、属性和子标题，并更新索引。"
 )]
 async fn delete_read_later(
     State(service): State<DocService>,

@@ -1,12 +1,13 @@
 ## 职责
 
-`apps/` 承载可独立运行的客户端应用。每个应用有自己的 CMake 工程、README 和测试；服务能力通过 services HTTP API 使用。
+`apps/` 承载可独立运行的客户端应用。原生界面和命令行应用各自维护构建和测试入口；控制中心服务能力通过 services HTTP API 使用。
 
 当前应用：
 
 - 根目录 `center/`：预留编排目录。
 - `apps/center/`：macOS 菜单栏状态入口。
 - `apps/harmony/`：HarmonyOS 手机执行中心，提供首页设备管理、扫码绑定和电脑状态查询。
+- `apps/org-daily/`：独立的 Rust 命令行程序，按日记日期和 Org 标题元数据读取本地记录。
 
 服务配置界面位于 `emacs/loki-assistant-config.el`；菜单栏设置通过 services 的 Emacs gateway 打开，不保留独立原生编辑器。应用之间不共享旧版 UI 或 Emacs 控制代码；跨应用能力以 services 的 HTTP 元数据和接口为准。
 

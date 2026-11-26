@@ -1,0 +1,18 @@
+[package]
+name = "org-daily"
+version = "0.1.0"
+edition = "2024"
+description = "查询和分析 Org-roam 日记中的记录"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

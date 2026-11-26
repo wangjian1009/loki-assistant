@@ -2,6 +2,7 @@
 .DS_Store
 .build/
 services/target/
+apps/org-daily/target/
 DerivedData/
 *.xcuserstate
 xcuserdata/
@@ -19,3 +20,4 @@ apps/harmony/entry/src/main/rust/target/
 
 # Chrome extension build output
 /dist/chrome-plugin/
+/dist/org-daily

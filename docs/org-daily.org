@@ -1,0 +1,63 @@
+#+TITLE: Org-roam 日记查询与文本分析
+
+* 使用
+
+在仓库根目录执行 ~make install~ ，可执行文件位于 ~dist/org-daily~ ，安装入口为符号链接 =~/.local/bin/org-daily= 。默认日记目录为 =~/workspace/org-roam/daily= 。可用 ~ORG_ROAM_DAILIES_DIR~ 设置日记目录，也可用 ~--dir~ 覆盖。目录对应 Emacs 把 ~org-roam-dailies-directory~ 展开到 ~org-roam-directory~ 后的位置。
+
+#+begin_src sh
+make install
+~/.local/bin/org-daily \
+  --from 2026-11-01 --to 2026-11-24 \
+  --tasks --title '阅读|复盘' --tag 工作 --property ID
+#+end_src
+
+日期范围包含首尾两天，单独指定一侧可查该日期之前或之后的记录。默认查询所有 Org 标题。~--tasks~ 只查询带任务状态的标题，包括已完成任务。可重复指定 ~--state TODO --state WAITING~ 查询任一指定状态。
+
+~--title~ 和 ~--body~ 接受与 ripgrep 同类的 Rust 正则表达式。 ~-F~ 使用字面匹配， ~-i~ 忽略大小写。标题匹配保留 Org 链接等行内源码，可搜索其中的链接说明。正文匹配使用标题直属的文本。标题、正文、标签和属性条件同时生效，重复的 ~--tag~ 和 ~--property~ 也须同时满足。
+
+标签精确匹配并区分大小写。查询包含文件的 ~#+FILETAGS~ 、父标题的标签和当前标题的标签。用 ~--local-tag~ 可仅匹配直接写在当前标题上的标签。程序从首个标题之前读取文件标签、任务关键字及本地 ~#+SETUPFILE~ ，并递归读取配置文件。任务关键字默认使用 ~TODO~ 和 ~DONE~ ，可由这些配置中的 ~#+TODO~ 、 ~#+SEQ_TODO~ 或 ~#+TYP_TODO~ 定义。
+
+~--property KEY~ 匹配当前标题的属性是否存在。~--property KEY=VALUE~ 匹配该属性的完整值，值区分大小写，键名按大写处理。~--property KEY=~ 可查询空值。属性来自标题的 ~:PROPERTIES:~ drawer，可放在计划行之后。
+
+* 标签和属性表达式
+
+用 ~--where~ 将标签和属性组成布尔表达式。整个表达式用 shell 单引号包住。
+
+#+begin_src sh
+~/.local/bin/org-daily \
+  --from 2026-11-01 --to 2026-11-24 \
+  --title '^(阅读|复盘)' \
+  --where '(tag:工作 OR tag:阅读) AND prop:ID AND NOT prop:STATUS=archived'
+#+end_src
+
+| 表达式 | 匹配条件 |
+|--------+----------|
+| ~tag:工作~ | 具有该标签，包含继承标签 |
+| ~prop:ID~ | 当前标题具有该属性 |
+| ~prop:AREA="product infrastructure"~ | 当前标题的属性值完全相等 |
+| ~prop:NOTE=""~ | 当前标题具有该属性且值为空 |
+| ~NOT prop:NOTE~ | 当前标题缺少该属性 |
+
+运算符优先级从高到低为 ~NOT~ 、 ~AND~ 、 ~OR~ 。可用括号改变优先级。运算符和属性名的大小写均可混用，标签和属性值区分大小写。值含空格、冒号、等号或括号时，用双引号括起，并按 JSON 字符串规则转义。~--where~ 与日期、标题正则以及 ~--tag~ 、 ~--property~ 等参数同时生效。表达式错误会指出字符位置并以退出码 ~2~ 结束。
+
+* 输出与文本分析
+
+默认每条命中记录立即输出一行，并带有文件路径和从 1 开始的行号。文件按日期倒序，同一文件按标题出现的顺序输出。~--format jsonl~ 使用 JSON Lines，每行一个完整 JSON 对象，写入一行即刷新标准输出。对象包括 ~date~ 、 ~file~ 、 ~line~ 、 ~level~ 、 ~title~ 、 ~outline~ 、 ~state~ 、 ~tags~ 、 ~properties~ 和 ~body~ 。其中 ~outline~ 是从根标题到父标题的路径， ~state~ 在普通标题中为 ~null~ 。用 ~--include-undated~ 可包含未按日期命名的 Org 文件，此类文件排在最后， ~date~ 为 ~null~ ，此选项可用于无日期范围的查询。
+
+正文以当前标题和下一条标题为边界。分析时保留段落、列表、表格与代码块内容，省略 Org 指令、计划行、drawer 和注释。对子标题的匹配会输出一条独立记录。
+
+~--format summary~ 汇总当前查询的命中总数、每日数量、各任务状态和各标签的频次。每条记录的同一个标签只计一次。可先用正文表达式缩小范围，再统计出现频次。
+
+#+begin_src sh
+~/.local/bin/org-daily \
+  --from 2026-11-01 --to 2026-11-24 \
+  --body '复盘|结论' --format summary
+#+end_src
+
+退出码 ~0~ 表示命中， ~1~ 表示无匹配， ~2~ 表示参数错误或读取失败。
+
+* 查询实现
+
+参考 ripgrep 的目录剪枝、编译一次正则和逐条输出方式。程序先跳过范围外的年份、月份目录，再以文件名中的日期校验候选集合。支持 ~YYYY/MM/YYYY-MM-DD.org~ 、旧版 ~YYYY/YYYY-MM-DD.org~ 和其他可见目录中的合法日期文件。年月目录中的日记须按相应年月存放。输入为 UTF-8 Org 文件。
+
+查询逐个打开候选文件，顺序扫描标题、正文和直接属性，用当前标题路径计算继承标签。标题和属性通过过滤后，再检查正文表达式。序列化和输出在命中时执行，统计模式只累计计数。程序直接读取磁盘上的 Org 源文件，运行所需的数据来自日记及其本地配置。

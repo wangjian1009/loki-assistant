@@ -113,8 +113,8 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/doc/{id}~ | 按 Org ID 读取已保存的文档 |
 | POST | ~/doc/read-later/entries~ | 把网页链接保存到当天日记 |
 | GET | ~/doc/read-later/entries~ | 查询未读网页链接 |
-| POST | ~/doc/read-later/entries/{id}/read~ | 按 Org ID 标记已读 |
-| DELETE | ~/doc/read-later/entries/{id}~ | 移除日记标题的 Org ID |
+| POST | ~/doc/read-later/entries/{id}/read~ | 按稍后阅读标识标记已读 |
+| DELETE | ~/doc/read-later/entries/{id}~ | 删除整个稍后阅读条目 |
 | GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
 | GET | ~/status~ | 读取全部模块发布的状态 |
 | GET | ~/status/{module_id}~ | 读取模块完整状态对象 |
@@ -393,11 +393,11 @@ network 将 iroh 已认证的 Endpoint ID 写入转发请求的 ~x-loki-device~ 
 | 文档集合 | ~GET /doc~ | 分页返回摘要，按 ~kind~ 、 ~domain~ 和 ~tag~ 过滤，按标题及别名搜索 | 后续 |
 | 文档链接 | ~GET /doc/{id}/links~ | ~outgoing~ 和 ~incoming~ 各返回去重后的可访问文档 ID，~references~ 提供 ~ROAM_REFS~ 中的 HTTP(S) 来源 URL | 后续 |
 | 网页文章 | ~POST /doc/article~ | 直接保存网页全文，返回文档摘要 | 已实现 |
-| 稍后阅读 | ~/doc/read-later/entries~ | 捕获网页链接、查询未读节点、标记已读及移除节点 ID | 已实现 |
+| 稍后阅读 | ~/doc/read-later/entries~ | 捕获网页链接、查询未读记录、标记已读及删除记录 | 已实现 |
 
 HTTP 方法决定路径段的含义。services 对 ~GET /doc/{id}~ 和 ~POST /doc/{target}~ 在同一路由模板上注册不同方法的处理器。~GET /doc/article~ 查询 ID 为 ~article~ 的文档，~POST /doc/article~ 将目标 ~article~ 交给 Emacs。新增提交目标由 Emacs 注册。
 
-稍后阅读使用日记中带独立 Org ID 和 ~稍后阅读~ 标签的条目，来源写入标题链接，阅读状态作为工作流字段。
+稍后阅读使用日记中直接带 ~稍后阅读~ 标签的条目。来源写入标题链接，阅读状态作为工作流字段。
 
 ** 全文捕获接入
 
@@ -544,27 +544,27 @@ HTTP 200 返回 UTF-8 JSON。响应使用 ~application/json~ 并携带 ~Cache-Co
 
 ** 稍后阅读
 
-四个接口均使用协议版本 1，复用 Emacs gateway 和标准错误响应，并返回 ~Cache-Control: no-store~ 。本机和已绑定设备均可查询未读列表。捕获、标记已读和删除仅供本机调用。services 负责 HTTP 参数解码和结果转发。Emacs 负责捕获、索引查询、标记已读和删除。
+四个接口均使用协议版本 1，复用 Emacs gateway 和标准错误响应，并返回 ~Cache-Control: no-store~ 。本机和已绑定设备均可查询未读列表。捕获、标记已读和删除仅供本机调用。services 负责 HTTP 参数解码和结果转发。Emacs 通过 ~org-daily~ 查询磁盘上的日记标题，并负责捕获、标记已读、删除和保存后的索引更新。
 
 | 接口 | 请求 | HTTP 200 响应中的业务字段 |
 |------+------|------------------------------|
-| ~POST /doc/read-later/entries~ | JSON 对象，含 ~title~ 和绝对 HTTP(S) ~url~ | ~entry~ 为保存的节点摘要。同一链接已有未读节点时返回该节点 |
-| ~GET /doc/read-later/entries~ | 无请求体 | ~entries~ 为未读节点摘要数组，按捕获时间倒序，空列表为 ~[]~ |
-| ~POST /doc/read-later/entries/{id}/read~ | ~id~ 为 URL 路径段编码后的 Org ID，无请求体 | ~id~ 和首次标记的 ~read_at~ ，采用 UTC ISO 8601。重复标记返回相同时间 |
-| ~DELETE /doc/read-later/entries/{id}~ | ~id~ 为 URL 路径段编码后的 Org ID，无请求体 | ~id~ 为已移除的 Org ID |
+| ~POST /doc/read-later/entries~ | JSON 对象，含 ~title~ 和绝对 HTTP(S) ~url~ | ~entry~ 为保存的记录摘要。同一链接已有未读记录时返回该记录 |
+| ~GET /doc/read-later/entries~ | 无请求体 | ~entries~ 为未读记录摘要数组，按捕获时间倒序，空列表为 ~[]~ |
+| ~POST /doc/read-later/entries/{id}/read~ | ~id~ 为 URL 路径段编码后的记录标识，无请求体 | ~id~ 和首次标记的 ~read_at~ ，采用 UTC ISO 8601。重复标记返回相同时间 |
+| ~DELETE /doc/read-later/entries/{id}~ | ~id~ 为 URL 路径段编码后的记录标识，无请求体 | ~id~ 为已删除的记录标识 |
 
-节点摘要含 ~id~ 、 ~title~ 、 ~url~ 和 ~captured_at~ 。新捕获以标题中的 Org 链接保存来源，以本地 Org 非激活时间戳写入 ~CREATED~ 。列表从标题提取 HTTP(S) 链接，标题无此类链接时 ~url~ 为 ~null~ 。~captured_at~ 由 ~CREATED~ 转为 UTC ISO 8601，旧记录兼容 ~LOKI_READ_LATER_CAPTURED_AT~ ，无时间返回 ~null~ 。
+记录摘要含 ~id~ 、 ~title~ 、 ~url~ 和 ~captured_at~ 。新捕获以标题中的 Org 链接保存来源， ~CREATED~ 采用微秒精度的 UTC ISO 8601 时间，省去标题的 Org ~ID~ 。接口 ~id~ 由 ~CREATED~ 生成，旧记录继续使用已有的 Org ~ID~ 。客户端应原样使用接口返回的标识。列表从标题提取 HTTP(S) 链接，标题无此类链接时 ~url~ 为 ~null~ 。~captured_at~ 采用 UTC ISO 8601，旧记录兼容本地 Org 时间戳和 ~LOKI_READ_LATER_CAPTURED_AT~ ，无时间返回 ~null~ 。
 
-标记已读会将首次已读时间以本地 Org 非激活时间戳写入 ~READED~ ，如 ~[2026-11-24 Tue 17:33]~ 。删除只移除目标标题的 ~ID~ ，日记中的标题、属性和内容照常保留。保存并更新索引后，原 ID 从列表和 ~GET /doc/{id}~ 查询结果中消失。
+标记已读会将首次已读时间以本地 Org 非激活时间戳写入 ~READED~ ，如 ~[2026-11-24 Tue 17:33]~ 。删除会移除对应的标题、正文、属性及全部子标题，保存日记并更新 org-roam 索引。
 
 捕获使用目标 Emacs 会话的本地日期，调用 ~org-roam-dailies-capture-today~ 。日记位置继承 ~org-roam-dailies-capture-templates~ 中指定模板的 ~:target~ ，由 ~loki-assistant-read-later-daily-template-key~ 选择，默认为 ~d~ 。 [[file:emacs.org::*稍后阅读][Emacs 稍后阅读]]
 
 | HTTP | 错误码 | 含义 |
 |------+--------+------|
 | 400 | ~invalid-read-later-link~ | 网页标题、链接或提交格式无效 |
-| 404 | ~read-later-not-found~ | Org ID 无对应的稍后阅读节点 |
+| 404 | ~read-later-not-found~ | 标识无对应的稍后阅读记录 |
 | 409 | ~read-later-daily-conflict~ | 日记有尚未保存或加载的更改 |
-| 502 | ~document-read-failed~ | Emacs 无法查询索引 |
+| 502 | ~document-read-failed~ | Emacs 无法执行日记查询或解析查询结果 |
 | 502 | ~read-later-save-failed~ | Emacs 无法保存日记 |
 | 502 | ~read-later-index-failed~ | 日记索引更新失败 |
 | 503 | ~read-later-template-unavailable~ | 日记模板缺失或目标超出日记目录 |

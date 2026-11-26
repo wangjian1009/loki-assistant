@@ -113,18 +113,18 @@ Loki Assistant 的界面在状态栏显示操作快捷键。按 ~C-c C-q~ 退出
 
 ** 稍后阅读
 
-执行 ~M-x loki-assistant-read-later~ ，或在命令菜单按 ~r~ ，打开稍后阅读模式。列表从本地 org-roam 索引查询未读日记条目，默认按加入时间倒序显示。
+在仓库根目录执行 ~make install~ 安装 ~org-daily~ 。执行 ~M-x loki-assistant-read-later~ ，或在命令菜单按 ~r~ ，打开列表。Emacs 查询直接带 ~稍后阅读~ 标签且缺少 ~READED~ 的日记标题，新记录通过 ~CREATED~ 定位，旧记录沿用原先的 Org ~ID~ 。列表异步读取 JSONL，一收到完整记录就分批显示，默认按加入时间倒序排列。按 ~g~ 刷新时会取消上一轮查询。要指定可执行文件路径，可在 Customize 中设置 ~loki-assistant-read-later-search-program~ 。 [[file:org-daily.org][Org-roam 日记查询]]
 
 | 快捷键 | 操作 |
 |--------+------|
 | ~g~ | 刷新未读列表 |
-| ~RET~ | 打开当前条目的 Org 日记标题 |
-| ~b~ | 打开当前条目的网页链接 |
+| ~RET~ / ~b~ | 打开当前条目的网页链接 |
+| ~Alt-Enter~ (macOS 的 ~Option-Enter~) | 跳转到当前条目在本地 Org 日记中的位置 |
 | ~r~ | 保存已读时间并从未读列表移除当前条目 |
 | ~?~ | 查看模式帮助 |
 | ~C-c C-q~ | 退出列表 |
 
-要更换用于定位日记文件的模板，可在 Customize 中设置 ~loki-assistant-read-later-daily-template-key~ ，默认使用 ~org-roam-dailies-capture-templates~ 中的 ~d~ 模板。捕获通过 ~org-roam-dailies-capture-today~ 写入带 ID、 ~稍后阅读~ 标签和 ~CREATED~ 属性的链接标题。删除移除标题的 ~ID~ 并更新 org-roam 索引。 [[file:control-center-services.org::*稍后阅读][稍后阅读 HTTP 协议]]
+要更换用于定位日记文件的模板，可在 Customize 中设置 ~loki-assistant-read-later-daily-template-key~ ，默认使用 ~org-roam-dailies-capture-templates~ 中的 ~d~ 模板。每条新捕获包含网页链接标题、 ~稍后阅读~ 标签和 UTC ~CREATED~ ，省去标题的 Org ~ID~ 。删除接口移除整个 Org 子树并更新 org-roam 索引。 [[file:control-center-services.org::*稍后阅读][稍后阅读 HTTP 协议]]
 
 * 服务配置管理
 
