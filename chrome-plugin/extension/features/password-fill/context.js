@@ -20,15 +20,30 @@ export function hasPasswordInput() {
   return inspect(document);
 }
 
-export async function readPageContext(browser = chrome) {
+export async function readPageContext(browser = chrome, detectionTimeoutMs = 1000) {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   const context = { tab: tab ? { id: tab.id, url: tab.url || "", title: tab.title || "" } : null, hasPasswordInput: false, detectionError: "" };
   if (!Number.isInteger(tab?.id) || !/^https?:\/\//iu.test(tab.url || "")) return context;
+  let timeout;
   try {
-    const frames = await browser.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: hasPasswordInput });
-    context.hasPasswordInput = frames.some((frame) => frame.result === true);
+    const detect = async () => {
+      const target = { tabId: tab.id };
+      const main = await browser.scripting.executeScript({ target, func: hasPasswordInput });
+      if (main.some((frame) => frame.result === true)) return true;
+      const frames = await browser.scripting.executeScript({ target: { ...target, allFrames: true }, func: hasPasswordInput });
+      return frames.some((frame) => frame.result === true);
+    };
+    // frame 注入可能一直等待，超时后仍返回当前标签页供保存工具使用。
+    context.hasPasswordInput = await Promise.race([
+      detect(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("密码框检测超时。")), detectionTimeoutMs);
+      }),
+    ]);
   } catch {
     context.detectionError = "无法检测当前页面的密码框，可手动切换到密码。";
+  } finally {
+    clearTimeout(timeout);
   }
   return context;
 }

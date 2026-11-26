@@ -7,6 +7,7 @@ import { generateTotp } from "../features/password-otp/otp.js";
 import { loadEntry, copyableValue } from "../features/password-manager/manager.js";
 import { installReadLater } from "../features/read-later/view.js";
 
+const PAGE_CONTEXT_TIMEOUT_MS = 3000;
 const $ = (id) => document.getElementById(id);
 const readLater = installReadLater({
   save: $("read-later-save"), saveStatus: $("tool-status"), list: $("read-later-entries"),
@@ -403,8 +404,14 @@ document.addEventListener("keydown", (event) => {
 window.addEventListener("pagehide", clearDetails);
 
 async function initialize() {
+  let timeout;
   try {
-    const context = await sendMessage({ type: PAGE_CONTEXT });
+    const context = await Promise.race([
+      sendMessage({ type: PAGE_CONTEXT }),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("检测当前页面超时。")), PAGE_CONTEXT_TIMEOUT_MS);
+      }),
+    ]);
     if (!context?.ok) throw new Error(context?.error || "无法读取当前页面，可手动选择功能。");
     state.tab = context.tab;
     state.contextReady = true;
@@ -425,6 +432,8 @@ async function initialize() {
     $("tool-status").textContent = "无法读取当前页面，请重新打开插件后重试。";
     $("tool-status").classList.add("error");
     setStatus(error.message, true);
+  } finally {
+    clearTimeout(timeout);
   }
   if (state.view === "password") {
     if (state.loaded) renderEntries();

@@ -44,15 +44,46 @@ test("默认页检测支持 open Shadow DOM，并排除隐藏的宿主", () => {
 });
 
 test("后台汇总全部可访问 frame，有密码框即选择密码，与条目数量无关", async () => {
-  let request;
+  const requests = [];
   const context = await readPageContext({
     tabs: { query: async () => [{ id: 7, url: "https://id1.cloud.huawei.com/login", title: "登录" }] },
-    scripting: { executeScript: async (args) => { request = args; return [{ frameId: 0, result: false }, { frameId: 1, result: true }]; } },
+    scripting: { executeScript: async (request) => {
+      requests.push(request);
+      return request.target.allFrames ? [{ frameId: 1, result: true }] : [{ frameId: 0, result: false }];
+    } },
   });
   assert.equal(context.hasPasswordInput, true);
   assert.equal(context.tab.id, 7);
-  assert.deepEqual(request.target, { tabId: 7, allFrames: true });
-  assert.equal(request.func, hasPasswordInput);
+  assert.deepEqual(requests, [
+    { target: { tabId: 7 }, func: hasPasswordInput },
+    { target: { tabId: 7, allFrames: true }, func: hasPasswordInput },
+  ]);
+});
+
+test("主文档有密码框时无需等待子 frame", async () => {
+  const context = await readPageContext({
+    tabs: { query: async () => [{ id: 7, url: "https://example.com" }] },
+    scripting: { executeScript: async ({ target }) => {
+      assert.deepEqual(target, { tabId: 7 });
+      return [{ frameId: 0, result: true }];
+    } },
+  });
+  assert.equal(context.hasPasswordInput, true);
+  assert.equal(context.detectionError, "");
+});
+
+test("子 frame 检测无响应时仍返回保存所需的标签页信息", async () => {
+  const tab = { id: 7, url: "https://example.com/article", title: "文章" };
+  const context = await readPageContext({
+    tabs: { query: async () => [tab] },
+    scripting: { executeScript: async ({ target }) => {
+      if (target.allFrames) return new Promise(() => {});
+      return [{ frameId: 0, result: false }];
+    } },
+  }, 15);
+  assert.deepEqual(context.tab, tab);
+  assert.equal(context.hasPasswordInput, false);
+  assert.match(context.detectionError, /手动切换/u);
 });
 
 test("受限页面不注入，检测失败降级工具页并返回原因", async () => {
