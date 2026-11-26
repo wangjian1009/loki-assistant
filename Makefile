@@ -213,7 +213,7 @@ build: configure
 test: test-mac services-test chrome-test
 
 test-mac:
-	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(TEST_BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON -DLOKI_APP_BUNDLE_IDENTIFIER=cc.loki-assistant.center.testhost -DLOKI_APP_URL_SCHEME=loki-assistant-testhost -DLOKI_APP_REGISTER_MAILTO=OFF
+	"$(CMAKE)" -S "$(PROJECT_ROOT)/apps/center/mac" -B "$(TEST_BUILD_DIR)" -G Xcode -DBUILD_TESTING=ON -DLOKI_APP_BUNDLE_IDENTIFIER=cc.loki-assistant.center.testhost -DLOKI_APP_DISPLAY_NAME=LokiAssistantTests -DLOKI_APP_URL_SCHEME=loki-assistant-testhost -DLOKI_APP_REGISTER_MAILTO=OFF
 	"$(CMAKE)" --build "$(TEST_BUILD_DIR)" --config "$(CONFIG)"
 	"$(CTEST)" --test-dir "$(TEST_BUILD_DIR)" -C "$(CONFIG)" --output-on-failure
 

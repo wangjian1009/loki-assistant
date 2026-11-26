@@ -54,10 +54,28 @@ impl AlertService {
         Ok(alert)
     }
 
+    pub(crate) async fn publish_silent(
+        &self,
+        id: &str,
+        input: AlertInput,
+    ) -> Result<Alert, AlertError> {
+        let (alert, _) = self.publish_with_notification(id, input, false).await?;
+        Ok(alert)
+    }
+
     pub(super) async fn publish_with_creation(
         &self,
         id: &str,
         input: AlertInput,
+    ) -> Result<(Alert, bool), AlertError> {
+        self.publish_with_notification(id, input, true).await
+    }
+
+    async fn publish_with_notification(
+        &self,
+        id: &str,
+        input: AlertInput,
+        notify: bool,
     ) -> Result<(Alert, bool), AlertError> {
         validate_id(id)?;
         if input.title.trim().is_empty() {
@@ -75,7 +93,7 @@ impl AlertService {
 
         let id = id.to_owned();
         self.process
-            .with(move |state| Box::pin(async move { state.publish(&id, input).await }))
+            .with(move |state| Box::pin(async move { state.publish(&id, input, notify).await }))
             .await
     }
 
@@ -89,7 +107,12 @@ impl AlertService {
 }
 
 impl State {
-    async fn publish(&mut self, id: &str, input: AlertInput) -> Result<(Alert, bool), AlertError> {
+    async fn publish(
+        &mut self,
+        id: &str,
+        input: AlertInput,
+        notify: bool,
+    ) -> Result<(Alert, bool), AlertError> {
         let previous = self.active.get(id);
         if let Some(previous) = previous.filter(|alert| {
             alert.app == input.app
@@ -120,12 +143,14 @@ impl State {
         self.publish_snapshot(&next).await?;
         self.active = next;
 
-        self.notification.trigger(NotificationRequest {
-            app: alert.app.clone(),
-            title: alert.title.clone(),
-            body: alert.body.clone(),
-            callback_url: alert.callback_url.clone(),
-        });
+        if notify {
+            self.notification.trigger(NotificationRequest {
+                app: alert.app.clone(),
+                title: alert.title.clone(),
+                body: alert.body.clone(),
+                callback_url: alert.callback_url.clone(),
+            });
+        }
         Ok((alert, created))
     }
 

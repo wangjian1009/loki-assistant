@@ -26,7 +26,7 @@
 
 点击托盘菜单中的「收件箱」，即可打开 mu4e 中快捷键 ~i~ 对应的收件箱书签。同步完成后，菜单项也会显示未读邮件数量。 [[file:../../docs/control-center-services.org::*邮件跳转][邮件跳转协议]]
 
-点击「立即同步邮件」可启动同步或查看当前正在运行的一轮。窗口显示下载邮件、更新索引、刷新未读数三个阶段和实时 ~mu~ 索引消息。关掉窗口后，已受理的同步继续运行。 [[file:../../docs/control-center-services.org::*手动同步与进度][手动同步协议]]
+点击「立即同步邮件」可启动同步或查看当前正在运行的一轮。窗口显示下载邮件、更新索引、刷新未读数三个阶段。直接执行 ~mu index~ 时显示实时输出，Emacs 接手时在索引完成后显示统计。定时同步在后台运行，同步失败可从托盘的「告警」查看。关掉窗口后，已受理的同步继续运行。 [[file:../../docs/control-center-services.org::*手动同步与进度][手动同步协议]]
 
 * 应用图标
 
@@ -47,7 +47,7 @@ make restart-center
 
 Slack 通知使用 ~app: "slack"~ 和内置的 ~slack.png~ 。使用 ~make export-icons~ 从公共 SVG 母版生成 Slack 通知图标。 [[https://commons.wikimedia.org/wiki/File:Slack_icon_2019.svg][Slack 图标来源]]
 
-新邮件和邮件同步失败通知使用 ~app: "mail"~ 。~make export-icons~ 从深绿底的信封 SVG 母版生成 ~mail.png~ 。 [[file:../../resources/icons/mail.svg][邮件图标母版]]
+新邮件通知使用 ~app: "mail"~ 。~make export-icons~ 从深绿底的信封 SVG 母版生成 ~mail.png~ 。 [[file:../../resources/icons/mail.svg][邮件图标母版]]
 
 未提供 ~app~ 或找不到对应资源时继续展示文字通知；图标附件不改变系统通知来源名称及来源应用图标。
 
@@ -63,7 +63,7 @@ make restart-center
 
 修改菜单栏 App 后使用 ~make restart-center~ ，确保旧实例退出并加载新的 binary。
 
-~make test-mac~ 使用独立构建目录、测试宿主 Bundle ID 和 URL scheme，避免与正在使用的托盘实例争用 LaunchServices 注册；测试只验证协议与状态逻辑，不操作真实服务。
+~make test-mac~ 使用独立构建目录、测试宿主显示名 ~LokiAssistantTests~ 、Bundle ID 和 URL scheme。测试只验证协议与状态逻辑，不操作真实服务。
 
 需要 macOS、CMake 3.30 及以上和支持 Swift 6 的 Xcode。构建配置及源文件列表以 [[file:mac/CMakeLists.txt][CMakeLists.txt]] 为准。
 

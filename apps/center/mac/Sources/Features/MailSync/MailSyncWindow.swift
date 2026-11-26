@@ -4,10 +4,10 @@ import SwiftUI
 @MainActor
 final class MailSyncWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
-    private var tracking = false
+    private var syncTask: Task<Void, Never>?
 
-    func show() {
-        if let window, tracking {
+    func syncFromMenu() {
+        if let window, syncTask != nil {
             if window.isMiniaturized {
                 window.deminiaturize(nil)
             }
@@ -22,13 +22,11 @@ final class MailSyncWindow: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        tracking = true
+        let sync = MailSyncSession()
         window.title = "邮件同步"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentViewController = NSHostingController(rootView: MailSyncView {
-            [weak self] in self?.tracking = false
-        })
+        window.contentViewController = NSHostingController(rootView: MailSyncView(session: sync))
         window.contentMinSize = NSSize(width: 380, height: 240)
         if self.window == nil {
             window.setContentSize(NSSize(width: 520, height: 300))
@@ -37,22 +35,28 @@ final class MailSyncWindow: NSObject, NSWindowDelegate {
         self.window = window
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        syncTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            await sync.run()
+            if !Task.isCancelled {
+                self?.syncTask = nil
+            }
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
-        // 移除 SwiftUI 视图会结束进度查询，services 继续当前同步。
-        window?.contentViewController = nil
+        syncTask?.cancel()
+        syncTask = nil
         window = nil
-        tracking = false
     }
 }
 
 private struct MailSyncView: View {
-    let finished: @MainActor () -> Void
-    @State private var snapshot: MailSyncSnapshot?
-    @State private var connectionError: String?
+    let session: MailSyncSession
 
     var body: some View {
+        let snapshot = session.snapshot
+        let connectionError = session.connectionError
         VStack(alignment: .leading, spacing: 12) {
             Text(connectionError == nil ? (snapshot?.phase.title ?? "正在连接 services…") : "无法获取同步进度")
                 .font(.headline)
@@ -104,10 +108,16 @@ private struct MailSyncView: View {
         }
         .padding(20)
         .frame(minWidth: 380, minHeight: 240)
-        .task { await sync() }
     }
+}
 
-    private func sync() async {
+@MainActor
+@Observable
+private final class MailSyncSession {
+    private(set) var snapshot: MailSyncSnapshot?
+    private(set) var connectionError: String?
+
+    func run() async {
         let operation = CenterLog.shared.start("立即同步邮件")
         do {
             let client = MailSyncClient()
@@ -133,8 +143,6 @@ private struct MailSyncView: View {
         }
         if Task.isCancelled {
             CenterLog.shared.finish(operation, result: "cancelled")
-        } else {
-            finished()
         }
     }
 }

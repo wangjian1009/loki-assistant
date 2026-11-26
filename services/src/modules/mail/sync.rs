@@ -21,7 +21,7 @@ use crate::modules::alert::{AlertInput, AlertLevel};
 const INTERVAL: Duration = Duration::from_secs(300);
 const SYNC_DEADLINE: Duration = Duration::from_secs(120);
 const INDEX_DEADLINE: Duration = Duration::from_secs(60);
-const INDEX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const EMACS_RESULT_GRACE: Duration = Duration::from_secs(10);
 const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MU_LOCK_BACKOFF: [u64; 4] = [250, 500, 1000, 2000];
 const SYNC_ALERT: &str = "mail.sync";
@@ -35,10 +35,10 @@ pub(super) struct MuDatabase {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum IndexReply {
-    Complete(MuDatabase),
-    Running(IndexCounts),
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum IndexResult {
+    Completed { database: MuDatabase },
+    Failed { error: String },
 }
 
 #[derive(Deserialize)]
@@ -189,11 +189,9 @@ impl MailService {
         let result = self
             .emacs
             .eval_running(
-                r#"(cond
-  ((not (and (fboundp 'mu4e-running-p) (mu4e-running-p))) 'unavailable)
-  ((bound-and-true-p mu4e--server-indexing) 'busy)
-  (t (require 'loki-assistant-mail)
-     (loki-assistant-mail-database)))"#,
+                r#"(progn
+  (require 'loki-assistant-mail)
+  (loki-assistant-mail-database-for-refresh))"#,
             )
             .await
             .map_err(|error| format!("读取 mu4e 索引位置失败：{error}"))?;
@@ -230,62 +228,42 @@ impl MailService {
 
     async fn index_in_emacs(&self) -> Result<Option<MuDatabase>, String> {
         let request = uuid::Uuid::new_v4();
-        time::timeout(INDEX_DEADLINE, async {
-            let mut started = false;
-            loop {
-                let check_only = if started { "t" } else { "nil" };
-                let script = format!(
-                    r#"(if (and (fboundp 'mu4e-running-p) (mu4e-running-p))
-    (progn
-      (require 'loki-assistant-mail)
-      (if (fboundp 'loki-assistant-mail-index-progress)
-          (loki-assistant-mail-index-progress "{request}" {check_only})
-        (loki-assistant-mail-index "{request}" {check_only})))
-  'unavailable)"#
-                );
-                let result = self
-                    .emacs
-                    .eval_running(&script)
-                    .await
-                    .map_err(|error| format!("mu4e 索引失败：{error}"))?;
-                match result.as_deref() {
-                    None | Some("unavailable") if !started => return Ok(None),
-                    None | Some("unavailable") => {
-                        return Err("mu4e 已退出，无法确认索引结果。".into());
-                    }
-                    Some("busy") if !started => self
-                        .sync_progress
-                        .message("等待 mu4e 完成正在运行的索引。".into()),
-                    Some("running") => started = true,
-                    Some(result) if started => {
-                        match decode_emacs_json(result)
-                            .map_err(|_| "无法读取 mu4e 返回的索引进度。")?
-                        {
-                            IndexReply::Complete(database) => {
-                                if let Some(counts) = &database.index {
-                                    self.sync_progress.message(counts.message());
-                                }
-                                return Ok(Some(database));
-                            }
-                            IndexReply::Running(counts) => {
-                                self.sync_progress.message(counts.message())
-                            }
-                        }
-                    }
-                    _ => return Err("mu4e 返回的索引状态无效。".into()),
+        let receipt = self.sync_progress.expect_index_result(request).await;
+        let script = format!(
+            r#"(progn
+  (require 'loki-assistant-mail)
+  (loki-assistant-mail-start-index "{request}" {}))"#,
+            INDEX_DEADLINE.as_secs(),
+        );
+        let accepted = time::timeout(EMACS_RESULT_GRACE, self.emacs.eval_running(&script))
+            .await
+            .map_err(|_| "等待 Emacs 接收索引请求超时。")?
+            .map_err(|error| format!("无法请求 Emacs 更新索引：{error}"))?;
+        match accepted.as_deref() {
+            None | Some("unavailable") => return Ok(None),
+            Some("accepted") => {}
+            _ => return Err("Emacs 返回的索引接收回执无效。".into()),
+        }
+        let result = time::timeout(INDEX_DEADLINE + EMACS_RESULT_GRACE, receipt)
+            .await
+            .map_err(|_| "等待 Emacs 返回索引结果超时。")?
+            .map_err(|_| "Emacs 索引结果接收已结束。")?;
+        match result {
+            IndexResult::Completed { database } => {
+                if let Some(counts) = &database.index {
+                    self.sync_progress.message(counts.message());
                 }
-                time::sleep(INDEX_POLL_INTERVAL).await;
+                Ok(Some(database))
             }
-        })
-        .await
-        .map_err(|_| "等待 mu4e 索引完成超时。".to_owned())?
+            IndexResult::Failed { error } => Err(error),
+        }
     }
 
     async fn report_failure(&self, body: String) {
         log::warn!("邮箱同步失败：{}", body.replace('\n', " "));
         if let Err(error) = self
             .alert
-            .publish(
+            .publish_silent(
                 SYNC_ALERT,
                 AlertInput {
                     app: Some(MODULE_ID.into()),

@@ -11,6 +11,7 @@ set(CMAKE_XCODE_ATTRIBUTE_SWIFT_VERSION "6.0")
 project(LokiAssistant VERSION 0.1.0 LANGUAGES Swift)
 
 set(LOKI_APP_BUNDLE_IDENTIFIER "cc.loki-assistant.center" CACHE STRING "App Bundle ID")
+set(LOKI_APP_DISPLAY_NAME "Loki的助理" CACHE STRING "App display name")
 set(LOKI_APP_URL_SCHEME "loki-assistant" CACHE STRING "App URL scheme")
 option(LOKI_APP_REGISTER_MAILTO "Register the system mailto URL scheme" ON)
 if(LOKI_APP_REGISTER_MAILTO)
@@ -65,7 +66,7 @@ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/Sources" PREFIX Sources FILES ${L
 set_target_properties(LokiAssistant PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
     MACOSX_BUNDLE_GUI_IDENTIFIER "${LOKI_APP_BUNDLE_IDENTIFIER}"
-    MACOSX_BUNDLE_BUNDLE_NAME "Loki的助理"
+    MACOSX_BUNDLE_BUNDLE_NAME "${LOKI_APP_DISPLAY_NAME}"
     MACOSX_BUNDLE_ICON_FILE "AppIcon"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
     MACOSX_BUNDLE_BUNDLE_VERSION "2"
@@ -89,6 +90,7 @@ if(BUILD_TESTING)
     xctest_add_bundle(LokiAssistantTests LokiAssistant
         Tests/ServiceStatusTests.swift
         Tests/MenuStatusDotTests.swift
+        Tests/MailSyncWindowTests.swift
         Tests/ServiceSettingsTests.swift
         Tests/CenterLogTests.swift
         Tests/SystemNotificationTests.swift

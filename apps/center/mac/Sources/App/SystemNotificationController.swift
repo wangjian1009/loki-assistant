@@ -146,14 +146,14 @@ final class CenterAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
         instanceLock = CenterInstanceLock()
         if instanceLock == nil {
-            let existing = NSRunningApplication.runningApplications(
-                withBundleIdentifier: Bundle.main.bundleIdentifier ?? "cc.loki-assistant.center"
-            ).first { $0.processIdentifier != getpid() }
-            existing?.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
             DispatchQueue.main.async {
                 NSApplication.shared.terminate(nil)
             }
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        false
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

@@ -1,5 +1,6 @@
 ;;; loki-assistant-mail.el --- 邮件服务的 Emacs 入口 -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
 (require 'json)
 (require 'seq)
 (require 'subr-x)
@@ -21,6 +22,7 @@
 (defvar mu4e--started)
 (defvar mu4e--server-indexing)
 (defvar mu4e--server-process)
+(defvar mu4e-hide-index-messages)
 (defvar mu4e-index-update-status)
 (defvar mu4e-info-func)
 (defvar mu4e-remove-func)
@@ -33,40 +35,97 @@
   :type 'character
   :group 'loki-assistant)
 
-(defvar loki-assistant-mail--index-request nil
-  "最近一次 services 索引请求的标识、mu 进程及发起前的完成状态。")
+(cl-defstruct loki-assistant-mail--index-job
+  id process deadline timer started)
 
-(defvar loki-assistant-mail--index-info nil
-  "最近一次 services 索引请求收到的 mu 进度消息。")
+(defvar loki-assistant-mail--index-job nil
+  "当前由 services 委托给 Emacs 的索引任务。")
 
 (defvar loki-assistant-mail--refresh-timer nil
   "合并连续邮件变更回执的定时器。")
 
-(defun loki-assistant-mail-database (&optional index-info)
-  "返回当前 mu4e 数据库位置和 mu 可执行文件的 JSON。
+(defun loki-assistant-mail--database (&optional index-info)
+  "返回当前 mu4e 的数据库位置和 mu 可执行文件。
 INDEX-INFO 非空时附带索引计数。"
   (let ((database (mu4e-database-path)))
-    (json-serialize `((program . ,(car (process-command mu4e--server-process)))
-                      (home . ,(directory-file-name (file-name-directory database)))
-                      ,@(when index-info
-                          `((index . ,(loki-assistant-mail--index-counts index-info))))))))
+    `((program . ,(car (process-command mu4e--server-process)))
+      (home . ,(directory-file-name (file-name-directory database)))
+      ,@(when (and (natnump (plist-get index-info :checked))
+                   (natnump (plist-get index-info :updated)))
+          `((index . ,(loki-assistant-mail--index-counts index-info)))))))
+
+(defun loki-assistant-mail--mu4e-running-p ()
+  "判断当前 Emacs 是否持有正在运行的 mu 进程。"
+  (and (fboundp 'mu4e-running-p) (mu4e-running-p)))
+
+(defun loki-assistant-mail-database-for-refresh ()
+  "返回可用于刷新未读数的 mu4e 数据库。"
+  (cond
+   ((not (loki-assistant-mail--mu4e-running-p)) 'unavailable)
+   (mu4e--server-indexing 'busy)
+   (t (json-serialize (loki-assistant-mail--database)))))
 
 (defun loki-assistant-mail--index-counts (info)
   "将 mu 索引回执 INFO 中的计数转为 JSON 对象可用的 alist。"
   `((checked . ,(plist-get info :checked))
     (updated . ,(plist-get info :updated))
-    ,@(when-let* ((removed (plist-get info :cleaned-up)))
-        `((cleaned_up . ,removed)))))
+    ,@(let ((removed (plist-get info :cleaned-up)))
+        (when (natnump removed)
+          `((cleaned_up . ,removed))))))
 
-(defun loki-assistant-mail--observe-index (info)
-  "记录当前 services 索引对应的 mu 回执 INFO。"
-  (pcase-let ((`(,_ ,process ,previous-status) loki-assistant-mail--index-request))
-    (when (and process (eq process mu4e--server-process)
-               (eq previous-status mu4e-index-update-status)
-               (eq (plist-get info :info) 'index)
-               (numberp (plist-get info :checked))
-               (numberp (plist-get info :updated)))
-      (setq loki-assistant-mail--index-info info))))
+(defun loki-assistant-mail--finish-index (job result)
+  "结束 JOB，并将最终 RESULT 异步回报给 services。"
+  (when (eq job loki-assistant-mail--index-job)
+    (when-let* ((timer (loki-assistant-mail--index-job-timer job)))
+      (cancel-timer timer))
+    (setq loki-assistant-mail--index-job nil)
+    (require 'loki-assistant)
+    (loki-assistant-request
+     "POST" (format "/mail/index/result/%s" (loki-assistant-mail--index-job-id job))
+     :body result :timeout 5
+     :callback
+     (lambda (response)
+       (unless (or (plist-get response :ok)
+                   (equal (plist-get response :error-code) "mail-index-request-not-found"))
+         (message "邮件索引结果回报失败：%s" (plist-get response :error-message)))))))
+
+(defun loki-assistant-mail--fail-index (job reason)
+  "结束 JOB，并回报失败原因 REASON。"
+  (loki-assistant-mail--finish-index job `((status . "failed") (error . ,reason))))
+
+(defun loki-assistant-mail--handle-index-reply (handler info)
+  "静默处理 services 索引的 INFO，完成时发送最终结果。"
+  (let ((job loki-assistant-mail--index-job))
+    (if (and job (loki-assistant-mail--index-job-started job)
+             (eq (loki-assistant-mail--index-job-process job) mu4e--server-process)
+             (eq (plist-get info :info) 'index))
+        (let ((mu4e-hide-index-messages t))
+          (unwind-protect
+              (funcall handler info)
+            (when (eq (plist-get info :status) 'complete)
+              (condition-case err
+                  (loki-assistant-mail--finish-index
+                   job `((status . "completed")
+                         (database . ,(loki-assistant-mail--database info))))
+                (error (loki-assistant-mail--fail-index job (error-message-string err)))))))
+      (funcall handler info))))
+
+(defun loki-assistant-mail--advance-index (job)
+  "在 mu4e 空闲时发起 JOB，同时监控超时与进程退出。"
+  (when (eq job loki-assistant-mail--index-job)
+    (cond
+     ((not (and (loki-assistant-mail--mu4e-running-p)
+                (eq (loki-assistant-mail--index-job-process job) mu4e--server-process)))
+      (loki-assistant-mail--fail-index job "mu4e 进程已退出，无法确认索引结果。"))
+     ((>= (float-time) (loki-assistant-mail--index-job-deadline job))
+      (loki-assistant-mail--fail-index job "等待 mu4e 索引完成超时。"))
+     ((and (not (loki-assistant-mail--index-job-started job))
+           (not mu4e--server-indexing))
+      (setf (loki-assistant-mail--index-job-started job) t)
+      (condition-case err
+          (let ((mu4e-hide-index-messages t))
+            (mu4e-update-index-nonlazy))
+        (error (loki-assistant-mail--fail-index job (error-message-string err))))))))
 
 (defun loki-assistant-mail--request-refresh ()
   "异步通知 services 刷新本机邮件状态。"
@@ -95,8 +154,8 @@ INDEX-INFO 非空时附带索引计数。"
 (defun loki-assistant-mail--observe-replies ()
   "在 mu4e 的邮件操作回执处理完成后安排刷新。"
   (when (default-value 'mu4e-info-func)
-    (add-function :before (default-value 'mu4e-info-func)
-                  #'loki-assistant-mail--observe-index))
+    (add-function :around (default-value 'mu4e-info-func)
+                  #'loki-assistant-mail--handle-index-reply))
   ;; 打开邮件的回执也可能包含打开时自动标记已读的结果。
   (dolist (handler '(mu4e-update-func mu4e-remove-func mu4e-view-func))
     (when (default-value handler)
@@ -108,33 +167,19 @@ INDEX-INFO 非空时附带索引计数。"
   (loki-assistant-mail--observe-replies)
   (add-hook 'mu4e-index-updated-hook #'loki-assistant-mail--index-updated))
 
-(defun loki-assistant-mail-index (request-id check-only)
-  "在已有的 mu4e 进程中发起或查询 REQUEST-ID 对应的索引更新。
-CHECK-ONLY 非空时只查询已发起的索引。"
-  (pcase-let ((`(,id ,process ,previous-status) loki-assistant-mail--index-request))
-    (cond
-     ((equal request-id id)
-      (unless (and (eq process mu4e--server-process) (mu4e-running-p))
-        (error "mu4e 进程已退出，无法确认索引结果"))
-      (if (eq previous-status mu4e-index-update-status)
-          'running
-        (loki-assistant-mail-database mu4e-index-update-status)))
-     (check-only (error "找不到此前发起的 mu4e 索引请求"))
-     (mu4e--server-indexing 'busy)
-     (t
-      (let ((status mu4e-index-update-status))
-        (setq loki-assistant-mail--index-info nil)
-        (mu4e-update-index-nonlazy)
-        (setq loki-assistant-mail--index-request (list request-id mu4e--server-process status))
-        'running)))))
-
-(defun loki-assistant-mail-index-progress (request-id check-only)
-  "发起或查询 REQUEST-ID，并在运行期间返回已收到的索引计数。
-CHECK-ONLY 非空时只查询已发起的索引。"
-  (let ((result (loki-assistant-mail-index request-id check-only)))
-    (if (and (eq result 'running) loki-assistant-mail--index-info)
-        (json-serialize (loki-assistant-mail--index-counts loki-assistant-mail--index-info))
-      result)))
+(defun loki-assistant-mail-start-index (request-id timeout)
+  "接受 services 的 REQUEST-ID，在 TIMEOUT 秒内等待、索引并回报结果。"
+  (cond
+   ((not (loki-assistant-mail--mu4e-running-p)) 'unavailable)
+   (loki-assistant-mail--index-job (error "Emacs 已接收一轮邮件索引请求"))
+   (t
+    (let ((job (make-loki-assistant-mail--index-job
+                :id request-id :process mu4e--server-process
+                :deadline (+ (float-time) timeout))))
+      (setq loki-assistant-mail--index-job job)
+      (setf (loki-assistant-mail--index-job-timer job)
+            (run-at-time 0 0.25 #'loki-assistant-mail--advance-index job))
+      'accepted))))
 
 (defun loki-assistant-mail--focus ()
   "选中可用于显示邮件的图形 frame。"

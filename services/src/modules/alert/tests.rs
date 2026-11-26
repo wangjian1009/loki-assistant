@@ -29,6 +29,39 @@ impl NotificationLauncher for BlockingLauncher {
 }
 
 #[tokio::test]
+async fn silent_alert_is_visible_without_triggering_notification() {
+    let (sent, mut notifications) = mpsc::unbounded_channel();
+    let notification = Arc::new(NotificationService::with_launcher(
+        Arc::new(BlockingLauncher(sent)),
+        Duration::from_secs(30),
+    ));
+    let status = Arc::new(StatusService::new());
+    let alerts = AlertService::new(status.clone(), notification);
+    let alert = alerts
+        .publish_silent(
+            "mail.sync",
+            AlertInput {
+                app: Some("mail".into()),
+                title: "邮箱同步失败".into(),
+                body: Some("同步超时。".into()),
+                callback_url: Some("/mail/config/open".into()),
+                level: AlertLevel::Error,
+            },
+        )
+        .await
+        .unwrap();
+    let (code, current) =
+        request(&status.router(), "GET", "/status/alert/active", Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(current["value"], json!([alert]));
+    assert!(
+        timeout(Duration::from_millis(100), notifications.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn rust_and_http_share_alert_state_and_trigger_background_notifications() {
     let (sent, mut notifications) = mpsc::unbounded_channel();
     let notification = Arc::new(NotificationService::with_launcher(

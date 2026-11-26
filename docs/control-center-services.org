@@ -841,13 +841,13 @@ Codex 入口依次读取原生请求头 ~thread-id~ 、 ~session-id~ 和 ~sessio
 
 ~mail/enabled~ 默认为 ~false~ 。开启后立即执行首次同步，每轮结束五分钟后再次执行。关闭后当前轮次结束即停止定时任务。~mail/mbsync_config~ 默认为 ~~/.mbsyncrc~ ，其中的 ~loki-auto~ 组决定要同步的邮箱和文件夹。
 
-services 每轮先运行 ~mbsync~ 。部分邮箱同步失败时，仍索引已下载的邮件。services 通过 ~emacsclient~ 连接 ~emacs/socket_name~ 指定的已有 Emacs server。若该实例的 ~mu4e~ 正在运行，则复用它持有数据库的 ~mu server~ 更新索引。若已有索引任务在运行，则等待该任务结束后再发起更新。索引完成后，对同一数据库执行只读的 ~mu find~ 来刷新未读数。
+services 每轮先运行 ~mbsync~ 。部分邮箱同步失败时，仍索引已下载的邮件。services 通过 ~emacsclient~ 连接 ~emacs/socket_name~ 指定的已有 Emacs server，调用一次 ~loki-assistant-mail-start-index~ 。Emacs 负责等待已有索引、发起本轮更新和处理完成、超时或进程退出。services 收到完成回执后，对同一数据库执行只读的 ~mu find~ 刷新未读数。
 
-目标 Emacs server 不可连接或 ~mu4e~ 未运行时，services 直接运行 ~mu index~ 。自动同步只连接已有 Emacs server。若 Emacs 已接手但无法确认索引完成，本轮保留最近一次的未读状态。命令行 ~mu~ 遇到数据库锁冲突时异步退避，最多重试四次。
+目标 Emacs server 不可连接或 ~mu4e~ 未运行时，services 直接运行 ~mu index~ 。自动同步只连接已有 Emacs server。Emacs 接受后通过本机 ~POST /mail/index/result/{id}~ 回报终态。成功回报 ~status: completed~ 和 ~database~ ，其中包含 ~program~ 、 ~home~ 及可选的 ~index~ 统计。失败回报 ~status: failed~ 和 ~error~ 。services 只接受当前待处理请求 ID 的一次回执。无法确认索引完成时，本轮保留最近一次的未读状态。命令行 ~mu~ 遇到数据库锁冲突时异步退避，最多重试四次。
 
-services 汇总同轮的同步、索引和未读查询错误，通过告警模块发布 ~mail.sync~ 。命令失败时从 stderr 提取已知诊断，例如 IMAP 主机与端口、DNS、连接超时、TLS、认证、配置行号和本地索引错误。告警使用提取后的诊断，避免输出包含凭据的原始命令错误。整轮成功或关闭自动同步后清理告警。点击告警通知可打开 ~mbsync~ 配置。
+services 汇总同轮的同步、索引和未读查询错误，通过告警模块发布 ~mail.sync~ 供托盘菜单查看。命令失败时从 stderr 提取已知诊断，例如 IMAP 主机与端口、DNS、连接超时、TLS、认证、配置行号和本地索引错误。告警使用提取后的诊断，避免输出包含凭据的原始命令错误。整轮成功或关闭自动同步后清理告警。点击托盘告警可打开 ~mbsync~ 配置。
 
-手动或定时同步完成索引后，以及 Emacs 请求刷新时，services 都通过同一刷新操作查询全局收件箱中未读且未标记删除的邮件，按 Message-ID 去重。首次成功查询建立基线，随后每封新匹配的邮件发送一条包含主题的系统通知，同一进程对每个 Message-ID 只通知一次。点击通知后由 services 通过 Emacs gateway 打开对应邮件。新邮件和同步失败通知使用应用标识 ~mail~ 。
+手动或定时同步完成索引后，以及 Emacs 请求刷新时，services 都通过同一刷新操作查询全局收件箱中未读且未标记删除的邮件，按 Message-ID 去重。首次成功查询建立基线，随后每封新匹配的邮件发送一条包含主题的系统通知，同一进程对每个 Message-ID 只通知一次。点击通知后由 services 通过 Emacs gateway 打开对应邮件。新邮件通知使用应用标识 ~mail~ 。
 
 同一次查询通过共享状态模块发布 ~mail/unread_count~ 。本机和已绑定设备可通过 ~GET /status/mail/unread_count~ 读取该整数，也可从 ~GET /status~ 的快照读取。索引暂不可用时，状态保留最近一次成功值，首次成功前该状态项缺省。
 
@@ -857,9 +857,9 @@ mu4e 在查看邮件、更新标记、移动或删除邮件完成后，异步调
 
 本机 ~POST /mail/sync~ 接受空请求体，返回 ~202~ 和 ~{"api_version":"1","id":"<uuid>"}~ 。关闭自动同步时仍可手动触发。已排队或开始的同步与手动请求合并，返回同一个任务 ID。完成一轮同步后，已启用的定时任务从该轮结束起重新计时。
 
-本机 ~GET /mail/sync/{id}~ 返回 ~200~ 和包含 ~api_version~ 、 ~sync~ 的 JSON。~sync~ 包含 ~id~ 、 ~phase~ 、 ~messages~ 和 ~error~ 。~phase~ 依次为 ~queued~ 、 ~downloading~ 、 ~indexing~ 、 ~refreshing~ ，最终为 ~completed~ 或 ~failed~ 。失败时 ~error~ 为诊断文本，其余时候为 ~null~ 。~messages~ 按收到顺序保留最近 64 条索引消息。直接执行 ~mu index~ 时显示 stdout 和 stderr 的输出行。复用 ~mu4e~ 时显示 ~mu server~ 回报的检查、更新和清理计数。进度条按阶段推进。
+本机 ~GET /mail/sync/{id}~ 返回 ~200~ 和包含 ~api_version~ 、 ~sync~ 的 JSON。~sync~ 包含 ~id~ 、 ~phase~ 、 ~messages~ 和 ~error~ 。~phase~ 依次为 ~queued~ 、 ~downloading~ 、 ~indexing~ 、 ~refreshing~ ，最终为 ~completed~ 或 ~failed~ 。失败时 ~error~ 为诊断文本，其余时候为 ~null~ 。~messages~ 按收到顺序保留最近 64 条索引消息。直接执行 ~mu index~ 时实时显示 stdout 和 stderr 的输出行。复用 ~mu4e~ 时在索引完成后显示检查、更新和清理计数。进度条按阶段推进。
 
-services 在内存保留当前轮次和最近八轮结果。关闭进度窗口后，已受理的同步继续运行。未知或已清理的任务返回 ~404 mail-sync-not-found~ 。
+services 在内存保留当前轮次和最近八轮结果。托盘仅在点击「立即同步邮件」时前置进度窗口。定时同步及 Loki 发起的 mu4e 索引在后台运行。关闭进度窗口后，已受理的同步继续运行。未知或已清理的任务返回 ~404 mail-sync-not-found~ 。
 
 ** 邮件配置与草稿
 

@@ -11,11 +11,38 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::MailService;
+use super::{MailService, sync::IndexResult};
 use crate::{
     http::error::{API_VERSION, ErrorSource, response},
     modules::emacs::error_response,
 };
+
+#[loki_api(
+    module = "mail",
+    mount = "Arc<MailService>",
+    id = "index-result",
+    method = "POST",
+    path = "/mail/index/result/{id}",
+    summary = "接收 Emacs 邮件索引结果",
+    description = "接收已发起的索引任务的最终结果。"
+)]
+async fn index_result(
+    State(service): State<Arc<MailService>>,
+    Path(id): Path<String>,
+    result: Result<Json<IndexResult>, JsonRejection>,
+) -> Result<Json<Value>, Response> {
+    let id = Uuid::parse_str(&id).map_err(|_| invalid("邮件索引请求 ID 无效。"))?;
+    let Json(result) = result.map_err(|_| invalid("邮件索引结果无效。"))?;
+    if !service.sync_progress.receive_index_result(id, result).await {
+        return Err(response(
+            StatusCode::NOT_FOUND,
+            ErrorSource::Business,
+            "mail-index-request-not-found",
+            "找不到待接收结果的邮件索引请求。",
+        ));
+    }
+    Ok(Json(json!({"api_version": API_VERSION})))
+}
 
 #[loki_api(
     module = "mail",

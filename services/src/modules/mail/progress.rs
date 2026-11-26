@@ -2,10 +2,12 @@ use std::{collections::VecDeque, sync::Arc};
 
 use futures_util::FutureExt;
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use uuid::Uuid;
 
 use crate::process::Process;
+
+use super::sync::IndexResult;
 
 const RECENT_RUNS: usize = 8;
 const RECENT_MESSAGES: usize = 64;
@@ -33,6 +35,7 @@ pub(super) struct Snapshot {
 struct Runs {
     active: Option<Snapshot>,
     recent: VecDeque<Snapshot>,
+    index_reply: Option<(Uuid, oneshot::Sender<IndexResult>)>,
 }
 
 impl Runs {
@@ -103,6 +106,7 @@ impl SyncProgress {
     pub(super) async fn finish(&self, error: Option<String>) {
         self.runs
             .call(move |runs| {
+                runs.index_reply = None;
                 let mut run = runs.active.take().expect("同步任务已开始");
                 run.phase = if error.is_some() {
                     Phase::Failed
@@ -116,6 +120,32 @@ impl SyncProgress {
                 runs.recent.push_front(run);
             })
             .await;
+    }
+
+    pub(super) async fn expect_index_result(&self, id: Uuid) -> oneshot::Receiver<IndexResult> {
+        let (sender, receiver) = oneshot::channel();
+        self.runs
+            .call(move |runs| runs.index_reply = Some((id, sender)))
+            .await;
+        receiver
+    }
+
+    pub(super) async fn receive_index_result(&self, id: Uuid, result: IndexResult) -> bool {
+        self.runs
+            .call(move |runs| {
+                if runs
+                    .index_reply
+                    .as_ref()
+                    .is_some_and(|(expected, _)| *expected == id)
+                {
+                    return runs
+                        .index_reply
+                        .take()
+                        .is_some_and(|(_, sender)| sender.send(result).is_ok());
+                }
+                false
+            })
+            .await
     }
 
     pub(super) async fn snapshot(&self, id: Uuid) -> Option<Snapshot> {
