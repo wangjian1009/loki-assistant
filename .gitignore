@@ -11,14 +11,15 @@ xcuserdata/
 *.elc
 
 # HarmonyOS build outputs
-harmony/.hvigor/
-harmony/.signing/
-harmony/build/
-harmony/entry/build/
-harmony/oh_modules/
-harmony/entry/oh_modules/
-harmony/entry/libs/
-harmony/entry/src/main/rust/target/
+harmony/*/.hvigor/
+harmony/*/.signing/
+harmony/*/BuildProfile.ets
+harmony/*/build/
+harmony/*/entry/build/
+harmony/*/oh_modules/
+harmony/*/entry/oh_modules/
+harmony/*/entry/libs/
+harmony/*/entry/src/main/rust/target/
 
 # Chrome extension build output
 /dist/chrome-plugin/

@@ -1,0 +1,113 @@
+#+TITLE: Loki Assistant HarmonyOS 手机应用
+
+* 项目说明
+
+这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS，Rust/NAPI 提供 iroh 设备通信。首页显示当前电脑的连接、设备信息、未读消息和邮件同步进度。左侧菜单提供当前设备、设备管理和设置。跨设备同步与后台常驻仍在规划中。
+
+桌面和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。桌面使用系统裁切的分层图标，启动窗口使用静态 PNG。根目录 ~make export-icons~ 将资源导出到 ~AppScope/resources/base/media/~ ，构建直接使用仓库中的导出资源。 [[file:../../docs/icon-design.org][图标设计]]
+
+* 设备管理
+
+点击顶部的菜单按钮展开左侧菜单。设备信息卡显示选中电脑的名称和连接状态。点击状态行可在同一张卡片内展开或收起详情，查看最近检查时间、设备类型、绑定时间和设备标识。没有当前设备时，可点击“前往设备管理”添加电脑或选择已有电脑。设计稿见 [[file:../../design/harmony/device-management.fig][HarmonyOS 设备管理]]。
+
+在当前设备页顶部下拉并松手，可立即为选中电脑重新订阅状态。刷新面板监听独立的刷新事件，在「当前设备」标题下方显示同步进度和结果。成功状态显示 1 秒，失败状态显示 2 秒，随后自动收起。
+
+首页默认依次排列设备信息、邮件收件箱和 Slack 新消息。电脑在线时，服务代理通过 ~GET /status~ 的 SSE 流同步状态和后续变更。邮件控件显示收件箱未读总数和最多 20 封邮件的主题，Slack 控件显示最多 20 个未读会话的最新消息摘要。两个列表默认各显示前两项。
+
+打开「更多 → 编辑」。长按后上下拖动可移动整个面板，在应用启动器内长按后左右拖动可移动单个应用。左滑显示「删除」，点击后从当前页面隐藏该项。页面底部的加号用于恢复面板，启动器内的加号用于恢复应用入口。有可恢复的项目时，各自显示加号。顺序和隐藏状态自动保存，点击「完成」退出编辑。
+
+邮件收件箱的「同步」按钮与 Mac 托盘使用同一个 ~POST /mail/sync~ 接口。手机优先订阅 SSE，实时显示任务阶段、近期输出和错误。收到普通 JSON 响应或邮件事件流中断后，手机从共享状态订阅读取任务进度。同步完成后更新未读邮件。
+
+在电脑的 Emacs 设备管理界面点击“新增设备”，再进入手机的“设备管理”，点击底部“扫码添加设备”。扫码支持相机和相册。设备管理会标记当前设备，也可对其他电脑点击“设为当前设备”。切换会停止旧电脑请求，之后的请求发往新选中的电脑。手机重启后恢复上次选中的电脑。
+
+设备页面监听 Rust 服务代理。收到认证状态快照后显示在线，手机到 relay 或电脑的连接断开、状态流中断时显示离线。代理会重新订阅并同步新快照。“绑定中”和“绑定失败”显示在当前设备的状态卡片和设备管理中。切到后台后解除页面监听。绑定失败时，可在设备管理查看原因、删除失败记录并重新扫码。删除当前设备会清除 Network 目标，电脑端授权由电脑的设备管理界面处理。
+
+从左侧菜单打开“设置”可修改手机名称，下一次扫码绑定时会把名称与 ~device_type: mobile~ 上报给电脑。Mac 上的 services 使用系统设置中的电脑名称，类型为 ~computer~ 。手机绑定后通过 ~GET /status~ 取得名称和类型。
+
+扫码后应用将电脑配置设置到 Network，由 Network 自动绑定，不再调用独立绑定接口。电脑二维码有效期为 300 秒，成功绑定后立即从有效队列移除；再次使用同一二维码提示过期。绑定成功后获得 token，除内部绑定握手外，所有远程请求都必须校验身份和 token。失败结果保存在 Service，界面提示删除后扫描新二维码，不保留待确认或重试恢复状态。
+
+手机随机身份、电脑配置和协议签发的凭据保存在应用私有目录的 ~devices.json~ ，使用 ~0600~ 权限和原子替换；成功或失败后清除一次性邀请，显示数据不包含凭据。协议见 [[file:../../docs/control-center-services.org::*扫码绑定][扫码绑定]]。
+
+手机应用层 Application 管理多台电脑、名称、目标选择和持久化；Rust Workspace 只构造唯一 Network，不提供 devices 管理模块。Network 只持有当前一个 Service，绑定后可获取完整配置，由应用保存，下次启动重新设置到 Network 即可在请求时恢复连接。旧记录缺少新协议 token 时保留手机身份并提示重新扫码。
+
+邮件和 Slack 的界面组件分别位于 ~ets/panels/mail~ 和 ~ets/panels/slack~ 。请求、响应和事件类型与服务代理由 [[file:../../library/service-proxy/Cargo.toml][loki-service-proxy]] 定义。
+
+ArkTS 通过原生 ~Workspace~ 获取 ~Network~ 、 ~Mail~ 和 ~Slack~ 对象。Rust 宏生成 NAPI 导出和方法声明，绑定转换参数与返回值并转发回调。邮件和 Slack 卡片分别向各自的 Rust 对象订阅状态。
+
+通用调试接口 ~Network.request()~ 接收 ~ServiceRequest~ 、 ~RequestOptions~ 以及成功和错误回调。错误直接使用 ~ResponsError~ Union，分别表示未设置、未绑定、网络失败、取消、Services 拒绝与参数错误；各分支独立定义原因。Workspace 停止时取消请求并等待回调，不删除已保存绑定。接口、分发与生命周期见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
+
+* 应用入口
+
+「当前设备」页的「应用启动器」面板提供个人健康、咖啡管理和 AI 远程对话。三个入口随面板一起排序，电脑离线时也可使用。点击入口打开只有标题的独立窗口。三个窗口可分别启动和返回，共用手机助手的安装包和进程。分屏和浮窗的可用性由设备窗口模式决定。
+
+在入口上长按并选择「添加到桌面」，可向系统申请添加占一个图标位置的快捷方式。手机的 1×1 服务卡片只支持锁屏，桌面一格入口使用系统快捷方式。系统确认后即可从桌面直达各应用。 [[https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/arkts-ui-widget-configuration][卡片尺寸支持表]] [[https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/store-productviewmanager][桌面快捷方式接口]]
+
+* 构建与运行
+
+工程依赖 DevEco Studio 提供的 Node.js、OHPM、Hvigor 和 HarmonyOS SDK，以及 Rust 工具链和 ~aarch64-unknown-linux-ohos~ target。原生库当前构建 ARM64 版本。默认工具路径为：
+
+- ~/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw~
+- ~/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc~
+
+在 DevEco Studio 中打开 ~harmony/assistant/~ 。以下命令在该目录执行。
+
+#+begin_src sh
+make check-sdk   # 检查 SDK 安装
+make deps        # 检查 SDK 并安装工程依赖
+make build       # 构建 Debug HAP，使用 OrgTasksDebug 调试签名
+make test        # 检查并测试应用层与 Rust 网络模块
+make devices     # 查看 hdc 设备
+make install     # 安装到已连接设备
+make run         # 启动手机应用
+make deploy      # 检查真机，构建、安装并启动
+#+end_src
+
+~make build~ 自动检查 SDK 目录及 ~sdk-pkg.json~ ，执行工程和 entry 模块的 OHPM 依赖安装，使用 Rust 和 DevEco NDK 编译设备通信库，再通过 Hvigor 的 ~default@PackingCheck~ 和 ~default@CollectDebugSymbol~ 打包。构建显式指定 ~module=entry@default~ 、 ~product=default~ 、 ~buildMode=debug~ 和 ~debuggable=true~ ，随后由 ~scripts/sign-hap.cjs~ 使用 ~signing/config.json~ 指定的材料独立签名，生成 ~entry/build/default/outputs/default/entry-default-signed.hap~ 。安装入口只使用已签名产物，真机还需已授权的 ~hdc~ 连接。根目录 ~make harmony-test~ 执行手机应用层测试与 Rust 检查；~make services-test~ 同时验证手机入口与 services 的真实 relay 握手。
+
+~make install~ 和 ~make run~ 同样通过设备选择脚本自动选择唯一真机；也可用 ~HDC_TARGET=<设备 ID>~ 显式选择已连接的模拟器。根目录提供 ~make harmony-deps~ 和 ~make harmony-check-sdk~ 对应依赖安装与 SDK 检查。
+
+~make deploy~ 在构建前检查真机，自动选中唯一已连接的真机；多台真机时通过 ~HDC_TARGET=<设备 ID>~ 指定。模拟器、离线或未授权设备不能作为部署目标。确认设备后依次完成构建签名、安装和启动，任一步失败即停止；并行执行 make 时也保持此顺序。根目录的 ~make deploy~ 和 ~make harmony-deploy~ 均调用此入口。
+
+* 启动页面与导航测试
+
+~make run PAGE=Devices~ 直接打开设备管理，根目录使用 ~make harmony-run PAGE=Devices~ 。Ability 从 ~Want.parameters.page~ 读取 ~Index~ 、 ~Devices~ 、 ~Settings~ 或用逗号分隔的页面路径。路径按从根到末级的顺序传入，例如 ~make run PAGE=Index,Settings~ 。导航管理器保存完整路径，只加载末级页面，按系统返回时再加载上一级。单独打开设备管理或设置后可返回首页。冷启动未指定有效路径时进入首页。应用已经运行时可用同一个参数设置路径，缺省、无效值或正在编辑手机名称时保留当前页面。
+
+Debug 构建可通过 ~Want.parameters.httpApiEnabled~ 临时启停 Rust Workspace 的 HTTP 服务，监听设备的 ~127.0.0.1:8787~ 。普通启动默认关闭，Workspace 停止时关闭监听和在途请求。可与 ~page~ 一起传入，也支持参考实现中的 ~httpApiPage~ ，其值只在显式开启调试服务时读取。
+
+启用调试 HTTP 时，HarmonyOS 在初始化代码中调用 ~Workspace.registerHttpRoute(path, methods, handler)~ ，传入导航路径、允许的方法和处理函数，再启动监听。Rust 根据注册信息分发请求，处理函数通过 ~Workspace.respondHttp~ 返回响应。
+
+以下命令在本目录运行，使用 ~make devices~ 查找设备并设置 ~TEST_DEVICE~ 。
+
+#+begin_src sh
+HDC_BIN=/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc
+make run HDC_TARGET="$TEST_DEVICE" PAGE=Index,Settings HTTP_API_ENABLED=true
+"$HDC_BIN" -t "$TEST_DEVICE" fport tcp:18787 tcp:8787
+
+curl --fail-with-body http://127.0.0.1:18787/api/v1/ui/navigation
+curl --fail-with-body -X PUT http://127.0.0.1:18787/api/v1/ui/navigation \
+  -H 'Content-Type: application/json' \
+  -d '{"pages":[{"url":"Index"},{"url":"Settings"}]}'
+
+curl --fail-with-body http://127.0.0.1:18787/service/network/session
+curl --fail-with-body -X POST http://127.0.0.1:18787/api/v1/device/refresh
+
+make run HDC_TARGET="$TEST_DEVICE" HTTP_API_ENABLED=false
+"$HDC_BIN" -t "$TEST_DEVICE" fport rm tcp:18787 tcp:8787
+#+end_src
+
+GET 返回从根到当前页的完整 ~pages~ 。PUT 接收相同结构并设置页面路径，每一项的 ~url~ 填写页面名称。与启动参数一样，PUT 只加载末级页面。窗口未就绪返回 HTTP 503，跳转进行中或设置页正在编辑名称时 PUT 返回 HTTP 409，无效页面路径返回 HTTP 400。
+
+~GET /service/network/session~ 去掉 ~/service~ 前缀后，通过当前 Network 向选中的电脑发起 ~GET /network/session~ 。其他查询路径按同一规则映射，保留查询参数的顺序和重复项。电脑按已有绑定和接口访问范围处理请求。成功时使用电脑返回的 HTTP 状态码和 JSON 响应体，失败时返回 ~ResponsError~ JSON。电脑拒绝保留其状态码，未选择电脑或请求已取消返回 503，未绑定返回 403，网络超时返回 504，其他通信错误返回 502。协议见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
+
+~POST /api/v1/device/refresh~ 请求立即刷新当前选中的电脑，接受请求时返回 HTTP 202。当前设备页的刷新面板通过刷新事件显示进度与结果。调试 HTTP 服务由 Rust 的 ~loki-service-proxy~ 提供，Workspace 负责启停。
+
+* 调试签名
+
+HarmonyOS 包名为 ~cc.github.wangjian1009.assistant~ 。项目复用 ~OrgTasksDebug~ 调试证书，配套的调试 Profile 绑定该包名及后台登记的手机，有效期至 2027-10-11。
+
+- ~signing/OrgTasksDebug.cer~ ：公共证书链，纳入版本管理。
+- ~signing/LokiAssistantDebug.p7b~ ：Loki 专用调试 Profile，纳入版本管理；增加调试设备时需在华为后台更新并重新下载。
+- ~signing/config.json~ ：证书、Profile、私钥路径、keyAlias 和 Keychain 条目名称，纳入版本管理。
+- ~signing/org-tasks.p12~ ：与调试证书配套的密码保护 PKCS#12 密钥库，纳入版本管理。
+
+签名脚本从 macOS Keychain 的 ~org-tasks-signing~ / ~development~ 条目读取密码，通过 stdin 交给 JVM 内的签名工具；密码不写入工程配置或命令行。签名前校验签名材料的有效期、Profile 包名以及证书与私钥是否配套。

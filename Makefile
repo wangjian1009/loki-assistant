@@ -18,6 +18,7 @@ XBLOOM_MANIFEST := $(PROJECT_ROOT)/apps/xbloom/Cargo.toml
 XBLOOM_TARGET := $(PROJECT_ROOT)/apps/xbloom/target
 XBLOOM_APP_DIR ?= $(HOME)/app/xbloom
 XBLOOM_LIBRARY_DIR ?= $(HOME)/library/xbloom
+HARMONY_ASSISTANT_DIR := $(PROJECT_ROOT)/harmony/assistant
 
 .PHONY: emacs-deps emacs-load emacs-test emacs-config emacs-devices chrome-build chrome-test export-icons
 .PHONY: relay-image harmony-test install org-daily-build org-daily-test xbloom-build xbloom-test
@@ -265,39 +266,39 @@ release:
 	"$(CMAKE)" --build "$(RELEASE_BUILD_DIR)" --config Release
 
 harmony-help:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" help
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" help
 
 harmony-deps:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" deps
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" deps
 
 harmony-check-sdk:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" check-sdk
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" check-sdk
 
 harmony-build:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" build
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" build
 
 harmony-test:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" test
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" test
 
 harmony-install:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" install
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" install
 
 harmony-run:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" run
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" run
 
 deploy: harmony-deploy
 
 harmony-deploy:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" deploy
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" deploy
 
 harmony-devices:
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" devices
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" devices
 
 harmony-clean:
 	@if [ -f "$(TEST_BUILD_DIR)/CMakeCache.txt" ]; then \
 	  "$(CMAKE)" --build "$(TEST_BUILD_DIR)" --config "$(CONFIG)" --target clean; \
 	fi
-	$(MAKE) -C "$(PROJECT_ROOT)/harmony" clean
+	$(MAKE) -C "$(HARMONY_ASSISTANT_DIR)" clean
 
 clean:
 	@if [ -f "$(BUILD_DIR)/CMakeCache.txt" ]; then \

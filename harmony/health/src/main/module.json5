@@ -1,0 +1,9 @@
+{
+  "module": {
+    "name": "health",
+    "type": "har",
+    "deviceTypes": [
+      "phone"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/Devices",
+    "pages/Settings",
+    "pages/Health",
+    "pages/Coffee",
+    "pages/AgentViewer"
+  ]
+}

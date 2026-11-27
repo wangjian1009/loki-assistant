@@ -85,7 +85,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     sources = root / "resources" / "icons"
     mac_resources = Path("apps/center/mac/Resources")
-    harmony_media = Path("harmony/AppScope/resources/base/media")
+    harmony_media = Path("harmony/assistant/AppScope/resources/base/media")
     chrome_icons = Path("chrome-plugin/extension/icons")
     with tempfile.TemporaryDirectory(prefix="loki-icon-export-") as temporary:
         staging = Path(temporary)
@@ -93,6 +93,10 @@ def main() -> None:
                                sources / "loki-assistant-menu-v1.svg",
                                sources / "loki-assistant-menu-sleep-v1.svg", staging / mac_resources)
         export_harmony(sources / "loki-assistant-v1.svg", app_png, staging / harmony_media)
+        entry_media = staging / "harmony/assistant/entry/src/main/resources/base/media"
+        entry_media.mkdir(parents=True)
+        for app in ("health", "coffee", "agent-viewer"):
+            render(sources / f"{app}.svg", entry_media / f"{app.replace('-', '_')}_icon.png", 384)
         export_chrome(sources / "loki-assistant-chrome-v1.svg", staging / chrome_icons)
         notifications = staging / mac_resources / "NotificationAppIcons"
         notifications.mkdir()

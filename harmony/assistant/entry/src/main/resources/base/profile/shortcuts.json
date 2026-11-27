@@ -1,0 +1,28 @@
+{
+  "shortcuts": [
+    {
+      "shortcutId": "health",
+      "label": "$string:health_title",
+      "icon": "$media:health_icon",
+      "wants": [
+        { "bundleName": "cc.github.wangjian1009.assistant", "moduleName": "entry", "abilityName": "HealthAbility" }
+      ]
+    },
+    {
+      "shortcutId": "coffee",
+      "label": "$string:coffee_title",
+      "icon": "$media:coffee_icon",
+      "wants": [
+        { "bundleName": "cc.github.wangjian1009.assistant", "moduleName": "entry", "abilityName": "CoffeeAbility" }
+      ]
+    },
+    {
+      "shortcutId": "agent-viewer",
+      "label": "$string:agent_viewer_title",
+      "icon": "$media:agent_viewer_icon",
+      "wants": [
+        { "bundleName": "cc.github.wangjian1009.assistant", "moduleName": "entry", "abilityName": "AgentViewerAbility" }
+      ]
+    }
+  ]
+}

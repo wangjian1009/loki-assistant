@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Loki的助理手机执行中心"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Loki的助理手机执行中心"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Loki的助理"
+    },
+    {
+      "name": "health_title",
+      "value": "个人健康"
+    },
+    {
+      "name": "coffee_title",
+      "value": "咖啡管理"
+    },
+    {
+      "name": "agent_viewer_title",
+      "value": "AI 远程对话"
+    }
+  ]
+}

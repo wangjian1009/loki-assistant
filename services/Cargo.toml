@@ -49,7 +49,7 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 
 [dev-dependencies]
-loki-mobile-network = { path = "../harmony/entry/src/main/rust" }
+loki-mobile-network = { path = "../harmony/assistant/entry/src/main/rust" }
 quircs = "0.10"
 iroh-relay = { version = "=1.4.1", default-features = false, features = ["server"] }
 tokio = { version = "1", features = ["test-util"] }

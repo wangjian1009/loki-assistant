@@ -1,0 +1,14 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Loki Assistant HarmonyOS 手机执行中心",
+  "main": "",
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "liblokiworkspace.so": "file:./src/main/cpp/types/liblokiworkspace",
+    "health": "file:../../health",
+    "coffee": "file:../../coffee",
+    "agent_viewer": "file:../../agent-viewer"
+  }
+}

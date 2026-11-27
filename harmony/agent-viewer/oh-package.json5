@@ -1,0 +1,7 @@
+{
+  "name": "agent_viewer",
+  "version": "1.0.0",
+  "description": "AI 远程对话",
+  "main": "Index.ets",
+  "dependencies": {}
+}

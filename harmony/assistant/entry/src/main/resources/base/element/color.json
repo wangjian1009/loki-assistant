@@ -1,0 +1,12 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "logical_app_start_background",
+      "value": "#111318"
+    }
+  ]
+}

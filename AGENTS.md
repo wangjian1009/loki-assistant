@@ -16,7 +16,7 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 ## 顶层目录职责
 
 - `apps/`：可独立运行的电脑平台客户端应用与命令行程序。
-- `harmony/`：HarmonyOS 手机助手。
+- `harmony/`：HarmonyOS 应用，按应用划分子目录。
 - `library/`：可由多个应用复用的库。
 - `chrome-plugin/`：Chrome Manifest V3 插件，按功能提供浏览器入口。
 - `center/`：预留的应用编排与唤起层。

@@ -4,7 +4,7 @@
 
 Loki Assistant 是个人使用的助理程序，应用中文名称为“Loki的助理”。当前重新设计由 Rust services、macOS 菜单栏入口、Chrome 全文捕获插件和 HarmonyOS 手机执行中心组成。
 
-仓库根目录的 ~apps/~ 存放电脑平台的客户端应用与命令行程序， ~harmony/~ 存放 HarmonyOS 手机助手。
+仓库根目录的 ~apps/~ 存放电脑平台的客户端应用与命令行程序。 ~harmony/~ 按应用划分 HarmonyOS 工程，手机助手位于 ~harmony/assistant/~ 。
 
 * 当前阶段
 
@@ -129,7 +129,7 @@ make emacs-test
 | make harmony-test | 检查并测试 HarmonyOS 应用层与 Rust 网络模块 |
 | make harmony-build | 检查 SDK、安装依赖，构建并使用 OrgTasksDebug 签名 |
 | make harmony-install | 构建并安装 HarmonyOS 手机应用 |
-| make harmony-run | 启动 HarmonyOS 手机应用，可指定 ~PAGE=Index,Settings~ ，调试用法见 [[file:harmony/README.org::*启动页面与导航测试][启动页面与导航测试]] |
+| make harmony-run | 启动 HarmonyOS 手机应用，可指定 ~PAGE=Index,Settings~ ，调试用法见 [[file:harmony/assistant/README.org::*启动页面与导航测试][启动页面与导航测试]] |
 | make deploy | 检查 HarmonyOS 真机，构建、安装并启动 |
 | make harmony-deploy | 同 make deploy |
 | make harmony-devices | 查看 HarmonyOS ~hdc~ 设备 |
@@ -139,7 +139,11 @@ make emacs-test
 * 文档入口
 
 - [[file:apps/center/README.org][Mac 菜单栏入口]]
-- [[file:harmony/README.org][HarmonyOS 手机执行中心]]
+- [[file:harmony/assistant/README.org][HarmonyOS 手机执行中心]]
+- HarmonyOS 应用
+  - [[file:harmony/health/README.org][个人健康]]
+  - [[file:harmony/coffee/README.org][咖啡管理]]
+  - [[file:harmony/agent-viewer/README.org][AI 远程对话]]
 - [[file:chrome-plugin/README.org][Chrome 全文捕获插件]]
 - [[file:docs/icon-design.org][应用图标设计与导出资源]]
 - [[file:services/README.org][控制中心服务层]]

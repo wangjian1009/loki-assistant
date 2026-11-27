@@ -1,0 +1,78 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "EntryAbility",
+    "deviceTypes": [
+      "phone"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET"
+      }
+    ],
+    "abilities": [
+      {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "launchType": "singleton",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:app_layered_icon",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:app_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "metadata": [
+          { "name": "ohos.ability.shortcuts", "resource": "$profile:shortcuts" }
+        ],
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "action.system.home"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "HealthAbility",
+        "srcEntry": "./ets/entryability/HealthAbility.ets",
+        "launchType": "singleton",
+        "label": "$string:health_title",
+        "icon": "$media:health_icon",
+        "startWindowIcon": "$media:health_icon",
+        "startWindowBackground": "$color:logical_app_start_background",
+        "exported": true,
+        "removeMissionAfterTerminate": true
+      },
+      {
+        "name": "CoffeeAbility",
+        "srcEntry": "./ets/entryability/CoffeeAbility.ets",
+        "launchType": "singleton",
+        "label": "$string:coffee_title",
+        "icon": "$media:coffee_icon",
+        "startWindowIcon": "$media:coffee_icon",
+        "startWindowBackground": "$color:logical_app_start_background",
+        "exported": true,
+        "removeMissionAfterTerminate": true
+      },
+      {
+        "name": "AgentViewerAbility",
+        "srcEntry": "./ets/entryability/AgentViewerAbility.ets",
+        "launchType": "singleton",
+        "label": "$string:agent_viewer_title",
+        "icon": "$media:agent_viewer_icon",
+        "startWindowIcon": "$media:agent_viewer_icon",
+        "startWindowBackground": "$color:logical_app_start_background",
+        "exported": true,
+        "removeMissionAfterTerminate": true
+      }
+    ]
+  }
+}

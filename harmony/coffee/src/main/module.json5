@@ -1,0 +1,9 @@
+{
+  "module": {
+    "name": "coffee",
+    "type": "har",
+    "deviceTypes": [
+      "phone"
+    ]
+  }
+}

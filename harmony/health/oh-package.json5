@@ -1,0 +1,7 @@
+{
+  "name": "health",
+  "version": "1.0.0",
+  "description": "个人健康",
+  "main": "Index.ets",
+  "dependencies": {}
+}

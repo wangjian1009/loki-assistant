@@ -1,0 +1,9 @@
+{
+  "module": {
+    "name": "agent_viewer",
+    "type": "har",
+    "deviceTypes": [
+      "phone"
+    ]
+  }
+}
