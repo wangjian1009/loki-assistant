@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::{
     network::{
-        ApiVersion, NetworkReason, Outcome, ResponsError, ServiceRequest, SseEventType, SseUpdate,
+        ApiVersion, CancelledReason, NetworkReason, Outcome, ResponsError, ServiceRequest,
+        SseEventType, SseUpdate,
     },
     service_proxy::{ServiceProxy, ServiceSnapshot, StatusSubscription},
 };
@@ -227,7 +228,7 @@ impl Mail {
                 error: None,
             };
             self.publish(generation, Some(sync.clone()), false, None);
-            return self.poll(generation, sync).await;
+            return self.follow_status(generation, sync).await;
         }
 
         let (done, ended) = oneshot::channel();
@@ -254,7 +255,7 @@ impl Mail {
             .and_then(|activity| activity.sync)
         {
             self.publish(generation, Some(sync.clone()), false, None);
-            return self.poll(generation, sync).await;
+            return self.follow_status(generation, sync).await;
         }
         // POST 可能已经受理。先读取状态中仍在运行的同步任务，避免重复提交。
         if result
@@ -277,39 +278,55 @@ impl Mail {
                     error: None,
                 };
                 self.publish(generation, Some(sync.clone()), false, None);
-                return self.poll(generation, sync).await;
+                return self.follow_status(generation, sync).await;
             }
         }
         result.and(Err(NetworkReason::InvalidResponse.into()))
     }
 
-    async fn poll(&self, generation: u64, mut sync: MailSyncSnapshot) -> Result<(), ResponsError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
-        loop {
-            let snapshot = self.proxy.refresh_status_for(generation).await?;
-            if let Some(error @ ResponsError::NotBound(_)) = snapshot.error {
-                return Err(error);
+    async fn follow_status(
+        &self,
+        generation: u64,
+        mut sync: MailSyncSnapshot,
+    ) -> Result<(), ResponsError> {
+        let mut snapshots = self.proxy.status_updates();
+        let follow = async {
+            while !sync.progress.phase.terminal() {
+                let snapshot = snapshots.borrow_and_update().clone();
+                if snapshot.generation != generation {
+                    return Err(CancelledReason::ServiceChanged.into());
+                }
+                if let Some(error @ ResponsError::NotBound(_)) = snapshot.error {
+                    return Err(error);
+                }
+                if let Some(updated) =
+                    MailActivity::from_snapshot(&snapshot).and_then(|activity| activity.sync)
+                    && updated != sync
+                {
+                    sync = updated;
+                    self.publish(generation, Some(sync.clone()), false, None);
+                    if sync.progress.phase.terminal() {
+                        break;
+                    }
+                }
+                snapshots
+                    .changed()
+                    .await
+                    .map_err(|_| CancelledReason::NetworkClosed)?;
             }
-            if !sync.progress.phase.terminal()
-                && let Some(activity) = MailActivity::from_snapshot(&snapshot)
-                && let Some(updated) = activity.sync
-            {
-                sync = updated;
-                self.publish(generation, Some(sync.clone()), false, None);
-            }
-            if sync.progress.phase.terminal() {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
+            Ok(())
+        };
+        match tokio::time::timeout(Duration::from_secs(300), follow).await {
+            Ok(result) => result,
+            Err(_) => {
                 self.publish(
                     generation,
                     Some(sync),
                     false,
                     Some(NetworkReason::RequestTimeout.into()),
                 );
-                return Ok(());
+                Ok(())
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 

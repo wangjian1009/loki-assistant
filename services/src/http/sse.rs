@@ -1,6 +1,9 @@
 use axum::{
     body::{Body, Bytes},
-    http::header::CONTENT_TYPE,
+    http::{
+        HeaderMap,
+        header::{ACCEPT, CONTENT_TYPE},
+    },
     response::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
@@ -12,6 +15,29 @@ use serde::Serialize;
 
 pub(crate) const MEDIA_TYPE: &str = "text/event-stream";
 pub(crate) const EVENT_LIMIT: usize = 1_048_576;
+
+pub(crate) fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value.split(',').any(|range| {
+                let mut parts = range.split(';');
+                let media_type = parts.next().unwrap_or_default().trim();
+                media_type.eq_ignore_ascii_case(MEDIA_TYPE)
+                    && parts
+                        .filter_map(|param| param.trim().split_once('='))
+                        .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                        .is_none_or(|(_, quality)| {
+                            quality
+                                .trim()
+                                .parse::<f32>()
+                                .is_ok_and(|value| value > 0.0 && value <= 1.0)
+                        })
+            })
+        })
+}
 
 /// SSE 事件的名称和 JSON 数据类型。
 pub trait SseEvent: Serialize + JsonSchema {

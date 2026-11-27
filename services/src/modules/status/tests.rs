@@ -3,8 +3,9 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 
 async fn request(
@@ -62,6 +63,117 @@ async fn rust_publishers_preserve_json_values_and_http_reads_the_shared_snapshot
     assert_eq!(value["value"], 123);
     let (_, read) = request(service, "GET", "/status", Value::Null).await;
     assert_eq!(read, serde_json::to_value(posted).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_sse_sends_current_snapshot_and_subsequent_batch_updates() {
+    let service = Arc::new(StatusService::new());
+    let response = service
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/status")
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(response.headers()["vary"], "Accept");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+
+    // 在读取首帧前发布，验证订阅登记后到首帧读取前的写入也能同步。
+    let values = json!({"tools":{"count":1,"enabled":true}});
+    let published = service
+        .publish_many(serde_json::from_value(values).unwrap())
+        .await
+        .unwrap();
+    let mut events = response.into_body().into_data_stream();
+    for expected in [
+        json!({"api_version":"1","status":{},"updated_at":null}),
+        serde_json::to_value(published).unwrap(),
+    ] {
+        let bytes = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event = std::str::from_utf8(&bytes).unwrap();
+        let data = event.strip_prefix("event: status\ndata: ").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(data).unwrap(), expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn remote_status_sse_filters_private_values_and_only_sends_visible_changes() {
+    use crate::modules::network::remote::{
+        DispatchRequest, HttpDispatcher, RequestContext, RequestDispatcher, ResponseMode,
+    };
+
+    let service = Arc::new(StatusService::new());
+    service
+        .publish("service", "name", json!("电脑"))
+        .await
+        .unwrap();
+    service
+        .publish("local", "private", json!("本机状态"))
+        .await
+        .unwrap();
+    let router = service.router();
+    let dispatcher = HttpDispatcher::new(move || Some(router.clone()));
+    let response = dispatcher
+        .dispatch(
+            RequestContext {
+                request_id: uuid::Uuid::new_v4(),
+                peer_id: iroh::SecretKey::generate().public(),
+            },
+            DispatchRequest {
+                method: axum::http::Method::GET,
+                path: "/status".to_owned(),
+                query: Vec::new(),
+                body: None,
+                response_mode: ResponseMode::Sse,
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut frames = response.into_body().into_data_stream();
+    let frame = tokio::time::timeout(Duration::from_secs(1), frames.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let event: Value = serde_json::from_slice(&frame[4..]).unwrap();
+    assert_eq!(event["event"], "status");
+    assert_eq!(event["data"]["status"], json!({"service":{"name":"电脑"}}));
+
+    service
+        .publish("local", "private", json!("更新本机状态"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), frames.next())
+            .await
+            .is_err()
+    );
+
+    service
+        .publish("service", "name", json!("新名称"))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(1), frames.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let event: Value = serde_json::from_slice(&frame[4..]).unwrap();
+    assert_eq!(event["event"], "status");
+    assert_eq!(
+        event["data"]["status"],
+        json!({"service":{"name":"新名称"}})
+    );
 }
 
 #[tokio::test]
@@ -191,6 +303,18 @@ async fn status_module_is_discoverable_and_old_emacs_status_routes_are_removed()
                     .unwrap()
                     .iter()
                     .all(|api| api["method"] == "GET")
+            );
+            let snapshot = body["apis"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|api| api["path"] == "/status")
+                .unwrap();
+            assert_eq!(snapshot["supports_sse"], true);
+            assert_eq!(snapshot["sse_events"][0]["event"], "status");
+            assert_eq!(
+                snapshot["sse_events"][0]["data_schema"]["properties"]["status"]["type"],
+                "object"
             );
         } else if path.ends_with("/status") {
             assert_eq!(body["path"], "my/status");

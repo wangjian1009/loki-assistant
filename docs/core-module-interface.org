@@ -526,12 +526,12 @@ fn service_status_metadata() -> StatusModuleMetadata {
 | 请求                                  | 可用范围 | 接口能力                           |
 |---------------------------------------+----------+------------------------------------|
 | GET /stats/meta                       | paired   | 读取各模块声明的状态结构。         |
-| GET /status                           | paired   | 读取所有可见状态的快照。           |
+| GET /status                           | paired   | 查询所有可见状态的快照，可通过 SSE 订阅变化。 |
 | GET /status/{module_id}               | paired   | 读取指定模块的状态。               |
 | GET /status/{module_id}/{key}         | paired   | 读取指定状态项。                   |
 | GET /status/{module_id}/{key}/{*path} | paired   | 读取状态项内的对象字段或数组元素。 |
 
-~paired~ 允许本机和已绑定设备调用。绑定设备只能读取 ~remote_access~ 为 ~true~ 的状态项。业务代码通过 Rust 发布状态。 [[file:control-center-services.org::*状态中心][状态中心协议]]
+~paired~ 允许本机和已绑定设备调用。绑定设备只能读取 ~remote_access~ 为 ~true~ 的状态项。业务代码通过 Rust 发布状态。~GET /status~ 的 SSE 事件名为 ~status~ ，数据类型为 ~StatusResponse~ 。 [[file:control-center-services.org::*状态中心][状态中心协议]]
 
 *** 响应示例
 ~GET /stats/meta~ 的响应节选，展示 ~service~ 模块。

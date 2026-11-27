@@ -1,6 +1,6 @@
 use http::{Method, StatusCode};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, SecretKey, Watcher,
     endpoint::{Connection, RecvStream, presets},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -420,13 +420,33 @@ impl Service {
         *guard = Some(connection.clone());
         Ok(connection)
     }
+
+    async fn relay_disconnected(&self) -> ResponsError {
+        let endpoint = match self.endpoint().await {
+            Ok(endpoint) => endpoint,
+            Err(error) => return error,
+        };
+        let mut relays = endpoint.home_relay_status();
+        let mut status = relays.get();
+        while status.iter().any(|relay| relay.is_connected()) {
+            tokio::select! {
+                _ = endpoint.closed() => break,
+                result = relays.updated() => match result {
+                    Ok(next) => status = next,
+                    Err(_) => break,
+                },
+            }
+        }
+        NetworkReason::ConnectFailed.into()
+    }
+
     async fn send_request(
         &self,
         request: &ServiceRequest<impl Serialize>,
         id: Uuid,
         sent: &AtomicBool,
         response_mode: Option<ResponseMode>,
-    ) -> Result<RecvStream, ResponsError> {
+    ) -> Result<(RecvStream, Connection), ResponsError> {
         if !request.path.starts_with('/')
             || request.path.starts_with("//")
             || request.path.contains(['?', '#', '\\'])
@@ -463,7 +483,7 @@ impl Service {
             .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
         send.finish()
             .map_err(|_| ResponsError::from(NetworkReason::SendFailed))?;
-        Ok(recv)
+        Ok((recv, connection))
     }
 
     async fn exchange(
@@ -472,7 +492,7 @@ impl Service {
         id: Uuid,
         sent: &AtomicBool,
     ) -> Result<(StatusCode, Value), ResponsError> {
-        let mut recv = self.send_request(request, id, sent, None).await?;
+        let (mut recv, _) = self.send_request(request, id, sent, None).await?;
         let bytes = recv
             .read_to_end(4_194_304)
             .await
@@ -762,6 +782,45 @@ impl Network {
         self.inner.changed.subscribe()
     }
 
+    fn service_for_generation(&self, generation: u64) -> Result<Arc<Service>, ResponsError> {
+        let state = self.inner.state.lock().unwrap();
+        if state.closed {
+            return Err(CancelledReason::NetworkClosed.into());
+        }
+        if state.generation != generation {
+            return Err(CancelledReason::ServiceChanged.into());
+        }
+        state
+            .service
+            .clone()
+            .ok_or(NotConfiguredReason::ServiceNotSet.into())
+    }
+
+    pub(crate) async fn wait_for_relay(&self, generation: u64) -> Result<(), ResponsError> {
+        let service = self.service_for_generation(generation)?;
+        let endpoint = service.endpoint().await?;
+        tokio::select! {
+            _ = endpoint.closed() => Err(NetworkReason::ConnectFailed.into()),
+            _ = endpoint.online() => Ok(()),
+        }
+    }
+
+    pub(crate) async fn wait_for_link_loss(&self, generation: u64) -> ResponsError {
+        let service = match self.service_for_generation(generation) {
+            Ok(service) => service,
+            Err(error) => return error,
+        };
+        let connection = service.connection.lock().await.clone();
+        tokio::select! {
+            error = service.relay_disconnected() => error,
+            _ = async {
+                if let Some(connection) = connection {
+                    connection.closed().await;
+                }
+            } => NetworkReason::ReceiveFailed.into(),
+        }
+    }
+
     pub(crate) async fn wait_for_binding(&self, generation: u64) -> Result<(), ResponsError> {
         let mut targets = self.target_changes();
         loop {
@@ -868,6 +927,7 @@ impl Network {
             None,
             request,
             options,
+            false,
             move |update| on_update(update),
             on_end,
         )
@@ -878,6 +938,7 @@ impl Network {
         expected: Option<u64>,
         request: ServiceRequest<impl Serialize + Send + Sync + 'static>,
         options: SseRequestOptions,
+        watch_links: bool,
         mut on_update: impl FnMut(SseUpdate<T>) + Send + 'static,
         on_end: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
     ) -> RequestHandle {
@@ -890,20 +951,21 @@ impl Network {
                 {
                     return Err(InvalidRequestReason::InvalidTimeout.into());
                 }
-                let (mut recv, status) = tokio::time::timeout(options.open_timeout, async {
-                    network.retire().await;
-                    let mut recv = service
-                        .send_request(&request, id, &sent, Some(ResponseMode::Sse))
-                        .await?;
-                    let head = read_frame(&mut recv, 16_384, options.open_timeout)
-                        .await?
-                        .ok_or(NetworkReason::InvalidResponse)?;
-                    let head: SseResponseHead = serde_json::from_slice(&head)
-                        .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
-                    Ok::<_, ResponsError>((recv, head.status(id)?))
-                })
-                .await
-                .map_err(|_| ResponsError::from(NetworkReason::RequestTimeout))??;
+                let (mut recv, status, connection) =
+                    tokio::time::timeout(options.open_timeout, async {
+                        network.retire().await;
+                        let (mut recv, connection) = service
+                            .send_request(&request, id, &sent, Some(ResponseMode::Sse))
+                            .await?;
+                        let head = read_frame(&mut recv, 16_384, options.open_timeout)
+                            .await?
+                            .ok_or(NetworkReason::InvalidResponse)?;
+                        let head: SseResponseHead = serde_json::from_slice(&head)
+                            .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
+                        Ok::<_, ResponsError>((recv, head.status(id)?, connection))
+                    })
+                    .await
+                    .map_err(|_| ResponsError::from(NetworkReason::RequestTimeout))??;
                 let mut update = |value| {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_update(value)))
                         .map_err(|_| ResponsError::from(CancelledReason::UserRequested))
@@ -914,20 +976,31 @@ impl Network {
                     generation,
                     data: (),
                 }))?;
-                while let Some(frame) =
-                    read_frame(&mut recv, 1_048_576, options.idle_timeout).await?
-                {
-                    if !frame.is_empty() {
-                        let event: T = serde_json::from_slice(&frame)
-                            .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
-                        if event.supported() {
-                            update(SseUpdate::Event(event))?;
+                let frames = async {
+                    while let Some(frame) =
+                        read_frame(&mut recv, 1_048_576, options.idle_timeout).await?
+                    {
+                        if !frame.is_empty() {
+                            let event: T = serde_json::from_slice(&frame)
+                                .map_err(|_| ResponsError::from(NetworkReason::InvalidResponse))?;
+                            if event.supported() {
+                                update(SseUpdate::Event(event))?;
+                            }
                         }
+                        // 缓冲中已有数据时也让目标切换和取消信号有机会被处理。
+                        tokio::task::yield_now().await;
                     }
-                    // 缓冲中已有数据时也让目标切换和取消信号有机会被处理。
-                    tokio::task::yield_now().await;
+                    Ok((status, ()))
+                };
+                if !watch_links {
+                    return frames.await;
                 }
-                Ok((status, ()))
+                tokio::select! {
+                    biased;
+                    error = service.relay_disconnected() => Err(error),
+                    _ = connection.closed() => Err(NetworkReason::ReceiveFailed.into()),
+                    result = frames => result,
+                }
             },
             move |result| on_end(result.map(|_| ())),
         )

@@ -74,11 +74,11 @@ Network 不读写多设备列表；应用保留完整配置和随机手机身份
 
 * 代理缓存与订阅
 
-~ServiceProxy~ 使用 ~generation~ 隔离切换前后的电脑数据。切换目标时清空上一个目标的快照与缓存。API 元数据按模块读取 ~GET /discover/modules/{module_id}~ ，配置元数据使用 ~GET /meta~ ，状态元数据使用 ~GET /stats/meta~ 。读取配置值时由 ~refresh_config~ 查询 ~GET /data/{module_id}~ ， ~cached_config~ 返回该目标已缓存的配置。代理从同一次 ~GET /status~ 获得电脑状态以及邮件、Slack 等已公开的业务状态。
+~ServiceProxy~ 使用 ~generation~ 隔离切换前后的电脑数据。切换目标时清空上一个目标的快照与缓存。API 元数据按模块读取 ~GET /discover/modules/{module_id}~ ，配置元数据使用 ~GET /meta~ ，状态元数据使用 ~GET /stats/meta~ 。读取配置值时由 ~refresh_config~ 查询 ~GET /data/{module_id}~ ， ~cached_config~ 返回该目标已缓存的配置。代理用同一条 ~GET /status~ SSE 流同步电脑状态以及邮件、Slack 等已公开的业务状态。
 
-~ServiceProxy::listen~ 接收返回类型化数据的快照投影和更新回调。订阅先收到当前快照，后续在投影结果变化时回调。~ServiceSnapshot::status<T>~ 将对应模块状态反序列化为业务类型。HarmonyOS 首页订阅设备状态，邮件和 Slack 卡片分别调用 Rust ~Mail::watch_status~ 和 ~Slack::watch_status~ 。卡片移除时调用 ~StatusSubscription::cancel~ 并释放模块句柄。代理在有订阅时跟踪目标变化和刷新状态，绑定中以 1 秒为间隔，已绑定目标以 20 秒为间隔。界面可请求即时刷新，后台结束首页订阅。
+~ServiceProxy::listen~ 接收返回类型化数据的快照投影和更新回调。订阅先收到当前快照，后续在投影结果变化时回调。~ServiceSnapshot::status<T>~ 将对应模块状态反序列化为业务类型。HarmonyOS 首页订阅设备状态，邮件和 Slack 卡片分别调用 Rust ~Mail::watch_status~ 和 ~Slack::watch_status~ 。卡片移除时调用 ~StatusSubscription::cancel~ 并释放模块句柄。代理监听绑定结果，并在有本地订阅时为当前已绑定的电脑维持一条 SSE 流。首条 ~status~ 事件同步全量快照，随后由服务端推送变化。本地 relay 断开、对端 QUIC 连接关闭或 SSE 流中断都会使设备状态转为离线。代理在 relay 可用时退避重连，重新订阅后以首帧同步最新状态。停止最后一个本地订阅时释放状态流。界面仍可请求即时查询，切到后台时结束首页订阅。旧服务明确返回 ~sse-not-supported~ 时可读取一次 JSON 快照，连接状态继续由网络事件更新。
 
-邮件模块定义同步请求、普通响应、进度事件与状态投影。任务进度优先来自 SSE，普通 JSON 请求和断流后通过共享状态快照中的 ~mail/sync_runs~ 查询。Slack 首页数据从同一个快照恢复为类型化对象。
+邮件模块定义同步请求、普通响应、进度事件与状态投影。任务进度优先来自邮件 SSE。收到普通 JSON 响应或邮件事件流中断后，代理从共享状态订阅的 ~mail/sync_runs~ 同步任务进度。Slack 首页数据从同一个快照恢复为类型化对象。
 
 * 异步请求与取消
 
@@ -219,7 +219,7 @@ impl Network {
 ** 邮件同步接入
 
 - 邮件模块声明创建同步的请求、JSON 响应和 SSE 事件类型。~POST /mail/sync~ 可选择 SSE 或普通 JSON。流中首个事件发送任务快照，后续更新及结束语义与本机托盘一致。 [[file:control-center-services.org::*手动同步与进度][邮件同步响应]]
-- 手机通过发现接口检查 ~POST /mail/sync~ 的 ~supports_sse~ 。旧电脑可以用普通 JSON 请求同步。通过 ~GET /status~ 的 ~mail/sync_runs~ 按任务 ID 查询进度，适用于普通 JSON 或事件流中断后的状态恢复。
+- 手机通过发现接口检查 ~POST /mail/sync~ 的 ~supports_sse~ 。旧电脑可以用普通 JSON 请求同步。普通 JSON 响应或邮件事件流中断后，通过共享状态订阅的 ~mail/sync_runs~ 跟踪对应任务。
 - 应用进入后台后结束首页的状态订阅。切换电脑时旧目标的请求与事件流会被取消，旧电脑继续执行已开始的同步。
 
 * 设备名称与类型
@@ -230,7 +230,7 @@ impl Network {
 
 * 存储与验证
 
-ArkTS Application 管理最多 64 台电脑和 ~selected_endpoint_id~ ，只选择一台设置到 Network；未选中的不轮询。Workspace 的通用私有存储适配原样保存应用 JSON，不解释电脑列表。沿用 ~devices.json~ 、版本 1、随机身份和原子替换；私钥不向 ArkTS 导出，身份损坏禁止自动重置。旧数据缺少通信凭据时保持未绑定并重新扫码。
+ArkTS Application 管理最多 64 台电脑和 ~selected_endpoint_id~ ，只选择一台设置到 Network，状态订阅随当前目标切换。Workspace 的通用私有存储适配原样保存应用 JSON，不解释电脑列表。沿用 ~devices.json~ 、版本 1、随机身份和原子替换；私钥不向 ArkTS 导出，身份损坏禁止自动重置。旧数据缺少通信凭据时保持未绑定并重新扫码。
 
 绑定失败或授权失效时，应用提示删除后重新扫码绑定，删除本地记录后可再次扫码。删除当前目标时清除 Network，删除其他记录不影响当前目标；磁盘提交失败保留原数据。
 

@@ -441,7 +441,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         fixture.status.clone(),
         Duration::from_secs(10),
     ));
-    let config = fixture.config(service.clone());
+    let relay_settings = fixture.config(service.clone());
     let remote_fixture = Fixture::new();
     let remote_network = remote_fixture.service();
     let remote_config = crate::modules::config::Module::from_service(
@@ -476,11 +476,11 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
                 ))
         })
     })));
-    config
+    relay_settings
         .replace("network", "relay_url", json!(address))
         .await
         .unwrap();
-    config
+    relay_settings
         .replace("network", "relay_token", json!(token))
         .await
         .unwrap();
@@ -848,7 +848,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         );
     }
     check_remote_metadata_and_permissions(network.clone(), &fixture, &remote_config_service).await;
-    check_service_proxy(network.clone()).await;
+    check_service_proxy(network.clone(), &fixture, &relay_settings, &address).await;
     check_remote_sse(&network).await;
     let missing = channel_request(network.clone(), ServiceRequest::get("/missing"))
         .await
@@ -901,7 +901,12 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     relay.shutdown().await.unwrap();
 }
 
-async fn check_service_proxy(network: Arc<loki_mobile_network::network::Network>) {
+async fn check_service_proxy(
+    network: Arc<loki_mobile_network::network::Network>,
+    fixture: &Fixture,
+    relay_settings: &crate::modules::config::service::ConfigService,
+    relay_url: &str,
+) {
     use loki_mobile_network::{
         mail::{Mail, MailActivity, MailStatus, MailSyncPhase},
         service_proxy::{
@@ -977,13 +982,14 @@ async fn check_service_proxy(network: Arc<loki_mobile_network::network::Network>
             (
                 MailStatus::from_snapshot(snapshot).zip(SlackStatus::from_snapshot(snapshot)),
                 MailActivity::from_snapshot(snapshot),
+                snapshot.error.is_some(),
             )
         },
         move |status| updates.send(status).is_ok(),
     );
     let (mail, slack) = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let (Some(status), _) = received.recv().await.unwrap() {
+            if let (Some(status), _, false) = received.recv().await.unwrap() {
                 break status;
             }
         }
@@ -994,11 +1000,50 @@ async fn check_service_proxy(network: Arc<loki_mobile_network::network::Network>
     assert_eq!(mail.unread_subjects, ["测试邮件"]);
     assert_eq!(slack.unread_previews[0].preview, "新消息");
 
+    fixture
+        .status
+        .publish("mail", "unread_count", json!(4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(received.recv().await.unwrap(), (Some((mail, _)), _, false)
+            if mail.unread_count == Some(4))
+        {}
+    })
+    .await
+    .unwrap();
+
+    relay_settings
+        .replace("network", "relay_url", json!(""))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !received.recv().await.unwrap().2 {}
+    })
+    .await
+    .unwrap();
+    fixture
+        .status
+        .publish("mail", "unread_count", json!(5))
+        .await
+        .unwrap();
+    relay_settings
+        .replace("network", "relay_url", json!(relay_url))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !matches!(received.recv().await.unwrap(), (Some((mail, _)), _, false)
+            if mail.unread_count == Some(5))
+        {}
+    })
+    .await
+    .unwrap();
+
     let target = proxy.snapshot().endpoint_id.unwrap();
     Mail::new(proxy).start_sync(&target).unwrap();
     let sync = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let (_, activity) = received.recv().await.unwrap();
+            let (_, activity, _) = received.recv().await.unwrap();
             if let Some(sync) = activity.and_then(|activity| activity.sync)
                 && sync.progress.phase == MailSyncPhase::Completed
             {

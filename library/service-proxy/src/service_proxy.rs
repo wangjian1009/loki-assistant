@@ -28,6 +28,8 @@ pub struct ServiceSnapshot {
     pub error: Option<ResponsError>,
     pub status: Option<StatusValues>,
     local: StatusValues,
+    #[serde(skip)]
+    status_revision: u64,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -76,6 +78,30 @@ struct StatusResponse {
     _api_version: ApiVersion,
     status: StatusValues,
 }
+
+impl StatusResponse {
+    fn into_status(self) -> Result<StatusValues, ResponsError> {
+        let snapshot = ServiceSnapshot {
+            status: Some(self.status),
+            ..Default::default()
+        };
+        ComputerStatus::from_snapshot(&snapshot)
+            .and(snapshot.status)
+            .ok_or_else(|| NetworkReason::InvalidResponse.into())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum StatusEvent {
+    Status {
+        data: StatusResponse,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
+impl SseEventType for StatusEvent {}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ApiModuleMetadata {
@@ -351,13 +377,9 @@ impl ServiceProxy {
         P: Fn(&ServiceSnapshot) -> T + Send + 'static,
         F: FnMut(T) -> bool + Send + 'static,
     {
-        self.sync_target();
-        let mut state = self.state.subscribe();
+        let mut state = self.status_updates();
         let mut targets = self.network.target_changes();
         let network = self.network.clone();
-        if self.state.receiver_count() == 1 || state.borrow().checked_at == 0 {
-            self.request_refresh();
-        }
         self.runtime.spawn(async move {
             let mut previous = None;
             loop {
@@ -379,6 +401,16 @@ impl ServiceProxy {
                 }
             }
         })
+    }
+
+    pub(crate) fn status_updates(&self) -> watch::Receiver<ServiceSnapshot> {
+        self.sync_target();
+        let idle = self.state.receiver_count() == 0;
+        let state = self.state.subscribe();
+        if idle {
+            self.request_refresh();
+        }
+        state
     }
 
     pub fn request_refresh(&self) {
@@ -432,29 +464,135 @@ impl ServiceProxy {
 
     async fn monitor(proxy: Weak<Self>, mut targets: watch::Receiver<u64>) {
         while let Some(current) = proxy.upgrade() {
+            targets.borrow_and_update();
             current.sync_target();
-            let (closed, binding) = current
-                .network
-                .with_target(|_, target, closed| (closed, target.map(|(_, binding)| binding)));
+            let (generation, closed, binding) =
+                current.network.with_target(|generation, target, closed| {
+                    (generation, closed, target.map(|(_, binding)| binding))
+                });
             if closed {
                 break;
             }
-            if current.state.receiver_count() > 0 {
-                current.refresh_status().await;
-            }
-            let duration = match binding {
-                Some(BindingState::Bound { .. }) => Duration::from_secs(20),
-                Some(BindingState::Binding) => Duration::from_secs(1),
-                _ => Duration::from_secs(20),
-            };
             let observed = current.state.receiver_count() > 0;
             let requested = current.requested.clone();
+            let state = current.state.clone();
+            let network = current.network.clone();
+            let work = async {
+                match binding {
+                    Some(BindingState::Binding) => {
+                        let _ = network.wait_for_binding(generation).await;
+                    }
+                    Some(BindingState::Bound { .. }) => {
+                        Self::watch_status(&proxy, &network, generation).await;
+                    }
+                    Some(BindingState::Failed { error }) => {
+                        if let Some(current) = proxy.upgrade() {
+                            current.apply_status(generation, None, Err(error));
+                        }
+                        std::future::pending().await
+                    }
+                    _ => std::future::pending().await,
+                }
+            };
             drop(current);
             tokio::select! {
+                biased;
                 result = targets.changed() => { if result.is_err() { break; } }
                 _ = requested.notified() => {}
-                _ = tokio::time::sleep(duration), if observed => {}
+                _ = state.closed(), if observed => {}
+                _ = work, if observed => {}
             }
+        }
+    }
+
+    async fn watch_status(proxy: &Weak<Self>, network: &Network, generation: u64) {
+        let mut retry = Duration::from_secs(1);
+        loop {
+            let (mut error, received) = match network.wait_for_relay(generation).await {
+                Ok(()) => Self::subscribe_status(proxy, network, generation).await,
+                Err(error) => (error, false),
+            };
+            if matches!(&error, ResponsError::Services(error) if error.code == "sse-not-supported")
+            {
+                // 旧服务使用单次查询，连接状态仍由网络事件更新。
+                let Some(current) = proxy.upgrade() else {
+                    return;
+                };
+                let result = current.refresh_status_for(generation).await;
+                drop(current);
+                error = match result.and_then(|snapshot| snapshot.error.map_or(Ok(()), Err)) {
+                    Ok(()) => network.wait_for_link_loss(generation).await,
+                    Err(error) => error,
+                };
+            }
+            let revoked = matches!(&error, ResponsError::NotBound(_));
+            let cancelled = matches!(&error, ResponsError::Cancelled(_));
+            if cancelled {
+                return;
+            }
+            let Some(current) = proxy.upgrade() else {
+                return;
+            };
+            current.apply_status(generation, None, Err(error));
+            if revoked {
+                return;
+            }
+            drop(current);
+            if received {
+                retry = Duration::from_secs(1);
+            }
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn subscribe_status(
+        proxy: &Weak<Self>,
+        network: &Network,
+        generation: u64,
+    ) -> (ResponsError, bool) {
+        let (updates, mut snapshots) = watch::channel(None);
+        let (done, mut ended) = oneshot::channel();
+        let _request = CancelOnDrop(network.request_sse_for::<StatusEvent>(
+            Some(generation),
+            ServiceRequest::get("/status"),
+            SseRequestOptions::default(),
+            true,
+            move |update| {
+                if let SseUpdate::Event(StatusEvent::Status { data }) = update {
+                    updates.send_replace(Some(data.into_status()));
+                }
+            },
+            move |result| {
+                let _ = done.send(result);
+            },
+        ));
+        let mut received = false;
+        loop {
+            let result = tokio::select! {
+                biased;
+                Ok(()) = snapshots.changed() => {
+                    let Some(current) = proxy.upgrade() else {
+                        return (CancelledReason::UserRequested.into(), received);
+                    };
+                    if let Some(result) = snapshots.borrow_and_update().clone() {
+                        match result {
+                            Ok(status) => {
+                                current.apply_status(generation, None, Ok(status));
+                                received = true;
+                            }
+                            Err(error) => return (error, received),
+                        }
+                    }
+                    continue;
+                }
+                result = &mut ended => result,
+            };
+            let error = result
+                .ok()
+                .and_then(Result::err)
+                .unwrap_or_else(|| NetworkReason::ReceiveFailed.into());
+            return (error, received);
         }
     }
 
@@ -512,23 +650,25 @@ impl ServiceProxy {
         if expected.is_some_and(|expected| expected != generation) {
             return self.snapshot();
         }
+        let revision = self.state.borrow().status_revision;
         let result = match binding {
             Some(BindingState::Bound { .. }) => self
                 .request::<StatusResponse>(generation, ServiceRequest::get("/status"))
                 .await
-                .and_then(|response| {
-                    let status = response.data.status;
-                    let candidate = ServiceSnapshot {
-                        status: Some(status),
-                        ..Default::default()
-                    };
-                    ComputerStatus::from_snapshot(&candidate)
-                        .and(candidate.status)
-                        .ok_or_else(|| NetworkReason::InvalidResponse.into())
-                }),
+                .and_then(|response| response.data.into_status()),
             Some(BindingState::Failed { error }) => Err(error),
             _ => return self.snapshot(),
         };
+        self.apply_status(generation, Some(revision), result);
+        self.snapshot()
+    }
+
+    fn apply_status(
+        &self,
+        generation: u64,
+        revision: Option<u64>,
+        result: Result<StatusValues, ResponsError>,
+    ) {
         let checked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -545,7 +685,10 @@ impl ServiceProxy {
                     });
                 }
                 self.state.send_if_modified(|state| {
-                    if state.generation != generation {
+                    if state.generation != generation
+                        || (!revoked
+                            && revision.is_some_and(|revision| state.status_revision != revision))
+                    {
                         return false;
                     }
                     let mut next = state.clone();
@@ -563,15 +706,15 @@ impl ServiceProxy {
                             next.error = Some(error);
                         }
                     }
-                    if *state == next {
+                    if *state == next && next.error.is_some() {
                         return false;
                     }
+                    next.status_revision += 1;
                     *state = next;
                     true
                 });
             }
         });
-        self.snapshot()
     }
 
     pub async fn request<T: DeserializeOwned + Send + 'static>(
@@ -615,6 +758,7 @@ impl ServiceProxy {
             Some(generation),
             request,
             SseRequestOptions::default(),
+            false,
             update,
             end,
         )

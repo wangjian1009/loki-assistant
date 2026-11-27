@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,7 +9,9 @@ use super::protocol::{
     API_VERSION, StatusModuleResponse, StatusPathResponse, StatusResponse, StatusValueResponse,
     StatusValues,
 };
+use futures_util::{Stream, StreamExt, stream};
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::process::Process;
 
@@ -33,6 +36,7 @@ struct Snapshot {
     values: StatusValues,
     timestamps: BTreeMap<(String, String), u64>,
     updated_at: Option<u64>,
+    changes: watch::Sender<()>,
 }
 
 /// 通用内存状态存储；数据由发布方提供，不查询业务模块，不保存到配置文件。
@@ -58,6 +62,7 @@ impl StatusService {
         let (module, key) = (module.to_owned(), key.to_owned());
         self.snapshot.post(move |state| {
             Self::put(state, module, key, value, Self::now());
+            state.changes.send_replace(());
         });
     }
 
@@ -93,6 +98,41 @@ impl StatusService {
         self.snapshot
             .call(move |state| Self::snapshot_from(state, metadata.as_deref()))
             .await
+    }
+
+    pub(super) async fn subscribe_for(
+        self: &Arc<Self>,
+        remote: bool,
+    ) -> impl Stream<Item = StatusResponse> + Send + 'static {
+        let metadata = remote.then(|| Arc::<[StatusModuleMetadata]>::from(self.metadata()));
+        let initial_metadata = metadata.clone();
+        let (initial, changes) = self
+            .snapshot
+            .call(move |state| {
+                (
+                    Self::snapshot_from(state, initial_metadata.as_deref()),
+                    state.changes.subscribe(),
+                )
+            })
+            .await;
+        let updates = stream::unfold(
+            (Arc::downgrade(self), metadata, changes, initial.clone()),
+            |(service, metadata, mut changes, previous)| async move {
+                while changes.changed().await.is_ok() {
+                    let visible = metadata.clone();
+                    let current = service
+                        .upgrade()?
+                        .snapshot
+                        .call(move |state| Self::snapshot_from(state, visible.as_deref()))
+                        .await;
+                    if current != previous {
+                        return Some((current.clone(), (service, metadata, changes, current)));
+                    }
+                }
+                None
+            },
+        );
+        stream::iter([initial]).chain(updates)
     }
 
     fn snapshot_from(
@@ -306,6 +346,7 @@ impl StatusService {
                     value.clone(),
                     updated_at,
                 );
+                state.changes.send_replace(());
                 Ok(StatusValueResponse {
                     api_version: API_VERSION.to_owned(),
                     module_id: module_id.to_owned(),
@@ -331,6 +372,7 @@ impl StatusService {
                         Self::put(state, module.clone(), key, value, now);
                     }
                 }
+                state.changes.send_replace(());
                 Self::snapshot_from(state, None)
             })
             .await

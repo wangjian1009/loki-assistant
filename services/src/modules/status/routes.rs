@@ -7,14 +7,20 @@ use super::{
     service::StatusError,
 };
 use crate::{
-    http::error::{ErrorSource, response},
+    http::{
+        error::{ErrorSource, response},
+        sse::{self, RemoteSse},
+    },
     modules::network::remote::AuthenticatedPeer,
 };
 use axum::{
     Extension, Json, Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::Response,
+    http::{
+        HeaderMap, StatusCode,
+        header::{CACHE_CONTROL, VARY},
+    },
+    response::{IntoResponse, Response},
 };
 use loki_services_macros::loki_api;
 use std::sync::Arc;
@@ -50,14 +56,24 @@ async fn metadata(
     method = "GET",
     path = "/status",
     access = "paired",
+    sse_event = StatusResponse,
     summary = "读取全部状态",
-    description = "返回各发布方最后设置的模块/数据项快照；只读内存，不连接业务程序。"
+    description = "读取各发布方最后设置的状态快照，也可通过 SSE 订阅后续状态变更。"
 )]
 async fn snapshot(
     State(service): State<Arc<StatusService>>,
     peer: Option<Extension<AuthenticatedPeer>>,
-) -> Json<StatusResponse> {
-    Json(service.snapshot_for(peer.is_some()).await)
+    remote_sse: Option<Extension<RemoteSse>>,
+    headers: HeaderMap,
+) -> Response {
+    let remote = peer.is_some();
+    let body = if sse::accepts_event_stream(&headers) {
+        let events = service.subscribe_for(remote).await;
+        sse::response(events, remote_sse.map(|Extension(mode)| mode))
+    } else {
+        Json(service.snapshot_for(remote).await).into_response()
+    };
+    ([(CACHE_CONTROL, "no-store"), (VARY, "Accept")], body).into_response()
 }
 
 #[loki_api(

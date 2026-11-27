@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State, rejection::JsonRejection},
     http::{
         HeaderMap, StatusCode,
-        header::{ACCEPT, CACHE_CONTROL, VARY},
+        header::{CACHE_CONTROL, VARY},
     },
     response::{IntoResponse, Response},
 };
@@ -94,7 +94,7 @@ async fn start_sync(
     headers: HeaderMap,
 ) -> Response {
     let (initial, updates) = service.sync_progress.request().await;
-    let body = if accepts_progress(&headers) {
+    let body = if sse::accepts_event_stream(&headers) {
         let updates = stream::unfold(updates, |mut updates| async {
             updates.changed().await.ok()?;
             let sync = updates.borrow_and_update().clone();
@@ -115,29 +115,6 @@ async fn start_sync(
         body,
     )
         .into_response()
-}
-
-fn accepts_progress(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(|value| {
-            value.split(',').any(|range| {
-                let mut parts = range.split(';');
-                let media_type = parts.next().unwrap_or_default().trim();
-                media_type.eq_ignore_ascii_case(sse::MEDIA_TYPE)
-                    && parts
-                        .filter_map(|param| param.trim().split_once('='))
-                        .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
-                        .is_none_or(|(_, quality)| {
-                            quality
-                                .trim()
-                                .parse::<f32>()
-                                .is_ok_and(|value| value > 0.0 && value <= 1.0)
-                        })
-            })
-        })
 }
 
 #[loki_api(

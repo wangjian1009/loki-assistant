@@ -16,7 +16,7 @@ use std::sync::Arc;
 static STATUS_MODULE: ModuleRegistration = ModuleRegistration {
     id: "status",
     name: "状态中心",
-    description: "接收各模块发布的数据并提供统一状态查询。",
+    description: "接收各模块发布的数据并提供统一状态查询与订阅。",
     version: env!("CARGO_PKG_VERSION"),
 };
 

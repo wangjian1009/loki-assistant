@@ -282,7 +282,7 @@ services 每次从当前绑定关系验证已认证的远端 Endpoint ID 和绑�
 {"api_version":"1","type":"device.status","endpoint_id":"<services Endpoint ID>","status":"online","bound_at":1795104100}
 #+end_src
 
-~online~ 表示此次请求时电脑服务可用，不承诺持续在线。手机校验返回版本、类型、身份和绑定时间；连接失败显示“暂时无法连接”，不推断为解绑。前台每轮检查结束后间隔 20 秒刷新，支持手动刷新，后台停止安排轮询；页面重新进入时先显示等待检查，随后读取当前状态。此兼容状态请求只返回本机在线与绑定时间；通用 HTTP 请求使用下节的 services/1。
+~online~ 表示此次请求时电脑服务可用。手机校验返回版本、类型、身份和绑定时间。此兼容状态请求返回本机在线与绑定时间。当前手机端通过下节的 services/1 订阅 ~GET /status~ 。
 
 手机 ArkTS Application 负责最多 64 台电脑的列表、目标选择、名称和完整配置持久化；Rust Workspace 只持有本机身份、唯一 Network 和通用私有存储适配，不提供 devices 管理模块。应用保存 ~endpoint_id/relay_url/relay_token/binding~ ，下次读取后重新设置到 Network，首次请求时复用随机身份与绑定凭据恢复连接。~binding~ 是 ~unbound~ 、~binding~ 、携带 ~error~ 的 ~failed~ 或携带 ~credential{token,bound_at}~ 的 ~bound~ Union；没有凭据不能构造有效已绑定状态。
 
@@ -688,7 +688,7 @@ GET /password/entries/example.com/alice.gpg
 
 * 状态中心
 
-~modules/status~ 统一保存外部发布的模块/数据项数据，并提供 Rust 发布接口与版本为 ~1~ 的 HTTP 只读查询。该模块只处理名称校验、内存存储和序列化，具体值及更新时机由发布方负责；不读取配置、不查询 Emacs 或网络，不为查询启动业务程序。~Services~ 创建唯一 ~Arc<StatusService>~ ，业务发布方通过依赖注入共用这一实例。
+~modules/status~ 统一保存外部发布的模块/数据项数据，并提供 Rust 发布接口与版本为 ~1~ 的 HTTP 查询和订阅。该模块只处理名称校验、内存存储和序列化，具体值及更新时机由发布方负责。~Services~ 创建唯一 ~Arc<StatusService>~ ，业务发布方通过依赖注入共用这一实例。
 
 ** 服务自身运行状态
 
@@ -737,6 +737,12 @@ HTTP 状态路由仅提供 GET 查询，POST 和 PUT 返回 405。外部程序�
 ~GET /status~ 返回 ~api_version~ 、完整 ~status~ object 和全局 ~updated_at~ ；未发布任何值时返回空 object 与 ~updated_at: null~ 。~GET /status/{module_id}/{key}~ 返回完整状态项；~GET /status/{module_id}/{key}/{*path}~ 返回 ~module_id~、层级 ~path~、字段 ~value~ 和该项最后发布的 Unix 秒 ~updated_at~ 。字段路径按 URL 层级编码，不使用点号；未发布或字段不存在时返回 404 ~status-not-found~ 。显式发布 null 是有效值。
 
 模块名和键不能为空、不能包含 ~/~ 、不能为 ~.~ 或 ~..~ ；空批量发布或名称无效返回 ~StatusError~ ，整批不修改；HTTP 查询名称无效返回 400 ~invalid-request~ 。Rust 发布接口为 ~StatusService::publish~ 与 ~publish_many~ ，读取接口为 ~value~ 和 ~snapshot~ 。发布后的数据只保留在内存，重启后由各发布方重新设置，不写入 YAML。旧 Emacs 状态路由已迁移到本模块。
+
+** 订阅可见状态
+
+~GET /status~ 默认返回一次 JSON 快照。本机通过 ~Accept: text/event-stream~ 请求订阅，绑定设备通过 iroh 请求的 ~response_mode: "sse"~ 请求订阅。成功返回 200，事件名为 ~status~ ，每条事件的 ~data~ 使用普通查询的完整快照结构。第一条事件是订阅时的当前快照，随后在可见快照变化时推送最新值。连续发布可以合并为同一条快照，批量发布以同一版快照送达。
+
+远端订阅按普通查询的状态项权限过滤数据和更新时间。服务发现提供 ~supports_sse~ 和 ~sse_events~ 。连接中断后，客户端重新发起订阅以取得当前快照。 [[file:service-client.org::*SSE 远程请求][远端 SSE 帧]]
 
 * 告警模块
 
