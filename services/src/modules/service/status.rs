@@ -12,7 +12,7 @@ fn service_status_metadata() -> StatusModuleMetadata {
             StatusItemMetadata::new(
                 "name",
                 "设备名称",
-                "由本机 hostname 生成的只读显示名称，不用于认证。",
+                "本机的只读显示名称。macOS 优先使用系统设置中的电脑名称。",
                 StatusSchema::string(),
             ),
             StatusItemMetadata::new(

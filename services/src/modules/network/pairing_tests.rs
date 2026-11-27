@@ -934,6 +934,14 @@ async fn check_remote_metadata_and_permissions(
         .publish("mail", "unread_count", json!(3))
         .await
         .unwrap();
+    fixture
+        .status
+        .publish("mail", "unread_subjects", json!(["测试邮件"]))
+        .await
+        .unwrap();
+    fixture.status.publish("slack", "unread_previews", json!([{
+        "id":"TTEST.CROOM", "title":"测试会话", "team_name":"测试工作区", "unread_count":1, "preview":"新消息"
+    }])).await.unwrap();
     let get = |path: &'static str| channel_request(network.clone(), ServiceRequest::get(path));
     let catalog = get("/discover").await.unwrap().data;
     let modules = catalog["modules"].as_array().unwrap();
@@ -987,16 +995,23 @@ async fn check_remote_metadata_and_permissions(
         3
     );
     let snapshot = get("/status").await.unwrap().data;
-    assert_eq!(snapshot["status"]["mail"], json!({"unread_count": 3}));
+    assert_eq!(
+        snapshot["status"]["mail"],
+        json!({"unread_count": 3, "unread_subjects":["测试邮件"]})
+    );
     assert!(snapshot["status"].get("emacs").is_none());
     assert!(snapshot["status"].get("custom").is_none());
-    assert!(snapshot["status"].get("slack").is_none());
+    assert_eq!(
+        snapshot["status"]["slack"]["unread_previews"][0]["preview"],
+        "新消息"
+    );
+    assert!(snapshot["status"]["slack"].get("connections").is_none());
     assert!(
         get("/stats/meta").await.unwrap().data["modules"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|module| !matches!(module["id"].as_str(), Some("emacs" | "slack")))
+            .all(|module| module["id"] != "emacs")
     );
 
     for (method, path, body, code) in [

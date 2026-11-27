@@ -1,4 +1,4 @@
-import { AutoBinding, BindingState, DeviceType, Service, ServiceResponse, Workspace } from '../workspace/Workspace'
+import { AutoBinding, BindingState, DeviceType, Service, ServiceRequest, ServiceResponse, Workspace } from '../workspace/Workspace'
 import { NetworkFailure, ResponsError } from '../workspace/ResponsError'
 
 export interface ComputerDevice {
@@ -11,6 +11,7 @@ export interface ComputerDevice {
   checked_at: number
   active: boolean
   binding_error?: ResponsError
+  dashboard?: DashboardStatus
 }
 interface ComputerRecord extends Service {
   name: string
@@ -27,14 +28,23 @@ interface StoredComputer {
 }
 interface StoredState { computers?: StoredComputer[]; selected_endpoint_id?: string | null; device_name?: string }
 interface ApplicationState { computers: ComputerRecord[]; selected_endpoint_id: string | null; device_name: string }
-interface ComputerSession {
-  api_version: string
-  endpoint_id: string
-  status: string
-  bound_at: number
+interface ServiceStatus {
   name: string
   device_type: DeviceType
 }
+export interface SlackPreview {
+  id: string
+  title: string
+  team_name: string
+  unread_count: number
+  preview: string
+}
+interface SlackStatus { unread_previews?: SlackPreview[] }
+interface MailStatus { unread_count?: number; unread_subjects?: string[]; sync_runs?: MailSyncProgress[] }
+export interface DashboardStatus { service: ServiceStatus; slack?: SlackStatus; mail?: MailStatus }
+interface DashboardResponse { api_version: string; status: DashboardStatus }
+interface MailSyncStart { api_version: string; id: string }
+interface MailSyncProgress { id: string; phase: string }
 function now(): number { return Math.floor(Date.now() / 1000) }
 function copy(state: ApplicationState): ApplicationState { return JSON.parse(JSON.stringify(state)) as ApplicationState }
 function validName(name: string): boolean {
@@ -218,20 +228,34 @@ export class Application {
     computer.auto_binding = service.auto_binding
     if (JSON.stringify(state) !== JSON.stringify(this.state)) { await this.save(state) }
   }
-  private session(): Promise<ComputerSession> {
+  private request(request: ServiceRequest): Promise<ServiceResponse> {
     return new Promise((resolve, reject) => {
-      this.workspace.network.request({ method: 'GET', path: '/network/session' }, (response: ServiceResponse) => {
-        const session = response.body as ComputerSession
-        if (!session || session.api_version !== '1' || session.endpoint_id !== this.state.selected_endpoint_id ||
-          session.status !== 'online' || !Number.isSafeInteger(session.bound_at) || session.bound_at <= 0 ||
-          !validName(session.name) || (session.device_type !== 'computer' && session.device_type !== 'mobile')) {
-          const failure: NetworkFailure = {
-            kind: 'network', reason: 'invalid_response', message: '电脑返回的状态无效',
-            request_id: response.request_id, outcome: 'unknown'
-          }
-          reject(failure)
-        } else { resolve(session) }
-      }, (error: ResponsError) => { reject(error) })
+      this.workspace.network.request(request, (response: ServiceResponse) => { resolve(response) },
+        (error: ResponsError) => { reject(error) })
+    })
+  }
+  private async dashboard(): Promise<DashboardStatus> {
+    const response = await this.request({ method: 'GET', path: '/status' })
+    const dashboard = response.body as DashboardResponse
+    const service = dashboard?.status?.service
+    if (dashboard?.api_version !== '1' || !service || !validName(service.name) || service.device_type !== 'computer') {
+      const failure: NetworkFailure = {
+        kind: 'network', reason: 'invalid_response', message: '电脑返回的状态无效',
+        request_id: response.request_id, outcome: 'unknown'
+      }
+      return Promise.reject(failure)
+    }
+    return dashboard.status
+  }
+  startMailSync(endpointId: string): Promise<string> {
+    return this.run(async () => {
+      if (endpointId !== this.state.selected_endpoint_id) { throw new Error('当前电脑已切换') }
+      const response = await this.request({ method: 'POST', path: '/mail/sync' })
+      const start = response.body as MailSyncStart
+      if (response.status !== 202 || start?.api_version !== '1' || !/^[0-9a-f-]{36}$/i.test(start.id)) {
+        throw new Error('电脑返回的邮件同步任务无效')
+      }
+      return start.id
     })
   }
   refresh(): Promise<ComputerDevice[]> {
@@ -239,8 +263,8 @@ export class Application {
       await this.captureService()
       const selected = this.state.computers.find((item: ComputerRecord) => item.endpoint_id === this.state.selected_endpoint_id)
       if (!selected || selected.binding.status !== 'bound') { return this.views() }
-      let session: ComputerSession
-      try { session = await this.session() } catch (error) {
+      let dashboard: DashboardStatus
+      try { dashboard = await this.dashboard() } catch (error) {
         await this.captureService()
         const failure = error as ResponsError
         const views = this.views()
@@ -252,14 +276,21 @@ export class Application {
           return view
         })
       }
-      const state = copy(this.state)
-      const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === session.endpoint_id)
-      if (!computer) { throw new Error('电脑服务已切换') }
-      computer.name = session.name
-      computer.device_type = session.device_type
-      await this.save(state)
+      if (selected.name !== dashboard.service.name || selected.device_type !== dashboard.service.device_type) {
+        const state = copy(this.state)
+        const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === selected.endpoint_id)
+        if (!computer) { throw new Error('电脑服务已切换') }
+        computer.name = dashboard.service.name
+        computer.device_type = dashboard.service.device_type
+        await this.save(state)
+      }
       return this.views().map((view: ComputerDevice): ComputerDevice => {
-        if (view.active) { view.status = 'online'; view.detail = '电脑服务可用'; view.checked_at = now() }
+        if (view.active) {
+          view.status = 'online'
+          view.detail = '电脑服务可用'
+          view.checked_at = now()
+          view.dashboard = dashboard
+        }
         return view
       })
     })

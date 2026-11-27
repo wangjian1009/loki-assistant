@@ -134,6 +134,42 @@ fn slack_status_metadata() -> StatusModuleMetadata {
                 },
             )
             .local_only(),
+            StatusItemMetadata::new(
+                "unread_previews",
+                "Slack 未读摘要",
+                "最近 20 个未读会话的名称、工作区、未读数及最新未读消息摘要。",
+                StatusSchema::Array {
+                    items: Box::new(StatusSchema::Object {
+                        fields: vec![
+                            Field::new("id", "会话 ID", "会话标识。", StatusSchema::string()),
+                            Field::new(
+                                "title",
+                                "会话名称",
+                                "本地会话显示名称。",
+                                StatusSchema::string(),
+                            ),
+                            Field::new(
+                                "team_name",
+                                "工作区",
+                                "授权工作区名称。",
+                                StatusSchema::string(),
+                            ),
+                            Field::new(
+                                "unread_count",
+                                "未读数",
+                                "本机已同步的未读消息数。",
+                                StatusSchema::Integer,
+                            ),
+                            Field::new(
+                                "preview",
+                                "摘要",
+                                "最新未读消息的纯文本摘要。",
+                                StatusSchema::string(),
+                            ),
+                        ],
+                    }),
+                },
+            ),
         ],
     }
 }
@@ -146,6 +182,8 @@ struct NewConversation {
     session_id: Uuid,
     callback: String,
     unread_count: usize,
+    #[serde(skip)]
+    preview: String,
     #[serde(skip)]
     order: (u64, u32),
 }
@@ -169,6 +207,7 @@ impl ProjectsStatus {
     pub fn new(status: Arc<StatusService>) -> Self {
         status.post("slack", "connections", json!([]));
         status.post("slack", "new_conversations", json!([]));
+        status.post("slack", "unread_previews", json!([]));
         Self {
             entries: Process::start(Entries {
                 status,
@@ -244,6 +283,13 @@ impl ProjectsStatus {
                         team_name: account.identity.team_name.clone(),
                         session_id: account.identity.session_id,
                         unread_count,
+                        preview: notification::body_with_nicknames(target, users, Some(account))
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(240)
+                            .collect(),
                         order,
                     })
                 })
@@ -305,5 +351,20 @@ impl Entries {
         });
         self.status
             .post("slack", "new_conversations", json!(conversations));
+        let previews: Vec<_> = conversations
+            .iter()
+            .take(20)
+            .map(|entry| {
+                json!({
+                    "id": entry.id,
+                    "title": entry.title.chars().take(128).collect::<String>(),
+                    "team_name": entry.team_name.chars().take(128).collect::<String>(),
+                    "unread_count": entry.unread_count,
+                    "preview": entry.preview,
+                })
+            })
+            .collect();
+        self.status
+            .post("slack", "unread_previews", json!(previews));
     }
 }

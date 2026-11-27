@@ -113,7 +113,7 @@ static EXTENSION: ExtensionRegistration = ExtensionRegistration {
             notification: Arc::clone(context.notification),
             emacs: context.emacs.service(),
             status: Arc::clone(context.status),
-            sync_progress: progress::SyncProgress::new(),
+            sync_progress: progress::SyncProgress::new(Arc::clone(context.status)),
             refresh_requested: Notify::new(),
             stopping: Notify::new(),
         })))

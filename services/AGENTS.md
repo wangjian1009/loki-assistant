@@ -12,13 +12,13 @@
 
 同一 Endpoint 同时接收 `loki-assistant/device-status/1`，仅响应已绑定手机的 `device.status` 请求，逐次查询同一份设备授权记录；此兼容协议只提供固定状态查询。连接纳入既有跟踪和解绑撤销；未绑定或已解绑返回 `peer-not-bound`。状态请求必须携带绑定后签发的凭据；只有绑定接口允许无凭据。真实 relay 测试调用手机 Rust 客户端，验证绑定、配置恢复、状态和解绑。
 
-`remote.rs` 同时实现 `loki-assistant/services/1` 和 `HttpDispatcher`，统一将手机 Network 的 method/path/query/body 转为进程内 HTTP request，调用现有 Router；业务模块不另写远程分发。Services 组合根通过 `attach_remote(&runtime)` 注入 Weak runtime 的 Router 工厂，共用现有业务和 RuntimeState，不重复构造服务或引入循环持有。每条 stream 重新验证认证身份、绑定、随机 `binding_token` 和 API 访问范围；`#[loki_api(access = "paired")]` 显式开放，默认 local，discover 同时暴露 access。HttpDispatcher 按实际选中的路由和方法校验访问范围，并将认证后的 Endpoint ID 注入 Axum 请求扩展及 `x-loki-device` 与 `x-loki-remote-devices` 请求头。业务权限检查使用请求扩展，loopback HTTP 入口移除这两个请求头。邀请与绑定管理、Emacs、密码、Slack 和通知接口仅供本机调用。新手机状态改用 `/network/session`，旧状态 ALPN 只保留兼容。
+`remote.rs` 同时实现 `loki-assistant/services/1` 和 `HttpDispatcher`，统一将手机 Network 的 method/path/query/body 转为进程内 HTTP request，调用现有 Router；业务模块不另写远程分发。Services 组合根通过 `attach_remote(&runtime)` 注入 Weak runtime 的 Router 工厂，共用现有业务和 RuntimeState，不重复构造服务或引入循环持有。每条 stream 重新验证认证身份、绑定、随机 `binding_token` 和 API 访问范围；`#[loki_api(access = "paired")]` 显式开放，默认 local，discover 同时暴露 access。HttpDispatcher 按实际选中的路由和方法校验访问范围，并将认证后的 Endpoint ID 注入 Axum 请求扩展及 `x-loki-device` 与 `x-loki-remote-devices` 请求头。业务权限检查使用请求扩展，loopback HTTP 入口移除这两个请求头。邀请与绑定管理、Emacs、密码、Slack 和通知接口仅供本机调用。手机通过 `GET /status` 读取状态；邮件同步触发使用 `POST /mail/sync`。
 
 绑定成功生成并持久化每个手机的随机 256 bit `binding_token`，仅在认证绑定响应中交付；有效邀请入队，超时定时丢弃，成功绑定后立即移出有效队列；后续重复、过期或未知邀请一律返回 `pairing-expired`，不再次签发 token。仅保留最近 128 条供本机查询的结果元数据，不保存令牌摘要或原 token。重新扫码绑定替换凭据，解绑删除。`peers.rs` 的 StoredPeer 独立于公开 Peer DTO，设备列表、邀请查询、监控、Debug 和日志不泄露 token。兼容状态 ALPN 同样要求 token。旧授权无 token 时必须重新扫码，不开放无凭据恢复接口。
 
 二维码由 `qr_code.rs` 在阻塞工作线程中生成 PNG，经创建响应的 `qr_code_png_base64` 返回；仅保留令牌摘要，不缓存图片或原始令牌。图片编码失败须保留原邀请。设备管理界面属于 Emacs，托盘不提供绑定入口；服务端测试实际解码生成图片并比较完整 payload。
 
-`modules/service/` 在服务组合时向共享 `StatusService` 发布 `service`，包含进程 `start_at`（Unix 秒）、由 hostname 生成的只读 `name` 和 `device_type: computer`。认证后的 `/network/session` 同时返回名称和类型供手机展示。手机绑定上报 `device_name` 与 `device_type: mobile`，名称和类型不参与认证，services 不提供名称修改接口。
+`modules/service/` 在服务组合时向共享 `StatusService` 发布进程 `start_at`（Unix 秒）、只读 `name` 和 `device_type: computer`。Mac 优先使用系统设置中的电脑名称。手机从 `GET /status` 读取这些设备状态，绑定时上报 `device_name` 与 `device_type: mobile`。名称和类型仅用于展示。
 
 服务只面向本机 loopback。新增 HTTP 能力须使用版本化 JSON API，并在 `docs/control-center-services.org` 更新边界；不要让 HTTP 路由直接依赖 `emacsclient` 的命令行细节。
 

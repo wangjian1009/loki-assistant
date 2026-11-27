@@ -83,18 +83,6 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | 方法 | 路径 | 返回内容 |
 |------+------|----------|
 | GET | ~/healthz~ | services 健康状态 |
-| GET | ~/discover~ | 全部模块和 API 描述 |
-| GET | ~/discover/modules~ | 模块摘要列表 |
-| GET | ~/discover/modules/{module_id}~ | 单个模块描述 |
-| GET | ~/meta~ | 配置模型 |
-| GET | ~/meta/{module_id}~ | 单个配置模块模型 |
-| GET | ~/data/{module_id}~ | 生效配置值及来源 |
-| GET | ~/data/{module_id}/{key}~ | 单个生效配置值及来源 |
-| PUT | ~/data/{module_id}/{key}~ | 替换完整配置值 |
-| POST | ~/data/{module_id}/{key}~ | 合并字典或追加列表 |
-| PUT | ~/data/{module_id}/{key}/{instance}~ | 新增或更新结构数组记录 |
-| DELETE | ~/data/{module_id}/{key}/{instance}~ | 按主键删除结构数组记录 |
-| POST | ~/config/validate~ | 预检配置值，不修改配置 |
 | POST | ~/network/pairings~ | 创建绑定邀请并返回二维码 PNG 的 Base64 与数据 |
 | GET | ~/network/pairings/{id}~ | 查询绑定进度，不返回令牌 |
 | DELETE | ~/network/pairings/{id}~ | 取消尚未完成的绑定邀请 |
@@ -120,11 +108,6 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | GET | ~/xbloom/recipes/{id}~ | 按 Org ID 查询结构化配方 |
 | POST | ~/xbloom/recipes~ | 在当天日记中新建配方 |
 | PUT | ~/xbloom/recipes/{id}~ | 修改日记配方 |
-| GET | ~/stats/meta~ | 读取全部状态数据结构元数据 |
-| GET | ~/status~ | 读取全部模块发布的状态 |
-| GET | ~/status/{module_id}~ | 读取模块完整状态对象 |
-| GET | ~/status/{module_id}/{key}~ | 读取指定状态项 object 或 array |
-| GET | ~/status/{module_id}/{key}/{*path}~ | 按层级读取指定状态字段 |
 | POST | ~/emacs/activate~ | 显示 Emacs 或通过 buffer 查询参数定位目标 |
 | POST | ~/emacs/receiver/status~ | 接收 Emacs 业务状态并通过 Rust 接口发布 |
 | POST | ~/emacs/receiver/notification~ | 接收 Emacs 通知上报，默认展示 macOS 系统通知 |
@@ -140,6 +123,8 @@ Rust Workspace、Network 实例接口与通用请求的调用方式见 [[file:se
 | POST | ~/slack/teams/{team_id}/reset-credentials~ | 本机确认工作区凭据缺失或失效后重置凭据，配置变更处理器打开授权网页。见 [[file:slack-services.org::*工作区重新授权][重新授权接口]] |
 
 * 配置中心
+
+API 元数据、配置、状态与模块注册的函数原型和通用 HTTP 请求见 [[file:core-module-interface.org][核心模块接口]]。
 
 业务读取使用 ~/data~ ，配置编辑和写入使用 ~/editing~ 。配置模型、模块处理器与保存事务见 [[file:config-module.org][配置模块设计]]。
 
@@ -307,7 +292,7 @@ services 每次从当前绑定关系验证已认证的远端 Endpoint ID 和绑�
 
 不保留待确认状态或响应丢失后的重试恢复流程。手机界面仅展示“离线、绑定中、绑定失败、在线”；绑定失败提示删除后重新扫码绑定。失败状态可持久化恢复，后续不自动重试旧邀请；绑定中每轮结束后 1 秒读取状态，其他情况 20 秒刷新。私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。
 
-手机名称可以在手机设置页修改，后续绑定上报新名称；services 不提供名称修改接口。电脑 services 根据 hostname 生成名称，发布 ~service/name~ 和 ~service/device_type~ 监控字段；手机通过认证状态查询获取并缓存电脑的 ~name~ 与 ~device_type: computer~ 。手机绑定记录上报 ~device_type: mobile~ ；名称和类型不参与权限判断。
+手机可在设置页修改自身名称，并在后续绑定时上报新名称和 ~device_type: mobile~ 。Mac 上的 services 优先使用系统设置中的电脑名称，其他平台使用 hostname。电脑名称和设备类型发布到 ~service/name~ 和 ~service/device_type~ ，手机通过 ~GET /status~ 读取并缓存。名称和类型仅用于展示。
 
 *** 通用 services 请求通道
 
@@ -724,7 +709,7 @@ GET /password/entries/example.com/alice.gpg
 
 ~GET /stats/meta~ 返回 ~api_version~ 和 ~modules~ 列表。模块按 ~id~ 排序，每个模块包含 ~id~ 、 ~name~ 、 ~description~ 、 ~version~ 和 ~items~ 。状态项包含 ~key~ 、 ~name~ 、 ~description~ 、 ~remote_access~ 和递归 ~schema~ 。数据路径为 ~/status/{模块 id}/{状态项 key}~ ，嵌套字段使用 ~/status/{模块 id}/{状态项 key}/{层级路径}~ 。本次 services 启动时间可通过 ~GET /status/service~ 查询。
 
-通过 ~StatusItemMetadata::new~ 声明的状态项默认可由绑定设备读取，调用 ~local_only()~ 可将 ~remote_access~ 设为 ~false~ 。目前开放 ~service~ 的所有状态项、 ~network/my~ 和 ~mail/unread_count~ 。Emacs、Slack 与未声明状态项仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。状态上报接口仅供本机调用。
+通过 ~StatusItemMetadata::new~ 声明的状态项默认可由绑定设备读取，调用 ~local_only()~ 可将 ~remote_access~ 设为 ~false~ 。手机从 ~GET /status~ 读取 ~service/name~ 、 ~service/device_type~ 、 ~slack/unread_previews~ 和邮件状态。 ~slack/unread_previews~ 包含最近 20 个未读会话的名称、工作区、未读数和最新未读消息的纯文本摘要。Slack 授权、连接和本机打开路径仅限本机。远端元数据、全量快照和模块查询只返回开放项，更新时间取自可见数据。直接查询受限状态项或其嵌套字段返回 403 ~remote-status-forbidden~ 。状态上报接口仅供本机调用。
 
 ~schema.data_type~ 支持 ~string~ 、 ~integer~ 、 ~number~ 、 ~boolean~ 、 ~null~ 、 ~object~ 、 ~array~ 和 ~any~ 。object 的 ~fields~ 描述字段的 ~key~ 、中文名称、说明、 ~required~ 、 ~nullable~ 和子 schema；array 的 ~items~ 描述元素结构。string 可带 ~choices~ ，每个枚举项提供机器值 ~value~ 、中文 ~label~ 和 ~description~ 。例如 ~network/my~ 的 ~status~ 字段为 string，列出未配置、未连接、连接成功、连接失败和连接中的五个值及说明。
 
@@ -849,13 +834,15 @@ services 汇总同轮的同步、索引和未读查询错误，通过告警模�
 
 手动或定时同步完成索引后，以及 Emacs 请求刷新时，services 都通过同一刷新操作查询全局收件箱中未读且未标记删除的邮件，按 Message-ID 去重。首次成功查询建立基线，随后每封新匹配的邮件发送一条包含主题的系统通知，同一进程对每个 Message-ID 只通知一次。点击通知后由 services 通过 Emacs gateway 打开对应邮件。新邮件通知使用应用标识 ~mail~ 。
 
-同一次查询通过共享状态模块发布 ~mail/unread_count~ 。本机和已绑定设备可通过 ~GET /status/mail/unread_count~ 读取该整数，也可从 ~GET /status~ 的快照读取。索引暂不可用时，状态保留最近一次成功值，首次成功前该状态项缺省。
+同一次查询通过共享状态模块发布 ~mail/unread_count~ 和 ~mail/unread_subjects~ 。后者包含最近 20 封未读邮件的主题，按日期倒序。本机和已绑定设备可从 ~GET /status~ 快照读取这两个字段。索引暂不可用时保留最近一次成功值，首次成功前两个字段缺省。
 
 mu4e 在查看邮件、更新标记、移动或删除邮件完成后，异步调用本机 ~POST /mail/status/refresh~ 。索引有变更时也会调用该接口。连续回执合并发送，请求体为空。services 接受请求后返回 ~202~ 和 ~{"api_version":"1"}~ 。邮件处理循环串行执行同步和刷新，同步期间收到的请求可由同步结束后的查询处理。mu4e 正在索引、暂不可用或查询失败时，待处理的刷新请求合并为一次，每隔五秒重试，也可由下一轮同步后的成功查询处理。查询开始后到达的请求留待下一次查询。关闭自动同步时，此接口仍可刷新当前 mu4e 数据库。
 
 ** 手动同步与进度
 
-本机 ~POST /mail/sync~ 接受空请求体，返回 ~202~ 和 ~{"api_version":"1","id":"<uuid>"}~ 。关闭自动同步时仍可手动触发。已排队或开始的同步与手动请求合并，返回同一个任务 ID。完成一轮同步后，已启用的定时任务从该轮结束起重新计时。
+本机和已绑定设备可通过 ~POST /mail/sync~ 提交空请求体，服务返回 ~202~ 和 ~{"api_version":"1","id":"<uuid>"}~ 。关闭自动同步时仍可手动触发。已排队或开始的同步与手动请求合并，返回同一个任务 ID。完成一轮同步后，已启用的定时任务从该轮结束起重新计时。
+
+~mail/sync_runs~ 发布当前同步和最近八轮任务的 ~id~ 与 ~phase~ 。手机从 ~GET /status~ 读取该数组，并按提交时返回的任务 ID 显示进度。
 
 本机 ~GET /mail/sync/{id}~ 返回 ~200~ 和包含 ~api_version~ 、 ~sync~ 的 JSON。~sync~ 包含 ~id~ 、 ~phase~ 、 ~messages~ 和 ~error~ 。~phase~ 依次为 ~queued~ 、 ~downloading~ 、 ~indexing~ 、 ~refreshing~ ，最终为 ~completed~ 或 ~failed~ 。失败时 ~error~ 为诊断文本，其余时候为 ~null~ 。~messages~ 按收到顺序保留最近 64 条索引消息。直接执行 ~mu index~ 时实时显示 stdout 和 stderr 的输出行。复用 ~mu4e~ 时在索引完成后显示检查、更新和清理计数。进度条按阶段推进。
 

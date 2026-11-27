@@ -448,8 +448,13 @@ mod tests {
 
     #[tokio::test]
     async fn active_sync_shares_id_and_publishes_carriage_return_output_before_eof() {
-        let progress = SyncProgress::new();
+        let status = Arc::new(StatusService::new());
+        let progress = SyncProgress::new(Arc::clone(&status));
         let id = progress.request().await;
+        assert_eq!(
+            status.value(MODULE_ID, "sync_runs").await.unwrap().value,
+            json!([{"id":id,"phase":"queued"}])
+        );
         progress.begin().await;
         progress.phase(Phase::Indexing);
         assert_eq!(progress.request().await, id);
@@ -546,8 +551,8 @@ printf 'eval\n' >> "$0.calls"
             )),
             config,
             notification,
-            status,
-            sync_progress: SyncProgress::new(),
+            status: Arc::clone(&status),
+            sync_progress: SyncProgress::new(status),
             refresh_requested: Notify::new(),
             stopping: Notify::new(),
         });

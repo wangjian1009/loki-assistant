@@ -13,7 +13,7 @@
 - `ResponsError` 是直接返回的数据 Union，分为未设置、未绑定、网络、取消、Services 和参数错误，各分支分别定义 reason。ArkTS 请求采用成功/错误回调，直接返回 Union，不包装成 Error 类。
 - `network.rs` 提供单目标通信与绑定；`pairing.rs` 校验邀请；`error.rs` 定义错误；`workspace.rs` 提供实例分发和生命周期；`cpp/workspace.cpp` 只提供 NAPI 桥接。完整配置供业务存储，凭据不进入 UI、错误、监控或日志，Rust Debug 隐藏凭据。
 - `Workspace.stop()` 先同步通知网络关闭，再等待未完成请求取消回调并释放 runtime；NAPI 取消和停止信号不等待异步工作线程。停止须幂等，停止后不隐式重新打开。
-- 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。电脑状态通过 `request(GET /network/session)` 查询，包含只读 name 和 `device_type: computer`；名称和类型只用于展示，手机为固定 mobile、services 为固定 computer，UI 不提供设备类型编辑；services 不提供名称修改接口。
+- 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。当前设备页通过 `GET /status` 读取电脑名称、设备类型、Slack 和邮件状态。点击「立即同步邮件」调用 `POST /mail/sync`，按返回的任务 ID 从状态快照读取同步进度。名称和类型仅用于展示。
 - 界面只显示离线、绑定中、绑定失败、在线。只轮询当前选中电脑，绑定中每轮结束后间隔 1 秒读取 Service，其他情况每轮结束后 20 秒刷新；后台停止。失败错误来自 Service 的 ResponsError，提示删除后重新扫码绑定；删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
 
 - `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。

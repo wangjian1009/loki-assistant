@@ -2,12 +2,13 @@ use std::{collections::VecDeque, sync::Arc};
 
 use futures_util::FutureExt;
 use serde::Serialize;
+use serde_json::json;
 use tokio::sync::{Notify, oneshot};
 use uuid::Uuid;
 
-use crate::process::Process;
+use crate::{modules::status::StatusService, process::Process};
 
-use super::sync::IndexResult;
+use super::{MODULE_ID, status::SYNC_RUNS, sync::IndexResult};
 
 const RECENT_RUNS: usize = 8;
 const RECENT_MESSAGES: usize = 64;
@@ -31,8 +32,8 @@ pub(super) struct Snapshot {
     error: Option<String>,
 }
 
-#[derive(Default)]
 struct Runs {
+    status: Arc<StatusService>,
     active: Option<Snapshot>,
     recent: VecDeque<Snapshot>,
     index_reply: Option<(Uuid, oneshot::Sender<IndexResult>)>,
@@ -47,6 +48,16 @@ impl Runs {
             error: None,
         })
     }
+
+    fn publish(&self) {
+        let summaries: Vec<_> = self
+            .active
+            .iter()
+            .chain(&self.recent)
+            .map(|run| json!({"id": run.id, "phase": run.phase}))
+            .collect();
+        self.status.post(MODULE_ID, SYNC_RUNS, json!(summaries));
+    }
 }
 
 #[derive(Debug)]
@@ -56,9 +67,15 @@ pub(super) struct SyncProgress {
 }
 
 impl SyncProgress {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(status: Arc<StatusService>) -> Self {
+        status.post(MODULE_ID, SYNC_RUNS, json!([]));
         Self {
-            runs: Process::start(Runs::default()),
+            runs: Process::start(Runs {
+                status,
+                active: None,
+                recent: VecDeque::new(),
+                index_reply: None,
+            }),
             requested: Arc::new(Notify::new()),
         }
     }
@@ -68,6 +85,8 @@ impl SyncProgress {
         self.runs
             .call(move |runs| {
                 if runs.active.is_none() {
+                    runs.active();
+                    runs.publish();
                     requested.notify_one();
                 }
                 runs.active().id
@@ -82,12 +101,16 @@ impl SyncProgress {
                 // 定时任务可能已接手同时到达的手动请求。
                 let _ = requested.notified().now_or_never();
                 runs.active().phase = Phase::Downloading;
+                runs.publish();
             })
             .await;
     }
 
     pub(super) fn phase(&self, phase: Phase) {
-        self.runs.post(move |runs| runs.active().phase = phase);
+        self.runs.post(move |runs| {
+            runs.active().phase = phase;
+            runs.publish();
+        });
     }
 
     pub(super) fn message(&self, message: String) {
@@ -118,6 +141,7 @@ impl SyncProgress {
                     runs.recent.pop_back();
                 }
                 runs.recent.push_front(run);
+                runs.publish();
             })
             .await;
     }

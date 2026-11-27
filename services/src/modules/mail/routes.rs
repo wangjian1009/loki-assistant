@@ -50,6 +50,7 @@ async fn index_result(
     id = "sync",
     method = "POST",
     path = "/mail/sync",
+    access = "paired",
     summary = "立即同步邮件",
     description = "开始一轮同步，或返回当前同步任务的 ID。"
 )]

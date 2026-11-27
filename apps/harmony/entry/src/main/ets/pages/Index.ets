@@ -1,5 +1,5 @@
 import { common } from '@kit.AbilityKit'
-import { Application, ComputerDevice } from '../app/Application'
+import { Application, ComputerDevice, DashboardStatus, SlackPreview } from '../app/Application'
 import { NavigatorManager, NavigationResult, PageName } from '../app/NavigatorManager'
 import { ACCENT, ACCENT_TEXT, AppPage, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE,
   setSystemColors } from '../components/AppPage'
@@ -15,6 +15,13 @@ struct Index {
   @State private loaded: boolean = false
   @State private errorMessage: string = ''
   @State private refreshing: boolean = false
+  @State private dashboard: DashboardStatus | undefined = undefined
+  @State private showAllSlack: boolean = false
+  @State private showAllMail: boolean = false
+  @State private syncId: string = ''
+  @State private startingSync: boolean = false
+  @State private syncMessage: string = ''
+  @State private syncFailed: boolean = false
   private application?: Application
   private timer: number = -1
   private visible: boolean = false
@@ -38,6 +45,7 @@ struct Index {
     this.visible = false
     this.sidebarOpen = false
     this.detailsOpen = false
+    this.dashboard = undefined
     this.stopTimer()
   }
 
@@ -71,16 +79,33 @@ struct Index {
   private scheduleRefresh(): void {
     this.stopTimer()
     if (this.visible && this.foreground && this.current) {
-      this.timer = setTimeout(() => { this.refreshDevices() }, this.current.status === 'binding' ? 1000 : 20000)
+      if (this.syncId && this.current.status === 'online') {
+        this.timer = setTimeout(() => { this.refreshDevices() }, 2000)
+      } else {
+        this.timer = setTimeout(() => { this.refreshDevices() }, this.current.status === 'binding' ? 1000 : 20000)
+      }
     }
+  }
+
+  private updateCurrent(computers: ComputerDevice[]): void {
+    const next = computers.find((computer: ComputerDevice) => computer.active)
+    if (next?.endpoint_id !== this.current?.endpoint_id) {
+      this.syncId = ''
+      this.syncMessage = ''
+      this.syncFailed = false
+      this.showAllSlack = false
+      this.showAllMail = false
+    }
+    this.current = next
+    this.dashboard = this.visible && this.foreground ? next?.dashboard : undefined
+    if (!next) { this.detailsOpen = false }
   }
 
   private async loadDevices(): Promise<void> {
     if (this.working || !this.application) { return }
     this.working = true
     try {
-      this.current = (await this.application.list()).find((computer: ComputerDevice) => computer.active)
-      if (!this.current) { this.detailsOpen = false }
+      this.updateCurrent(await this.application.list())
       this.loaded = true
       this.errorMessage = ''
     } catch (error) {
@@ -96,10 +121,14 @@ struct Index {
     this.stopTimer()
     this.working = true
     this.refreshing = true
+    const syncId = this.syncId
     try {
-      this.current = (await this.application.refresh()).find((computer: ComputerDevice) => computer.active)
-      if (!this.current) { this.detailsOpen = false }
+      this.updateCurrent(await this.application.refresh())
       this.errorMessage = ''
+      if (syncId && syncId === this.syncId && this.dashboard) {
+        const task = this.dashboard.mail?.sync_runs?.find((run) => run.id === syncId)
+        this.updateSyncPhase(task?.phase)
+      }
     } catch (error) {
       this.errorMessage = (error as Error).message
     } finally {
@@ -107,6 +136,43 @@ struct Index {
       this.refreshing = false
       this.scheduleRefresh()
     }
+  }
+
+  private async startMailSync(): Promise<void> {
+    if (!this.application || this.current?.status !== 'online' || this.startingSync || this.syncId) { return }
+    const endpointId = this.current.endpoint_id
+    this.startingSync = true
+    this.syncFailed = false
+    this.syncMessage = '正在提交同步请求…'
+    try {
+      const id = await this.application.startMailSync(endpointId)
+      if (this.current?.endpoint_id === endpointId) {
+        this.syncId = id
+        this.syncMessage = '等待同步'
+      }
+    } catch (_) {
+      if (this.current?.endpoint_id === endpointId) {
+        this.syncFailed = true
+        this.syncMessage = '未收到同步确认，请重试'
+      }
+    } finally {
+      this.startingSync = false
+      this.scheduleRefresh()
+    }
+  }
+
+  private updateSyncPhase(phase?: string): void {
+    switch (phase) {
+      case 'queued': this.syncMessage = '等待同步'; return
+      case 'downloading': this.syncMessage = '正在下载邮件…'; return
+      case 'indexing': this.syncMessage = '正在更新索引…'; return
+      case 'refreshing': this.syncMessage = '正在刷新未读邮件…'; return
+      case 'completed': this.syncMessage = '邮件同步已完成'; break
+      case 'failed': this.syncMessage = '邮件同步失败'; break
+      default: this.syncMessage = '暂时无法获取同步进度'
+    }
+    this.syncId = ''
+    this.syncFailed = phase !== 'completed'
   }
 
   private async openDevices(): Promise<void> {
@@ -248,6 +314,82 @@ struct Index {
   }
 
   @Builder
+  private sectionTitle(title: string) {
+    Text(title).fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+  }
+
+  @Builder
+  private messageHint(message: string) {
+    Text(message).fontSize(14).fontColor(SECONDARY_TEXT).lineHeight(21)
+  }
+
+  @Builder
+  private listToggle(label: string, expanded: boolean, toggle: () => void) {
+    Button(expanded ? '收起' : label, { type: ButtonType.Normal })
+      .height(44).padding({ left: 0, right: 12 }).backgroundColor(Color.Transparent)
+      .fontSize(14).fontColor(ACCENT).onClick(toggle)
+  }
+
+  @Builder
+  private slackCard() {
+    Column({ space: 10 }) {
+      this.sectionTitle('Slack 新消息')
+      if (this.dashboard?.slack?.unread_previews?.length) {
+        ForEach(this.dashboard.slack.unread_previews.slice(0, this.showAllSlack ? 20 : 2),
+          (item: SlackPreview, index: number) => {
+          if (index > 0) { Divider().color(BORDER).strokeWidth(0.5) }
+          Column({ space: 4 }) {
+            Text(item.title).fontSize(16).fontColor(PRIMARY_TEXT).fontWeight(FontWeight.Medium)
+              .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+            this.messageHint(`${item.team_name} · ${item.unread_count} 条未读`)
+            Text(item.preview).fontSize(14).fontColor(PRIMARY_TEXT).lineHeight(21)
+          }.width('100%').alignItems(HorizontalAlign.Start)
+        }, (item: SlackPreview, index: number) => `${index}:${JSON.stringify(item)}`)
+        if (this.dashboard.slack.unread_previews.length > 2) {
+          this.listToggle('查看更多 Slack 消息', this.showAllSlack, () => { this.showAllSlack = !this.showAllSlack })
+        }
+      } else {
+        this.messageHint('暂无未读消息')
+      }
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(14)
+      .backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
+  }
+
+  @Builder
+  private mailCard() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Column({ space: 4 }) {
+          this.sectionTitle('邮件收件箱')
+          if (this.dashboard?.mail?.unread_count !== undefined) {
+            this.messageHint(`${this.dashboard.mail.unread_count} 封未读`)
+          }
+        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+        Button('立即同步邮件', { type: ButtonType.Normal })
+          .constraintSize({ minHeight: 44 }).padding({ left: 12, right: 12 }).borderRadius(10)
+          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
+          .enabled(!this.startingSync && !this.syncId).onClick(() => { this.startMailSync() })
+      }.width('100%')
+      if (this.syncMessage !== '') {
+        Text(this.syncMessage).fontSize(14).fontColor(this.syncFailed ? ERROR_TEXT : SECONDARY_TEXT)
+          .accessibilityDescription(this.syncMessage)
+      }
+      if (this.dashboard?.mail?.unread_subjects?.length) {
+        ForEach(this.dashboard.mail.unread_subjects.slice(0, this.showAllMail ? 20 : 2), (subject: string) => {
+          Divider().color(BORDER).strokeWidth(0.5)
+          Text(subject).fontSize(15).fontColor(PRIMARY_TEXT).lineHeight(22)
+        }, (subject: string, index: number) => `${index}:${subject}`)
+        if (this.dashboard.mail.unread_subjects.length > 2) {
+          this.listToggle('查看更多邮件', this.showAllMail, () => { this.showAllMail = !this.showAllMail })
+        }
+      } else if (this.dashboard && this.dashboard.mail?.unread_count === undefined) {
+        this.messageHint('等待电脑更新邮件索引')
+      }
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(14)
+      .backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
+  }
+
+  @Builder
   private pageContent() {
     Scroll() {
       Column({ space: 12 }) {
@@ -257,6 +399,10 @@ struct Index {
         this.feedback()
         if (this.loaded && !this.current) {
           this.emptyDevices()
+        }
+        if (this.current?.status === 'online' && this.dashboard) {
+          this.mailCard()
+          this.slackCard()
         }
       }.width('100%').padding({ left: this.current ? 12 : 24, right: this.current ? 12 : 24,
         top: this.current ? 6 : 16, bottom: 24 })

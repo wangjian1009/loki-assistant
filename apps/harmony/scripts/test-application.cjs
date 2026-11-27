@@ -58,7 +58,15 @@ function fixture(initial = {}) {
           if (control.requestError.kind === 'not_bound') { handle.service.binding = { status: 'failed', error: clone(control.requestError) }; }
           return fail(control.requestError);
         }
-        return ok({ request_id: 'request', status: 200, generation: 1, body: { api_version: '1', endpoint_id: handle.service.endpoint_id, bound_at: credential.bound_at, status: 'online', name: '工作电脑', device_type: 'computer' } });
+        if (request.method === 'POST' && request.path === '/mail/sync') {
+          return ok({ request_id: 'request', status: 202, generation: 1, body: { api_version: '1', id: '12345678-1234-1234-1234-123456789abc' } });
+        }
+        assert.equal(request.method, 'GET');
+        assert.equal(request.path, '/status');
+        return ok({ request_id: 'request', status: 200, generation: 1, body: {
+          api_version: '1', status: { service: { name: '工作电脑', device_type: 'computer' },
+            slack: { unread_previews: [] }, mail: { unread_count: 1, unread_subjects: ['测试邮件'], sync_runs: [] } }
+        } });
       }
       assert.fail(`未知原生操作 ${operation}`);
     }

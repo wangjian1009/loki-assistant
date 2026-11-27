@@ -1,0 +1,556 @@
+#+TITLE: 核心模块接口
+#+STARTUP: content hidestars indent
+
+* 模块与 API 元数据
+** 程序接口
+#+begin_src rust
+pub struct DiscoverResponse {
+    /// 服务标识，例如 `loki-services`。
+    pub service: String,
+    /// 当前运行的服务版本。
+    pub version: String,
+    /// 当前请求方可访问的模块及其 API 元数据。
+    pub modules: Vec<ModuleMetadata>,
+}
+
+pub struct ModuleListResponse {
+    /// 当前请求方可访问的模块摘要。
+    pub modules: Vec<ModuleSummary>,
+}
+
+pub struct ModuleMetadata {
+    /// 模块标识，用于填充路径中的 `{module_id}`。
+    pub id: String,
+    /// 模块显示名称。
+    pub name: String,
+    /// 模块职责说明。
+    pub description: String,
+    /// 模块声明的版本。
+    pub version: String,
+    /// 当前请求方可访问的 HTTP API 列表。
+    pub apis: Vec<ApiMetadata>,
+}
+
+pub struct ModuleSummary {
+    /// 模块标识，用于查询模块详情。
+    pub id: String,
+    /// 模块显示名称。
+    pub name: String,
+    /// 模块职责说明。
+    pub description: String,
+    /// 模块声明的版本。
+    pub version: String,
+}
+
+pub struct ApiMetadata {
+    /// 访问范围。`local` 限本机，`paired` 允许本机和已绑定设备调用。
+    pub access: String,
+    /// API 在所属模块中的标识。
+    pub id: String,
+    /// HTTP 请求方法，例如 `GET`。
+    pub method: String,
+    /// HTTP 路径模板，例如 `/meta/{module_id}`。
+    pub path: String,
+    /// API 功能的简短标题。
+    pub summary: String,
+    /// API 用途与行为说明。
+    pub description: String,
+    /// 该 API 声明的请求参数。
+    pub parameters: Vec<ParameterMetadata>,
+    /// 请求体的结构描述。未提供时序列化为 `null`。
+    pub request: Option<DataMetadata>,
+    /// 响应体的结构描述。未提供时序列化为 `null`。
+    pub response: Option<DataMetadata>,
+}
+
+pub struct ParameterMetadata {
+    /// 参数名称。
+    pub name: String,
+    /// 参数在 HTTP 请求中的位置，例如 `path`。
+    pub location: String,
+    /// 参数值的类型名称，例如 `string`。
+    pub type_name: String,
+    /// 发起请求时是否必须提供此参数。
+    pub required: bool,
+    /// 参数用途说明。
+    pub description: String,
+}
+
+pub struct DataMetadata {
+    /// 请求体或响应体的结构名称。
+    pub name: String,
+    /// 结构中声明的字段。
+    pub fields: Vec<FieldMetadata>,
+}
+
+pub struct FieldMetadata {
+    /// 请求体或响应体中的字段名。
+    pub name: String,
+    /// 字段值的类型名称。
+    pub type_name: String,
+    /// 数据中是否必须包含此字段。
+    pub required: bool,
+    /// 字段用途说明。
+    pub description: String,
+}
+#+end_src
+
+以源码中的 Rust 定义为准。 [[file:../services/src/modules/discover/protocol.rs][发现接口响应]] · [[file:../services/src/modules/discover/model.rs][模块与 API 元数据]]
+
+*** 服务声明示例
+
+#+begin_src rust
+#[loki_api(
+    // 模块标识，用于归类发现元数据。路由挂载组默认使用此标识。
+    module = "mail",
+    // Axum 路由的状态类型，与下方 State 提取器对应。无状态接口填写 "()"。
+    mount = "Arc<MailService>",
+    // API 在所属模块中的标识。
+    id = "sync",
+    // HTTP 请求方法和路径模板共同确定路由。
+    method = "POST",
+    path = "/mail/sync",
+    // paired 允许本机和已绑定设备调用。省略时默认为 local，仅限本机。
+    access = "paired",
+    // 发现接口返回的操作标题和行为说明。
+    summary = "立即同步邮件",
+    description = "开始一轮同步，或返回当前同步任务的 ID。"
+)]
+async fn start_sync(State(service): State<Arc<MailService>>) -> Response {
+    let id = service.sync_progress.request().await;
+    // 202 表示已受理，响应中的 id 标识同步任务。
+    (
+        StatusCode::ACCEPTED,
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({"api_version": API_VERSION, "id": id})),
+    )
+        .into_response()
+}
+#+end_src
+
+[[file:../services/src/modules/mail/routes.rs::async fn start_sync][邮件同步路由源码]]
+
+** 服务接口
+| 请求                              | 响应的 Rust 类型     |
+|-----------------------------------+----------------------|
+| GET /discover                     | ~DiscoverResponse~   |
+| GET /discover/modules             | ~ModuleListResponse~ |
+| GET /discover/modules/{module_id} | ~ModuleMetadata~     |
+
+*** 响应示例
+~GET /discover/modules/config~ 响应示例（仅展示一个 API）
+
+#+begin_src json
+{
+  "id": "config",
+  "name": "配置中心",
+  "description": "提供配置模型、配置数据读取、更新和变化订阅。",
+  "version": "0.1.0",
+  "apis": [
+    {
+      "id": "module-meta",
+      "method": "GET",
+      "path": "/meta/{module_id}",
+      "access": "paired",
+      "summary": "获取模块配置模型",
+      "description": "返回单个配置模块的完整描述。",
+      "parameters": [
+        {
+          "name": "module_id",
+          "location": "path",
+          "type_name": "string",
+          "required": true,
+          "description": "路径参数"
+        }
+      ],
+      "request": null,
+      "response": null
+    }
+  ]
+}
+#+end_src
+
+* 配置
+** 程序接口
+#+begin_src rust
+pub struct ConfigModuleMetadata {
+    /// 模块标识，用于配置接口的 {module_id}。
+    pub id: String,
+    /// 模块显示名称。
+    pub name: String,
+    /// 模块配置的用途。
+    pub description: String,
+    /// 模块声明的版本。
+    pub version: String,
+    /// 模块声明的配置项。
+    pub items: Vec<ConfigItemMetadata>,
+}
+
+pub struct ConfigItemMetadata {
+    /// 配置项标识，用于配置接口的 {key}。
+    pub key: String,
+    /// 配置项显示名称。
+    pub name: String,
+    /// 配置项用途。
+    pub description: String,
+    /// 配置值的类型。
+    pub data_type: ConfigDataType,
+    /// 已绑定设备对该配置项的读写权限。
+    #[serde(default)]
+    pub remote_access: ConfigRemoteAccess,
+    /// 配置项是否要求有值。
+    pub required: bool,
+    /// 未设置用户值时使用的静态默认值。
+    pub default: Option<Value>,
+    /// 字典条目的声明及是否允许额外条目。
+    pub dictionary: Option<DictionaryMetadata>,
+    /// 列表元素的类型及数量限制。
+    pub list: Option<ListMetadata>,
+    /// 配置值的校验规则。
+    pub checker: Option<CheckerMetadata>,
+    /// 文件或目录路径的约束。
+    pub file_path: Option<FilePathMetadata>,
+    /// 默认可执行程序名和补充搜索目录。
+    pub executable: Option<ExecutableMetadata>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDataType {
+    String,
+    Key,
+    Password {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    Integer,
+    Number,
+    Boolean,
+    Dictionary,
+    Structure,
+    PasswordReference,
+    List,
+    FilePath,
+    Executable,
+    /// 引用配置模块声明的命名类型。
+    Ref(String),
+}
+
+#[derive(Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigRemoteAccess {
+    /// 仅本机可访问，也是省略该字段时的默认值。
+    #[default]
+    Local,
+    /// 已绑定设备可读取元数据与生效值。
+    Read,
+    /// 已绑定设备可读写，也可预检写入值。
+    ReadWrite,
+}
+
+pub struct ConfigValue {
+    /// 当前生效的 JSON 值。
+    pub value: Value,
+    /// User 表示用户设置，Default 表示默认值或自动发现的值。
+    pub source: ConfigValueSource,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum ConfigValueSource {
+    User,
+    Default,
+}
+
+// ConfigService
+// 读取配置声明、生效值或校验后的候选值。
+async fn metadata(&self) -> Vec<ConfigModuleMetadata>;
+async fn module_values(&self, module_id: &str) -> Result<BTreeMap<String, ConfigValue>, ConfigServiceError>;
+async fn value(&self, module_id: &str, key: &str) -> Result<ConfigValue, ConfigServiceError>;
+async fn validate_value(&self, module_id: &str, key: &str, value: &Value) -> Result<Value, ConfigServiceError>;
+// 完整替换配置值，或按配置类型合并字典、追加列表。
+async fn replace(&self, module_id: &str, key: &str, value: Value) -> Result<Value, ConfigServiceError>;
+async fn partial(&self, module_id: &str, key: &str, partial: Value) -> Result<Value, ConfigServiceError>;
+// 订阅指定模块生效值的变更。
+fn subscribe_module(&self, module_id: &str) -> ModuleSubscription;
+
+// ModuleSubscription
+// 等待下一次变更，订阅关闭时返回 None。
+async fn recv(&mut self) -> Option<ConfigChange>;
+#+end_src
+
+配置类型、约束和订阅事件以 Rust 定义为准。 [[file:../services/src/modules/config/model.rs][配置模型]] · [[file:../services/src/modules/config/service.rs][配置服务]]
+
+*** 配置声明示例
+#+begin_src rust
+// 元数据函数为无参数的同步函数，返回模块及其配置项声明。
+#[loki_config]
+fn control_center_metadata() -> ConfigModuleMetadata {
+    ConfigModuleMetadata {
+        id: "control-center".to_owned(),
+        name: "控制中心".to_owned(),
+        description: "控制菜单栏程序的启动行为。".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        items: vec![ConfigItemMetadata {
+            key: "center_auto_start".to_owned(),
+            name: "登录时自动启动".to_owned(),
+            description: "登录 macOS 后自动启动菜单栏程序；系统操作成功后才保存。".to_owned(),
+            data_type: ConfigDataType::Boolean,
+            // 绑定设备可查询此配置项，本机可以提交修改。
+            remote_access: crate::modules::config::model::ConfigRemoteAccess::Read,
+            // 用户可省略此项，生效值默认为 false。
+            required: false,
+            default: Some(Value::Bool(false)),
+            // 此布尔值没有附加的类型约束。
+            dictionary: None,
+            list: None,
+            checker: None,
+            file_path: None,
+            executable: None,
+        }],
+    }
+}
+#+end_src
+
+[[file:../services/src/modules/control_center/config.rs::fn control_center_metadata][控制中心配置声明源码]]
+
+** 服务接口
+| 请求                                         | 可用范围 | 接口能力                                         |
+|----------------------------------------------+----------+--------------------------------------------------|
+| GET /meta                                    | paired   | 读取全部配置模块的元数据。                       |
+| GET /meta/{module_id}                        | paired   | 读取指定模块的配置元数据。                       |
+| GET /data/{module_id}                        | paired   | 读取指定模块的生效配置。                         |
+| GET /data/{module_id}/{key}                  | paired   | 读取指定配置项的生效值及来源。                   |
+| GET /config/options/{module_id}/{type_name}  | local    | 查询命名类型的候选项。                           |
+| POST /config/validate                        | paired   | 预检配置值并规范化有效值。                       |
+| GET /editing/{module_id}                     | local    | 查看模块的已确认值、候选值及处理状态。           |
+| PATCH /editing/{module_id}                   | local    | 批量提交同一模块的多项配置变更。                 |
+| PUT /editing/{module_id}/{key}               | paired   | 替换整个配置值或重试待确认变更。                 |
+| POST /editing/{module_id}/{key}              | paired   | 合并字典、追加列表项或新增由服务分配标识的记录。 |
+| PATCH /editing/{module_id}/{key}             | paired   | 更新配置对象的指定字段。                         |
+| DELETE /editing/{module_id}/{key}            | paired   | 移除受监控的单值配置。                           |
+| PUT /editing/{module_id}/{key}/{instance}    | local    | 新增或替换指定记录，也可重试待确认变更。         |
+| PATCH /editing/{module_id}/{key}/{instance}  | local    | 更新指定记录的部分字段。                         |
+| DELETE /editing/{module_id}/{key}/{instance} | local    | 删除指定记录。                                   |
+
+可用范围按路由声明标注。 ~local~ 仅限本机， ~paired~ 也允许已绑定设备调用。绑定设备对具体配置项的读写还受该项 ~remote_access~ 限制。
+
+[[file:config-module.org][配置模块设计]]
+
+*** 响应示例
+~GET /meta/control-center~ 返回已声明的配置项及监控点。
+
+#+begin_src json
+{
+  "id": "control-center",
+  "name": "控制中心",
+  "description": "控制菜单栏程序的启动行为。",
+  "version": "0.1.0",
+  "items": [
+    {
+      "key": "center_auto_start",
+      "name": "登录时自动启动",
+      "description": "登录 macOS 后自动启动菜单栏程序；系统操作成功后才保存。",
+      "data_type": "boolean",
+      "remote_access": "read",
+      "required": false,
+      "default": false,
+      "dictionary": null,
+      "list": null,
+      "checker": null,
+      "file_path": null,
+      "executable": null,
+      "monitor": "login-startup"
+    }
+  ],
+  "monitors": [
+    {
+      "id": "login-startup",
+      "name": "登录时自动启动",
+      "scope": "module"
+    }
+  ]
+}
+#+end_src
+
+* 状态
+** 程序接口
+#+begin_src rust
+pub struct StatusModuleMetadata {
+    /// 模块标识，用于状态接口的 {module_id}。
+    pub id: String,
+    /// 模块显示名称。
+    pub name: String,
+    /// 模块发布的状态所描述的内容。
+    pub description: String,
+    /// 模块声明的版本。
+    pub version: String,
+    /// 此模块声明的状态项。
+    pub items: Vec<StatusItemMetadata>,
+}
+
+pub struct StatusItemMetadata {
+    /// 状态项标识，用于状态接口的 {key}。
+    pub key: String,
+    /// 状态项显示名称。
+    pub name: String,
+    /// 状态值所表示的内容。
+    pub description: String,
+    /// 是否允许已绑定设备读取该状态项。
+    pub remote_access: bool,
+    /// 状态值的递归结构。
+    pub schema: StatusSchema,
+}
+
+#[serde(tag = "data_type", rename_all = "snake_case")]
+pub enum StatusSchema {
+    String {
+        /// 允许的字符串枚举值，空列表表示任意字符串。
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<StatusChoiceMetadata>,
+    },
+    Integer,
+    Number,
+    Boolean,
+    Null,
+    Object {
+        /// 对象字段的名称、约束和类型。
+        fields: Vec<StatusFieldMetadata>,
+    },
+    Array {
+        /// 数组元素的类型。
+        items: Box<StatusSchema>,
+    },
+    /// 允许任意 JSON 值。
+    Any,
+}
+
+pub struct StatusFieldMetadata {
+    /// JSON 对象中的字段名。
+    pub key: String,
+    /// 字段显示名称。
+    pub name: String,
+    /// 字段用途。
+    pub description: String,
+    /// 字段是否必须存在。
+    pub required: bool,
+    /// 字段存在时是否允许为 null。
+    pub nullable: bool,
+    /// 字段值的递归结构。
+    pub schema: StatusSchema,
+}
+
+pub struct StatusChoiceMetadata {
+    /// 字符串枚举中的实际 JSON 值。
+    pub value: Value,
+    /// 枚举项显示名称。
+    pub label: String,
+    /// 枚举项含义。
+    pub description: String,
+}
+
+/// 按模块标识和状态项标识组织的 JSON 值。
+pub type StatusValues = BTreeMap<String, BTreeMap<String, Value>>;
+
+// StatusService
+// 读取静态元数据、当前快照或指定状态值。
+fn metadata(&self) -> Vec<StatusModuleMetadata>;
+async fn snapshot(&self) -> StatusResponse;
+async fn module_value(&self, module_id: &str) -> Result<StatusModuleResponse, StatusError>;
+async fn value(&self, module_id: &str, key: &str) -> Result<StatusValueResponse, StatusError>;
+async fn path_value(&self, module_id: &str, key: &str, path: &str) -> Result<StatusPathResponse, StatusError>;
+// 发布单项或批量更新。
+async fn publish(&self, module_id: &str, key: &str, value: Value) -> Result<StatusValueResponse, StatusError>;
+async fn publish_many(&self, values: StatusValues) -> Result<StatusResponse, StatusError>;
+// 按声明校验整个批次，通过后统一发布。
+async fn publish_many_validated(&self, values: StatusValues) -> Result<StatusResponse, StatusError>;
+#+end_src
+
+状态模型、响应结构与函数签名以 Rust 源码为准。 [[file:../services/src/modules/status/model.rs][状态模型]] · [[file:../services/src/modules/status/protocol.rs][状态响应]] · [[file:../services/src/modules/status/service.rs][状态服务]]
+
+*** 状态声明示例
+#+begin_src rust
+// 状态元数据函数为无参数的同步函数。
+#[loki_status]
+fn service_status_metadata() -> StatusModuleMetadata {
+    StatusModuleMetadata {
+        id: "service".to_owned(),
+        name: "服务".to_owned(),
+        description: "本机 services 进程的自身运行信息。".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // new 默认允许已绑定设备读取，调用 local_only() 可限制为仅本机读取。
+        items: vec![
+            StatusItemMetadata::new(
+                "name",
+                "设备名称",
+                "本机的只读显示名称。macOS 优先使用系统设置中的电脑名称。",
+                StatusSchema::string(),
+            ),
+            StatusItemMetadata::new(
+                "device_type",
+                "设备类型",
+                "当前 services 为 computer，移动端为 mobile。",
+                StatusSchema::string(),
+            ),
+            StatusItemMetadata::new(
+                "start_at",
+                "启动时间",
+                "本次 services 进程启动时间，Unix 秒。",
+                StatusSchema::Integer,
+            ),
+        ],
+    }
+}
+#+end_src
+
+[[file:../services/src/modules/service/status.rs::fn service_status_metadata][服务状态声明源码]]
+
+** 服务接口
+| 请求                                  | 可用范围 | 接口能力                           |
+|---------------------------------------+----------+------------------------------------|
+| GET /stats/meta                       | paired   | 读取各模块声明的状态结构。         |
+| GET /status                           | paired   | 读取所有可见状态的快照。           |
+| GET /status/{module_id}               | paired   | 读取指定模块的状态。               |
+| GET /status/{module_id}/{key}         | paired   | 读取指定状态项。                   |
+| GET /status/{module_id}/{key}/{*path} | paired   | 读取状态项内的对象字段或数组元素。 |
+
+~paired~ 允许本机和已绑定设备调用。绑定设备只能读取 ~remote_access~ 为 ~true~ 的状态项。业务代码通过 Rust 发布状态。 [[file:control-center-services.org::*状态中心][状态中心协议]]
+
+*** 响应示例
+~GET /stats/meta~ 的响应节选，展示 ~service~ 模块。
+
+#+begin_src json
+{
+  "api_version": "1",
+  "modules": [
+    {
+      "id": "service",
+      "name": "服务",
+      "description": "本机 services 进程的自身运行信息。",
+      "version": "0.1.0",
+      "items": [
+        {
+          "key": "name",
+          "name": "设备名称",
+          "description": "本机的只读显示名称。macOS 优先使用系统设置中的电脑名称。",
+          "remote_access": true,
+          "schema": {"data_type": "string"}
+        },
+        {
+          "key": "device_type",
+          "name": "设备类型",
+          "description": "当前 services 为 computer，移动端为 mobile。",
+          "remote_access": true,
+          "schema": {"data_type": "string"}
+        },
+        {
+          "key": "start_at",
+          "name": "启动时间",
+          "description": "本次 services 进程启动时间，Unix 秒。",
+          "remote_access": true,
+          "schema": {"data_type": "integer"}
+        }
+      ]
+    }
+  ]
+}
+#+end_src
