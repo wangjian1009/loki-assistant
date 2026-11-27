@@ -1,5 +1,6 @@
-import { ACCENT, ACCENT_TEXT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET,
-  PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SURFACE, TOUCH_SIZE } from '../../components/AppPage'
+import { ACCENT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET,
+  PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SELECTED_SURFACE, SURFACE,
+  TOUCH_SIZE } from '../../components/AppPage'
 import { Mail, MailActivity, MailStatus, MailStatusChanged, StatusSubscription } from 'liblokiworkspace.so'
 import { Workspace } from '../../workspace/Workspace'
 import { mailSyncPhaseText } from './MailModel'
@@ -87,9 +88,12 @@ export struct MailCard {
             Text(`${this.mail.unread_count} 封未读`).fontSize(META_SIZE).fontColor(SECONDARY_TEXT)
           }
         }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        Button('立即同步邮件', { type: ButtonType.Normal })
-          .constraintSize({ minHeight: TOUCH_SIZE }).padding({ left: PAGE_INSET, right: PAGE_INSET }).borderRadius(PANEL_RADIUS)
-          .fontSize(BODY_SIZE).fontWeight(FontWeight.Medium).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
+        Button({ type: ButtonType.Normal }) {
+          Text('同步').fontSize(13).fontWeight(FontWeight.Medium).fontColor(ACCENT)
+            .constraintSize({ minWidth: 56, minHeight: 30 }).padding({ left: CONTENT_GAP, right: CONTENT_GAP })
+            .textAlign(TextAlign.Center).backgroundColor(SELECTED_SURFACE).borderRadius(7)
+        }.constraintSize({ minHeight: TOUCH_SIZE }).padding(0).backgroundColor(Color.Transparent)
+          .accessibilityText('同步邮件')
           .flexShrink(0).enabled(!this.syncing()).onClick(() => { this.startSync() })
       }.width('100%')
       if (this.syncMessage()) {

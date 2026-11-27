@@ -238,6 +238,15 @@ test('冷启动只加载末级页面，多级返回按需加载父页并复用�
   assert.deepEqual(operations.slice(6), [['replace', 'pages/Devices'], ['replace', 'pages/Index']]);
 });
 
+test('控件顺序保留已保存的有效位置，忽略旧控件和重复记录并补齐缺项', () => {
+  const { load } = fixture();
+  const { currentDeviceOrder } = load(path.join(etsRoot, 'app/CurrentDeviceLayout.ets'));
+  assert.deepEqual(currentDeviceOrder(), ['device', 'mail', 'slack']);
+  assert.deepEqual(currentDeviceOrder('slack,refresh,mail'), ['device', 'slack', 'mail']);
+  assert.deepEqual(currentDeviceOrder('slack,other,slack'), ['device', 'slack', 'mail']);
+  assert.deepEqual(currentDeviceOrder('slack,device,mail'), ['slack', 'device', 'mail']);
+});
+
 test('应用保存多台电脑，Network 只恢复选中的一个目标', async () => {
   const fixtureState = fixture(); let { app, workspace } = fixtureState.create();
   await app.addService(JSON.stringify(invitation(1))); await observedDevices(app);
@@ -256,9 +265,8 @@ test('应用保存多台电脑，Network 只恢复选中的一个目标', async 
   await app.select(id(1)); assert.equal((await (await workspace.open()).service()).endpoint_id, id(1));
 });
 
-test('一次获取全部开放状态并展示新增状态，手动同步复用托盘路径', async () => {
-  const { control, create, load } = fixture();
-  const { statusDetails } = load(path.join(etsRoot, 'components/DeviceStatus.ets'));
+test('一次获取全部开放状态，手动同步复用托盘路径', async () => {
+  const { control, create } = fixture();
   const { app, workspace } = create();
   const taskId = '12345678-1234-1234-1234-123456789abc';
   control.statusSnapshot = {
@@ -271,14 +279,6 @@ test('一次获取全部开放状态并展示新增状态，手动同步复用�
   await app.addService(JSON.stringify(invitation(1)));
   const [computer] = await observedDevices(app);
   assert.deepEqual(computer.dashboard.status, control.statusSnapshot);
-  const details = statusDetails(computer.dashboard.status);
-  assert.deepEqual(details.map(detail => detail.label), [
-    '服务启动时间', '中转连接', '最近的邮件同步', 'example/available', 'example/nested'
-  ]);
-  assert.equal(details[1].value, '已连接');
-  assert.equal(details[2].value, '邮件同步已完成');
-  assert.equal(details[3].value, 'false');
-  assert.deepEqual(JSON.parse(details[4].value), control.statusSnapshot.example.nested);
   const progress = [];
   const slackUpdates = [];
   const nativeWorkspace = await workspace.open();

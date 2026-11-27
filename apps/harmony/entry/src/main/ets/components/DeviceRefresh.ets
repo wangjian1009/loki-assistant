@@ -1,17 +1,14 @@
 import { DeviceRefreshStep } from 'liblokiworkspace.so'
 import { Workspace } from '../workspace/Workspace'
-import { ACCENT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET, PAGE_MAX_WIDTH,
-  PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE } from './AppPage'
+import { ACCENT, BODY_SIZE, CONTENT_GAP, ERROR_TEXT, SECONDARY_TEXT } from './AppPage'
 
 @Component
 export struct DeviceRefresh {
   workspace: () => Workspace | undefined = () => undefined
   @Prop @Watch('targetChanged') endpointId: string = ''
-  @BuilderParam content: () => void
+  @Prop @Watch('requestRefresh') refreshRequest: number = 0
   @State private phase: 'idle' | 'running' | 'success' | 'failure' = 'idle'
   @State private message: string = ''
-  private readonly scroller: Scroller = new Scroller()
-  private startedAtTop: boolean = false
   private timer: number = -1
   private version: number = 0
 
@@ -21,13 +18,16 @@ export struct DeviceRefresh {
     this.reset()
   }
 
+  private requestRefresh(): void {
+    this.sync()
+  }
+
   private reset(): void {
     this.version += 1
     if (this.timer !== -1) {
       clearTimeout(this.timer)
       this.timer = -1
     }
-    this.startedAtTop = false
     this.phase = 'idle'
     this.message = ''
   }
@@ -57,50 +57,18 @@ export struct DeviceRefresh {
     this.timer = setTimeout(() => { this.reset() }, this.phase === 'success' ? 1000 : 2000)
   }
 
-  @Builder
-  private progress() {
-    Column({ space: 4 }) {
-      if (this.phase === 'running') {
-        Row({ space: CONTENT_GAP }) {
-          LoadingProgress().width(16).height(16).color(ACCENT).accessibilityLevel('no')
-          Text(this.message).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
-        }
-      } else {
-        Text(this.phase === 'success' ? '设备同步成功' : '设备同步失败')
-          .fontSize(BODY_SIZE).fontWeight(FontWeight.Medium)
-          .fontColor(this.phase === 'success' ? '#9AE2B9' : ERROR_TEXT)
-        if (this.phase === 'failure') {
-          Text(this.message).width('100%').fontSize(META_SIZE).fontColor(SECONDARY_TEXT)
-            .textAlign(TextAlign.Center).maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-      }
-    }.width('100%').constraintSize({ minHeight: 48 }).padding(CONTENT_GAP)
-      .justifyContent(FlexAlign.Center).backgroundColor(SURFACE)
-      .borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
-  }
-
   build() {
-    Column() {
-      if (this.phase !== 'idle') {
-        Column() {
-          this.progress()
-        }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET, top: CONTENT_GAP })
-      }
-      Scroll(this.scroller) {
-        this.content()
-      }.width('100%').layoutWeight(1).align(Alignment.Top).edgeEffect(EdgeEffect.None)
-        .scrollBar(BarState.Auto).scrollBarColor('#4D576B').scrollBarWidth(3)
-        .parallelGesture(
-          PanGesture({ direction: PanDirection.Down })
-            .onActionStart(() => {
-              this.startedAtTop = this.scroller.currentOffset().yOffset <= 0
-            })
-            .onActionEnd((event: GestureEvent) => {
-              if (this.startedAtTop && event.offsetY >= 72) { this.sync() }
-              this.startedAtTop = false
-            })
-            .onActionCancel(() => { this.startedAtTop = false })
-        )
-    }.width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH }).layoutWeight(1).align(Alignment.Top)
+    if (this.phase !== 'idle') {
+      Row({ space: CONTENT_GAP }) {
+        if (this.phase === 'running') {
+          LoadingProgress().width(14).height(14).color(ACCENT).accessibilityLevel('no')
+          Text(this.message).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+        } else {
+          Text(this.phase === 'success' ? '设备同步成功' : '设备同步失败')
+            .fontSize(BODY_SIZE).fontColor(this.phase === 'success' ? '#9AE2B9' : ERROR_TEXT)
+            .accessibilityDescription(this.phase === 'failure' ? this.message : '')
+        }
+      }.width('100%').constraintSize({ minHeight: 28 })
+    }
   }
 }
