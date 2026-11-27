@@ -10,8 +10,20 @@
 (require 'url-util)
 
 (declare-function agent-shell-buffers "agent-shell")
+(declare-function agent-shell-busy-submit-steer "agent-shell-prompt-queue")
+(declare-function agent-shell-initialized-p "agent-shell")
+(declare-function agent-shell-insert "agent-shell")
+(declare-function agent-shell-session-id "agent-shell")
+(declare-function agent-shell-status "agent-shell")
+(declare-function agent-shell-subscribe-to "agent-shell")
+(declare-function agent-shell-unsubscribe "agent-shell")
 (declare-function agent-shell--live-prompt-start "agent-shell-prompt")
+(declare-function agent-shell--prompt-input-start "agent-shell-prompt")
+(declare-function agent-shell--prompt-queue-enqueue "agent-shell-prompt-queue")
+(declare-function agent-shell--prompt-queue-process-next "agent-shell-prompt-queue")
 (declare-function agent-shell-markdown-reconstruct "agent-shell-markdown")
+
+(defvar agent-shell--state)
 
 ;; 块和批次大小按字符数计算，留出 UTF-8 与 JSON 转义空间。
 (defconst loki-assistant-agent-shell-stream--block-size 2048)
@@ -23,6 +35,7 @@
 
 (defvar-local loki-assistant-agent-shell-stream--state nil)
 (defvar-local loki-assistant-agent-shell-stream--recent-state nil)
+(defvar-local loki-assistant-agent-shell-stream--init-subscription nil)
 (defvar loki-assistant-agent-shell-stream--epoch 0)
 
 (defun loki-assistant-agent-shell-stream--plain (text)
@@ -198,25 +211,74 @@
                  (batch (gethash next (loki-assistant-agent-shell-stream--state-batches state))))
             (if batch (json-encode batch) "null")))))))
 
+(defun loki-assistant-agent-shell-stream--submit-with-draft (submit)
+  "执行 SUBMIT 并将桌面草稿恢复到提交后的输入区。"
+  (save-restriction
+    (widen)
+    (let* ((start (agent-shell--prompt-input-start))
+           (draft (when (and start (< start (point-max)))
+                    (buffer-substring start (point-max))))
+           (offset (when (and draft (>= (point) start))
+                     (- (point) start))))
+      (save-excursion
+        (when draft (delete-region start (point-max)))
+        (unwind-protect
+            (funcall submit)
+          (when draft
+            (goto-char (point-max))
+            (insert draft))))
+      (when offset
+        (goto-char (+ (- (point-max) (length draft)) offset))))))
+
+(defun loki-assistant-agent-shell-stream--finish-init (buffer)
+  "在 BUFFER 初始化完成后启动等待中的提交。"
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (eq (agent-shell-status) 'ready)
+                 (process-live-p (map-nested-elt agent-shell--state '(:client :process))))
+        (loki-assistant-agent-shell-stream--submit-with-draft
+         #'agent-shell--prompt-queue-process-next)))))
+
+(defun loki-assistant-agent-shell-stream--queue-during-init (text)
+  "将 TEXT 加入当前会话的队列，并在初始化完成后尝试提交。"
+  (unless loki-assistant-agent-shell-stream--init-subscription
+    (let ((buffer (current-buffer)))
+      (setq loki-assistant-agent-shell-stream--init-subscription
+            (agent-shell-subscribe-to
+             :shell-buffer buffer :event 'init-finished
+             :on-event
+             (lambda (_event)
+               (agent-shell-unsubscribe
+                :subscription loki-assistant-agent-shell-stream--init-subscription)
+               (setq loki-assistant-agent-shell-stream--init-subscription nil)
+               ;; 让初始化处理器先发出已经附带的本机请求。
+               (run-at-time 0 nil #'loki-assistant-agent-shell-stream--finish-init buffer))))))
+  (agent-shell--prompt-queue-enqueue :prompt text))
+
 (defun loki-assistant-agent-shell-send-message (session-id text)
-  "向 SESSION-ID 提交 TEXT，保留电脑草稿。"
-  (let ((buffer (get-buffer session-id)))
-    (json-encode
-     (list (cons 'kind
-                 (if (not (memq buffer (agent-shell-buffers))) "missing"
-                   (with-current-buffer buffer
-                     (save-restriction
-                       (widen)
-                       (let* ((client (map-elt agent-shell--state :client))
-                              (start (agent-shell--prompt-input-start)))
-                         (cond
-                          ((not (and (agent-shell-session-id) start
-                                     (process-live-p (map-elt client :process)))) "unavailable")
-                          ((not (eq (agent-shell-status) 'ready)) "busy")
-                          ((< start (point-max)) "draft")
-                          (t (agent-shell-insert :text text :submit t :no-focus t
-                                                 :shell-buffer buffer)
-                             "accepted")))))))))))
+  "向 SESSION-ID 提交 TEXT，执行中的会话使用 steer。"
+  (let* ((buffer (get-buffer session-id))
+         (kind
+          (cond
+           ((not (and buffer (memq buffer (agent-shell-buffers)))) "missing")
+           (t
+            (with-current-buffer buffer
+              (cond
+               ((not (process-live-p (map-nested-elt agent-shell--state '(:client :process))))
+                "unavailable")
+               ((not (if (fboundp 'agent-shell-initialized-p)
+                         (agent-shell-initialized-p)
+                       (agent-shell-session-id)))
+                (loki-assistant-agent-shell-stream--queue-during-init text)
+                "accepted")
+               (t
+                (if (eq (agent-shell-status) 'ready)
+                    (loki-assistant-agent-shell-stream--submit-with-draft
+                     (lambda () (agent-shell-insert :text text :submit t :no-focus t
+                                                    :shell-buffer buffer)))
+                  (agent-shell-busy-submit-steer text))
+                "accepted")))))))
+    (json-encode (list (cons 'kind kind)))))
 
 (defun loki-assistant-agent-shell-stream--image-reference-p (source)
   "判断 SOURCE 是否是已提交会话中存在的链接目标。"

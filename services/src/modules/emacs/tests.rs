@@ -213,12 +213,6 @@ async fn agent_shell_messages_forward_exact_text_and_distinguish_emacs_outcomes(
             StatusCode::NOT_FOUND,
             Some("agent-shell-session-not-found"),
         ),
-        ("busy", StatusCode::CONFLICT, Some("agent-shell-busy")),
-        (
-            "draft",
-            StatusCode::CONFLICT,
-            Some("agent-shell-draft-present"),
-        ),
         (
             "unavailable",
             StatusCode::SERVICE_UNAVAILABLE,

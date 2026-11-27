@@ -324,8 +324,6 @@ struct MessageResponse {
 enum MessageOutcome {
     Accepted,
     Missing,
-    Busy,
-    Draft,
     Unavailable,
 }
 
@@ -337,7 +335,7 @@ enum MessageOutcome {
     path = "/agent-shell/sessions/{session_id}/messages",
     access = "paired",
     summary = "向 Agent Shell 会话发送消息",
-    description = "以文本向状态中心公布的 Agent Shell 会话提交消息，最多 16 KiB UTF-8。"
+    description = "以文本向状态中心公布的 Agent Shell 会话提交消息，最多 16 KiB UTF-8。Emacs 按会话状态直接提交、引导正在运行的轮次或排队。"
 )]
 async fn submit_message(
     State(emacs): State<Arc<EmacsService>>,
@@ -379,18 +377,6 @@ async fn submit_message(
         )
             .into_response()),
         MessageOutcome::Missing => Err(ReadError::Missing.into_response()),
-        MessageOutcome::Busy => Err(error_response(
-            StatusCode::CONFLICT,
-            ErrorSource::Business,
-            "agent-shell-busy",
-            "当前会话仍在处理上一条消息。",
-        )),
-        MessageOutcome::Draft => Err(error_response(
-            StatusCode::CONFLICT,
-            ErrorSource::Business,
-            "agent-shell-draft-present",
-            "电脑上的会话中有未发送的草稿。",
-        )),
         MessageOutcome::Unavailable => Err(ReadError::Unavailable.into_response()),
     }
 }

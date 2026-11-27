@@ -974,14 +974,14 @@ services 通过配置中的 Emacs server 用固定入口 ~loki-assistant-agent-s
 
 本机和已绑定设备可通过 ~POST /agent-shell/sessions/{session_id}/messages~ 提交消息。请求使用 ~application/json~ ，正文包含字符串 ~text~ ，以 UTF-8 计算最多 16 KiB，至少含一个非空白字符且不含 NUL。路径使用与会话订阅相同的 buffer 名称编码。services 将原文作为参数传给 Emacs 的 ~loki-assistant-agent-shell-send-message~ ，保留空格和换行。
 
-会话接受后返回 HTTP 202，响应为 ~{"api_version":"1","accepted":true}~ 。后续消息和回复通过会话 SSE 展示。发送请求超时或连接断开时，客户端可从会话流核对消息是否已经发出，再决定是否重发。
+Emacs 按会话状态处理消息。会话空闲时直接提交并保留电脑上的草稿。会话正在执行时使用 Agent Shell 的引导功能，Agent 不支持引导时将消息排队。会话初始化期间收到的消息排队，待初始化完成后提交。
+
+Emacs 接收消息后返回 HTTP 202，响应为 ~{"api_version":"1","accepted":true}~ 。此响应涵盖立即提交、引导和排队。消息提交后与后续回复一起通过会话 SSE 展示。发送请求超时或连接断开时，客户端可从会话流核对消息是否已经发出，再决定是否重发。
 
 | HTTP 状态 | 错误码 | 含义 |
 |-----------+--------+------|
 | 400 | ~invalid-request~ | 路径编码或消息格式无效。 |
 | 404 | ~agent-shell-session-not-found~ | 会话不存在。 |
-| 409 | ~agent-shell-busy~ | 会话正在处理上一条消息。 |
-| 409 | ~agent-shell-draft-present~ | 电脑上有未发送的草稿。 |
 | 502 | ~invalid-emacs-response~ | Emacs 返回的数据无效。 |
 | 503 | ~emacs-unavailable~ | Emacs 或会话输入暂不可用。 |
 | 504 | ~emacs-timeout~ | Emacs 网关超时。 |

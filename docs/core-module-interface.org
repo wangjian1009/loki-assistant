@@ -537,7 +537,7 @@ Emacs 上报时通过本机 ~POST /emacs/receiver/status~ 调用 ~publish_many_v
 
 ~GET /agent-shell/sessions/{session_id}/events~ 是 Emacs 模块声明的 ~paired~ SSE 接口。事件名为 ~agent-shell~ ，事件数据通过 ~sse_events~ 公布。设备用状态数组中的原始 buffer 名选择订阅目标，并在请求路径中将名称编码为单一路径段。查询参数 ~recent=10~ 从最近十条会话记录开始订阅，省略参数则从完整历史开始。内容块可携带 ~parent_id~ 和 ~collapsed~ 以传递分组关系与初始展开状态。 [[file:control-center-services.org::*Agent Shell 会话订阅][Agent Shell 会话订阅协议]]
 
-Emacs 模块通过 ~POST /agent-shell/sessions/{session_id}/messages~ 接收会话消息，通过 ~GET /agent-shell/sessions/{session_id}/image~ 读取会话引用的图片。两个接口的访问范围均为 ~paired~ ，会话标识与订阅接口一致。services 通过固定的 Emacs 入口处理这两种操作。 [[file:control-center-services.org::*Agent Shell 消息与图片][Agent Shell 消息与图片协议]]
+Emacs 模块通过 ~POST /agent-shell/sessions/{session_id}/messages~ 接收会话消息，通过 ~GET /agent-shell/sessions/{session_id}/image~ 读取会话引用的图片。两个接口的访问范围均为 ~paired~ ，会话标识与订阅接口一致。services 通过固定的 Emacs 入口处理这两种操作。消息接口的 HTTP 202 表示 Emacs 已接收消息，由 Agent Shell 按会话状态提交、引导或排队。 [[file:control-center-services.org::*Agent Shell 消息与图片][Agent Shell 消息与图片协议]]
 
 *** 响应示例
 ~GET /stats/meta~ 的响应节选，展示 ~service~ 模块。

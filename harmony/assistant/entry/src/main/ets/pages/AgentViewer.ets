@@ -1,3 +1,4 @@
+import { KeyboardAvoidMode } from '@kit.ArkUI'
 import { AgentViewerScreen, ViewerBlock, ViewerSession } from 'agent_viewer'
 import { AgentShell, AgentShellBlock, AgentShellSession, AgentShellConversationEvent, RequestHandle,
   renderDocument, ResponsError } from 'liblokiworkspace.so'
@@ -38,6 +39,7 @@ struct AgentViewer {
   private conversation?: RequestHandle
 
   onPageShow(): void {
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE)
     this.visible = true
     this.applySessionRequest()
     this.foregroundChanged()
@@ -106,6 +108,7 @@ struct AgentViewer {
           this.sessions = []
           this.selected = ''
           this.blocks = []
+          this.conversationKey += 1
         }
         this.deviceName = current?.name ?? ''
         this.deviceOnline = current?.status === 'online'
@@ -139,6 +142,7 @@ struct AgentViewer {
     }))
     if (this.sessions.length === 0) {
       this.stopConversation()
+      if (this.selected) this.conversationKey += 1
       this.selected = ''
       this.blocks = []
       this.notice = '电脑上暂无打开的会话'
@@ -186,9 +190,11 @@ struct AgentViewer {
 
   private async submit(text: string): Promise<string> {
     const shell = this.shell
-    if (!shell || !this.selected || !this.deviceOnline) return '电脑未连接'
+    const sessionId = this.selected
+    if (!sessionId) return '请先选择会话'
+    if (!shell) return '无法连接电脑'
     try {
-      const error = await shell.sendMessage(this.selected, text)
+      const error = await shell.sendMessage(sessionId, text)
       return error?.message ?? ''
     } catch (_) {
       return '无法发送消息'

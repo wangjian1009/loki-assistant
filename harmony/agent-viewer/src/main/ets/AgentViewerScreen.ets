@@ -19,6 +19,7 @@ const GREEN: string = '#9AE2B9'
 const RED: string = '#FFB4B1'
 const AMBER: string = '#F5CF92'
 const DETAIL: string = '#929DB1'
+const COMPOSER_GAP: number = 16
 
 function blockLabel(kind: string): string {
   switch (kind) {
@@ -53,7 +54,7 @@ export struct AgentViewerScreen {
   private readonly folds: Map<string, boolean> = new Map()
   @State private sidebar: boolean = false
   @State private draft: string = ''
-  @State private sending: boolean = false
+  @State private pendingMessages: string[] = []
   @State private sendError: string = ''
   @State private preview: string = ''
   private followTimer: number = -1
@@ -63,13 +64,16 @@ export struct AgentViewerScreen {
 
   aboutToAppear(): void { this.refreshRows() }
 
-  aboutToDisappear(): void { clearTimeout(this.followTimer) }
+  aboutToDisappear(): void {
+    clearTimeout(this.followTimer)
+    this.followTimer = -1
+  }
 
   private resetConversation(): void {
     this.folds.clear()
     this.following = true
     this.draft = ''
-    this.sending = false
+    this.pendingMessages = []
     this.sendError = ''
     this.preview = ''
     this.refreshRows()
@@ -81,32 +85,37 @@ export struct AgentViewerScreen {
   }
 
   private followLatest(): void {
-    if (!this.following) return
-    clearTimeout(this.followTimer)
+    if (!this.following || this.followTimer !== -1 || this.rows.length === 0) return
     this.followTimer = setTimeout(() => {
-      if (this.following) this.history.scrollEdge(Edge.Bottom)
-    }, 50)
+      this.followTimer = -1
+      if (this.following && this.rows.length > 0) {
+        this.history.scrollToIndex(this.rows.length - 1, false, ScrollAlign.END)
+      }
+    }, 16)
   }
 
   private async send(): Promise<void> {
-    if (this.sending || !this.connected || !this.sessionId || !this.draft.trim()) return
     const text = this.draft
+    if (!this.sessionId || !text.trim() || this.pendingMessages.includes(text)) return
     const key = this.conversationKey
-    this.sending = true
+    this.pendingMessages = [...this.pendingMessages, text]
     this.sendError = ''
     try {
       const error = await this.onSend(text)
       if (this.conversationKey !== key) return
-      this.sendError = error
-      if (!error && this.draft === text) {
-        this.draft = ''
+      if (error) {
+        this.sendError = error
+      } else {
+        if (this.draft === text) this.draft = ''
         this.following = true
         this.followLatest()
       }
     } catch (_) {
       if (this.conversationKey === key) this.sendError = '无法发送消息'
     } finally {
-      if (this.conversationKey === key) this.sending = false
+      if (this.conversationKey === key) {
+        this.pendingMessages = this.pendingMessages.filter(message => message !== text)
+      }
     }
   }
 
@@ -122,7 +131,8 @@ export struct AgentViewerScreen {
 
   private toggleFold(row: ConversationRow): void {
     this.folds.set(row.id, !row.collapsed)
-    this.rows = conversationRows(this.blocks, this.folds)
+    if (!row.collapsed) this.following = true
+    this.refreshRows()
   }
 
   private selected(): ViewerSession | undefined {
@@ -210,12 +220,17 @@ export struct AgentViewerScreen {
         }
       }, (row: ConversationRow) => JSON.stringify([row.id, row.kind, row.title, row.depth, row.foldable,
         row.collapsed, row.collapsed ? '' : row.text]))
-    }.width('100%').layoutWeight(1).padding({ top: 12, bottom: 16 })
+    }.width('100%').layoutWeight(1)
+      .contentStartOffset(12).contentEndOffset(COMPOSER_GAP).stackFromEnd(true)
       .edgeEffect(EdgeEffect.None).scrollBar(BarState.Auto)
-      .onTouch(event => {
-        if (event.type === TouchType.Move) this.following = false
+      .onAreaChange((_oldArea: Area, _newArea: Area) => { this.followLatest() })
+      .onWillScroll((offset: number, _state: ScrollState, source: ScrollSource) => {
+        if (offset !== 0 && (source === ScrollSource.DRAG || source === ScrollSource.OTHER_USER_INPUT ||
+          source === ScrollSource.SCROLL_BAR)) this.following = false
       })
-      .onScrollStop(() => { this.following = this.history.isAtEnd() })
+      .onScrollStop(() => {
+        if (this.history.isAtEnd()) this.following = true
+      })
   }
 
   @Builder
@@ -228,11 +243,17 @@ export struct AgentViewerScreen {
         TextInput({ placeholder: '输入消息', text: this.draft }).layoutWeight(1)
           .fontSize(15).fontColor(TEXT).placeholderColor(SECONDARY).backgroundColor(PANEL)
           .height(46).enterKeyType(EnterKeyType.Send).enabled(!!this.sessionId)
+          .onFocus(() => { this.following = true; this.followLatest() })
           .onChange((text: string) => { this.draft = text })
-          .onSubmit(() => { this.send() })
-        Button(this.sending ? '发送中' : '发送', { type: ButtonType.Normal }).height(44)
+          .onSubmit((_key: EnterKeyType, event: SubmitEvent) => {
+            event.keepEditableState()
+            this.draft = event.text
+            this.send()
+          })
+        Button(this.pendingMessages.includes(this.draft) ? '发送中' : '发送',
+          { type: ButtonType.Normal }).height(44)
           .fontSize(14).fontColor('#182143').backgroundColor(ACCENT)
-          .enabled(this.connected && !!this.sessionId && !!this.draft.trim() && !this.sending)
+          .enabled(!!this.sessionId && !!this.draft.trim() && !this.pendingMessages.includes(this.draft))
           .onClick(() => { this.send() })
       }.width('100%')
     }.width('100%').padding({ top: 4, bottom: 8 })
