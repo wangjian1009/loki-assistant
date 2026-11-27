@@ -1,19 +1,28 @@
 import { AgentViewerScreen, ViewerBlock, ViewerSession } from 'agent_viewer'
-import { AgentShell, AgentShellSession, AgentShellConversationEvent, RequestHandle,
-  ResponsError } from 'liblokiworkspace.so'
+import { AgentShell, AgentShellBlock, AgentShellSession, AgentShellConversationEvent, RequestHandle,
+  renderDocument, ResponsError } from 'liblokiworkspace.so'
 import { Application, ComputerDevice } from '../app/Application'
 import { StatusSubscription as DeviceSubscription } from '../workspace/ServiceStatus'
+
+function viewerBlock(block: AgentShellBlock): ViewerBlock {
+  return { id: block.id, kind: block.kind, title: block.title ?? '', text: block.text,
+    parentId: block.parent_id ?? '', collapsed: block.collapsed }
+}
 
 @Entry
 @Component
 struct AgentViewer {
   @StorageLink('lokiAgentViewerForeground') @Watch('foregroundChanged') private foreground: boolean = true
+  @StorageLink('lokiAgentSessionRequest') @Watch('applySessionRequest') private sessionRequest: string = ''
   @State private sessions: ViewerSession[] = []
   @State private blocks: ViewerBlock[] = []
   @State private deviceName: string = ''
   @State private selected: string = ''
   @State private notice: string = '正在读取会话'
   @State private conversationKey: number = 0
+  @State private full: boolean = false
+  @State private deviceOnline: boolean = false
+  private pendingSessionId: string = ''
   private visible: boolean = false
   private active: boolean = false
   private lifetime: number = 0
@@ -24,14 +33,31 @@ struct AgentViewer {
   private retryTimer: number = -1
   private retryDelay: number = 500
   private endpointId: string = ''
-  private deviceOnline: boolean = false
   private shell?: AgentShell
   private devices?: DeviceSubscription
   private conversation?: RequestHandle
 
   onPageShow(): void {
     this.visible = true
+    this.applySessionRequest()
     this.foregroundChanged()
+  }
+
+  private applySessionRequest(): void {
+    if (!this.sessionRequest) return
+    try {
+      const request = JSON.parse(this.sessionRequest) as [string, number]
+      this.pendingSessionId = request[0]
+      if (this.sessions.some(session => session.id === this.pendingSessionId)) {
+        const id = this.pendingSessionId
+        this.pendingSessionId = ''
+        this.select(id)
+      }
+    } catch (_) {
+      this.pendingSessionId = ''
+    } finally {
+      this.sessionRequest = ''
+    }
   }
 
   onPageHide(): void {
@@ -116,6 +142,10 @@ struct AgentViewer {
       this.selected = ''
       this.blocks = []
       this.notice = '电脑上暂无打开的会话'
+    } else if (this.pendingSessionId && this.sessions.some(session => session.id === this.pendingSessionId)) {
+      const id = this.pendingSessionId
+      this.pendingSessionId = ''
+      this.select(id)
     } else if (!this.sessions.some(session => session.id === this.selected)) {
       const first = this.sessions.find(session => session.phase === 'running' || session.phase === 'waiting_input')
         ?? this.sessions[0]
@@ -141,11 +171,37 @@ struct AgentViewer {
     if (this.selected === sessionId) return
     this.stopConversation()
     this.selected = sessionId
+    this.full = false
     this.blocks = []
     this.conversationKey += 1
     this.streamEnded = false
     this.retryDelay = 500
     this.openConversation()
+  }
+
+  private loadFull(): void {
+    this.full = true
+    this.openConversation()
+  }
+
+  private async submit(text: string): Promise<string> {
+    const shell = this.shell
+    if (!shell || !this.selected || !this.deviceOnline) return '电脑未连接'
+    try {
+      const error = await shell.sendMessage(this.selected, text)
+      return error?.message ?? ''
+    } catch (_) {
+      return '无法发送消息'
+    }
+  }
+
+  private readImage(source: string): Promise<string> {
+    const directory = AppStorage.get<string>('lokiAgentImageCache')
+    const shell = this.shell
+    if (!directory || !shell || !this.selected || !this.deviceOnline) {
+      return Promise.reject(new Error('电脑未连接'))
+    }
+    return shell.cacheImage(directory, this.selected, source)
   }
 
   private openConversation(): void {
@@ -156,7 +212,7 @@ struct AgentViewer {
     this.notice = '正在读取会话'
     const version = this.streamVersion
     try {
-      this.conversation = shell.watchConversation(this.selected, (event: AgentShellConversationEvent) => {
+      this.conversation = shell.watchConversation(this.selected, this.full, (event: AgentShellConversationEvent) => {
         if (version === this.streamVersion && event.session_id === this.selected) this.receive(event)
       }, (error: ResponsError | null) => {
         if (version !== this.streamVersion) return
@@ -170,6 +226,14 @@ struct AgentViewer {
 
   private receive(event: AgentShellConversationEvent): void {
     if (event.kind === 'closed' || event.kind === 'error') {
+      if (event.kind === 'closed') {
+        const directory = AppStorage.get<string>('lokiAgentImageCache')
+        if (directory) {
+          this.shell?.clearSessionImages(directory, this.endpointId, event.session_id).catch(() => {})
+        }
+        this.blocks = []
+        this.conversationKey += 1
+      }
       this.streamEnded = true
       this.notice = event.kind === 'closed' ? '会话已关闭' : event.message || '无法读取会话'
       return
@@ -178,7 +242,7 @@ struct AgentViewer {
       this.revision = event.revision
       this.hasSnapshot = true
       this.retryDelay = 500
-      this.blocks = event.blocks.map((block): ViewerBlock => ({ id: block.id, kind: block.kind, title: block.title ?? '', text: block.text }))
+      this.blocks = event.blocks.map(viewerBlock)
       this.notice = this.blocks.length ? '' : '暂无会话内容'
       return
     }
@@ -191,7 +255,7 @@ struct AgentViewer {
     const indices = new Map<string, number>()
     next.forEach((block, index) => { indices.set(block.id, index) })
     for (const block of event.blocks) {
-      const item: ViewerBlock = { id: block.id, kind: block.kind, title: block.title ?? '', text: block.text }
+      const item = viewerBlock(block)
       const index = indices.get(block.id)
       if (index === undefined) {
         indices.set(block.id, next.length)
@@ -224,8 +288,13 @@ struct AgentViewer {
     Column() {
       AgentViewerScreen({ title: $r('app.string.agent_viewer_title'), sessionId: this.selected,
         sessions: this.sessions, blocks: this.blocks, deviceName: this.deviceName, notice: this.notice,
+        full: this.full, connected: this.deviceOnline,
+        parseDocument: renderDocument,
         conversationKey: this.conversationKey,
         onSelect: (id: string): void => { this.select(id) },
+        onFull: (): void => { this.loadFull() },
+        onSend: (value: string): Promise<string> => this.submit(value),
+        readImage: (source: string): Promise<string> => this.readImage(source),
         onRetry: (): void => { this.openConversation() } })
     }.width('100%').height('100%')
   }

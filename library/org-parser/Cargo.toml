@@ -1,0 +1,9 @@
+[package]
+name = "loki-org-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ammonia = "4.1"
+orgize = "=0.10.0-alpha.10"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

@@ -1,0 +1,7 @@
+{
+  "name": "org_renderer",
+  "version": "1.0.0",
+  "description": "Org 与 Markdown 富文本渲染",
+  "main": "Index.ets",
+  "dependencies": {}
+}

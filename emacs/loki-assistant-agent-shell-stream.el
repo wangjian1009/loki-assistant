@@ -6,9 +6,12 @@
 (require 'json)
 (require 'map)
 (require 'subr-x)
+(require 'url-parse)
+(require 'url-util)
 
 (declare-function agent-shell-buffers "agent-shell")
 (declare-function agent-shell--live-prompt-start "agent-shell-prompt")
+(declare-function agent-shell-markdown-reconstruct "agent-shell-markdown")
 
 ;; 块和批次大小按字符数计算，留出 UTF-8 与 JSON 转义空间。
 (defconst loki-assistant-agent-shell-stream--block-size 2048)
@@ -19,6 +22,7 @@
   tick blocks (revision 0) snapshot-index (batches (make-hash-table :test #'eql)))
 
 (defvar-local loki-assistant-agent-shell-stream--state nil)
+(defvar-local loki-assistant-agent-shell-stream--recent-state nil)
 (defvar loki-assistant-agent-shell-stream--epoch 0)
 
 (defun loki-assistant-agent-shell-stream--plain (text)
@@ -35,9 +39,11 @@
         (t "system")))
 
 (defun loki-assistant-agent-shell-stream--fragment (from to state)
-  "提取 FROM 到 TO 的片段 STATE，忽略折叠指示和编辑器属性。"
+  "提取 FROM 到 TO 的片段 STATE 及其折叠信息。"
   (let* ((id (alist-get :qualified-id state))
-         (kind (loki-assistant-agent-shell-stream--kind id)) labels body)
+         (group (eq (alist-get :kind state) 'group))
+         (kind (if group "group" (loki-assistant-agent-shell-stream--kind id)))
+         labels body indicator)
     (unless (string-prefix-p "bootstrapping-" id)
       (while (< from to)
         (let* ((section (get-text-property from 'agent-shell-ui-section))
@@ -45,14 +51,22 @@
           (pcase section
             ((or 'label-left 'label-right)
              (push (buffer-substring-no-properties from next) labels))
-            ('body (push (buffer-substring-no-properties from next) body)))
+            ('body
+             (push (if (fboundp 'agent-shell-markdown-reconstruct)
+                       (agent-shell-markdown-reconstruct from next)
+                     (buffer-substring-no-properties from next))
+                   body))
+            ('indicator (setq indicator t)))
           (setq from next)))
       (let ((title (string-trim (loki-assistant-agent-shell-stream--plain
                                  (string-join (nreverse labels) " "))))
             (content (string-trim (loki-assistant-agent-shell-stream--plain
                                    (apply #'concat (nreverse body))))))
         (unless (and (string-empty-p title) (string-empty-p content))
-          (list id kind title content))))))
+          ;; 普通正文虽然也有 :collapsed，但没有实际折叠控件。
+          (list id kind title content (alist-get :group-id state)
+                (when (or group (and indicator (not (string-empty-p title)) body))
+                  (if (alist-get :collapsed state) t :json-false))))))))
 
 (defun loki-assistant-agent-shell-stream--blocks ()
   "读取当前 Shell 已提交区域，保留会话的可读片段。"
@@ -64,6 +78,8 @@
                    (when-let* ((process (get-buffer-process (current-buffer))))
                      (marker-position (process-mark process)))
                    (point-min)))
+          (counts (make-hash-table :test #'equal))
+          (groups (make-hash-table :test #'equal))
           rows)
       (while (< position end)
         (let* ((state (get-text-property position 'agent-shell-ui-state))
@@ -81,19 +97,29 @@
                     (let ((content (string-trim (loki-assistant-agent-shell-stream--plain
                                                  (apply #'concat (nreverse parts))))))
                       (unless (string-empty-p content)
-                        (list (format "user-%d" position) "user" "" content)))))))
+                        (list "submitted-user" "user" "" content nil nil)))))))
           (when fragment
-            (pcase-let ((`(,id ,kind ,title ,body) fragment))
-              ;; 行号区分由 Emacs 重用内部标识所产生的多个实际片段。
-              (let ((offset 0) (length (length body))
-                    (key (concat "block-" (number-to-string position) "-" id)))
+            (pcase-let ((`(,id ,kind ,title ,body ,group-id ,collapsed) fragment))
+              ;; 位置会随前文更新而移动。使用片段标识与同名片段出现次序。
+              (let* ((count (1+ (gethash id counts 0)))
+                     (key (format "%s:%d" id count))
+                     (parent (and group-id (gethash group-id groups)))
+                     (offset 0)
+                     (length (length body)))
+                (puthash id count counts)
+                (when (equal kind "group")
+                  (puthash id key groups))
                 (while (or (zerop offset) (< offset length))
-                  (push `((id . ,(format "%s:%d" key offset))
-                          (kind . ,kind)
-                          ,@(when (and (zerop offset) (not (string-empty-p title)))
-                              `((title . ,(substring title 0 (min 256 (length title))))))
-                          (text . ,(substring body offset (min length (+ offset loki-assistant-agent-shell-stream--block-size)))))
-                        rows)
+                  (let ((first (zerop offset)))
+                    (push `((id . ,(if first key (format "%s:%d" key offset)))
+                            (kind . ,(if first kind "continuation"))
+                            ,@(when (if first parent key)
+                                `((parent_id . ,(if first parent key))))
+                            ,@(when (and first collapsed) `((collapsed . ,collapsed)))
+                            ,@(when (and first (not (string-empty-p title)))
+                                `((title . ,(substring title 0 (min 256 (length title))))))
+                            (text . ,(substring body offset (min length (+ offset loki-assistant-agent-shell-stream--block-size)))))
+                          rows))
                   (cl-incf offset loki-assistant-agent-shell-stream--block-size)))))
           (setq position next)))
       (nreverse rows))))
@@ -112,12 +138,30 @@
                  (loki-assistant-agent-shell-stream--state-batches state)))
       (setq kind "update"))))
 
-(defun loki-assistant-agent-shell-stream--refresh (state)
+(defun loki-assistant-agent-shell-stream--recent (blocks count)
+  "返回 BLOCKS 最后 COUNT 条逻辑片段，保留祖先和完整正文。"
+  (let ((remaining count) (included (make-hash-table :test #'equal)))
+    (dolist (row (reverse blocks))
+      (let ((id (alist-get 'id row)) (kind (alist-get 'kind row)))
+        (when (or (gethash id included)
+                  (and (> remaining 0) (not (member kind '("group" "continuation")))))
+          (unless (equal kind "group") (cl-decf remaining))
+          (puthash id t included)
+          (when-let* ((parent (alist-get 'parent_id row))) (puthash parent t included)))))
+    (seq-filter (lambda (row)
+                  (or (gethash (alist-get 'id row) included)
+                      (and (equal (alist-get 'kind row) "continuation")
+                           (gethash (alist-get 'parent_id row) included))))
+                blocks)))
+
+(defun loki-assistant-agent-shell-stream--refresh (state &optional recent)
   "更新 STATE 的片段和变更记录。"
-  (let ((tick (buffer-chars-modified-tick)))
+  (let ((tick (buffer-modified-tick))
+        (json-false :json-false))
     (unless (eql tick (loki-assistant-agent-shell-stream--state-tick state))
       (let* ((old (loki-assistant-agent-shell-stream--state-blocks state))
-             (blocks (loki-assistant-agent-shell-stream--blocks))
+             (all-blocks (loki-assistant-agent-shell-stream--blocks))
+             (blocks (if recent (loki-assistant-agent-shell-stream--recent all-blocks recent) all-blocks))
              (rest blocks) (reset nil) changes)
         (dolist (row old)
           (if (equal (alist-get 'id row) (alist-get 'id (car rest)))
@@ -135,23 +179,129 @@
         (setf (loki-assistant-agent-shell-stream--state-tick state) tick
               (loki-assistant-agent-shell-stream--state-blocks state) blocks)))))
 
-(defun loki-assistant-agent-shell-stream-read (session-id revision)
+(defun loki-assistant-agent-shell-stream-read (session-id revision &optional recent)
   "返回 SESSION-ID 自 REVISION 之后的一批可读会话事件 JSON。"
   (let* ((candidate (get-buffer session-id))
          (buffer (and candidate (memq candidate (agent-shell-buffers)) candidate)))
     (if (not buffer)
         (json-encode `((kind . ,(if revision "closed" "missing")) (revision . ,(or revision 0))))
       (with-current-buffer buffer
-        (let ((state (or loki-assistant-agent-shell-stream--state
-                         (setq loki-assistant-agent-shell-stream--state
-                               (make-loki-assistant-agent-shell-stream--state
-                                :revision (ash (cl-incf loki-assistant-agent-shell-stream--epoch) 32))))))
-          (loki-assistant-agent-shell-stream--refresh state)
+        (let* ((slot (if recent 'loki-assistant-agent-shell-stream--recent-state
+                       'loki-assistant-agent-shell-stream--state))
+               (state (or (symbol-value slot)
+                          (set slot (make-loki-assistant-agent-shell-stream--state
+                                     :revision (ash (cl-incf loki-assistant-agent-shell-stream--epoch) 32))))))
+          (loki-assistant-agent-shell-stream--refresh state recent)
           (let* ((first (loki-assistant-agent-shell-stream--state-snapshot-index state))
                  (last (loki-assistant-agent-shell-stream--state-revision state))
                  (next (if (and revision (<= first revision last)) (1+ revision) first))
                  (batch (gethash next (loki-assistant-agent-shell-stream--state-batches state))))
             (if batch (json-encode batch) "null")))))))
+
+(defun loki-assistant-agent-shell-send-message (session-id text)
+  "向 SESSION-ID 提交 TEXT，保留电脑草稿。"
+  (let ((buffer (get-buffer session-id)))
+    (json-encode
+     (list (cons 'kind
+                 (if (not (memq buffer (agent-shell-buffers))) "missing"
+                   (with-current-buffer buffer
+                     (save-restriction
+                       (widen)
+                       (let* ((client (map-elt agent-shell--state :client))
+                              (start (agent-shell--prompt-input-start)))
+                         (cond
+                          ((not (and (agent-shell-session-id) start
+                                     (process-live-p (map-elt client :process)))) "unavailable")
+                          ((not (eq (agent-shell-status) 'ready)) "busy")
+                          ((< start (point-max)) "draft")
+                          (t (agent-shell-insert :text text :submit t :no-focus t
+                                                 :shell-buffer buffer)
+                             "accepted")))))))))))
+
+(defun loki-assistant-agent-shell-stream--image-reference-p (source)
+  "判断 SOURCE 是否是已提交会话中存在的链接目标。"
+  (let ((pattern (concat "\\(?:](<?\\|\\[\\[\\)"
+                         (regexp-opt (list source (concat "file:" source)))
+                         "\\(?:[>) \t]\\|\\]\\)"))
+        (tail ""))
+    (cl-some (lambda (block)
+               (let* ((chunk (alist-get 'text block))
+                      (text (if (equal (alist-get 'kind block) "continuation") (concat tail chunk) chunk)))
+                 (setq tail (substring text (max 0 (- (length text) (+ 16 (length source))))))
+                 (string-match-p pattern text)))
+             (loki-assistant-agent-shell-stream--blocks))))
+
+(defun loki-assistant-agent-shell-stream--public-ipv4-p (address)
+  "判断 ADDRESS 是否为公网 IPv4 地址。"
+  (when (string-match "^\\([0-9]+\\)\\.\\([0-9]+\\)\\.\\([0-9]+\\)\\.[0-9]+$" address)
+    (let ((a (string-to-number (match-string 1 address)))
+          (b (string-to-number (match-string 2 address)))
+          (c (string-to-number (match-string 3 address))))
+      (and (<= 1 a 223) (not (memq a '(10 127)))
+           (not (or (and (= a 100) (<= 64 b 127))
+                    (and (= a 169) (= b 254))
+                    (and (= a 172) (<= 16 b 31))
+                    (and (= a 192) (or (= b 168) (and (= b 0) (memq c '(0 2)))))
+                    (and (= a 198) (or (memq b '(18 19)) (and (= b 51) (= c 100))))
+                    (and (= a 203) (= b 0) (= c 113))))))))
+
+(defun loki-assistant-agent-shell-stream--fetch-image (source)
+  "读取 SOURCE 的公网图片，固定 DNS 结果并限制大小。"
+  (let* ((url (url-generic-parse-url source))
+         (host (url-host url))
+         (port (url-port url)))
+    (when (and host (string-match-p "^[-.a-zA-Z0-9]+$" host)
+               (null (url-user url)) (null (url-password url)) (memq port '(80 443)))
+      (when-let* ((address (cl-find-if #'loki-assistant-agent-shell-stream--public-ipv4-p
+                                      (mapcar (lambda (address) (format-network-address address t))
+                                              (network-lookup-address-info host 'ipv4))))
+                  (curl (executable-find "curl")))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (when (eq 0 (call-process curl nil (list (current-buffer) nil) nil
+                                    "-q" "--silent" "--fail" "--ipv4" "--noproxy" "*"
+                                    "--proto" "=http,https" "--globoff" "--max-time" "4"
+                                    "--max-filesize" "1048576"
+                                    "--resolve" (format "%s:%d:%s" host port address) "--" source))
+            (buffer-string)))))))
+
+(defun loki-assistant-agent-shell-stream--image-bytes (source)
+  "读取 SOURCE 对应的图像字节。"
+  (cond
+   ((string-match-p "^https?://" source)
+    (loki-assistant-agent-shell-stream--fetch-image source))
+   ((not (file-remote-p default-directory))
+    (let* ((encoded (cond
+                     ((string-prefix-p "file://" source)
+                      (let ((url (url-generic-parse-url source)))
+                        (when (member (url-host url) '(nil "" "localhost"))
+                          (url-filename url))))
+                     ((string-prefix-p "file:" source) (substring source 5))
+                     (t source)))
+           (path (and encoded (decode-coding-string (url-unhex-string encoded) 'utf-8))))
+      (when (and path (not (file-remote-p path))
+                 (not (string-match-p "^[a-zA-Z][a-zA-Z0-9+.-]*:" path)))
+        (let ((file (expand-file-name path)))
+          (when (and (file-regular-p file) (file-readable-p file))
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert-file-contents-literally file nil 0 1048577)
+              (buffer-string)))))))))
+
+(defun loki-assistant-agent-shell-read-image (session-id source)
+  "读取 SESSION-ID 的已提交内容中 SOURCE 指向的图片。"
+  (when-let* ((buffer (get-buffer session-id))
+              ((memq buffer (agent-shell-buffers))))
+    (with-current-buffer buffer
+      (when-let* (((loki-assistant-agent-shell-stream--image-reference-p source))
+                  (data (ignore-errors (loki-assistant-agent-shell-stream--image-bytes source)))
+                  ((<= 12 (length data) 1048576))
+                  (mime (cond ((string-prefix-p (unibyte-string 137 80 78 71 13 10 26 10) data) "image/png")
+                              ((string-prefix-p (unibyte-string 255 216 255) data) "image/jpeg")
+                              ((or (string-prefix-p "GIF87a" data) (string-prefix-p "GIF89a" data)) "image/gif")
+                              ((and (string-prefix-p "RIFF" data)
+                                    (string= (substring data 8 12) "WEBP")) "image/webp"))))
+        (json-encode (list (cons 'mime mime) (cons 'data (base64-encode-string data t))))))))
 
 (provide 'loki-assistant-agent-shell-stream)
 ;;; loki-assistant-agent-shell-stream.el ends here

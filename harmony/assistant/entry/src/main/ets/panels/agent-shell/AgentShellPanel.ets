@@ -1,28 +1,10 @@
-import { AgentShellPhase, AgentShellSession, StatusSubscription } from 'liblokiworkspace.so'
+import { AgentShellSession, StatusSubscription } from 'liblokiworkspace.so'
+import { common } from '@kit.AbilityKit'
+import { AgentShellStatusIcon } from 'agent_viewer'
 import { CurrentDeviceState } from '../../app/CurrentDeviceState'
-import { ACCENT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, PAGE_INSET, PANEL_RADIUS,
+import { BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, PAGE_INSET, PANEL_RADIUS,
   PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SURFACE } from '../../components/AppPage'
 import { Workspace } from '../../workspace/Workspace'
-
-interface PhaseAppearance {
-  icon: Resource
-  label: string
-  color: string
-}
-
-function phaseAppearance(phase: AgentShellPhase): PhaseAppearance {
-  switch (phase) {
-    case 'idle': return { icon: $r('sys.symbol.circle'), label: '空闲', color: SECONDARY_TEXT }
-    case 'starting': return { icon: $r('sys.symbol.hourglass'), label: '启动中', color: ACCENT }
-    case 'running': return { icon: $r('sys.symbol.play_circle'), label: '执行中', color: ACCENT }
-    case 'waiting_input': return { icon: $r('sys.symbol.ellipsis_bubble'), label: '等待输入', color: '#F5CF92' }
-    case 'completed': return { icon: $r('sys.symbol.checkmark_circle'), label: '已完成', color: '#9AE2B9' }
-    case 'cancelled': return { icon: $r('sys.symbol.stop_circle'), label: '已取消', color: SECONDARY_TEXT }
-    case 'failed': return { icon: $r('sys.symbol.exclamationmark_circle'), label: '执行失败', color: ERROR_TEXT }
-    case 'disconnected': return { icon: $r('sys.symbol.wifi_slash'), label: '已断开', color: SECONDARY_TEXT }
-    default: return { icon: $r('sys.symbol.questionmark_circle'), label: '状态未知', color: SECONDARY_TEXT }
-  }
-}
 
 @Component
 export struct AgentShellPanel {
@@ -80,10 +62,12 @@ export struct AgentShellPanel {
     return this.errorMessage || (this.sessions ? '暂无会话' : '尚未收到会话状态')
   }
 
-  @Builder
-  private phaseIcon(appearance: PhaseAppearance) {
-    SymbolGlyph(appearance.icon).fontSize(18).fontColor([appearance.color])
-      .flexShrink(0).accessibilityLevel('yes').accessibilityText(appearance.label)
+  private openSession(id: string): void {
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext
+    context.startAbility({ bundleName: context.abilityInfo.bundleName, moduleName: 'entry',
+      abilityName: 'AgentViewerAbility', parameters: { sessionId: id } }).catch(() => {
+      this.errorMessage = '无法打开 AI 远程对话'
+    })
   }
 
   build() {
@@ -91,12 +75,18 @@ export struct AgentShellPanel {
       Text('Agent Shell').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
       if (this.sessions?.length) {
         ForEach(this.sessions, (session: AgentShellSession, index: number) => {
-          Row({ space: CONTENT_GAP }) {
-            Text(session.title || `会话 ${index + 1}`).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
-              .layoutWeight(1).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
-            this.phaseIcon(phaseAppearance(session.phase))
-          }.width('100%')
+          Button({ type: ButtonType.Normal }) {
+            Row({ space: CONTENT_GAP }) {
+              Text(session.title || `会话 ${index + 1}`).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
+                .layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              AgentShellStatusIcon({ phase: session.phase })
+            }.width('100%')
+          }.width('100%').constraintSize({ minHeight: 44 }).padding(0)
+            .backgroundColor(Color.Transparent).onClick(() => { this.openSession(session.id) })
         }, (session: AgentShellSession, index: number) => JSON.stringify([session.id, session.phase, session.title, index]))
+        if (this.errorMessage) {
+          Text(this.errorMessage).fontSize(BODY_SIZE).fontColor(ERROR_TEXT)
+        }
       } else {
         Text(this.emptyMessage())
           .fontSize(BODY_SIZE).fontColor(this.errorMessage ? ERROR_TEXT : SECONDARY_TEXT)

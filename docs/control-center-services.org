@@ -960,11 +960,35 @@ Emacs 使用相同的本机上报入口提交 ~emacs/agent_shell~ 。每次发�
 | ~closed~ | 无 | 会话已关闭，结束订阅。 |
 | ~error~ | ~message~ | 读取会话失败，显示错误并结束订阅。 |
 
-~blocks~ 为会话内容块数组。每个块包含字符串 ~id~ 、 ~kind~ 和 ~text~ ，可带字符串 ~title~ 。当前块类型包括 ~user~ 、 ~assistant~ 、 ~thought~ 、 ~tool~ 、 ~permission~ 和 ~system~ 。它们分别表示用户消息、Agent 回复、思考片段、工具调用、权限请求和系统内容。块传递用于显示的文本，客户端可按 ~kind~ 设置样式。
+~blocks~ 为会话内容块数组。每个块包含字符串 ~id~ 、 ~kind~ 和 ~text~ ，可带字符串 ~title~ 和 ~parent_id~ ，以及布尔字段 ~collapsed~ 。 ~user~ 、 ~assistant~ 、 ~thought~ 、 ~tool~ 、 ~permission~ 和 ~system~ 分别表示用户消息、Agent 回复、思考片段、工具调用、权限请求和系统内容。 ~group~ 表示 Agent Shell 的活动分组标题。客户端按数组顺序显示同级块，并将带 ~parent_id~ 的普通子块归入对应分组。 ~collapsed~ 为 ~true~ 时初始折叠，为 ~false~ 时初始展开。缺少字段的块沿用客户端默认展示方式。
+
+超长正文可分为首块和若干 ~continuation~ 续片。续片的 ~parent_id~ 指向首块的 ~id~ ，客户端按顺序拼接各个续片的 ~text~ ，与首块一起显示和折叠。续片可以在后续的 ~update~ 批次到达。
 
 首次连接和重连均以 ~snapshot~ 开始。较长历史会在首个快照后通过多个 ~update~ 批次补齐，各更新携带递增的 ~revision~ 。Emacs 重建内容或重置版本记录后会发送新的 ~snapshot~ ，后续批次继续补齐。断开订阅即可停止后续读取。
 
+手机默认使用 ~recent=10~ 订阅，以最近十条会话记录作为起点。记录包含其折叠组内容和正文续片。省略 ~recent~ 时从完整历史开始。已建立的订阅继续推送所选范围的后续更新。切换范围时关闭旧订阅，再按新范围读取快照。 ~recent~ 目前仅支持 ~10~ ，其他值返回 400 ~invalid-request~ 。
+
 services 通过配置中的 Emacs server 用固定入口 ~loki-assistant-agent-shell-stream-read~ 读取会话，buffer 名称作为数据参数传入。名称编码无效返回 400 ~invalid-request~ ，以普通 JSON 模式调用返回 406 ~agent-shell-stream-required~ ，会话找不到返回 404 ~agent-shell-session-not-found~ 。连接尚未建立时，网关不可用、响应无效或超时分别返回 503、502 或 504，并使用标准错误响应。会话内容从当前 Emacs buffer 取得，覆盖编辑器中已经提交和接收的可读内容。
+
+** Agent Shell 消息与图片
+
+本机和已绑定设备可通过 ~POST /agent-shell/sessions/{session_id}/messages~ 提交消息。请求使用 ~application/json~ ，正文包含字符串 ~text~ ，以 UTF-8 计算最多 16 KiB，至少含一个非空白字符且不含 NUL。路径使用与会话订阅相同的 buffer 名称编码。services 将原文作为参数传给 Emacs 的 ~loki-assistant-agent-shell-send-message~ ，保留空格和换行。
+
+会话接受后返回 HTTP 202，响应为 ~{"api_version":"1","accepted":true}~ 。后续消息和回复通过会话 SSE 展示。发送请求超时或连接断开时，客户端可从会话流核对消息是否已经发出，再决定是否重发。
+
+| HTTP 状态 | 错误码 | 含义 |
+|-----------+--------+------|
+| 400 | ~invalid-request~ | 路径编码或消息格式无效。 |
+| 404 | ~agent-shell-session-not-found~ | 会话不存在。 |
+| 409 | ~agent-shell-busy~ | 会话正在处理上一条消息。 |
+| 409 | ~agent-shell-draft-present~ | 电脑上有未发送的草稿。 |
+| 502 | ~invalid-emacs-response~ | Emacs 返回的数据无效。 |
+| 503 | ~emacs-unavailable~ | Emacs 或会话输入暂不可用。 |
+| 504 | ~emacs-timeout~ | Emacs 网关超时。 |
+
+本机和已绑定设备可通过 ~GET /agent-shell/sessions/{session_id}/image?source=...~ 读取会话中引用的图片。查询参数 ~source~ 是会话中的原始图片引用，按 UTF-8 计算最多 4096 字节。services 将引用交给 Emacs 的 ~loki-assistant-agent-shell-read-image~ 。Emacs 核对引用所属会话，并读取对应的图片数据。
+
+成功响应包含 ~api_version~ 、 ~mime~ 和使用标准 Base64 编码的 ~data~ ，响应带 ~Cache-Control: no-store~ 。支持 PNG、JPEG、GIF 和 WebP，图片原始数据最多 1 MiB。引用无效返回 400 ~invalid-request~ ，会话中没有可读取的图片返回 404 ~agent-shell-image-not-found~ ，网关错误使用上表中的 502、503 或 504。
 
 ** 打开 Emacs 应用
 

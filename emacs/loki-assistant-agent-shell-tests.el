@@ -292,6 +292,41 @@
             (should (equal (alist-get 'kind update) "update"))
             (should (equal (alist-get 'text (car (alist-get 'blocks update))) "回答更新"))))))))
 
+(ert-deftest loki-assistant-agent-shell-stream-preserves-folds-and-fragment-source ()
+  (require 'loki-assistant-agent-shell-stream)
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (group '((:qualified-id . "activity-1") (:kind . group) (:collapsed . t)))
+           (tool '((:qualified-id . "exec-1") (:group-id . "activity-1") (:collapsed . t)))
+           (inhibit-read-only t))
+      (insert (propertize "活动" 'agent-shell-ui-state group 'agent-shell-ui-section 'label-left))
+      (insert "\n")
+      (insert (propertize "› " 'agent-shell-ui-state tool 'agent-shell-ui-section 'indicator))
+      (insert (propertize "工具" 'agent-shell-ui-state tool 'agent-shell-ui-section 'label-left))
+      (insert (propertize "显示文本" 'agent-shell-ui-state tool 'agent-shell-ui-section 'body
+                          'agent-shell-markdown-source "```rust\n  let value = 1;\n```"))
+      (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list buffer)))
+                ((symbol-function 'agent-shell--live-prompt-start) #'point-max))
+        (let* ((snapshot (json-parse-string
+                          (loki-assistant-agent-shell-stream-read (buffer-name) nil)
+                          :object-type 'alist :array-type 'list))
+               (blocks (alist-get 'blocks snapshot))
+               (group-id (alist-get 'id (car blocks))))
+          (should (equal (alist-get 'kind (car blocks)) "group"))
+          (should (eq (alist-get 'collapsed (car blocks)) t))
+          (should (equal (alist-get 'parent_id (cadr blocks)) group-id))
+          (should (equal (alist-get 'text (cadr blocks)) "```rust\n  let value = 1;\n```"))
+          (put-text-property (point-min) (+ (point-min) 2) 'agent-shell-ui-state
+                             '((:qualified-id . "activity-1") (:kind . group) (:collapsed . nil)))
+          (let* ((update (json-parse-string
+                          (loki-assistant-agent-shell-stream-read (buffer-name) (alist-get 'revision snapshot))
+                          :object-type 'alist :array-type 'list :false-object :false))
+                 (changed (alist-get 'blocks update)))
+            (should (equal (alist-get 'kind update) "update"))
+            (should (= (length changed) 1))
+            (should (equal (alist-get 'id (car changed)) group-id))
+            (should (eq (alist-get 'collapsed (car changed)) :false))))))))
+
 (provide 'loki-assistant-agent-shell-tests)
 
 ;;; loki-assistant-agent-shell-tests.el ends here

@@ -85,23 +85,44 @@ fn wire(envelope: Value) -> CommandOutput {
     }
 }
 
+fn conversation_reply(value: Value) -> Result<CommandOutput, EmacsError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    Ok(wire(json!({
+        "result": serde_json::to_string(&STANDARD.encode(value.to_string())).unwrap()
+    })))
+}
+
+fn assert_conversation_lisp(args: &[String]) {
+    let (_, wrapped_source) = args[3].split_once("(let* ((source ").unwrap();
+    let source = serde_json::Deserializer::from_str(wrapped_source)
+        .into_iter::<String>()
+        .next()
+        .unwrap()
+        .unwrap();
+    // 两个参数均为 Base64，Lisp 源码不需要反斜线转义。
+    assert!(!source.contains('\\'));
+}
+
 #[tokio::test]
 async fn agent_shell_stream_sends_snapshot_increment_and_closure() {
     use base64::{Engine, engine::general_purpose::STANDARD};
 
     let session_id = "*中文 会话/\"quoted\"..*";
     let encoded = "%2A%E4%B8%AD%E6%96%87%20%E4%BC%9A%E8%AF%9D%2F%22quoted%22%2E%2E%2A";
-    let batch = |value: Value| {
-        Ok(wire(json!({
-            "result": serde_json::to_string(&STANDARD.encode(value.to_string())).unwrap()
-        })))
-    };
+    let group = json!({
+        "id": "activity-1", "kind": "group", "title": "运行命令", "text": "",
+        "collapsed": true
+    });
+    let update = json!([
+        {"id": "activity-1", "kind": "group", "title": "运行命令", "text": "", "collapsed": false},
+        {"id": "tool-1", "kind": "tool", "text": "第一行", "parent_id": "activity-1", "collapsed": true},
+        {"id": "tool-1:1", "kind": "continuation", "text": "第二行", "parent_id": "tool-1"},
+        {"id": "message-1", "kind": "assistant", "text": "执行完成"}
+    ]);
     let (emacs, runner, _) = service(vec![
-        batch(json!({"kind": "snapshot", "revision": 0, "blocks": []})),
-        batch(json!({"kind": "update", "revision": 1, "blocks": [
-                {"id": "message-1", "kind": "assistant", "text": "第一条消息\n第二行"}
-        ]})),
-        batch(json!({"kind": "missing"})),
+        conversation_reply(json!({"kind": "snapshot", "revision": 0, "blocks": [group]})),
+        conversation_reply(json!({"kind": "update", "revision": 1, "blocks": update})),
+        conversation_reply(json!({"kind": "missing"})),
     ]);
     let response = routes::router(emacs)
         .oneshot(
@@ -131,14 +152,11 @@ async fn agent_shell_stream_sends_snapshot_increment_and_closure() {
         messages[0]["data"],
         json!({
             "api_version": "1", "session_id": session_id,
-            "kind": "snapshot", "revision": 0, "blocks": []
+            "kind": "snapshot", "revision": 0, "blocks": [group]
         })
     );
     assert_eq!(messages[1]["data"]["kind"], "update");
-    assert_eq!(
-        messages[1]["data"]["blocks"][0]["text"],
-        "第一条消息\n第二行"
-    );
+    assert_eq!(messages[1]["data"]["blocks"], update);
     assert_eq!(messages[2]["data"]["kind"], "closed");
     let calls = runner.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
@@ -146,9 +164,154 @@ async fn agent_shell_stream_sends_snapshot_increment_and_closure() {
     for ((_, args), cursor) in calls.iter().zip(["nil", "0", "1"]) {
         assert!(args[3].contains(&format!(r#"base64-decode-string \"{lisp_argument}\""#)));
         assert!(args[3].contains(&format!(
-            "loki-assistant-agent-shell-stream-read name {cursor}"
+            "loki-assistant-agent-shell-stream-read name {cursor})"
         )));
         assert!(!args[3].contains(session_id));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_stream_keeps_recent_scope_across_revisions() {
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!({"kind": "snapshot", "revision": 12, "blocks": []})),
+        conversation_reply(json!({"kind": "update", "revision": 13, "blocks": []})),
+        conversation_reply(json!({"kind": "missing"})),
+    ]);
+    let response = routes::router(emacs)
+        .oneshot(
+            Request::builder()
+                .uri("/agent-shell/sessions/session/events?recent=10")
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream = to_bytes(response.into_body(), 4096).await.unwrap();
+    let events = std::str::from_utf8(&stream).unwrap();
+    for kind in ["snapshot", "update", "closed"] {
+        assert!(events.contains(&format!(r#""kind":"{kind}""#)));
+    }
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    for ((_, args), cursor) in calls.iter().zip(["nil", "12", "13"]) {
+        assert!(args[3].contains(&format!(
+            "loki-assistant-agent-shell-stream-read name {cursor} 10)"
+        )));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_messages_forward_exact_text_and_distinguish_emacs_outcomes() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let outcomes = [
+        ("accepted", StatusCode::ACCEPTED, None),
+        (
+            "missing",
+            StatusCode::NOT_FOUND,
+            Some("agent-shell-session-not-found"),
+        ),
+        ("busy", StatusCode::CONFLICT, Some("agent-shell-busy")),
+        (
+            "draft",
+            StatusCode::CONFLICT,
+            Some("agent-shell-draft-present"),
+        ),
+        (
+            "unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("emacs-unavailable"),
+        ),
+    ];
+    let (emacs, runner, _) = service(
+        outcomes
+            .iter()
+            .map(|(kind, _, _)| conversation_reply(json!({"kind": kind})))
+            .collect(),
+    );
+    let text = "  你好 \"手机\"\n  第二行\n";
+    let route = "/agent-shell/sessions/%2A%E4%B8%AD%E6%96%87%2F%22quoted%22%2A/messages";
+    for body in [
+        json!({"text": " "}),
+        json!({"text": "你好\0"}),
+        json!({"text": "中".repeat(5500)}),
+        json!({"text": "你好", "extra": true}),
+    ] {
+        let (status, reply) = request(emacs.clone(), "POST", route, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply["error"]["code"], "invalid-request");
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    for (_, expected, code) in outcomes {
+        let (status, reply) = request(emacs.clone(), "POST", route, json!({"text": text})).await;
+        assert_eq!(status, expected);
+        if let Some(code) = code {
+            assert_eq!(reply["error"]["code"], code);
+            assert!(!reply.to_string().contains("第二行"));
+        } else {
+            assert_eq!(reply, json!({"api_version": "1", "accepted": true}));
+        }
+    }
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), outcomes.len());
+    for (_, args) in calls.iter() {
+        assert_conversation_lisp(args);
+        assert!(args[3].contains("loki-assistant-agent-shell-send-message name argument"));
+        assert!(args[3].contains(&STANDARD.encode("*中文/\"quoted\"*")));
+        assert!(args[3].contains(&STANDARD.encode(text)));
+        assert!(!args[3].contains("第二行"));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_images_forward_source_and_validate_bridge_data() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let png = STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!({"mime": "image/png", "data": png})),
+        conversation_reply(Value::Null),
+        conversation_reply(json!({"mime": "image/jpeg", "data": png})),
+        conversation_reply(json!({"mime": "image/png", "data": "invalid"})),
+        Ok(wire(json!({"result": "nil"}))),
+    ]);
+    let route = "/agent-shell/sessions/session/image";
+    let (status, reply) = request(emacs.clone(), "GET", route, Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply["error"]["code"], "invalid-request");
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let source = "https://example.invalid/图 片.png?q=\"w\"";
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("source", source)
+        .finish();
+    let route = format!("{route}?{query}");
+    for (expected, code) in [
+        (StatusCode::OK, None),
+        (StatusCode::NOT_FOUND, Some("agent-shell-image-not-found")),
+        (StatusCode::BAD_GATEWAY, Some("invalid-emacs-response")),
+        (StatusCode::BAD_GATEWAY, Some("invalid-emacs-response")),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("emacs-unavailable")),
+    ] {
+        let (status, reply) = request(emacs.clone(), "GET", &route, Value::Null).await;
+        assert_eq!(status, expected);
+        if let Some(code) = code {
+            assert_eq!(reply["error"]["code"], code);
+        } else {
+            assert_eq!(
+                reply,
+                json!({"api_version": "1", "mime": "image/png", "data": png})
+            );
+        }
+    }
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert_conversation_lisp(args);
+        assert!(args[3].contains("loki-assistant-agent-shell-read-image name argument"));
+        assert!(args[3].contains(&STANDARD.encode(source)));
+        assert!(!args[3].contains("example.invalid"));
     }
 }
 
@@ -171,6 +334,25 @@ async fn agent_shell_stream_validates_request_before_reading_emacs() {
             .await
             .unwrap();
         assert_eq!(response.status(), expected);
+    }
+    for query in [
+        "recent=9",
+        "recent=abc",
+        "recent=10&recent=10",
+        "unknown=10",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/agent-shell/sessions/session/events?{query}"))
+                    .header("accept", "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     assert!(runner.calls.lock().unwrap().is_empty());
 }
@@ -532,7 +714,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 12);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 14);
             let conversation = body["apis"]
                 .as_array()
                 .unwrap()
@@ -547,6 +729,28 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
             assert_eq!(conversation["access"], "paired");
             assert_eq!(conversation["supports_sse"], true);
             assert_eq!(conversation["sse_events"][0]["event"], "agent-shell");
+            for (id, method, path) in [
+                (
+                    "agent-shell-submit-message",
+                    "POST",
+                    "/agent-shell/sessions/{session_id}/messages",
+                ),
+                (
+                    "agent-shell-read-image",
+                    "GET",
+                    "/agent-shell/sessions/{session_id}/image",
+                ),
+            ] {
+                let api = body["apis"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|api| api["id"] == id)
+                    .unwrap();
+                assert_eq!(api["method"], method);
+                assert_eq!(api["path"], path);
+                assert_eq!(api["access"], "paired");
+            }
             let open_app = body["apis"]
                 .as_array()
                 .unwrap()

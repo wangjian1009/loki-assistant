@@ -1,6 +1,7 @@
 *.local.md
 .DS_Store
 .build/
+library/org-parser/target/
 services/target/
 apps/org-daily/target/
 apps/xbloom/target/

@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use crate::{
     Workspace as RustWorkspace, WorkspaceOptions as RustWorkspaceOptions,
     agent_shell::{AgentShell as RustAgentShell, AgentShellSession},
+    agent_shell_images::ImageCache,
     mail::{Mail as RustMail, MailStatusChanged},
     network::{
         InvalidRequestReason, Network as RustNetwork, QueryParameter,
@@ -25,6 +26,15 @@ use crate::{
 
 fn js_value(value: impl Serialize) -> Result<Value> {
     serde_json::to_value(value).map_err(|error| Error::from_reason(error.to_string()))
+}
+
+#[napi]
+pub fn render_document(source: String, format: String) -> String {
+    match format.as_str() {
+        "org" => loki_org_parser::org(&source),
+        "markdown" => loki_org_parser::markdown(&source),
+        _ => loki_org_parser::render(&source),
+    }
 }
 
 fn typed_result<T>(env: Env, result: std::result::Result<T, ResponsError>) -> Result<T> {
@@ -53,6 +63,7 @@ pub struct WorkspaceOptions {
 #[napi]
 pub struct Workspace {
     inner: Arc<RustWorkspace>,
+    agent_images: Arc<ImageCache>,
 }
 
 #[napi]
@@ -63,6 +74,7 @@ impl Workspace {
             .await
             .map(|inner| Self {
                 inner: Arc::new(inner),
+                agent_images: Arc::new(ImageCache::default()),
             })
     }
 
@@ -90,7 +102,8 @@ impl Workspace {
     #[napi]
     pub fn open_agent_shell(&self) -> AgentShell {
         AgentShell {
-            inner: self.inner.open_agent_shell(),
+            inner: Arc::new(self.inner.open_agent_shell()),
+            images: self.agent_images.clone(),
         }
     }
 
@@ -351,7 +364,8 @@ impl Slack {
 
 #[napi]
 pub struct AgentShell {
-    inner: RustAgentShell,
+    inner: Arc<RustAgentShell>,
+    images: Arc<ImageCache>,
 }
 
 #[napi]
@@ -364,12 +378,13 @@ impl AgentShell {
     }
 
     #[napi(
-        ts_args_type = "sessionId: string, changed: (event: AgentShellConversationEvent) => void, ended: (error: ResponsError | null) => void"
+        ts_args_type = "sessionId: string, full: boolean, changed: (event: AgentShellConversationEvent) => void, ended: (error: ResponsError | null) => void"
     )]
     pub fn watch_conversation(
         &self,
         env: Env,
         session_id: String,
+        full: bool,
         changed: Function<'_, Value, ()>,
         ended: Function<'_, Value, ()>,
     ) -> Result<RequestHandle> {
@@ -385,6 +400,7 @@ impl AgentShell {
             .build()?;
         let handle = self.inner.watch_conversation(
             session_id,
+            full,
             move |event| {
                 if let Ok(value) = js_value(event) {
                     changed.call(value, NonBlocking);
@@ -399,6 +415,35 @@ impl AgentShell {
         Ok(RequestHandle {
             inner: Some(typed_result(env, handle)?),
         })
+    }
+
+    #[napi(ts_return_type = "Promise<ResponsError | null>")]
+    pub async fn send_message(&self, session_id: String, text: String) -> Result<Value> {
+        js_value(self.inner.send_message(&session_id, text).await.err())
+    }
+
+    #[napi]
+    pub async fn cache_image(
+        &self,
+        cache_dir: String,
+        session_id: String,
+        source: String,
+    ) -> Result<String> {
+        self.images
+            .clone()
+            .read(&self.inner, cache_dir.into(), session_id, source)
+            .await
+            .map_err(Error::from_reason)
+    }
+    #[napi]
+    pub async fn clear_session_images(
+        &self,
+        cache_dir: String,
+        endpoint_id: String,
+        session_id: String,
+    ) {
+        self.images
+            .close(std::path::Path::new(&cache_dir), &endpoint_id, &session_id);
     }
 }
 

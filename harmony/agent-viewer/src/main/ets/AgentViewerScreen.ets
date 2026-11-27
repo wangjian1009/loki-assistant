@@ -1,14 +1,11 @@
+import { OrgRenderer } from 'org_renderer'
+import { AgentShellStatusIcon, agentShellAppearance } from './AgentShellStatusIcon'
+import { ConversationRow, ViewerBlock, conversationRows } from './ConversationLayout'
+
 export interface ViewerSession {
   id: string
   title: string
   phase: string
-}
-
-export interface ViewerBlock {
-  id: string
-  kind: string
-  title: string
-  text: string
 }
 
 const BACKGROUND: string = '#111318'
@@ -21,49 +18,14 @@ const ACCENT: string = '#C2CCFF'
 const GREEN: string = '#9AE2B9'
 const RED: string = '#FFB4B1'
 const AMBER: string = '#F5CF92'
-
-function phaseIcon(phase: string): Resource {
-  switch (phase) {
-    case 'starting': return $r('sys.symbol.hourglass')
-    case 'running': return $r('sys.symbol.play_circle')
-    case 'waiting_input': return $r('sys.symbol.ellipsis_bubble')
-    case 'completed': return $r('sys.symbol.checkmark_circle')
-    case 'cancelled': return $r('sys.symbol.stop_circle')
-    case 'failed': return $r('sys.symbol.exclamationmark_circle')
-    case 'disconnected': return $r('sys.symbol.wifi_slash')
-    default: return $r('sys.symbol.circle')
-  }
-}
-
-function phaseColor(phase: string): string {
-  switch (phase) {
-    case 'starting':
-    case 'running': return ACCENT
-    case 'waiting_input': return AMBER
-    case 'completed': return GREEN
-    case 'failed': return RED
-    default: return SECONDARY
-  }
-}
-
-function phaseLabel(phase: string): string {
-  switch (phase) {
-    case 'starting': return '启动中'
-    case 'running': return '执行中'
-    case 'waiting_input': return '等待输入'
-    case 'completed': return '已完成'
-    case 'cancelled': return '已取消'
-    case 'failed': return '执行失败'
-    case 'disconnected': return '已断开'
-    default: return '空闲'
-  }
-}
+const DETAIL: string = '#929DB1'
 
 function blockLabel(kind: string): string {
   switch (kind) {
     case 'user': return '你'
     case 'assistant': return 'Agent'
     case 'thought': return '思考'
+    case 'group': return '活动'
     case 'tool': return '工具'
     case 'permission': return '等待授权'
     default: return ''
@@ -75,28 +37,96 @@ export struct AgentViewerScreen {
   @Prop title: ResourceStr
   @Prop deviceName: string = ''
   @Prop sessionId: string = ''
-  @Prop @Watch('scrollToSelection') conversationKey: number = 0
+  @Prop @Watch('resetConversation') conversationKey: number = 0
   @Prop sessions: ViewerSession[] = []
-  @Prop blocks: ViewerBlock[] = []
+  @Prop @Watch('refreshRows') blocks: ViewerBlock[] = []
   @Prop notice: string = ''
+  @Prop full: boolean = false
+  @Prop connected: boolean = false
   onSelect: (id: string) => void = () => {}
   onRetry: () => void = () => {}
+  onFull: () => void = () => {}
+  onSend: (text: string) => Promise<string> = () => Promise.resolve('无法发送消息')
+  readImage: (source: string) => Promise<string> = () => Promise.reject(new Error('图片不可用'))
+  parseDocument: (source: string, format: string) => string = () => ''
+  @State private rows: ConversationRow[] = []
+  private readonly folds: Map<string, boolean> = new Map()
   @State private sidebar: boolean = false
+  @State private draft: string = ''
+  @State private sending: boolean = false
+  @State private sendError: string = ''
+  @State private preview: string = ''
+  private followTimer: number = -1
+  private following: boolean = true
   private readonly history: Scroller = new Scroller()
   private readonly sessionList: Scroller = new Scroller()
 
-  private scrollToSelection(): void {
-    this.history.scrollEdge(Edge.Top)
+  aboutToAppear(): void { this.refreshRows() }
+
+  aboutToDisappear(): void { clearTimeout(this.followTimer) }
+
+  private resetConversation(): void {
+    this.folds.clear()
+    this.following = true
+    this.draft = ''
+    this.sending = false
+    this.sendError = ''
+    this.preview = ''
+    this.refreshRows()
+  }
+
+  private refreshRows(): void {
+    this.rows = conversationRows(this.blocks, this.folds)
+    this.followLatest()
+  }
+
+  private followLatest(): void {
+    if (!this.following) return
+    clearTimeout(this.followTimer)
+    this.followTimer = setTimeout(() => {
+      if (this.following) this.history.scrollEdge(Edge.Bottom)
+    }, 50)
+  }
+
+  private async send(): Promise<void> {
+    if (this.sending || !this.connected || !this.sessionId || !this.draft.trim()) return
+    const text = this.draft
+    const key = this.conversationKey
+    this.sending = true
+    this.sendError = ''
+    try {
+      const error = await this.onSend(text)
+      if (this.conversationKey !== key) return
+      this.sendError = error
+      if (!error && this.draft === text) {
+        this.draft = ''
+        this.following = true
+        this.followLatest()
+      }
+    } catch (_) {
+      if (this.conversationKey === key) this.sendError = '无法发送消息'
+    } finally {
+      if (this.conversationKey === key) this.sending = false
+    }
+  }
+
+  private async openImage(source: string): Promise<void> {
+    const key = this.conversationKey
+    try {
+      const path = await this.readImage(source)
+      if (key === this.conversationKey) this.preview = path
+    } catch (_) {
+      if (key === this.conversationKey) this.sendError = '无法打开会话图片'
+    }
+  }
+
+  private toggleFold(row: ConversationRow): void {
+    this.folds.set(row.id, !row.collapsed)
+    this.rows = conversationRows(this.blocks, this.folds)
   }
 
   private selected(): ViewerSession | undefined {
     return this.sessions.find(session => session.id === this.sessionId)
-  }
-
-  @Builder
-  private status(phase: string) {
-    SymbolGlyph(phaseIcon(phase)).fontSize(19).fontColor([phaseColor(phase)])
-      .accessibilityLevel('yes').accessibilityText(phaseLabel(phase))
   }
 
   @Builder
@@ -110,41 +140,102 @@ export struct AgentViewerScreen {
         }
       }.width(44).height(44).padding(0).borderRadius(12).backgroundColor(PANEL)
         .accessibilityText('打开会话列表').onClick(() => { this.sidebar = true })
-      Text(this.selected()?.title || this.title).fontSize(18).fontWeight(FontWeight.Medium)
-        .fontColor(TEXT).layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-      if (this.selected()) {
-        this.status(this.selected()!.phase)
+      Column({ space: 2 }) {
+        Text(this.selected()?.title || this.title).fontSize(18).fontWeight(FontWeight.Medium)
+          .fontColor(TEXT).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.selected()) {
+          Row({ space: 5 }) {
+            AgentShellStatusIcon({ phase: this.connected ? this.selected()!.phase : 'disconnected', iconSize: 12 })
+            Text(this.connected ? agentShellAppearance(this.selected()!.phase).label : '电脑离线')
+              .fontSize(12).fontColor(agentShellAppearance(this.connected ? this.selected()!.phase : 'disconnected').color)
+          }
+        }
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+      if (this.sessionId && !this.full && this.connected) {
+        Button('全部', { type: ButtonType.Normal }).height(40).fontSize(13).fontColor(ACCENT)
+          .padding({ left: 12, right: 12 }).backgroundColor(PANEL)
+          .accessibilityText('加载全部会话')
+          .onClick(() => { this.following = true; this.onFull() })
       }
     }.width('100%').padding({ top: 5, bottom: 10 })
   }
 
   @Builder
-  private message(block: ViewerBlock) {
+  private message(row: ConversationRow) {
     Column({ space: 6 }) {
-      if (block.title || blockLabel(block.kind)) {
-        Text(block.title || blockLabel(block.kind)).width('100%').fontSize(13)
-          .fontWeight(FontWeight.Medium).fontColor(block.kind === 'permission' ? AMBER : SECONDARY)
+      if (row.foldable) {
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 8 }) {
+            SymbolGlyph(row.collapsed ? $r('sys.symbol.chevron_right') : $r('sys.symbol.chevron_down'))
+              .fontSize(10).fontColor([DETAIL])
+            Text(row.title || blockLabel(row.kind)).layoutWeight(1)
+              .fontSize(12).fontColor(row.kind === 'permission' ? AMBER : DETAIL)
+              .maxLines(row.collapsed ? 1 : 2).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }.width('100%')
+        }.width('100%').constraintSize({ minHeight: 32 }).padding(0).backgroundColor(Color.Transparent)
+          .accessibilityGroup(true)
+          .accessibilityText((row.title || blockLabel(row.kind)) + (row.collapsed ? '，已折叠' : '，已展开'))
+          .onClick(() => { this.toggleFold(row) })
+      } else if (row.title || blockLabel(row.kind)) {
+        Text(row.title || blockLabel(row.kind)).width('100%').fontSize(13)
+          .fontWeight(FontWeight.Medium).fontColor(row.kind === 'user' ? ACCENT :
+            row.kind === 'assistant' ? GREEN : row.kind === 'permission' ? AMBER : SECONDARY)
       }
-      if (block.text) {
-        Text(block.text).width('100%').fontSize(15).fontColor(TEXT)
-          .lineHeight(24).wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.LocalDevice)
+      if (row.text && !row.collapsed) {
+        if (row.kind === 'assistant' || row.kind === 'thought' || row.kind === 'tool') {
+          OrgRenderer({ source: row.text, subdued: row.foldable, parse: this.parseDocument, readImage: this.readImage,
+            onOpenImage: (source: string): void => { this.openImage(source) },
+            onContentReady: (): void => { this.followLatest() } })
+        } else {
+          Text(row.text).width('100%').fontSize(15).fontColor(TEXT)
+            .lineHeight(24).wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.LocalDevice)
+        }
       }
     }.width('100%').alignItems(HorizontalAlign.Start)
-      .padding(block.kind === 'assistant' ? { top: 6, bottom: 6 } : 12)
-      .backgroundColor(block.kind === 'user' ? SELECTED : block.kind === 'assistant' ? BACKGROUND : PANEL)
+      .padding(row.foldable ? { bottom: row.collapsed || !row.text ? 0 : 8, left: 8, right: 8 } :
+        row.kind === 'user' ? { top: 10, bottom: 10, left: 12, right: 12 } : { top: 6, bottom: 6 })
+      .backgroundColor(row.kind === 'user' ? SELECTED : Color.Transparent)
       .borderRadius(12)
   }
 
   @Builder
   private chat() {
-    List({ scroller: this.history, space: 10 }) {
-      ForEach(this.blocks, (block: ViewerBlock) => {
+    List({ scroller: this.history, space: 8 }) {
+      ForEach(this.rows, (row: ConversationRow) => {
         ListItem() {
-          this.message(block)
+          Row() {
+            this.message(row)
+          }.width('100%').padding({ left: row.depth * 12 })
+            .border({ width: { left: row.depth > 0 ? 1 : 0 }, color: BORDER })
         }
-      }, (block: ViewerBlock) => JSON.stringify([block.id, block.title, block.text]))
+      }, (row: ConversationRow) => JSON.stringify([row.id, row.kind, row.title, row.depth, row.foldable,
+        row.collapsed, row.collapsed ? '' : row.text]))
     }.width('100%').layoutWeight(1).padding({ top: 12, bottom: 16 })
-      .divider({ strokeWidth: 0 }).edgeEffect(EdgeEffect.None).scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.None).scrollBar(BarState.Auto)
+      .onTouch(event => {
+        if (event.type === TouchType.Move) this.following = false
+      })
+      .onScrollStop(() => { this.following = this.history.isAtEnd() })
+  }
+
+  @Builder
+  private composer() {
+    Column({ space: 4 }) {
+      if (this.sendError) {
+        Text(this.sendError).width('100%').fontSize(12).fontColor(RED)
+      }
+      Row({ space: 8 }) {
+        TextInput({ placeholder: '输入消息', text: this.draft }).layoutWeight(1)
+          .fontSize(15).fontColor(TEXT).placeholderColor(SECONDARY).backgroundColor(PANEL)
+          .height(46).enterKeyType(EnterKeyType.Send).enabled(!!this.sessionId)
+          .onChange((text: string) => { this.draft = text })
+          .onSubmit(() => { this.send() })
+        Button(this.sending ? '发送中' : '发送', { type: ButtonType.Normal }).height(44)
+          .fontSize(14).fontColor('#182143').backgroundColor(ACCENT)
+          .enabled(this.connected && !!this.sessionId && !!this.draft.trim() && !this.sending)
+          .onClick(() => { this.send() })
+      }.width('100%')
+    }.width('100%').padding({ top: 4, bottom: 8 })
   }
 
   @Builder
@@ -166,7 +257,7 @@ export struct AgentViewerScreen {
           ListItem() {
             Button({ type: ButtonType.Normal }) {
               Row({ space: 10 }) {
-                this.status(session.phase)
+                AgentShellStatusIcon({ phase: session.phase, iconSize: 19 })
                 Text(session.title).layoutWeight(1).maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis }).fontSize(15).fontColor(TEXT)
                 if (session.id === this.sessionId) {
@@ -203,6 +294,7 @@ export struct AgentViewerScreen {
             }
           }.width('100%').padding({ top: 4, bottom: 4 })
         }
+        this.composer()
       }.width('100%').height('100%').padding({ left: 16, right: 16 })
 
       if (this.sidebar) {
@@ -210,6 +302,16 @@ export struct AgentViewerScreen {
           .width('100%').height('100%').borderRadius(0).backgroundColor('#99000000')
           .accessibilityText('关闭会话列表').onClick(() => { this.sidebar = false })
         this.drawer()
+      }
+      if (this.preview) {
+        Column() {
+          Row() {
+            Blank()
+            Button('关闭', { type: ButtonType.Normal }).height(44).fontColor(TEXT)
+              .backgroundColor(PANEL).onClick(() => { this.preview = '' })
+          }.width('100%').padding(12)
+          Image('file://' + this.preview).width('100%').layoutWeight(1).objectFit(ImageFit.Contain)
+        }.width('100%').height('100%').backgroundColor('#F0000000')
       }
     }.width('100%').height('100%').backgroundColor(BACKGROUND)
   }

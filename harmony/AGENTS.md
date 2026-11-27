@@ -4,6 +4,7 @@
 
 - `assistant/` 是 Loki Assistant 手机助手的 DevEco Studio 工程根目录，包含应用配置、`entry/` 模块、构建脚本和签名材料。应用通过 Stage 模式 ArkTS 提供手机端入口，通过 iroh 与电脑完成扫码绑定和状态查询。业务 HTTP 服务在电脑本机提供。
 - `health/`、`coffee/`、`agent-viewer/` 分别维护个人健康、咖啡管理和 AI 远程对话的页面。三个 HAR 随手机助手的 entry HAP 构建，各有一个在 entry 声明的 `UIAbility`，同一应用进程中各自拥有窗口和生命周期。
+- `org-renderer/` 是 Org 与 Markdown 的复用渲染组件。调用方注入 `library/org-parser/` 的原生解析入口，两种格式共用排版样式。
 
 ## 手机助手约定
 

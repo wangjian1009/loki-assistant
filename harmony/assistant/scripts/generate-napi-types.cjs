@@ -4,6 +4,7 @@ const entries = fs.readFileSync(metadata, 'utf8').trim().split('\n').map(line =>
 const implementations = new Map(entries.filter(item => item.kind === 'impl').map(item => [item.name, item.def]));
 const declarations = entries.flatMap(({ kind, name, def }) => {
   if (kind === 'impl') return [];
+  if (kind === 'fn') return [def];
   if (kind !== 'struct' && kind !== 'interface') throw new Error(`未知 NAPI 声明类型 ${kind}`);
   const body = kind === 'struct' ? implementations.get(name) ?? '' : def;
   const lines = body.split('\\n').map(line => line.trim()).filter(Boolean);

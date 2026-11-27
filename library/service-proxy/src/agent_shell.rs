@@ -1,7 +1,9 @@
 use crate::network::{
-    InvalidRequestReason, RequestHandle, ResponsError, ServiceRequest, SseEvent, SseUpdate,
+    InvalidRequestReason, QueryParameter, RequestHandle, ResponsError, ServiceRequest, SseEvent,
+    SseUpdate,
 };
 use crate::service_proxy::{ServiceProxy, ServiceSnapshot, StatusSubscription};
+use http::Method;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write as _, sync::Arc};
 
@@ -34,6 +36,8 @@ pub struct AgentShellBlock {
     pub kind: String,
     pub title: Option<String>,
     pub text: String,
+    pub parent_id: Option<String>,
+    pub collapsed: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -42,6 +46,12 @@ pub struct AgentShellConversationEvent {
     pub revision: u64,
     #[serde(flatten)]
     pub update: AgentShellConversationUpdate,
+}
+
+#[derive(Deserialize)]
+pub struct AgentShellImage {
+    pub mime: String,
+    pub data: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -86,22 +96,19 @@ impl AgentShell {
     pub fn watch_conversation(
         &self,
         session_id: String,
+        full: bool,
         mut changed: impl FnMut(AgentShellConversationEvent) + Send + 'static,
         ended: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
     ) -> Result<RequestHandle, ResponsError> {
-        if session_id.is_empty() || session_id.chars().any(char::is_control) {
-            return Err(InvalidRequestReason::InvalidPath.into());
-        }
-        let mut segment = String::with_capacity(session_id.len());
-        for byte in session_id.bytes() {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-                segment.push(char::from(byte));
-            } else {
-                let _ = write!(segment, "%{byte:02X}");
-            }
-        }
+        let path = Self::session_path(&session_id)?;
         let generation = self.proxy.snapshot().generation;
-        let request = ServiceRequest::get(format!("/agent-shell/sessions/{segment}/events"));
+        let mut request = ServiceRequest::get(format!("{path}/events"));
+        if !full {
+            request.query.push(QueryParameter {
+                name: "recent".into(),
+                value: "10".into(),
+            });
+        }
         Ok(self
             .proxy
             .request_sse::<SseEvent<AgentShellConversationEvent>>(
@@ -117,5 +124,79 @@ impl AgentShell {
                 },
                 ended,
             ))
+    }
+
+    pub async fn send_message(&self, session_id: &str, text: String) -> Result<(), ResponsError> {
+        let request = ServiceRequest {
+            method: Method::POST,
+            path: format!("{}/messages", Self::session_path(session_id)?),
+            query: vec![],
+            body: Some(serde_json::json!({ "text": text })),
+        };
+        self.proxy
+            .request::<serde_json::Value>(self.proxy.snapshot().generation, request)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn read_image(
+        &self,
+        generation: u64,
+        session_id: &str,
+        source: String,
+    ) -> Result<AgentShellImage, ResponsError> {
+        let mut request = ServiceRequest::get(format!("{}/image", Self::session_path(session_id)?));
+        request.query.push(QueryParameter {
+            name: "source".into(),
+            value: source,
+        });
+        self.proxy
+            .request::<AgentShellImage>(generation, request)
+            .await
+            .map(|response| response.data)
+    }
+
+    pub fn image_target(&self) -> (Option<String>, u64) {
+        let snapshot = self.proxy.snapshot();
+        (snapshot.endpoint_id, snapshot.generation)
+    }
+
+    pub fn has_session(&self, generation: u64, session_id: &str) -> bool {
+        let snapshot = self.proxy.snapshot();
+        snapshot.generation == generation
+            && AgentShellSession::from_snapshot(&snapshot)
+                .is_some_and(|sessions| sessions.iter().any(|session| session.id == session_id))
+    }
+
+    pub fn watch_image_sessions(
+        &self,
+        changed: impl FnMut(Option<(String, Vec<String>)>) -> bool + Send + 'static,
+    ) -> StatusSubscription {
+        self.proxy.subscribe(
+            |snapshot| {
+                let endpoint = snapshot.endpoint_id.clone()?;
+                let sessions = AgentShellSession::from_snapshot(snapshot)?;
+                Some((
+                    endpoint,
+                    sessions.into_iter().map(|session| session.id).collect(),
+                ))
+            },
+            changed,
+        )
+    }
+
+    fn session_path(session_id: &str) -> Result<String, ResponsError> {
+        if session_id.is_empty() || session_id.chars().any(char::is_control) {
+            return Err(InvalidRequestReason::InvalidPath.into());
+        }
+        let mut segment = String::with_capacity(session_id.len());
+        for byte in session_id.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                segment.push(char::from(byte));
+            } else {
+                let _ = write!(segment, "%{byte:02X}");
+            }
+        }
+        Ok(format!("/agent-shell/sessions/{segment}"))
     }
 }

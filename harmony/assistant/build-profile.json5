@@ -47,6 +47,10 @@
     {
       "name": "agent_viewer",
       "srcPath": "../agent-viewer"
+    },
+    {
+      "name": "org_renderer",
+      "srcPath": "../org-renderer"
     }
   ]
 }

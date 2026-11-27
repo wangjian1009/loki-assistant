@@ -9,6 +9,7 @@
     "liblokiworkspace.so": "file:./src/main/cpp/types/liblokiworkspace",
     "health": "file:../../health",
     "coffee": "file:../../coffee",
-    "agent_viewer": "file:../../agent-viewer"
+    "agent_viewer": "file:../../agent-viewer",
+    "org_renderer": "file:../../org-renderer"
   }
 }

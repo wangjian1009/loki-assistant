@@ -32,6 +32,8 @@
 (require 'image)
 (require 'loki-assistant-monitor)
 (autoload 'loki-assistant-agent-shell-stream-read "loki-assistant-agent-shell-stream")
+(autoload 'loki-assistant-agent-shell-send-message "loki-assistant-agent-shell-stream")
+(autoload 'loki-assistant-agent-shell-read-image "loki-assistant-agent-shell-stream")
 (require 'subr-x)
 
 (declare-function agent-shell--get-files-context "agent-shell")

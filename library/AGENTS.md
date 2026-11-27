@@ -1,6 +1,7 @@
 ## 职责
 
 - `library/service-proxy/`：平台无关的 Rust 服务客户端。Network 处理认证和传输，ServiceProxy 缓存类型化元数据、配置与状态，并分别发布状态更新和刷新事件。调试 HTTP 服务监听回环地址，提供当前电脑刷新入口，并按路径和方法分发已注册的测试处理函数。邮件与 Slack 各自声明业务类型及业务逻辑，界面组件由应用维护。
+- `library/org-parser/`：平台无关的 Org 与 Markdown 片段解析。使用 orgize 和 pulldown-cmark 输出供展示层消费的 HTML 片段。
 
 - `library/xbloom/recipes/`：账号配方导出和公开分享读取，通过 `HttpTransport` 对接客户端的 HTTP 实现。
 - `library/xbloom/device/`：xBloom Studio 的 BLE 会话、配方编码与冲煮指令，通过 `BleTransport` 对接客户端的蓝牙实现。

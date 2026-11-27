@@ -1,0 +1,7 @@
+{
+  "module": {
+    "name": "org_renderer",
+    "type": "har",
+    "deviceTypes": ["phone"]
+  }
+}

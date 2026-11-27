@@ -124,7 +124,14 @@ export interface SlackStatusChanged { generation: number; status: SlackStatus | 
 export type AgentShellPhase = 'idle' | 'starting' | 'running' | 'waiting_input' | 'completed' |
   'cancelled' | 'failed' | 'disconnected' | 'unknown'
 export interface AgentShellSession { id: string; title: string | null; phase: AgentShellPhase; stop_reason: string | null }
-export interface AgentShellBlock { id: string; kind: string; title: string | null; text: string }
+export interface AgentShellBlock {
+  id: string
+  kind: string
+  title: string | null
+  text: string
+  parent_id: string | null
+  collapsed: boolean | null
+}
 export type AgentShellConversationEvent = { session_id: string; revision: number } & (
   { kind: 'snapshot' | 'update'; blocks: AgentShellBlock[] } |
   { kind: 'closed' } |
