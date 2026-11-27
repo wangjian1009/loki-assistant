@@ -159,21 +159,28 @@ async fn remote_status_sse_filters_private_values_and_only_sends_visible_changes
             .is_err()
     );
 
-    service
-        .publish("service", "name", json!("新名称"))
-        .await
-        .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(1), frames.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let event: Value = serde_json::from_slice(&frame[4..]).unwrap();
-    assert_eq!(event["event"], "status");
-    assert_eq!(
-        event["data"]["status"],
-        json!({"service":{"name":"新名称"}})
-    );
+    for agent_shell in [
+        json!([{"id":"session-1", "phase":"running"}]),
+        json!([{"id":"session-1", "title":"整理会话列表", "phase":"running"}]),
+    ] {
+        service
+            .publish_many_validated(
+                serde_json::from_value(json!({"emacs":{"agent_shell":agent_shell}})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(1), frames.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(event["event"], "status");
+        assert_eq!(
+            event["data"]["status"],
+            json!({"service":{"name":"电脑"},"emacs":{"agent_shell":agent_shell}})
+        );
+    }
 }
 
 #[tokio::test]
@@ -407,7 +414,7 @@ async fn metadata_is_complete_before_publication_and_contains_no_runtime_values(
 }
 
 #[tokio::test]
-async fn metadata_describes_emacs_runtime_and_all_network_states() {
+async fn metadata_describes_emacs_and_all_network_states() {
     use crate::modules::network::protocol::ConnectionStatus;
     let service = Arc::new(StatusService::new());
     let (_, metadata) = request(service, "GET", "/stats/meta", Value::Null).await;
@@ -417,10 +424,45 @@ async fn metadata_describes_emacs_runtime_and_all_network_states() {
         .find(|module| module["id"] == "emacs")
         .unwrap();
     let items = emacs["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
     let runtime = items.iter().find(|item| item["key"] == "runtime").unwrap();
     assert_eq!(runtime["schema"]["data_type"], "object");
     assert_eq!(runtime["schema"]["fields"].as_array().unwrap().len(), 4);
+    assert_eq!(runtime["remote_access"], false);
+    let agent_shell = items
+        .iter()
+        .find(|item| item["key"] == "agent_shell")
+        .unwrap();
+    assert_eq!(agent_shell["remote_access"], true);
+    assert_eq!(agent_shell["schema"]["data_type"], "array");
+    let fields = agent_shell["schema"]["items"]["fields"].as_array().unwrap();
+    let title = fields.iter().find(|field| field["key"] == "title").unwrap();
+    assert_eq!(title["schema"]["data_type"], "string");
+    assert_eq!(title["required"], false);
+    let phase = fields.iter().find(|field| field["key"] == "phase").unwrap();
+    let phases: Vec<_> = phase["schema"]["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|choice| choice["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "idle",
+            "starting",
+            "running",
+            "waiting_input",
+            "completed",
+            "cancelled",
+            "failed",
+            "disconnected"
+        ]
+    );
+    let stop_reason = fields
+        .iter()
+        .find(|field| field["key"] == "stop_reason")
+        .unwrap();
+    assert_eq!(stop_reason["required"], false);
     let network = modules
         .iter()
         .find(|module| module["id"] == "network")

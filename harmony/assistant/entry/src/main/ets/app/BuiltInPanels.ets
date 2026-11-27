@@ -1,3 +1,4 @@
+import { AgentShellPanel } from '../panels/agent-shell/AgentShellPanel'
 import { AppLauncherPanel } from '../panels/launcher/AppLauncherPanel'
 import { AppLauncherRegistry } from '../panels/launcher/AppLaunchers'
 import { DeviceStatus } from '../panels/device/DeviceStatus'
@@ -39,6 +40,11 @@ function slackPanel(context: CurrentDevicePanelContext) {
   SlackCard({ workspace: context.device.workspace })
 }
 
+@Builder
+function agentShellPanel(context: CurrentDevicePanelContext) {
+  AgentShellPanel({ device: context.device })
+}
+
 function isOnline(device: CurrentDeviceState): boolean {
   return device.hasStatus && device.current?.status === 'online' && !!device.workspace
 }
@@ -51,5 +57,7 @@ export function createCurrentDevicePanels(): CurrentDevicePanelRegistry {
     isAvailable: isOnline, render: wrapBuilder(mailPanel) })
   panels.register({ id: 'slack', title: 'Slack 新消息', supportsEditing: false,
     isAvailable: isOnline, render: wrapBuilder(slackPanel) })
+  panels.register({ id: 'agent-shell', title: 'Agent Shell', supportsEditing: false,
+    render: wrapBuilder(agentShellPanel) })
   return panels
 }

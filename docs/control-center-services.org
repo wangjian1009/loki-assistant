@@ -921,6 +921,32 @@ Emacs 包通过 ~POST /emacs/receiver/status~ 主动上报 ~emacs/runtime~ 。 ~
 
 ~GET /status/emacs/runtime~ 读取最近一次成功上报的运行信息。 ~loki-assistant-monitor-mode~ 默认每 5 秒上报一次，关闭后取消上报定时器。通用读写协议见 [[*状态中心][状态中心]]。
 
+** Agent Shell 执行状态
+
+Emacs 使用相同的本机上报入口提交 ~emacs/agent_shell~ 。每次发布整个当前会话数组，关闭的会话从数组移除，空数组清空上一版会话状态。 ~GET /status/emacs/agent_shell~ 返回最近一次上报的数组，本机和已绑定设备也可从 ~GET /status~ 的 SSE 快照订阅变化。 ~emacs/runtime~ 仅本机可读。
+
+| 字段 | 类型 | 含义 |
+|------+------|------|
+| ~id~ | string | Emacs 分配的临时会话标识，在该会话打开期间保持稳定。 |
+| ~title~ | string，可选 | Agent Shell 会话标题的首行，供设备展示。标题可能源自首条提示，Emacs 去除首尾空白并限制为 96 个字符（包括省略号）。标题尚未生成或不可用时省略。 |
+| ~phase~ | string | 当前执行阶段，取值见下表。 |
+| ~stop_reason~ | string，可选 | 标准化停止原因，取值为 ~end_turn~ 、 ~max_tokens~ 、 ~max_turn_requests~ 、 ~refusal~ 、 ~cancelled~ 或 ~other~ 。 |
+
+| ~phase~ | 含义 |
+|---------+------|
+| ~idle~ | 空闲。 |
+| ~starting~ | 正在初始化。 |
+| ~running~ | 正在处理当前轮次。 |
+| ~waiting_input~ | 正在等待授权或其他输入。 |
+| ~completed~ | 当前轮次已结束。 |
+| ~cancelled~ | 当前轮次已取消。 |
+| ~failed~ | 当前轮次执行出错。 |
+| ~disconnected~ | 与 Agent 的连接已关闭。 |
+
+#+begin_src json
+{"emacs":{"agent_shell":[{"id":"session-1","title":"整理会话列表","phase":"waiting_input"},{"id":"session-2","phase":"completed","stop_reason":"end_turn"}]}}
+#+end_src
+
 ** 打开 Emacs 应用
 
 ~POST /emacs/apps/open~ 接受必填的 ~app~ 查询参数，请求不需要正文；当前支持 ~app=config~ 和 ~app=logs~ 。控制中心“设置”和“日志”都调用此业务接口，客户端不维护 Lisp 脚本或 Emacs 窗口操作。

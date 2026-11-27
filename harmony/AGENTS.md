@@ -14,7 +14,7 @@
 以下目录均位于 `entry/src/main/ets/`。
 
 - `pages/` 放置可独立打开的 ArkUI 页面，包括当前设备、设备管理、设置和由各自 UIAbility 打开的应用页面。每个页面在 `main_pages.json` 注册。
-- `panels/` 放置能注册到「当前设备」的插件及其专用代码，按设备信息、邮件、Slack 和应用启动器分别维护在 `device/`、`mail/`、`slack/` 和 `launcher/`。
+- `panels/` 放置能注册到「当前设备」的插件及其专用代码，按设备信息、邮件、Slack、应用启动器和 Agent Shell 分别维护在 `device/`、`mail/`、`slack/`、`launcher/` 和 `agent-shell/`。
 - `components/` 放置页面共用组件和当前设备页的面板容器。面板排序、左滑删除及恢复由 `CurrentDeviceWidgets.ets` 统一负责。
 - `app/` 放置应用状态、导航、布局存储、面板接口和注册入口。 `entryability/` 放置 UIAbility 入口及主窗口加载代码， `workspace/` 放置 Rust Workspace 的 ArkTS 适配。
 

@@ -533,6 +533,8 @@ fn service_status_metadata() -> StatusModuleMetadata {
 
 ~paired~ 允许本机和已绑定设备调用。绑定设备只能读取 ~remote_access~ 为 ~true~ 的状态项。业务代码通过 Rust 发布状态。~GET /status~ 的 SSE 事件名为 ~status~ ，数据类型为 ~StatusResponse~ 。 [[file:control-center-services.org::*状态中心][状态中心协议]]
 
+Emacs 上报时通过本机 ~POST /emacs/receiver/status~ 调用 ~publish_many_validated~ 。已绑定设备可读取 ~emacs/agent_shell~ 会话状态数组，数组项可包含会话标题 ~title~ 。 [[file:control-center-services.org::*Agent Shell 执行状态][Agent Shell 状态字段与访问范围]]
+
 *** 响应示例
 ~GET /stats/meta~ 的响应节选，展示 ~service~ 模块。
 

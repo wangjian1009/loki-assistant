@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     Workspace as RustWorkspace, WorkspaceOptions as RustWorkspaceOptions,
+    agent_shell::{AgentShell as RustAgentShell, AgentShellSession},
     mail::{Mail as RustMail, MailStatusChanged},
     network::{
         InvalidRequestReason, Network as RustNetwork, QueryParameter,
@@ -83,6 +84,13 @@ impl Workspace {
     pub fn open_slack(&self) -> Slack {
         Slack {
             inner: self.inner.open_slack(),
+        }
+    }
+
+    #[napi]
+    pub fn open_agent_shell(&self) -> AgentShell {
+        AgentShell {
+            inner: self.inner.open_agent_shell(),
         }
     }
 
@@ -338,6 +346,21 @@ impl Slack {
     #[napi(ts_args_type = "changed: (snapshot: SlackStatusChanged) => void")]
     pub fn watch_status(&self, changed: Function<'_, Value, ()>) -> Result<StatusSubscription> {
         subscribe::<SlackStatusChanged>(changed, |changed| self.inner.watch_status(changed))
+    }
+}
+
+#[napi]
+pub struct AgentShell {
+    inner: RustAgentShell,
+}
+
+#[napi]
+impl AgentShell {
+    #[napi(ts_args_type = "changed: (sessions: AgentShellSession[] | null) => void")]
+    pub fn watch_status(&self, changed: Function<'_, Value, ()>) -> Result<StatusSubscription> {
+        subscribe::<Option<Vec<AgentShellSession>>>(changed, |changed| {
+            self.inner.watch_status(changed)
+        })
     }
 }
 

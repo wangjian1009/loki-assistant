@@ -332,6 +332,8 @@ HTTP 成功仅表示处理器已响应，系统通知展示状态需用 notifica
     (when (fboundp 'agent-shell-macext-setup)
       (remove-hook 'agent-shell-mode-hook #'agent-shell-macext-setup))
     (add-hook 'agent-shell-mode-hook #'loki-assistant-agent-shell-setup)
+    (add-hook 'loki-assistant-status-collect-functions
+              #'loki-assistant-agent-shell--collect-status)
     (add-hook 'agent-shell-viewport-edit-mode-hook
               #'loki-assistant-agent-shell--setup-dnd)
     (add-hook 'agent-shell-viewport-view-mode-hook

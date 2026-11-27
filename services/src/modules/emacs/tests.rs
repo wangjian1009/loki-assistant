@@ -1161,11 +1161,18 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
         runner.clone(),
         Duration::from_secs(1),
     ));
-    let values =
-        json!({"emacs":{"runtime":{"pid":42,"version":"31.1","started_at":1,"reported_at":2}}});
+    let sessions = json!([
+        {"id":"session-1", "title":"整理会话列表", "phase":"running"},
+        {"id":"session-2", "phase":"completed", "stop_reason":"end_turn"}
+    ]);
+    let values = json!({"emacs":{
+        "runtime":{"pid":42,"version":"31.1","started_at":1,"reported_at":2},
+        "agent_shell":sessions
+    }});
     let (response, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
     assert_eq!(response, StatusCode::OK);
     assert_eq!(body["status"]["network"]["my"]["status"], "disconnected");
+    assert_eq!(body["status"]["emacs"]["agent_shell"], sessions);
     assert_eq!(
         status.value("emacs", "runtime").await.unwrap().value,
         json!({"pid":42,"version":"31.1","started_at":1,"reported_at":2})
@@ -1178,6 +1185,11 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
         json!({"emacs":[]}),
         json!({"emacs":{"":1}}),
         json!({"ok":{"value":2},"bad/module":{"value":1}}),
+        json!({"emacs":{"agent_shell":[{"id":"session-1", "phase":"busy"}]}}),
+        json!({"emacs":{"agent_shell":[{"id":"session-1", "title":7, "phase":"running"}]}}),
+        json!({"emacs":{"agent_shell":[{"id":"session-1", "title":null, "phase":"running"}]}}),
+        json!({"emacs":{"agent_shell":[{"id":"session-1", "phase":"running", "prompt":"私有内容"}]}}),
+        json!({"emacs":{"agent_shell":[{"id":"session-1", "phase":"failed", "stop_reason":"其他说明"}]}}),
     ] {
         let (code, body) = request(service.clone(), "POST", "/emacs/receiver/status", values).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -1187,6 +1199,16 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
             before
         );
     }
+    let (response, body) = request(
+        service,
+        "POST",
+        "/emacs/receiver/status",
+        json!({"emacs":{"agent_shell":[]}}),
+    )
+    .await;
+    assert_eq!(response, StatusCode::OK);
+    assert_eq!(body["status"]["emacs"]["agent_shell"], json!([]));
+    assert_eq!(body["status"]["emacs"]["runtime"]["pid"], 42);
     assert!(runner.calls.lock().unwrap().is_empty());
 }
 

@@ -121,6 +121,10 @@ export interface SlackPreview {
 export interface SlackStatus { unread_previews: SlackPreview[] }
 export interface SlackStatusChanged { generation: number; status: SlackStatus | null }
 
+export type AgentShellPhase = 'idle' | 'starting' | 'running' | 'waiting_input' | 'completed' |
+  'cancelled' | 'failed' | 'disconnected' | 'unknown'
+export interface AgentShellSession { id: string; title: string | null; phase: AgentShellPhase; stop_reason: string | null }
+
 export interface WorkspaceOptions {
   directory: string
 }
@@ -131,6 +135,7 @@ export class Workspace {
   network(): Network
   openMail(): Mail
   openSlack(): Slack
+  openAgentShell(): AgentShell
   loadState(): ApplicationData
   saveState(state: Object): Promise<void>
   refreshDevice(endpoint: string): void
@@ -175,6 +180,11 @@ export class Mail {
 export class Slack {
   private constructor()
   watchStatus(changed: (snapshot: SlackStatusChanged) => void): StatusSubscription
+}
+
+export class AgentShell {
+  private constructor()
+  watchStatus(changed: (sessions: AgentShellSession[] | null) => void): StatusSubscription
 }
 
 export class StatusSubscription {

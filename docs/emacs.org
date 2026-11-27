@@ -290,6 +290,8 @@ Agent 的 ~permission-request~ 和 ~turn-complete~ 事件通过
 ~loki-assistant-agent-shell-notifications~ 控制；默认在 Emacs 未聚焦或当前显示其他缓冲区时
 发送，~loki-assistant-agent-shell-notify-current-buffer~ 可设为 ~t~ 以便当前会话也发送。
 
+开启 Emacs 状态监控后，扩展将当前打开的会话以 ~emacs/agent_shell~ 上报。输入提交、权限或表单请求及回应、回合结束、标题变化和清理会触发合并同步。定时同步也会重新读取 Shell 状态和进程存活情况，覆盖进程意外退出。状态值包含临时标识、执行阶段，以及可选的标题和停止原因。标题取会话状态的首行，与 ~agent-shell-consult~ 来源相同。已绑定设备可订阅状态中心的 SSE 快照。 [[file:control-center-services.org::*Agent Shell 执行状态][状态协议]]
+
 远程输入接收尚未实现；后续交互命令暂定命名为
 ~loki-assistant-agent-shell-receive-input~ ，以便与通知和文件输入能力保持同一命名空间。
 

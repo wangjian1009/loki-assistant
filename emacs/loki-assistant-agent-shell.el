@@ -30,6 +30,8 @@
 
 (require 'agent-shell)
 (require 'image)
+(require 'loki-assistant-monitor)
+(require 'subr-x)
 
 (declare-function agent-shell--get-files-context "agent-shell")
 (declare-function agent-shell-insert "agent-shell")
@@ -343,6 +345,103 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
      :on-event (lambda (event)
                  (loki-assistant-agent-shell--handle-event buffer event)))))
 
+;;; 执行状态
+
+(defvar loki-assistant-agent-shell--status-prefix
+  (substring (secure-hash 'sha256 (format "%s:%s:%s" (current-time) (emacs-pid) (random))) 0 16))
+(defvar loki-assistant-agent-shell--status-counter 0)
+(defvar-local loki-assistant-agent-shell--status-id nil)
+(defvar-local loki-assistant-agent-shell--status-subscription nil)
+(defvar-local loki-assistant-agent-shell--outcome nil)
+
+(defun loki-assistant-agent-shell--collect-status (write)
+  "用 WRITE 发布当前各会话的执行状态快照。"
+  (let (entries)
+    (dolist (buffer (agent-shell-buffers))
+      (with-current-buffer buffer
+        (when agent-shell--state
+          (loki-assistant-agent-shell--subscribe-status)
+          (push (loki-assistant-agent-shell--status-entry) entries))))
+    (funcall write "emacs" "agent_shell"
+             (vconcat (sort entries (lambda (left right)
+                                      (string< (alist-get 'id left) (alist-get 'id right))))))))
+
+(defun loki-assistant-agent-shell--status-title ()
+  "返回当前会话用于显示的标题首行。"
+  (when-let* ((title (map-nested-elt agent-shell--state '(:session :title)))
+              ((stringp title))
+              (first-line (car (split-string (string-trim title) "[\r\n]+" t)))
+              (line (string-trim (substring-no-properties first-line)))
+              ((not (string-empty-p line))))
+    (if (> (length line) 96)
+        (concat (substring line 0 95) "…")
+      line)))
+
+(defun loki-assistant-agent-shell--status-entry ()
+  "读取当前会话的标题、执行阶段和最近一次回合结果。"
+  (let* ((client (map-elt agent-shell--state :client))
+         (live (and (process-live-p (get-buffer-process (current-buffer)))
+                    (or (not client) (process-live-p (map-elt client :process)))))
+         (status (and live (agent-shell-status)))
+         (phase (cond
+                 ((not live) "disconnected")
+                 ((eq status 'blocked) "waiting_input")
+                 ((and (not loki-assistant-agent-shell--outcome)
+                       (not (if (fboundp 'agent-shell-initialized-p)
+                                (agent-shell-initialized-p)
+                              (agent-shell-session-id))))
+                  "starting")
+                 ((eq status 'busy) "running")
+                 (loki-assistant-agent-shell--outcome
+                  (car loki-assistant-agent-shell--outcome))
+                 (t "idle")))
+         (reason (and (equal phase (car loki-assistant-agent-shell--outcome))
+                      (cdr loki-assistant-agent-shell--outcome)))
+         (title (loki-assistant-agent-shell--status-title)))
+    `((id . ,loki-assistant-agent-shell--status-id)
+      (phase . ,phase)
+      ,@(when title `((title . ,title)))
+      ,@(when reason `((stop_reason . ,reason))))))
+
+(defun loki-assistant-agent-shell--status-event (buffer event)
+  "记录 BUFFER 的 EVENT 结果并请求同步状态。"
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (pcase (map-elt event :event)
+        ((or 'init-started 'session-selected 'input-submitted)
+         (setq loki-assistant-agent-shell--outcome nil)
+         (loki-assistant-status-trigger-sync))
+        ('turn-complete
+         (let* ((stop (map-nested-elt event '(:data :stop-reason)))
+                (reason (if (member stop '("end_turn" "cancelled" "max_tokens" "max_turn_requests" "refusal"))
+                            stop "other"))
+                (phase (pcase reason
+                         ("end_turn" "completed")
+                         ("cancelled" "cancelled")
+                         (_ "failed"))))
+           (setq loki-assistant-agent-shell--outcome (cons phase reason))
+           (loki-assistant-status-trigger-sync)))
+        ('error
+         (setq loki-assistant-agent-shell--outcome '("failed" . "other"))
+         (loki-assistant-status-trigger-sync))
+        ((or 'init-finished 'prompt-ready 'session-title-changed 'permission-request 'permission-response
+             'elicitation-request 'elicitation-response 'clean-up)
+         (loki-assistant-status-trigger-sync))))))
+
+(defun loki-assistant-agent-shell--subscribe-status ()
+  "为当前会话分配不透明标识并订阅执行事件。"
+  (unless loki-assistant-agent-shell--status-id
+    (setq loki-assistant-agent-shell--status-id
+          (format "%s-%x" loki-assistant-agent-shell--status-prefix
+                  (cl-incf loki-assistant-agent-shell--status-counter))))
+  (unless loki-assistant-agent-shell--status-subscription
+    (let ((buffer (current-buffer)))
+      (setq loki-assistant-agent-shell--status-subscription
+            (agent-shell-subscribe-to
+             :shell-buffer buffer
+             :on-event (lambda (event)
+                         (loki-assistant-agent-shell--status-event buffer event)))))))
+
 ;;; Setup
 
 ;;;###autoload
@@ -355,7 +454,10 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
   (define-key agent-shell-viewport-edit-mode-map [remap yank]
               #'loki-assistant-agent-shell-yank)
   (loki-assistant-agent-shell--setup-dnd)
-  (loki-assistant-agent-shell--setup-notifications))
+  (loki-assistant-agent-shell--setup-notifications)
+  (when (and (derived-mode-p 'agent-shell-mode) agent-shell--state)
+    (loki-assistant-agent-shell--subscribe-status)
+    (loki-assistant-status-trigger-sync)))
 
 (provide 'loki-assistant-agent-shell)
 

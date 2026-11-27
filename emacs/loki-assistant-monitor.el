@@ -34,6 +34,10 @@
 (defvar loki-assistant-monitor--epoch nil)
 (defvar loki-assistant-monitor--last-error nil)
 
+(defvar loki-assistant-status-collect-functions nil
+  "同步前运行的状态采集函数。
+每个函数接收一个写入函数，以模块名、数据项名称及 JSON 值为参数。")
+
 (defun loki-assistant-monitor--set-interval (symbol value)
   "设置 SYMBOL 为正数秒 VALUE，必要时重新启动定时器。"
   (unless (and (numberp value) (> value 0)) (error "上报间隔必须为正数"))
@@ -153,18 +157,21 @@ FUNCTION 的第一个参数是当前值，后续参数为 ARGS；可用于 list/
             (json-null :null) (json-false :false))
         (setq loki-assistant-monitor--inflight t loki-assistant-monitor--dirty nil)
         (condition-case err
-            (loki-assistant-request
-             'post "/emacs/receiver/status" :body (json-encode (loki-assistant-status-store-values loki-assistant-status--store))
-             :callback
-             (lambda (response)
-               (when (eq epoch loki-assistant-monitor--epoch)
-                 (setq loki-assistant-monitor--inflight nil)
-                 (if (plist-get response :ok)
-                     (progn
-                       (setq loki-assistant-monitor--last-error nil)
-                       (when loki-assistant-monitor--dirty (loki-assistant-monitor--queue)))
-                   (loki-assistant-monitor--report-error
-                    (or (plist-get response :error-message) "状态上报失败"))))))
+            (progn
+              (run-hook-with-args 'loki-assistant-status-collect-functions
+                                  #'loki-assistant-status--set-internal)
+              (loki-assistant-request
+               'post "/emacs/receiver/status" :body (json-encode (loki-assistant-status-store-values loki-assistant-status--store))
+               :callback
+               (lambda (response)
+                 (when (eq epoch loki-assistant-monitor--epoch)
+                   (setq loki-assistant-monitor--inflight nil)
+                   (if (plist-get response :ok)
+                       (progn
+                         (setq loki-assistant-monitor--last-error nil)
+                         (when loki-assistant-monitor--dirty (loki-assistant-monitor--queue)))
+                     (loki-assistant-monitor--report-error
+                      (or (plist-get response :error-message) "状态上报失败")))))))
           (error
            (setq loki-assistant-monitor--inflight nil)
            (loki-assistant-monitor--report-error (error-message-string err))))))))

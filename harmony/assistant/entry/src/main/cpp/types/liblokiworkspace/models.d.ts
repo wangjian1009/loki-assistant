@@ -119,3 +119,7 @@ export interface SlackPreview {
 }
 export interface SlackStatus { unread_previews: SlackPreview[] }
 export interface SlackStatusChanged { generation: number; status: SlackStatus | null }
+
+export type AgentShellPhase = 'idle' | 'starting' | 'running' | 'waiting_input' | 'completed' |
+  'cancelled' | 'failed' | 'disconnected' | 'unknown'
+export interface AgentShellSession { id: string; title: string | null; phase: AgentShellPhase; stop_reason: string | null }

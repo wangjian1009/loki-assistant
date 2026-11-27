@@ -3,6 +3,7 @@ use crate::{
     storage,
 };
 use loki_service_proxy::{
+    agent_shell::AgentShell,
     debug_http::{HttpDispatch, HttpRoutes, HttpServer},
     mail::Mail,
     service_proxy::{
@@ -195,6 +196,10 @@ impl Workspace {
 
     pub fn open_mail(&self) -> Mail {
         self.mail.clone()
+    }
+
+    pub fn open_agent_shell(&self) -> AgentShell {
+        AgentShell::new(self.proxy.clone())
     }
 
     pub fn open_slack(&self) -> loki_service_proxy::slack::Slack {

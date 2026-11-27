@@ -1,3 +1,4 @@
+pub mod agent_shell;
 pub mod debug_http;
 pub mod error;
 pub mod mail;

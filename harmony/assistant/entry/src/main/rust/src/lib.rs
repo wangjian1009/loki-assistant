@@ -1,4 +1,4 @@
-pub use loki_service_proxy::{error, mail, network, pairing, service_proxy, slack};
+pub use loki_service_proxy::{agent_shell, error, mail, network, pairing, service_proxy, slack};
 mod storage;
 mod workspace;
 pub use workspace::{Workspace, WorkspaceOptions};

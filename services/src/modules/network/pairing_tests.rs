@@ -962,7 +962,14 @@ async fn check_service_proxy(
         values.values["relay_url"].value
     );
 
-    assert!(status.modules.iter().all(|module| module.id != "emacs"));
+    let emacs_status = status
+        .modules
+        .iter()
+        .find(|module| module.id == "emacs")
+        .unwrap();
+    assert_eq!(emacs_status.items.len(), 1);
+    assert_eq!(emacs_status.items[0].key, "agent_shell");
+    assert!(emacs_status.items[0].remote_access);
     let mail_status = status
         .modules
         .iter()
@@ -1126,6 +1133,12 @@ async fn check_remote_metadata_and_permissions(
         .publish("emacs", "runtime", json!({"pid":123}))
         .await
         .unwrap();
+    let agent_shell = json!([{"id":"session-1","title":"整理会话列表","phase":"waiting_input"}]);
+    fixture
+        .status
+        .publish("emacs", "agent_shell", agent_shell.clone())
+        .await
+        .unwrap();
     fixture
         .status
         .publish("custom", "private", json!(true))
@@ -1216,20 +1229,30 @@ async fn check_remote_metadata_and_permissions(
         snapshot["status"]["mail"],
         json!({"unread_count": 3, "unread_subjects":["测试邮件"]})
     );
-    assert!(snapshot["status"].get("emacs").is_none());
+    assert_eq!(
+        snapshot["status"]["emacs"],
+        json!({"agent_shell":agent_shell})
+    );
+    assert_eq!(
+        get("/status/emacs/agent_shell").await.unwrap().data["value"],
+        agent_shell
+    );
     assert!(snapshot["status"].get("custom").is_none());
     assert_eq!(
         snapshot["status"]["slack"]["unread_previews"][0]["preview"],
         "新消息"
     );
     assert!(snapshot["status"]["slack"].get("connections").is_none());
-    assert!(
-        get("/stats/meta").await.unwrap().data["modules"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|module| module["id"] != "emacs")
-    );
+    let metadata = get("/stats/meta").await.unwrap().data;
+    let emacs_status = metadata["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|module| module["id"] == "emacs")
+        .unwrap();
+    let emacs_items = emacs_status["items"].as_array().unwrap();
+    assert_eq!(emacs_items.len(), 1);
+    assert_eq!(emacs_items[0]["key"], "agent_shell");
 
     for (method, path, body, code) in [
         (
@@ -1295,7 +1318,7 @@ async fn check_remote_metadata_and_permissions(
         (
             "POST",
             "/emacs/receiver/status",
-            Some(json!({"service":{"name":"禁止提交的名称"}})),
+            Some(json!({"service":{"name":"禁止提交的名称"},"emacs":{"agent_shell":[]}})),
             "remote-api-forbidden",
         ),
     ] {
