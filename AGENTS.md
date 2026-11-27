@@ -45,3 +45,5 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 - services HTTP 接口以 `docs/control-center-services.org` 和各模块元数据为准。
 - 仅运行与改动有关的检查；不为纯文档变更添加实现测试。
 - services 网络模块已实现本地身份持久化与按配置注册中转。HarmonyOS 手机端提供首页设备管理、扫码绑定与电脑状态查询，使用持久化随机身份；具体辅助能力、正式跨设备同步和独立后台服务仍按后续阶段规划。
+
+- 修改 services 核心代码、公开接口或 `docs/core-module-interface.org` 前，主代理必须委派给 `core_maintainer`。涉及接口定义变更时须先取得用户授权，维护流程见 `.codex/agents/core_maintainer.toml`。
