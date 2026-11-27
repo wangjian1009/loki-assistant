@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { Application, ComputerDevice } from '../app/Application'
+import { StatusSubscription } from '../workspace/ServiceStatus'
 import { NavigatorManager, PageName } from '../app/NavigatorManager'
 import { ACCENT, ACCENT_TEXT, AppPage, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE,
   setSystemColors } from '../components/AppPage'
@@ -18,7 +19,9 @@ struct Devices {
   @State private errorMessage: string = ''
   private application?: Application
   private visible: boolean = false
-  private bindingTimer: number = -1
+  private subscription?: StatusSubscription
+  private subscriptionVersion: number = 0
+  private watching: boolean = false
 
   onPageShow(): void {
     this.visible = true
@@ -30,7 +33,7 @@ struct Devices {
   onPageHide(): void {
     this.visible = false
     this.sidebarOpen = false
-    this.stopBindingTimer()
+    this.stopWatching()
   }
 
   aboutToDisappear(): void {
@@ -50,61 +53,62 @@ struct Devices {
     if (this.foreground && this.visible) {
       this.loadDevices()
     } else {
-      this.stopBindingTimer()
+      this.stopWatching()
     }
   }
 
-  private stopBindingTimer(): void {
-    if (this.bindingTimer !== -1) {
-      clearTimeout(this.bindingTimer)
-      this.bindingTimer = -1
-    }
-  }
-
-  private scheduleBindingCheck(): void {
-    this.stopBindingTimer()
-    if (this.visible && this.foreground &&
-      this.computers.some((computer: ComputerDevice) => computer.active && computer.status === 'binding')) {
-      this.bindingTimer = setTimeout(() => { this.loadDevices() }, 1000)
-    }
+  private stopWatching(): void {
+    this.subscriptionVersion += 1
+    this.subscription?.cancel()
+    this.subscription = undefined
+    this.watching = false
   }
 
   private async loadDevices(): Promise<void> {
-    if (this.working) return
-    if (!this.application) {
+    if (this.watching || this.subscription || !this.visible || !this.foreground) { return }
+    const application = this.application
+    if (!application) {
       this.errorMessage = '应用尚未准备好，请重试'
       return
     }
-    const wasBinding = this.computers.some((computer: ComputerDevice) => computer.active && computer.status === 'binding')
-    await this.updateDevices(this.loaded ? '' : '正在读取设备', undefined, wasBinding)
+    const version = ++this.subscriptionVersion
+    this.watching = true
+    try {
+      const subscription = await application.watchDevices((devices: ComputerDevice[]) => {
+        if (version === this.subscriptionVersion) {
+          this.computers = devices
+          this.loaded = true
+        }
+      }, (message: string) => {
+        if (version === this.subscriptionVersion) { this.errorMessage = message }
+      })
+      if (version === this.subscriptionVersion) {
+        this.subscription = subscription
+      } else {
+        subscription.cancel()
+      }
+    } catch (error) {
+      if (version === this.subscriptionVersion) { this.errorMessage = (error as Error).message }
+    } finally {
+      if (version === this.subscriptionVersion) { this.watching = false }
+    }
   }
 
-  private async updateDevices(progress: string, action?: (application: Application) => Promise<void>,
-    refreshWhenBound: boolean = false): Promise<void> {
+  private async updateDevices(progress: string, action: (application: Application) => Promise<void>): Promise<void> {
     const application = this.application
     if (this.working || !application) return
     this.working = true
-    this.stopBindingTimer()
     this.progress = progress
     this.errorMessage = ''
     try {
-      if (action) await action(application)
-    } catch (error) {
-      this.errorMessage = (error as Error).message
-    }
-    try {
+      await action(application)
       this.computers = await application.list()
       this.loaded = true
-      if (refreshWhenBound && this.errorMessage === '' && this.visible && this.foreground &&
-        this.computers.some((computer: ComputerDevice) => computer.active && computer.bound_at !== null)) {
-        this.computers = await application.refresh()
-      }
     } catch (error) {
-      if (this.errorMessage === '') this.errorMessage = (error as Error).message
+      this.errorMessage = (error as Error).message
     } finally {
       this.progress = ''
       this.working = false
-      this.scheduleBindingCheck()
     }
   }
 
@@ -122,7 +126,7 @@ struct Devices {
       }
       this.progress = '正在配置电脑'
       await application.addService(result.originalValue)
-    }, true)
+    })
   }
 
   @Builder

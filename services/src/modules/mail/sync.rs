@@ -36,20 +36,21 @@ pub(super) struct MuDatabase {
 
 #[derive(Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(super) enum IndexResult {
+pub(super) enum IndexUpdate {
+    Running { index: IndexCounts },
     Completed { database: MuDatabase },
     Failed { error: String },
 }
 
 #[derive(Deserialize)]
-struct IndexCounts {
+pub(super) struct IndexCounts {
     checked: u64,
     updated: u64,
     cleaned_up: Option<u64>,
 }
 
 impl IndexCounts {
-    fn message(&self) -> String {
+    pub(super) fn message(&self) -> String {
         let counts = format!(
             "mu server 已检查 {} 封，更新 {} 封",
             self.checked, self.updated
@@ -166,12 +167,12 @@ impl MailService {
         };
         let sync_error = match run(
             Command::new("mbsync")
-                .args(["-q", "-c"])
+                .args(["-V", "-c"])
                 .arg(&path)
                 .arg("loki-auto"),
             "mbsync",
             SYNC_DEADLINE,
-            None,
+            Some(&self.sync_progress),
         )
         .await
         {
@@ -244,19 +245,14 @@ impl MailService {
             Some("accepted") => {}
             _ => return Err("Emacs 返回的索引接收回执无效。".into()),
         }
-        let result = time::timeout(INDEX_DEADLINE + EMACS_RESULT_GRACE, receipt)
+        let database = time::timeout(INDEX_DEADLINE + EMACS_RESULT_GRACE, receipt)
             .await
             .map_err(|_| "等待 Emacs 返回索引结果超时。")?
-            .map_err(|_| "Emacs 索引结果接收已结束。")?;
-        match result {
-            IndexResult::Completed { database } => {
-                if let Some(counts) = &database.index {
-                    self.sync_progress.message(counts.message());
-                }
-                Ok(Some(database))
-            }
-            IndexResult::Failed { error } => Err(error),
+            .map_err(|_| "Emacs 索引结果接收已结束。")??;
+        if let Some(counts) = &database.index {
+            self.sync_progress.message(counts.message());
         }
+        Ok(Some(database))
     }
 
     async fn report_failure(&self, body: String) {
@@ -345,6 +341,7 @@ async fn run(
     let mut stderr_pipe = child.stderr.take().expect("已配置标准错误管道");
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let progress = progress.map(|progress| (progress, name));
     let result = time::timeout(deadline, async {
         let (status, _, _) = tokio::try_join!(
             child.wait(),
@@ -378,9 +375,9 @@ async fn run(
 async fn read_output(
     pipe: &mut (impl AsyncRead + Unpin),
     output: &mut Vec<u8>,
-    progress: Option<&SyncProgress>,
+    progress: Option<(&SyncProgress, &str)>,
 ) -> std::io::Result<()> {
-    let Some(progress) = progress else {
+    let Some((progress, command)) = progress else {
         return pipe.read_to_end(output).await.map(|_| ());
     };
     const MAX_MESSAGE_BYTES: usize = 2048;
@@ -389,15 +386,15 @@ async fn read_output(
     loop {
         let count = pipe.read(&mut buffer).await?;
         if count == 0 {
-            publish_output(progress, &message);
+            publish_output(progress, command, &message);
             return Ok(());
         }
         let bytes = &buffer[..count];
         output.extend_from_slice(bytes);
-        // mu 使用回车在终端原地更新同一行进度。
+        // 命令的终端进度可以用回车覆盖同一行。
         for byte in bytes {
             if matches!(byte, b'\r' | b'\n') {
-                publish_output(progress, &message);
+                publish_output(progress, command, &message);
                 message.clear();
             } else if message.len() < MAX_MESSAGE_BYTES {
                 message.push(*byte);
@@ -406,8 +403,14 @@ async fn read_output(
     }
 }
 
-fn publish_output(progress: &SyncProgress, bytes: &[u8]) {
+fn publish_output(progress: &SyncProgress, command: &str, bytes: &[u8]) {
     let message = String::from_utf8_lossy(bytes);
+    if command == "mbsync" {
+        if let Some(message) = diagnostic::mbsync_progress(message.trim()) {
+            progress.message(format!("mbsync · {message}"));
+        }
+        return;
+    }
     let message = match message.as_bytes().first() {
         Some(b'\\' | b'|' | b'/' | b'-') if message[1..].starts_with(" indexing messages") => {
             &message[2..]
@@ -431,11 +434,18 @@ pub(super) fn exit_message(name: &str, output: &Output) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
+    use axum::{
+        Router,
+        body::{Body, BodyDataStream, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use futures_util::StreamExt;
     use serde_json::json;
     use tokio::{io::AsyncWriteExt, sync::Notify};
+    use tower::ServiceExt;
 
     use super::*;
     use crate::modules::{
@@ -446,35 +456,274 @@ mod tests {
         status::StatusService,
     };
 
+    fn test_service(config: Arc<ConfigService>) -> Arc<MailService> {
+        let status = Arc::new(StatusService::new());
+        let notification = Arc::new(NotificationService::new());
+        Arc::new(MailService {
+            emacs: Arc::new(EmacsService::new(
+                EmacsConfig::new(Arc::clone(&config)),
+                Arc::clone(&notification),
+                Arc::clone(&status),
+            )),
+            alert: Arc::new(AlertService::new(
+                Arc::clone(&status),
+                Arc::clone(&notification),
+            )),
+            config,
+            notification,
+            status: Arc::clone(&status),
+            sync_progress: SyncProgress::new(status),
+            refresh_requested: Notify::new(),
+            stopping: Notify::new(),
+        })
+    }
+
+    pub(in crate::modules) fn relay_test_sync_router() -> Router {
+        let service = test_service(Arc::new(ConfigService::from_registry()));
+        let router =
+            crate::http::mount_routes(Router::new(), MODULE_ID).with_state(service.clone());
+        tokio::spawn(async move {
+            let progress = &service.sync_progress;
+            progress.requested.notified().await;
+            progress.begin().await;
+            progress.message("同步测试邮件。".into());
+            progress.finish(None).await;
+        });
+        router
+    }
+
+    async fn next_sync_event(events: &mut BodyDataStream) -> serde_json::Value {
+        let frame = time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame = std::str::from_utf8(&frame).unwrap();
+        let data = frame.strip_prefix("event: sync\ndata: ").unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_sync_shares_download_and_index_progress() {
+        let service = test_service(Arc::new(ConfigService::from_registry()));
+        let app = crate::http::mount_routes(Router::new(), MODULE_ID).with_state(service.clone());
+        let start = |accept| {
+            app.clone().oneshot(
+                Request::post("/mail/sync")
+                    .header("accept", accept)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let started = start("text/event-stream").await.unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        assert_eq!(started.headers()["content-type"], "text/event-stream");
+        assert_eq!(started.headers()["cache-control"], "no-store");
+        let mut events = started.into_body().into_data_stream();
+        let initial = next_sync_event(&mut events).await;
+        let id = &initial["sync"]["id"];
+        assert_eq!(
+            initial,
+            json!({"api_version":"1", "sync":{"id":id,"phase":"queued","messages":[],"error":null}})
+        );
+        let default = start("application/json, text/event-stream;q=0")
+            .await
+            .unwrap();
+        assert_eq!(default.status(), StatusCode::ACCEPTED);
+        let payload = to_bytes(default.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            json!({"api_version":"1","id":id})
+        );
+        let other = start("text/event-stream").await.unwrap();
+        let mut other_events = other.into_body().into_data_stream();
+        assert_eq!(next_sync_event(&mut other_events).await, initial);
+
+        let remote = app
+            .clone()
+            .oneshot(
+                Request::post("/mail/sync")
+                    .header("accept", "text/event-stream")
+                    .extension(crate::http::sse::RemoteSse)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remote.status(), StatusCode::ACCEPTED);
+        assert!(
+            remote
+                .extensions()
+                .get::<crate::http::sse::FramedSse>()
+                .is_some()
+        );
+        let mut remote_events = remote.into_body().into_data_stream();
+        let first = remote_events.next().await.unwrap().unwrap();
+        let length = u32::from_be_bytes(first[..4].try_into().unwrap()) as usize;
+        assert_eq!(first.len() - 4, length);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first[4..]).unwrap(),
+            json!({"event":"sync","data":initial})
+        );
+        drop(remote_events);
+
+        let progress = &service.sync_progress;
+        progress.begin().await;
+        assert_eq!(
+            next_sync_event(&mut events).await["sync"]["phase"],
+            "downloading"
+        );
+        assert_eq!(
+            next_sync_event(&mut other_events).await["sync"]["phase"],
+            "downloading"
+        );
+
+        let download_messages = [
+            "mbsync · 正在打开邮箱。",
+            "mbsync · IMAP 登录认证失败。",
+            "mbsync · Channels: 1    Boxes: 1    Far: +0 *0 #0 -0    Near: +1 *0 #0 -0",
+        ];
+        let (mut mbsync_writer, mut mbsync_reader) = tokio::io::duplex(512);
+        let mut mbsync_output = Vec::new();
+        let read = read_output(
+            &mut mbsync_reader,
+            &mut mbsync_output,
+            Some((progress, "mbsync")),
+        );
+        let observe = async {
+            mbsync_writer
+                .write_all(
+                    b"Opening far side box PRIVATE-FOLDER...\r\n\
+                      IMAP command 'LOGIN user TOP-SECRET' returned an error\n\
+                      unexpected output with another secret\n\
+                      Channels: 1    Boxes: 1    Far: +0 *0 #0 -0    Near: +1 *0 #0 -0\n",
+                )
+                .await
+                .unwrap();
+            for subscriber in [&mut events, &mut other_events] {
+                loop {
+                    let snapshot = next_sync_event(subscriber).await;
+                    assert_eq!(snapshot["sync"]["id"], *id);
+                    assert_eq!(snapshot["sync"]["phase"], "downloading");
+                    let messages = snapshot["sync"]["messages"].as_array().unwrap();
+                    assert!(download_messages.len() >= messages.len());
+                    assert_eq!(
+                        messages,
+                        &json!(download_messages[..messages.len()])
+                            .as_array()
+                            .unwrap()[..]
+                    );
+                    if messages.len() == download_messages.len() {
+                        break;
+                    }
+                }
+            }
+            mbsync_writer.shutdown().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(read, observe);
+        result.unwrap();
+        drop(other_events);
+
+        progress.phase(Phase::Indexing);
+        assert_eq!(
+            next_sync_event(&mut events).await["sync"]["phase"],
+            "indexing"
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let receipt = progress.expect_index_result(request_id).await;
+        let index_update = |id, payload: serde_json::Value| {
+            app.clone().oneshot(
+                Request::post(format!("/mail/index/result/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+        };
+        let running = json!({"status":"running", "index":{"checked":3,"updated":2,"cleaned_up":1}});
+        assert_eq!(
+            index_update(uuid::Uuid::new_v4(), running.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            index_update(request_id, running.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let counted = next_sync_event(&mut events).await;
+        let mut messages = download_messages.to_vec();
+        messages.push("mu server 已检查 3 封，更新 2 封，清理 1 封。");
+        let messages = json!(messages);
+        assert_eq!(counted["sync"]["phase"], "indexing");
+        assert_eq!(counted["sync"]["messages"], messages);
+        assert_eq!(
+            index_update(request_id, running.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            index_update(request_id, json!({"status":"failed", "error":"索引中断"}))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            index_update(request_id, running).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let result = receipt.await.unwrap().err();
+        assert_eq!(result.as_deref(), Some("索引中断"));
+        progress.finish(result).await;
+        let final_event = next_sync_event(&mut events).await;
+        assert_eq!(
+            final_event["sync"],
+            json!({"id":id,"phase":"failed","messages":messages,"error":"索引中断"})
+        );
+        assert!(
+            time::timeout(Duration::from_secs(2), events.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn active_sync_shares_id_and_publishes_carriage_return_output_before_eof() {
         let status = Arc::new(StatusService::new());
         let progress = SyncProgress::new(Arc::clone(&status));
-        let id = progress.request().await;
+        let (initial, mut updates) = progress.request().await;
+        let id = initial.id;
         assert_eq!(
             status.value(MODULE_ID, "sync_runs").await.unwrap().value,
             json!([{"id":id,"phase":"queued"}])
         );
         progress.begin().await;
         progress.phase(Phase::Indexing);
-        assert_eq!(progress.request().await, id);
+        assert_eq!(progress.request().await.0.id, id);
         assert!(progress.requested.notified().now_or_never().is_none());
 
         let (mut writer, mut reader) = tokio::io::duplex(128);
         let mut output = Vec::new();
-        let read = read_output(&mut reader, &mut output, Some(&progress));
+        let read = read_output(&mut reader, &mut output, Some((&progress, "mu index")));
         let observe = async {
             writer
                 .write_all(b"\\ indexing messages; checked: 2\r")
                 .await
                 .unwrap();
             loop {
-                let current = json!(progress.snapshot(id).await.unwrap());
+                updates.changed().await.unwrap();
+                let current = json!(&*updates.borrow_and_update());
                 assert_eq!(current["phase"], "indexing");
                 if current["messages"] == json!(["indexing messages; checked: 2"]) {
                     break;
                 }
-                tokio::task::yield_now().await;
             }
             writer.write_all(b"indexing finished").await.unwrap();
             writer.shutdown().await.unwrap();
@@ -486,7 +735,7 @@ mod tests {
         .unwrap();
         result.unwrap();
         progress.finish(None).await;
-        assert_ne!(progress.request().await, id);
+        assert_ne!(progress.request().await.0.id, id);
         let completed = json!(progress.snapshot(id).await.unwrap());
         assert_eq!(completed["phase"], "completed");
         assert_eq!(
@@ -537,25 +786,7 @@ printf 'eval\n' >> "$0.calls"
             .replace("emacs", "emacsclient_path", json!(client))
             .await
             .unwrap();
-        let status = Arc::new(StatusService::new());
-        let notification = Arc::new(NotificationService::new());
-        let service = Arc::new(MailService {
-            emacs: Arc::new(EmacsService::new(
-                EmacsConfig::new(Arc::clone(&config)),
-                Arc::clone(&notification),
-                Arc::clone(&status),
-            )),
-            alert: Arc::new(AlertService::new(
-                Arc::clone(&status),
-                Arc::clone(&notification),
-            )),
-            config,
-            notification,
-            status: Arc::clone(&status),
-            sync_progress: SyncProgress::new(status),
-            refresh_requested: Notify::new(),
-            stopping: Notify::new(),
-        });
+        let service = test_service(config);
         let task = tokio::spawn({
             let service = Arc::clone(&service);
             async move { service.sync_loop().await }

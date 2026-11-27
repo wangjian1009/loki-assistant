@@ -220,3 +220,34 @@ impl std::fmt::Display for ResponsError {
     }
 }
 impl std::error::Error for ResponsError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn service_rejections_keep_their_own_reason_and_details() {
+        let response = json!({"api_version":"1","status":409,"error":{"source":"business","code":"busy","message":"服务忙"}});
+        let error = ResponsError::api(&response, 409).unwrap();
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["kind"], "services");
+        assert_eq!(value["reason"], "rejected");
+        assert_eq!(value["status"], 409);
+        assert_eq!(value["code"], "busy");
+        assert_eq!(value["source"], "business");
+        for (code, reason) in [
+            ("peer-not-bound", "binding_revoked"),
+            ("invalid-binding-token", "invalid_credential"),
+        ] {
+            let error=ResponsError::api(&json!({"api_version":"1","status":403,"error":{"source":"business","code":code,"message":"授权失败"}}),403).unwrap();
+            let value = serde_json::to_value(error).unwrap();
+            assert_eq!(value["kind"], "not_bound");
+            assert_eq!(value["reason"], reason);
+        }
+        assert!(matches!(
+            ResponsError::api(&response, 500).unwrap_err(),
+            ResponsError::Network(_)
+        ));
+    }
+}

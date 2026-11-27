@@ -1,5 +1,7 @@
-import { AutoBinding, BindingState, DeviceType, Service, ServiceRequest, ServiceResponse, Workspace } from '../workspace/Workspace'
-import { NetworkFailure, ResponsError } from '../workspace/ResponsError'
+import { AutoBinding, BindingState, MailSyncProgress, ResponsError, StatusSnapshot } from 'liblokiworkspace.so'
+import { DeviceType, Service, Workspace } from '../workspace/Workspace'
+import { StatusSubscription } from '../workspace/ServiceStatus'
+import { mailSyncPhaseText } from '../features/mail/MailModel'
 
 export interface ComputerDevice {
   endpoint_id: string
@@ -11,7 +13,7 @@ export interface ComputerDevice {
   checked_at: number
   active: boolean
   binding_error?: ResponsError
-  dashboard?: DashboardStatus
+  dashboard?: StatusSnapshot
 }
 interface ComputerRecord extends Service {
   name: string
@@ -28,24 +30,66 @@ interface StoredComputer {
 }
 interface StoredState { computers?: StoredComputer[]; selected_endpoint_id?: string | null; device_name?: string }
 interface ApplicationState { computers: ComputerRecord[]; selected_endpoint_id: string | null; device_name: string }
-interface ServiceStatus {
-  name: string
-  device_type: DeviceType
+export interface StatusDetail { path: string; label: string; value: string }
+interface RelayStatus { status?: string }
+
+function relayStatus(value: string): string {
+  switch (value) {
+    case 'connected': return '已连接'
+    case 'connecting': return '连接中'
+    case 'disconnected': return '未连接'
+    case 'failed': return '连接失败'
+    case 'offline': return '未配置'
+    default: return value
+  }
 }
-export interface SlackPreview {
-  id: string
-  title: string
-  team_name: string
-  unread_count: number
-  preview: string
+
+export function statusDetails(snapshot: Object): StatusDetail[] {
+  const details: StatusDetail[] = []
+  for (const moduleEntry of Object.entries<Object>(snapshot as Record<string, Object>)) {
+    const moduleId = moduleEntry[0]
+    const moduleValues = moduleEntry[1]
+    if (!moduleValues || typeof moduleValues !== 'object') { continue }
+    for (const item of Object.entries<Object>(moduleValues as Record<string, Object>)) {
+      const key = item[0]
+      const value = item[1]
+      const path = `${moduleId}/${key}`
+      switch (path) {
+        case 'service/name':
+        case 'service/device_type':
+        case 'mail/unread_count':
+        case 'mail/unread_subjects':
+        case 'slack/unread_previews':
+          continue
+        case 'service/start_at':
+          if (typeof value === 'number') {
+            details.push({ path: path, label: '服务启动时间', value: new Date(value * 1000).toLocaleString() })
+            continue
+          }
+          break
+        case 'network/my': {
+          const relay = value as RelayStatus | null
+          if (relay && typeof relay.status === 'string' && Object.keys(relay).length === 1) {
+            details.push({ path: path, label: '中转连接', value: relayStatus(relay.status) })
+            continue
+          }
+          break
+        }
+        case 'mail/sync_runs':
+          if (Array.isArray(value)) {
+            const runs = value as MailSyncProgress[]
+            details.push({ path: path, label: '最近的邮件同步', value: runs.length ?
+              runs.map((run: MailSyncProgress) => mailSyncPhaseText(run.phase) ?? run.phase).join('、') : '暂无记录' })
+            continue
+          }
+          break
+      }
+      details.push({ path: path, label: path, value: typeof value === 'string' ? value : JSON.stringify(value, null, 2) })
+    }
+  }
+  return details
 }
-interface SlackStatus { unread_previews?: SlackPreview[] }
-interface MailStatus { unread_count?: number; unread_subjects?: string[]; sync_runs?: MailSyncProgress[] }
-export interface DashboardStatus { service: ServiceStatus; slack?: SlackStatus; mail?: MailStatus }
-interface DashboardResponse { api_version: string; status: DashboardStatus }
-interface MailSyncStart { api_version: string; id: string }
-interface MailSyncProgress { id: string; phase: string }
-function now(): number { return Math.floor(Date.now() / 1000) }
+
 function copy(state: ApplicationState): ApplicationState { return JSON.parse(JSON.stringify(state)) as ApplicationState }
 function validName(name: string): boolean {
   return typeof name === 'string' && name.trim().length > 0 &&
@@ -61,6 +105,7 @@ export class Application {
   private initialized: boolean = false
   private stopped: boolean = false
   private operations: Promise<void> = Promise.resolve()
+  private latestStatus?: StatusSnapshot
 
   constructor(workspace: Workspace, deviceName: string = 'HarmonyOS 手机') {
     this.workspace = workspace
@@ -77,7 +122,7 @@ export class Application {
   }
   private async initialize(): Promise<void> {
     if (this.initialized) { return }
-    const stored = await this.workspace.loadState()
+    const stored = (await this.workspace.open()).loadState()
     const input = stored.state as StoredState
     const computers = input.computers === undefined ? [] : input.computers
     if (!Array.isArray(computers) || computers.length > 64) { throw new Error('电脑记录已损坏') }
@@ -115,7 +160,7 @@ export class Application {
       state.selected_endpoint_id = state.computers[0].endpoint_id
     }
     const selected = state.computers.find((computer: ComputerRecord) => computer.endpoint_id === state.selected_endpoint_id)
-    if (selected) { await this.workspace.network.setService(this.service(selected)) }
+    if (selected) { (await this.workspace.open()).setService(this.service(selected)) }
     this.endpointId = stored.endpoint_id
     this.state = state
     this.initialized = true
@@ -131,11 +176,11 @@ export class Application {
     }
   }
   private async save(state: ApplicationState): Promise<void> {
-    await this.workspace.saveState(state)
+    await (await this.workspace.open()).saveState(state)
     this.state = state
   }
   private views(): ComputerDevice[] {
-    return this.state.computers.map((computer: ComputerRecord): ComputerDevice => {
+    const devices = this.state.computers.map((computer: ComputerRecord): ComputerDevice => {
       const active = computer.endpoint_id === this.state.selected_endpoint_id
       const failed = computer.binding.status === 'failed'
       const bindingError = computer.binding.status === 'failed' ? computer.binding.error : undefined
@@ -148,6 +193,19 @@ export class Application {
         checked_at: 0, active: active, binding_error: bindingError
       }
     })
+    const snapshot = this.latestStatus
+    const view = devices.find((device: ComputerDevice) => device.active && device.endpoint_id === snapshot?.endpoint_id)
+    if (view && snapshot) {
+      view.checked_at = snapshot.checked_at
+      if (!snapshot.error && snapshot.service) {
+        view.status = 'online'
+        view.detail = '电脑服务可用'
+        view.dashboard = snapshot
+      } else if (snapshot.error && view.status !== 'binding_failed') {
+        view.detail = snapshot.error.message
+      }
+    }
+    return devices
   }
   prepare(): Promise<void> {
     return this.run(async (): Promise<void> => {})
@@ -174,7 +232,9 @@ export class Application {
       const computer = latest.computers.find((item: ComputerRecord) => item.endpoint_id === endpointId)
       if (!computer) { throw new Error('电脑记录不存在') }
       await this.save(latest)
-      await this.workspace.network.setService(this.service(computer))
+      this.latestStatus = undefined
+      const workspace = await this.workspace.open()
+      workspace.setService(this.service(computer))
       await this.captureService()
     })
   }
@@ -191,12 +251,12 @@ export class Application {
       state.computers = state.computers.filter((item: ComputerRecord) => item.endpoint_id !== endpointId)
       if (active) { state.selected_endpoint_id = null }
       await this.save(state)
-      if (active) { await this.workspace.network.clearService() }
+      if (active) { this.latestStatus = undefined; (await this.workspace.open()).clearService() }
     })
   }
   addService(payload: string): Promise<void> {
     return this.run(async () => {
-      const invitation = await this.workspace.network.parseInvitation(payload)
+      const invitation = (await this.workspace.open()).parseInvitation(payload)
       if (invitation.endpoint_id === this.endpointId) { throw new Error('不能绑定手机自身') }
       await this.captureService()
       const state = copy(this.state)
@@ -213,87 +273,56 @@ export class Application {
       state.selected_endpoint_id = computer.endpoint_id
       await this.save(state)
       // 添加目标即触发自动绑定，应用不调用独立绑定接口。
-      await this.workspace.network.setService(this.service(computer))
+      this.latestStatus = undefined
+      const workspace = await this.workspace.open()
+      workspace.setService(this.service(computer))
       await this.captureService()
     })
   }
-  private async captureService(): Promise<void> {
-    const service = await this.workspace.network.service()
-    if (!service) { return }
+  private async captureService(): Promise<number | undefined> {
+    const service = (await this.workspace.open()).service()
+    if (!service) { return undefined }
     if (service.endpoint_id !== this.state.selected_endpoint_id) { throw new Error('电脑服务已切换') }
     const state = copy(this.state)
     const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === service.endpoint_id)
     if (!computer) { throw new Error('电脑记录不存在') }
     computer.binding = service.binding
     computer.auto_binding = service.auto_binding
-    if (JSON.stringify(state) !== JSON.stringify(this.state)) { await this.save(state) }
+    if (JSON.stringify(this.state) !== JSON.stringify(state)) await this.save(state)
+    return service.generation
   }
-  private request(request: ServiceRequest): Promise<ServiceResponse> {
-    return new Promise((resolve, reject) => {
-      this.workspace.network.request(request, (response: ServiceResponse) => { resolve(response) },
-        (error: ResponsError) => { reject(error) })
-    })
+  refresh(): Promise<void> {
+    return this.run(async () => { (await this.workspace.open()).requestRefresh() })
   }
-  private async dashboard(): Promise<DashboardStatus> {
-    const response = await this.request({ method: 'GET', path: '/status' })
-    const dashboard = response.body as DashboardResponse
-    const service = dashboard?.status?.service
-    if (dashboard?.api_version !== '1' || !service || !validName(service.name) || service.device_type !== 'computer') {
-      const failure: NetworkFailure = {
-        kind: 'network', reason: 'invalid_response', message: '电脑返回的状态无效',
-        request_id: response.request_id, outcome: 'unknown'
-      }
-      return Promise.reject(failure)
-    }
-    return dashboard.status
-  }
-  startMailSync(endpointId: string): Promise<string> {
-    return this.run(async () => {
-      if (endpointId !== this.state.selected_endpoint_id) { throw new Error('当前电脑已切换') }
-      const response = await this.request({ method: 'POST', path: '/mail/sync' })
-      const start = response.body as MailSyncStart
-      if (response.status !== 202 || start?.api_version !== '1' || !/^[0-9a-f-]{36}$/i.test(start.id)) {
-        throw new Error('电脑返回的邮件同步任务无效')
-      }
-      return start.id
-    })
-  }
-  refresh(): Promise<ComputerDevice[]> {
-    return this.run(async () => {
-      await this.captureService()
-      const selected = this.state.computers.find((item: ComputerRecord) => item.endpoint_id === this.state.selected_endpoint_id)
-      if (!selected || selected.binding.status !== 'bound') { return this.views() }
-      let dashboard: DashboardStatus
-      try { dashboard = await this.dashboard() } catch (error) {
-        await this.captureService()
-        const failure = error as ResponsError
-        const views = this.views()
-        return views.map((view: ComputerDevice): ComputerDevice => {
-          if (view.active) {
-            if (view.status !== 'binding_failed') { view.status = 'offline'; view.detail = failure.message }
-            view.checked_at = now()
+  async watchDevices(listener: (computers: ComputerDevice[]) => void, onError: (message: string) => void): Promise<StatusSubscription> {
+    await this.prepare()
+    let active = true
+    const subscription = (await this.workspace.open()).watchStatus((snapshot: StatusSnapshot) => {
+      this.run(async () => {
+        if (!active) { return }
+        const generation = await this.captureService()
+        if (!active || snapshot.endpoint_id !== this.state.selected_endpoint_id ||
+          (snapshot.endpoint_id !== null && snapshot.generation !== generation)) { return }
+        const selected = this.state.computers.find((item: ComputerRecord) => item.endpoint_id === snapshot.endpoint_id)
+        const computer = snapshot.service
+        if (selected && !snapshot.error && computer && validName(computer.name) &&
+          (selected.name !== computer.name || selected.device_type !== computer.device_type)) {
+          const state = copy(this.state)
+          const record = state.computers.find((item: ComputerRecord) => item.endpoint_id === selected.endpoint_id)
+          if (record) {
+            record.name = computer.name
+            record.device_type = computer.device_type
+            await this.save(state)
           }
-          return view
-        })
-      }
-      if (selected.name !== dashboard.service.name || selected.device_type !== dashboard.service.device_type) {
-        const state = copy(this.state)
-        const computer = state.computers.find((item: ComputerRecord) => item.endpoint_id === selected.endpoint_id)
-        if (!computer) { throw new Error('电脑服务已切换') }
-        computer.name = dashboard.service.name
-        computer.device_type = dashboard.service.device_type
-        await this.save(state)
-      }
-      return this.views().map((view: ComputerDevice): ComputerDevice => {
-        if (view.active) {
-          view.status = 'online'
-          view.detail = '电脑服务可用'
-          view.checked_at = now()
-          view.dashboard = dashboard
         }
-        return view
+        if (!active) { return }
+        this.latestStatus = snapshot
+        listener(this.views())
+      }).catch((error: Error) => {
+        if (active) onError(error.message)
       })
     })
+    return new StatusSubscription(() => { active = false; subscription.cancel() })
   }
   async stop(): Promise<void> {
     this.stopped = true

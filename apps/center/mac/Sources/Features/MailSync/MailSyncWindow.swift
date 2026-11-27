@@ -17,7 +17,7 @@ final class MailSyncWindow: NSObject, NSWindowDelegate {
         }
 
         let window = self.window ?? NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 324),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -27,9 +27,9 @@ final class MailSyncWindow: NSObject, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.contentViewController = NSHostingController(rootView: MailSyncView(session: sync))
-        window.contentMinSize = NSSize(width: 380, height: 240)
+        window.contentMinSize = NSSize(width: 400, height: 280)
         if self.window == nil {
-            window.setContentSize(NSSize(width: 520, height: 300))
+            window.setContentSize(NSSize(width: 520, height: 324))
             window.center()
         }
         self.window = window
@@ -57,57 +57,86 @@ private struct MailSyncView: View {
     var body: some View {
         let snapshot = session.snapshot
         let connectionError = session.connectionError
-        VStack(alignment: .leading, spacing: 12) {
-            Text(connectionError == nil ? (snapshot?.phase.title ?? "正在连接 services…") : "无法获取同步进度")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 10) {
+                if connectionError != nil || snapshot?.phase == .failed {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(.red)
+                        .accessibilityHidden(true)
+                } else if snapshot?.phase == .completed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .accessibilityHidden(true)
+                } else {
+                    ProgressView().controlSize(.small).accessibilityHidden(true)
+                }
+                Text(connectionError == nil ? (snapshot?.phase.title ?? "正在连接 services…") : "无法获取同步进度")
+                    .font(.title3.weight(.semibold))
+            }
 
-            if let steps = snapshot?.phase.finishedSteps {
-                ProgressView(value: steps, total: 3)
-                    .accessibilityLabel("同步阶段")
-            } else if snapshot == nil && connectionError == nil {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                    .accessibilityLabel("正在连接 services")
+            if let steps = snapshot?.phase.finishedSteps, connectionError == nil {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: steps, total: 3)
+                        .accessibilityLabel("同步阶段")
+                    HStack {
+                        Text("下载邮件")
+                        Spacer()
+                        Text("更新索引")
+                        Spacer()
+                        Text("刷新未读")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                }
             }
 
             if let error = connectionError ?? snapshot?.error {
-                Label(error, systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.red)
-                    .font(.callout)
-                    .textSelection(.enabled)
-            }
-
-            Text("mu 索引消息")
-                .font(.subheadline.weight(.semibold))
-
-            let messages = snapshot?.messages ?? []
-            ScrollViewReader { scroll in
-                ScrollView {
-                    VStack(alignment: .leading) {
-                        if messages.isEmpty {
-                            Text("暂无索引消息")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text(verbatim: messages.joined(separator: "\n"))
-                                .font(.system(.callout, design: .monospaced))
-                                .textSelection(.enabled)
-                        }
-                        Color.clear.frame(height: 0).id("end")
+                ViewThatFits(in: .vertical) {
+                    Text(error).fixedSize(horizontal: false, vertical: true)
+                    ScrollView {
+                        Text(error).frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
                 }
-                .onChange(of: messages) {
-                    scroll.scrollTo("end", anchor: .bottom)
-                }
+                .frame(maxHeight: 72, alignment: .topLeading)
+                .foregroundStyle(.red)
+                .font(.callout)
+                .textSelection(.enabled)
             }
-            .background(.background, in: RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("同步输出")
+                    .font(.subheadline.weight(.semibold))
+                let messages = snapshot?.messages ?? []
+                ScrollViewReader { scroll in
+                    ScrollView {
+                        VStack(alignment: .leading) {
+                            if messages.isEmpty {
+                                Text(snapshot?.phase.outputPlaceholder ?? "正在连接 services…")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text(verbatim: messages.joined(separator: "\n"))
+                                    .font(.system(.callout, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                            Color.clear.frame(height: 0).id("end")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                    }
+                    .onChange(of: messages) {
+                        scroll.scrollTo("end", anchor: .bottom)
+                    }
+                }
+                .frame(minHeight: 72, maxHeight: .infinity)
+                .background(.background, in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary)
+                }
             }
         }
         .padding(20)
-        .frame(minWidth: 380, minHeight: 240)
+        .frame(minWidth: 400, minHeight: 280)
     }
 }
 
@@ -123,18 +152,13 @@ private final class MailSyncSession {
             let client = MailSyncClient()
             let endpoint = try await NotificationReceiptClient().healthyEndpoint()
             try Task.checkCancellation()
-            let id = try await client.start(at: endpoint)
-            operation.call("POST /mail/sync", result: "accepted")
-            while !Task.isCancelled {
-                let update = try await client.progress(id, at: endpoint)
-                try Task.checkCancellation()
-                snapshot = update
-                if update.phase.isTerminal {
-                    CenterLog.shared.finish(operation, result: update.error == nil ? "success" : "failure")
-                    break
+            let final = try await client.monitor(at: endpoint) { update in
+                if snapshot == nil {
+                    operation.call("POST /mail/sync", result: "accepted")
                 }
-                try await Task.sleep(for: .milliseconds(500))
+                snapshot = update
             }
+            CenterLog.shared.finish(operation, result: final.phase == .completed ? "success" : "failure")
         } catch {
             if !Task.isCancelled {
                 connectionError = error.localizedDescription
@@ -147,7 +171,7 @@ private final class MailSyncSession {
     }
 }
 
-private struct MailSyncSnapshot: Decodable {
+struct MailSyncSnapshot: Decodable {
     let id: UUID
     let phase: Phase
     let messages: [String]
@@ -161,7 +185,7 @@ private struct MailSyncSnapshot: Decodable {
         var title: String {
             switch self {
             case .queued: "正在等待同步"
-            case .downloading: "正在下载邮件"
+            case .downloading: "正在同步下载邮件"
             case .indexing: "正在更新邮件索引"
             case .refreshing: "正在刷新未读邮件"
             case .completed: "邮件同步完成"
@@ -178,51 +202,74 @@ private struct MailSyncSnapshot: Decodable {
             case .failed: nil
             }
         }
+
+        var outputPlaceholder: String {
+            switch self {
+            case .queued: "同步开始后将显示输出"
+            case .downloading: "正在等待 mbsync 输出"
+            case .indexing: "正在等待 mu 输出"
+            case .refreshing, .completed, .failed: "暂无同步输出"
+            }
+        }
     }
 }
 
-private struct MailSyncClient {
-    private struct StartResponse: Decodable {
-        let api_version: String
-        let id: UUID
-    }
-
+/// 服务端将每个完整快照编码为一行 SSE data，心跳与事件名称不携带快照。
+struct MailSyncEventDecoder {
     private struct ProgressResponse: Decodable {
         let api_version: String
         let sync: MailSyncSnapshot
     }
 
-    private struct RequestError: LocalizedError {
-        let message: String
-        var errorDescription: String? { message }
-    }
+    private var id: UUID?
 
-    func start(at endpoint: ServiceEndpoint) async throws -> UUID {
-        let data = try await request("POST", path: "/mail/sync", at: endpoint, status: 202)
-        let result = try JSONDecoder().decode(StartResponse.self, from: data)
-        guard result.api_version == "1" else { throw URLError(.badServerResponse) }
-        return result.id
-    }
-
-    func progress(_ id: UUID, at endpoint: ServiceEndpoint) async throws -> MailSyncSnapshot {
-        let data = try await request("GET", path: "/mail/sync/\(id.uuidString)", at: endpoint, status: 200)
-        let result = try JSONDecoder().decode(ProgressResponse.self, from: data)
-        guard result.api_version == "1", result.sync.id == id else { throw URLError(.badServerResponse) }
+    mutating func decode(_ line: String) throws -> MailSyncSnapshot? {
+        guard line.hasPrefix("data:") else { return nil }
+        let payload = line.dropFirst("data:".count)
+        let result = try JSONDecoder().decode(ProgressResponse.self, from: Data(payload.utf8))
+        guard result.api_version == "1", id == nil || id == result.sync.id else {
+            throw MailSyncMonitorError(message: "服务返回了无效的邮件同步进度")
+        }
+        id = result.sync.id
         return result.sync
     }
+}
 
-    private func request(
-        _ method: String, path: String, at endpoint: ServiceEndpoint, status: Int
-    ) async throws -> Data {
-        let url = try NotificationReceiptClient.url(endpoint: endpoint, path: path)
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
-        request.httpMethod = method
-        let (data, response) = try await URLSession.shared.data(for: request)
+private struct MailSyncMonitorError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+@MainActor
+private struct MailSyncClient {
+    func monitor(
+        at endpoint: ServiceEndpoint, onUpdate: (MailSyncSnapshot) -> Void
+    ) async throws -> MailSyncSnapshot {
+        let url = try NotificationReceiptClient.url(endpoint: endpoint, path: "/mail/sync")
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 40)
+        request.httpMethod = "POST"
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        guard http.statusCode == status else {
+        guard http.statusCode == 202 else {
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count >= 16_384 { break }
+            }
             let error = try? JSONDecoder().decode(ServiceAPIErrorResponse.self, from: data)
-            throw RequestError(message: error?.error.message ?? "邮件同步请求失败（HTTP \(http.statusCode)）")
+            throw MailSyncMonitorError(message: error?.error.message ?? "邮件同步请求失败（HTTP \(http.statusCode)）")
         }
-        return data
+        guard http.mimeType == "text/event-stream" else {
+            throw MailSyncMonitorError(message: "服务未返回邮件同步进度流")
+        }
+        var decoder = MailSyncEventDecoder()
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard let update = try decoder.decode(line) else { continue }
+            onUpdate(update)
+            if update.phase.isTerminal { return update }
+        }
+        throw MailSyncMonitorError(message: "进度连接已断开，未收到同步结果")
     }
 }

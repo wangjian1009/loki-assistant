@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, Result, Token, parse::Parse, parse_macro_input};
+use syn::{ItemFn, LitStr, Result, Token, Type, parse::Parse, parse_macro_input};
 
 /// 将无参数配置元数据函数注册到编译期配置目录。
 #[proc_macro_attribute]
@@ -60,6 +60,7 @@ pub fn loki_status(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 struct ApiArguments {
     access: LitStr,
+    sse_event: Option<Type>,
     module: LitStr,
     id: LitStr,
     method: LitStr,
@@ -79,14 +80,23 @@ impl Parse for ApiArguments {
         let mut summary = None;
         let mut description = None;
         let mut access = None;
+        let mut sse_event = None;
         let mut mount = None;
         let mut mount_group = None;
 
         while !input.is_empty() {
             let name: syn::Ident = input.parse()?;
             input.parse::<Token![=]>()?;
+            let key = name.to_string();
+            if key == "sse_event" {
+                sse_event = Some(input.parse::<Type>()?);
+                if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
             let value: LitStr = input.parse()?;
-            match name.to_string().as_str() {
+            match key.as_str() {
                 "module" => module = Some(value),
                 "id" => id = Some(value),
                 "method" => method = Some(value),
@@ -111,12 +121,14 @@ impl Parse for ApiArguments {
             }
         }
 
+        let access = access.unwrap_or_else(|| LitStr::new("local", input.span()));
         Ok(Self {
             mount: mount.ok_or_else(|| {
                 syn::Error::new(input.span(), "缺少 mount，无状态接口使用 mount = \"()\"")
             })?,
             mount_group,
-            access: access.unwrap_or_else(|| LitStr::new("local", input.span())),
+            access,
+            sse_event,
             module: module.ok_or_else(|| syn::Error::new(input.span(), "缺少 module"))?,
             id: id.ok_or_else(|| syn::Error::new(input.span(), "缺少 id"))?,
             method: method.ok_or_else(|| syn::Error::new(input.span(), "缺少 method"))?,
@@ -166,6 +178,7 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
     let registration_name = format_ident!("__LOKI_API_{}", function_name);
     let ApiArguments {
         access,
+        sse_event,
         module,
         id,
         method,
@@ -175,6 +188,10 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
         mount,
         mount_group,
     } = args;
+    let sse_event = match sse_event {
+        Some(event) => quote!(Some(::loki_services::http::sse::metadata::<#event>)),
+        None => quote!(None),
+    };
     let path_value = path.value();
     let path_parameters = path_value
         .split('{')
@@ -238,6 +255,7 @@ pub fn loki_api(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::loki_services::modules::discover::registry::ApiDescriptor {
                 module_id: #module,
                 access: #access,
+                sse_event: #sse_event,
                 id: #id,
                 method: #method,
                 path: #path,

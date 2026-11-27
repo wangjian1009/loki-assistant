@@ -1,12 +1,15 @@
 use crate::{
     http_server::HttpServer,
-    network::{
-        AutoBinding, BindingState, InvalidRequestReason, Network, NetworkReason, RequestHandle,
-        RequestOptions, ResponsError, Service, ServiceRequest, ServiceResponse,
-    },
+    network::{AutoBinding, BindingState, InvalidRequestReason, Network, ResponsError, Service},
     storage,
 };
-use serde_json::{Value, json};
+use loki_service_proxy::{
+    mail::Mail,
+    service_proxy::{ComputerStatus, ServiceProxy, ServiceSnapshot},
+};
+use serde_json::Value;
+#[cfg(not(target_env = "ohos"))]
+use serde_json::json;
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -14,6 +17,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use tokio::runtime::Runtime;
 
@@ -28,15 +32,51 @@ impl WorkspaceOptions {
     }
 }
 
-struct Pending {
-    cancelled: bool,
-    handle: Option<RequestHandle>,
+#[derive(Clone, PartialEq, serde::Serialize)]
+pub struct DashboardUpdate {
+    generation: u64,
+    endpoint_id: Option<String>,
+    checked_at: u64,
+    error: Option<ResponsError>,
+    status: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>>,
+    service: Option<ComputerStatus>,
+}
+
+impl From<&ServiceSnapshot> for DashboardUpdate {
+    fn from(snapshot: &ServiceSnapshot) -> Self {
+        Self {
+            generation: snapshot.generation,
+            endpoint_id: snapshot.endpoint_id.clone(),
+            checked_at: snapshot.checked_at,
+            error: snapshot.error.clone(),
+            status: snapshot.status.clone(),
+            service: ComputerStatus::from_snapshot(snapshot),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ApplicationData {
+    pub state: serde_json::Map<String, Value>,
+    pub endpoint_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfiguration {
+    pub endpoint_id: String,
+    pub relay_url: String,
+    pub relay_token: String,
+    pub binding: BindingState,
+    #[serde(default)]
+    pub auto_binding: Option<AutoBinding>,
 }
 
 pub struct Workspace {
     network: Arc<Network>,
+    proxy: Arc<ServiceProxy>,
+    mail: Mail,
     storage: Mutex<(PathBuf, storage::Store)>,
-    pending: Arc<Mutex<std::collections::BTreeMap<String, Pending>>>,
     runtime: Mutex<Option<Runtime>>,
     executor: tokio::runtime::Handle,
     stopping: AtomicBool,
@@ -58,10 +98,13 @@ impl Workspace {
             let _enter = runtime.enter();
             Arc::new(Network::new())
         };
+        let proxy = ServiceProxy::new(network.clone(), runtime.handle().clone());
+        let mail = Mail::new(proxy.clone());
         Ok(Self {
             network,
+            proxy,
+            mail,
             storage: Mutex::new((path, store)),
-            pending: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             executor: runtime.handle().clone(),
             runtime: Mutex::new(Some(runtime)),
             stopping: AtomicBool::new(false),
@@ -73,6 +116,80 @@ impl Workspace {
     pub fn network(&self) -> Arc<Network> {
         self.network.clone()
     }
+    pub fn load_state(&self) -> ApplicationData {
+        let store = self.storage.lock().unwrap();
+        ApplicationData {
+            state: store.1.application.clone(),
+            endpoint_id: store.1.endpoint_id.clone(),
+        }
+    }
+
+    pub fn save_state(&self, state: serde_json::Map<String, Value>) -> Result<(), String> {
+        if ["secret_key", "endpoint_id", "version"]
+            .iter()
+            .any(|key| state.contains_key(*key))
+        {
+            return Err("应用数据格式无效".into());
+        }
+        let mut store = self.storage.lock().unwrap();
+        let mut candidate = store.1.clone();
+        candidate.application = state;
+        storage::save(&store.0, &candidate)?;
+        store.1 = candidate;
+        Ok(())
+    }
+
+    pub fn set_service(&self, config: ServiceConfiguration) -> Result<(), ResponsError> {
+        let key = self
+            .storage
+            .lock()
+            .unwrap()
+            .1
+            .secret_key
+            .parse()
+            .map_err(|_| InvalidRequestReason::InvalidService)?;
+        let id = config
+            .endpoint_id
+            .parse()
+            .map_err(|_| InvalidRequestReason::InvalidService)?;
+        let mut service = Service::new(key, id, config.relay_url, config.relay_token)?
+            .with_binding(config.binding);
+        if let Some(options) = config.auto_binding {
+            service = service.with_auto_binding(options);
+        }
+        self.network.set_service(service)?;
+        self.proxy.sync_target();
+        Ok(())
+    }
+
+    pub fn clear_service(&self) {
+        self.network.clear_service();
+        self.proxy.sync_target();
+    }
+
+    pub fn service(&self) -> Option<crate::network::ServiceState> {
+        self.network.service()
+    }
+
+    pub fn parse_invitation(
+        &self,
+        payload: &str,
+    ) -> Result<crate::pairing::Invitation, ResponsError> {
+        crate::pairing::Invitation::decode(payload)
+    }
+
+    pub fn request_refresh(&self) {
+        self.proxy.request_refresh();
+    }
+
+    pub fn open_mail(&self) -> Mail {
+        self.mail.clone()
+    }
+
+    pub fn open_slack(&self) -> loki_service_proxy::slack::Slack {
+        loki_service_proxy::slack::Slack::new(self.proxy.clone())
+    }
+
     /// 使用当前工作空间的 Network 监听设备回环地址，端口 0 由系统分配。
     pub fn start_http_server(
         &self,
@@ -94,13 +211,13 @@ impl Workspace {
         Ok(address)
     }
 
-    pub(crate) fn respond_http(&self, id: u64, status: u16, body: &str) {
+    pub fn respond_http(&self, id: u64, status: u16, body: &str) {
         if let Some(server) = self.http.lock().unwrap().as_ref() {
             server.respond(id, status, body);
         }
     }
 
-    async fn stop_http_server(&self) {
+    pub async fn stop_http_server(&self) {
         let server = self.http.lock().unwrap().take();
         if let Some(server) = server {
             server.stop().await;
@@ -123,24 +240,25 @@ impl Workspace {
     pub async fn close(&self) {
         self.stop().await;
     }
-    /// NAPI 工作线程使用的阻塞适配，所有操作复用本 Workspace。
+    pub fn shutdown(&self) {
+        self.begin_stop();
+        let _guard = self.stop_executor.lock().unwrap();
+        if self.runtime.lock().unwrap().is_some() {
+            self.executor.block_on(self.stop());
+            if let Some(runtime) = self.runtime.lock().unwrap().take() {
+                runtime.shutdown_timeout(Duration::from_secs(2));
+            }
+        }
+    }
+
+    #[cfg(not(target_env = "ohos"))]
     pub fn execute(&self, operation: &str, payload: &str) -> Value {
         if matches!(operation, "stop" | "close") {
-            let _guard = self.stop_executor.lock().unwrap();
-            if self.runtime.lock().unwrap().is_some() {
-                self.executor.block_on(self.stop());
-                let runtime = self.runtime.lock().unwrap().take();
-                if let Some(runtime) = runtime {
-                    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
-                }
-            }
+            self.shutdown();
             return json!({"ok":true});
         }
         if operation == "stop_http" {
-            let _guard = self.stop_executor.lock().unwrap();
-            if self.runtime.lock().unwrap().is_some() {
-                self.executor.block_on(self.stop_http_server());
-            }
+            self.executor.block_on(self.stop_http_server());
             return json!({"ok":true});
         }
         if self.stopping.load(Ordering::SeqCst) {
@@ -148,72 +266,25 @@ impl Workspace {
         }
         match operation {
             "load_state" => {
-                let storage = self.storage.lock().unwrap();
-                json!({"ok":true,"state":storage.1.application,"endpoint_id":storage.1.endpoint_id})
+                let data = self.load_state();
+                json!({"ok":true,"state":data.state,"endpoint_id":data.endpoint_id})
             }
-            "save_state" => {
-                let data = serde_json::from_str::<serde_json::Map<String, Value>>(payload);
-                match data {
-                    Ok(data)
-                        if !data.contains_key("secret_key")
-                            && !data.contains_key("endpoint_id")
-                            && !data.contains_key("version") =>
-                    {
-                        let mut storage = self.storage.lock().unwrap();
-                        let mut candidate = storage.1.clone();
-                        candidate.application = data;
-                        match storage::save(&storage.0, &candidate) {
-                            Ok(()) => {
-                                storage.1 = candidate;
-                                json!({"ok":true})
-                            }
-                            Err(error) => json!({"ok":false,"error":error}),
-                        }
-                    }
-                    _ => json!({"ok":false,"error":"应用数据格式无效"}),
-                }
-            }
-            "set_service" => {
-                #[derive(serde::Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct Configuration {
-                    endpoint_id: String,
-                    relay_url: String,
-                    relay_token: String,
-                    binding: BindingState,
-                    #[serde(default)]
-                    auto_binding: Option<AutoBinding>,
-                }
-                let service = (|| -> Result<Service, ResponsError> {
-                    let config: Configuration = serde_json::from_str(payload)
-                        .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidService))?;
-                    let key = self
-                        .storage
-                        .lock()
-                        .unwrap()
-                        .1
-                        .secret_key
-                        .parse()
-                        .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidService))?;
-                    let id = config
-                        .endpoint_id
-                        .parse()
-                        .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidService))?;
-                    let service = Service::new(key, id, config.relay_url, config.relay_token)?
-                        .with_binding(config.binding);
-                    Ok(if let Some(options) = config.auto_binding {
-                        service.with_auto_binding(options)
-                    } else {
-                        service
-                    })
-                })();
-                match service.and_then(|service| self.network.set_service(service)) {
-                    Ok(()) => json!({"ok":true}),
-                    Err(error) => failure(error),
-                }
-            }
+            "save_state" => match serde_json::from_str(payload)
+                .map_err(|_| "应用数据格式无效".to_owned())
+                .and_then(|state| self.save_state(state))
+            {
+                Ok(()) => json!({"ok":true}),
+                Err(error) => json!({"ok":false,"error":error}),
+            },
+            "set_service" => match serde_json::from_str(payload)
+                .map_err(|_| InvalidRequestReason::InvalidService.into())
+                .and_then(|config| self.set_service(config))
+            {
+                Ok(()) => json!({"ok":true}),
+                Err(error) => failure(error),
+            },
             "clear_service" => {
-                self.network.clear_service();
+                self.clear_service();
                 json!({"ok":true})
             }
             "service" => json!({"ok":true,"service":self.network.service()}),
@@ -221,114 +292,21 @@ impl Workspace {
                 Ok(invitation) => json!({"ok":true,"invitation":invitation}),
                 Err(error) => failure(error),
             },
-            "request" => self.request_json(payload),
-            "cancel" => {
-                let mut pending = self.pending.lock().unwrap();
-                let operation = pending.entry(payload.into()).or_insert(Pending {
-                    cancelled: false,
-                    handle: None,
-                });
-                operation.cancelled = true;
-                if let Some(handle) = &operation.handle {
-                    handle.cancel();
-                }
-                json!({"ok":true})
-            }
             _ => json!({"ok":false,"error":"未知工作空间操作"}),
         }
     }
-    fn request_json(&self, payload: &str) -> Value {
-        let parsed = || -> Result<(ServiceRequest, RequestOptions), ResponsError> {
-            let value: Value = serde_json::from_str(payload)
-                .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidBody))?;
-            let mut request = ServiceRequest::get(
-                value["path"]
-                    .as_str()
-                    .ok_or_else(|| ResponsError::from(InvalidRequestReason::InvalidPath))?,
-            );
-            request.method = value["method"]
-                .as_str()
-                .ok_or_else(|| ResponsError::from(InvalidRequestReason::InvalidMethod))?
-                .parse()
-                .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidMethod))?;
-            if let Some(query) = value.get("query") {
-                request.query = serde_json::from_value(query.clone())
-                    .map_err(|_| ResponsError::from(InvalidRequestReason::InvalidQuery))?;
-            }
-            request.body = value.get("body").cloned();
-            let options = RequestOptions {
-                timeout: std::time::Duration::from_millis(match value.get("timeout_ms") {
-                    None => 10000,
-                    Some(value) => value
-                        .as_u64()
-                        .ok_or_else(|| ResponsError::from(InvalidRequestReason::InvalidTimeout))?,
-                }),
-            };
-            Ok((request, options))
-        };
-        let (request, options) = match parsed() {
-            Ok(value) => value,
-            Err(error) => return failure(error),
-        };
-        let operation_id = serde_json::from_str::<Value>(payload)
-            .ok()
-            .and_then(|value| value["operation_id"].as_str().map(str::to_owned));
-        if let Some(id) = &operation_id {
-            self.pending
-                .lock()
-                .unwrap()
-                .entry(id.clone())
-                .or_insert(Pending {
-                    cancelled: false,
-                    handle: None,
-                });
-        }
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let error_sender = sender.clone();
-        let success_pending = self.pending.clone();
-        let error_pending = self.pending.clone();
-        let success_id = operation_id.clone();
-        let error_id = operation_id.clone();
-        let handle = self.network.request::<Value, _, _>(
-            request,
-            options,
-            move |response| {
-                if let Some(id) = success_id {
-                    success_pending.lock().unwrap().remove(&id);
-                }
-                let _ = sender.send(Ok(response));
-            },
-            move |error| {
-                if let Some(id) = error_id {
-                    error_pending.lock().unwrap().remove(&id);
-                }
-                let _ = error_sender.send(Err(error));
-            },
-        );
-        if let Some(id) = operation_id {
-            if let Some(pending) = self.pending.lock().unwrap().get_mut(&id) {
-                if pending.cancelled {
-                    handle.cancel();
-                }
-                pending.handle = Some(handle);
-            }
-        }
-        response(receiver)
+    pub fn watch_status(
+        &self,
+        notify: impl FnMut(DashboardUpdate) -> bool + Send + 'static,
+    ) -> loki_service_proxy::service_proxy::StatusSubscription {
+        self.proxy
+            .subscribe(|snapshot| DashboardUpdate::from(snapshot), notify)
     }
 }
+
+#[cfg(not(target_env = "ohos"))]
 fn failure(error: ResponsError) -> Value {
     json!({"ok":false,"respons_error":error})
-}
-fn response<T: serde::Serialize>(
-    receiver: std::sync::mpsc::Receiver<Result<ServiceResponse<T>, ResponsError>>,
-) -> Value {
-    match receiver.recv() {
-        Ok(Ok(response)) => {
-            json!({"ok":true,"request_id":response.request_id.to_string(),"status":response.status.as_u16(),"body":response.data,"generation":response.generation})
-        }
-        Ok(Err(error)) => failure(error),
-        Err(_) => failure(NetworkReason::InvalidResponse.into()),
-    }
 }
 impl Drop for Workspace {
     fn drop(&mut self) {

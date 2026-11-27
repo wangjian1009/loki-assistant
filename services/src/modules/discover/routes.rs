@@ -151,4 +151,42 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "module-not-found");
     }
+
+    #[tokio::test]
+    async fn exposes_sse_event_schema_with_nested_types() {
+        let (status, body) = get_json("/discover/modules/mail").await;
+        assert_eq!(status, StatusCode::OK);
+        let apis = body["apis"].as_array().unwrap();
+        let sync = apis.iter().find(|api| api["id"] == "sync").unwrap();
+        assert_eq!(sync["supports_sse"], true);
+        let event = &sync["sse_events"][0];
+        assert_eq!(event["event"], "sync");
+        let schema = &event["data_schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["api_version"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["sync"]["$ref"],
+            "#/definitions/Snapshot"
+        );
+        assert_eq!(
+            schema["definitions"]["Snapshot"]["properties"]["id"]["format"],
+            "uuid"
+        );
+        assert_eq!(
+            schema["definitions"]["Snapshot"]["properties"]["messages"]["items"]["type"],
+            "string"
+        );
+        assert!(
+            schema["definitions"]["Phase"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from("completed"))
+        );
+        let progress = apis
+            .iter()
+            .find(|api| api["id"] == "sync-progress")
+            .unwrap();
+        assert_eq!(progress["supports_sse"], false);
+        assert_eq!(progress["sse_events"], serde_json::json!([]));
+    }
 }

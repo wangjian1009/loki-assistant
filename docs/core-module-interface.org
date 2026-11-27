@@ -45,6 +45,10 @@ pub struct ModuleSummary {
 pub struct ApiMetadata {
     /// 访问范围。`local` 限本机，`paired` 允许本机和已绑定设备调用。
     pub access: String,
+    /// 是否可通过 SSE 读取响应。
+    pub supports_sse: bool,
+    /// 事件名称和各事件的 JSON 数据结构。
+    pub sse_events: Vec<SseEventMetadata>,
     /// API 在所属模块中的标识。
     pub id: String,
     /// HTTP 请求方法，例如 `GET`。
@@ -61,6 +65,11 @@ pub struct ApiMetadata {
     pub request: Option<DataMetadata>,
     /// 响应体的结构描述。未提供时序列化为 `null`。
     pub response: Option<DataMetadata>,
+}
+
+pub struct SseEventMetadata {
+    pub event: &'static str,
+    pub data_schema: serde_json::Value,
 }
 
 pub struct ParameterMetadata {
@@ -99,7 +108,19 @@ pub struct FieldMetadata {
 
 *** 服务声明示例
 
+SSE 事件数据使用实现 ~Serialize~ 和 ~JsonSchema~ 的 Rust 类型。~SseEvent::EVENT~ 定义事件名。~#[loki_api(sse_event = ...)]~ 根据声明类型返回 ~supports_sse: true~ 和 ~sse_events~ ，其中 ~data_schema~ 描述该事件的 ~data~ 对象，含嵌套类型。普通 API 返回 ~supports_sse: false~ 和空的 ~sse_events~ 。 [[file:../services/src/http/sse.rs][SSE 类型和编码]]
+
 #+begin_src rust
+#[derive(Serialize, JsonSchema)]
+struct SyncEvent {
+    api_version: &'static str,
+    sync: Snapshot,
+}
+
+impl SseEvent for SyncEvent {
+    const EVENT: &'static str = "sync";
+}
+
 #[loki_api(
     // 模块标识，用于归类发现元数据。路由挂载组默认使用此标识。
     module = "mail",
@@ -112,21 +133,16 @@ pub struct FieldMetadata {
     path = "/mail/sync",
     // paired 允许本机和已绑定设备调用。省略时默认为 local，仅限本机。
     access = "paired",
+    sse_event = SyncEvent,
     // 发现接口返回的操作标题和行为说明。
     summary = "立即同步邮件",
-    description = "开始一轮同步，或返回当前同步任务的 ID。"
+    description = "开始或加入当前邮件同步任务。可请求 SSE 进度，默认返回任务 ID。"
 )]
-async fn start_sync(State(service): State<Arc<MailService>>) -> Response {
-    let id = service.sync_progress.request().await;
-    // 202 表示已受理，响应中的 id 标识同步任务。
-    (
-        StatusCode::ACCEPTED,
-        [(CACHE_CONTROL, "no-store")],
-        Json(json!({"api_version": API_VERSION, "id": id})),
-    )
-        .into_response()
-}
 #+end_src
+
+~POST /mail/sync~ 返回 ~202~ 。本机发送 ~Accept: text/event-stream~ ，已绑定设备发送 ~response_mode: "sse"~ ，均收到包含同一数据结构的 ~sync~ 事件。默认 JSON 响应包含任务 ID。 [[file:control-center-services.org::*手动同步与进度][邮件同步响应]]
+
+本机 ~POST /mail/index/result/{id}~ 接收 Emacs 报告的 ~running~ 、 ~completed~ 或 ~failed~ 。运行中的计数更新可多次提交，终态仅接收一次。 [[file:control-center-services.org::*邮件模块][Emacs 索引回执]]
 
 [[file:../services/src/modules/mail/routes.rs::async fn start_sync][邮件同步路由源码]]
 
@@ -152,6 +168,8 @@ async fn start_sync(State(service): State<Arc<MailService>>) -> Response {
       "method": "GET",
       "path": "/meta/{module_id}",
       "access": "paired",
+      "supports_sse": false,
+      "sse_events": [],
       "summary": "获取模块配置模型",
       "description": "返回单个配置模块的完整描述。",
       "parameters": [

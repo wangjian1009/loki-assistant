@@ -1,17 +1,20 @@
 use super::*;
-use crate::{
-    network::*,
-    pairing::{Invitation, now},
-    storage,
-};
+use crate::{network::*, pairing::Invitation, storage};
 use iroh::SecretKey;
 use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
 
 struct Fixture(std::path::PathBuf);
 impl Fixture {
@@ -255,31 +258,6 @@ fn cancellation_switch_and_shutdown_preserve_separate_reasons() {
     drop(workspace);
     let (_, receiver) = request(&network, Duration::from_secs(10));
     assert_eq!(error_value(receiver)["reason"], "network_closed");
-}
-
-#[test]
-fn service_rejections_keep_their_own_reason_and_details() {
-    let response = json!({"api_version":"1","status":409,"error":{"source":"business","code":"busy","message":"服务忙"}});
-    let error = ResponsError::api(&response, 409).unwrap();
-    let value = serde_json::to_value(error).unwrap();
-    assert_eq!(value["kind"], "services");
-    assert_eq!(value["reason"], "rejected");
-    assert_eq!(value["status"], 409);
-    assert_eq!(value["code"], "busy");
-    assert_eq!(value["source"], "business");
-    for (code, reason) in [
-        ("peer-not-bound", "binding_revoked"),
-        ("invalid-binding-token", "invalid_credential"),
-    ] {
-        let error=ResponsError::api(&json!({"api_version":"1","status":403,"error":{"source":"business","code":code,"message":"授权失败"}}),403).unwrap();
-        let value = serde_json::to_value(error).unwrap();
-        assert_eq!(value["kind"], "not_bound");
-        assert_eq!(value["reason"], reason);
-    }
-    assert!(matches!(
-        ResponsError::api(&response, 500).unwrap_err(),
-        ResponsError::Network(_)
-    ));
 }
 
 fn auto_service(key: &SecretKey, qr: &Value) -> Service {

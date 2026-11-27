@@ -290,13 +290,13 @@ services 每次从当前绑定关系验证已认证的远端 Endpoint ID 和绑�
 
 应用只将扫码得到的 Service 配置和 ~auto_binding{invitation,device_name}~ 设置到 Network；Network 自动异步绑定，不提供公开的绑定或确认方法。绑定中和失败状态均保存在 Service，失败的 ~error~ 是 ResponsError Union，界面可读取详细原因。绑定成功或失败后清除一次性邀请，业务保存最新完整配置。
 
-不保留待确认状态或响应丢失后的重试恢复流程。手机界面仅展示“离线、绑定中、绑定失败、在线”；绑定失败提示删除后重新扫码绑定。失败状态可持久化恢复，后续不自动重试旧邀请；绑定中每轮结束后 1 秒读取状态，其他情况 20 秒刷新。私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。
+手机界面展示“离线、绑定中、绑定失败、在线”。失败状态可持久化恢复，用户删除记录后可重新扫码绑定。首页通过 ServiceProxy 订阅当前电脑状态，后台结束该订阅。私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。 [[file:service-client.org::*代理缓存与订阅][手机代理缓存与订阅]]
 
 手机可在设置页修改自身名称，并在后续绑定时上报新名称和 ~device_type: mobile~ 。Mac 上的 services 优先使用系统设置中的电脑名称，其他平台使用 hostname。电脑名称和设备类型发布到 ~service/name~ 和 ~service/device_type~ ，手机通过 ~GET /status~ 读取并缓存。名称和类型仅用于展示。
 
 *** 通用 services 请求通道
 
-手机 Network.request 使用 ~loki-assistant/services/1~ ALPN；使用完整认证的 QUIC，不使用 0-RTT。同一连接复用，每个请求独占双向 stream，请求和响应各以 FIN 结束 UTF-8 JSON。请求不指定 service，目标来自 Network 预设的唯一绑定。
+手机 Network 使用 ~loki-assistant/services/1~ ALPN 和完整认证的 QUIC。同一连接复用，每个请求独占双向 stream。请求以 FIN 结束 UTF-8 JSON，目标来自 Network 预设的唯一绑定。默认响应以 FIN 结束一个 UTF-8 JSON 对象。
 
 #+begin_src json
 {"api_version":"1","request_id":"550e8400-e29b-41d4-a716-446655440000","binding_token":"<当前 Service 的绑定凭据>","method":"GET","path":"/network/session","query":[]}
@@ -316,7 +316,9 @@ query 元素为 ~{"name":"...","value":"..."}~ ，支持重复键。无请求体
 
 network 将 iroh 已认证的 Endpoint ID 写入转发请求的 ~x-loki-device~ 和 ~x-loki-remote-devices~ 请求头，并注入 Axum 请求扩展。发现、配置和状态接口通过该扩展判断请求来源。loopback HTTP 入口移除这两个请求头。~GET /network/session~ 返回当前电脑的身份、在线状态、名称、设备类型和请求方的绑定时间。本机调用该接口返回 401 ~peer-authentication-required~ 。已解绑返回 403 ~peer-not-bound~ ，本机专用 API 返回 403 ~remote-api-forbidden~ ，未知路径返回 404，方法不支持返回 405。
 
-请求最大 1 MiB，响应最大 4 MiB；每个手机最多 8 个正在执行请求，服务总上限 64，超限返回 429。服务端 stream 处理上限 30 秒；手机请求默认 10 秒，允许 1 至 30 秒，覆盖连接、发送与读取。手机显式取消 reset 当前 stream，超时和取消不保证已经执行的写操作回滚。网络层不自动重发请求。
+请求最大 1 MiB，普通 JSON 响应最大 4 MiB。每个手机最多 8 个正在执行的普通 JSON 请求，服务总上限 64，超限返回 429。服务端普通请求处理上限 30 秒。手机请求默认 10 秒，允许 1 至 30 秒，覆盖连接、发送与读取。手机显式取消时终止当前 stream，已执行的写操作依照业务自身的语义完成。
+
+SSE 请求在同一请求 JSON 中使用 ~response_mode: "sse"~ 。服务发现的 ~supports_sse~ 和 ~sse_events~ 描述接口能力和事件数据结构。绑定设备请求一个开放但不支持 SSE 的接口时返回 406 ~sse-not-supported~ 。SSE 使用独立的并发额度，每个手机最多 4 条流，服务总上限 16。 [[file:core-module-interface.org::*模块与 API 元数据][API 元数据]] [[file:service-client.org::*SSE 远程请求][JSON 帧和手机客户端]]
 
 *** 错误和敏感数据
 
@@ -331,13 +333,14 @@ network 将 iroh 已认证的 Endpoint ID 写入转发请求的 ~x-loki-device~ 
 | 404 | ~pairing-not-found~ | 本机查询的邀请结果不存在或重启后丢失 |
 | 404 | ~peer-not-found~ | 已绑定设备不存在 |
 | 405 | ~method-not-allowed~ | 不支持的 HTTP 方法，source 为 services |
+| 406 | ~sse-not-supported~ | 接口未声明 SSE，source 为 services |
 | 409 | ~pairing-completed~ | 无法通过取消邀请解除已完成的绑定 |
 | 410 | ~pairing-expired~ | 握手邀请已消费、过期、取消、重启后丢失或不存在 |
 | 422 | ~pairing-qr-code-error~ | 绑定数据过长或二维码 PNG 编码失败 |
 | 500 | ~peer-storage-error~ | 设备记录无法读取、保存或超过容量 |
 | 503 | ~network-not-ready~ | 中继未就绪或正在切换配置 |
 
-除 HTTP 方法错误外，上表错误 ~source~ 为 ~business~ 。绑定令牌原文只出现在创建邀请响应与二维码，以及手机提交的加密绑定请求中，不进入状态中心、发现元数据、通知或日志；本机身份私钥始终不导出。
+表中标有 ~source~ 的错误使用对应来源，其余错误的 ~source~ 为 ~business~ 。绑定令牌原文只出现在创建邀请响应与二维码，以及手机提交的加密绑定请求中，不进入状态中心、发现元数据、通知或日志；本机身份私钥始终不导出。
 
 * 文档模块
 
@@ -828,7 +831,7 @@ Codex 入口依次读取原生请求头 ~thread-id~ 、 ~session-id~ 和 ~sessio
 
 services 每轮先运行 ~mbsync~ 。部分邮箱同步失败时，仍索引已下载的邮件。services 通过 ~emacsclient~ 连接 ~emacs/socket_name~ 指定的已有 Emacs server，调用一次 ~loki-assistant-mail-start-index~ 。Emacs 负责等待已有索引、发起本轮更新和处理完成、超时或进程退出。services 收到完成回执后，对同一数据库执行只读的 ~mu find~ 刷新未读数。
 
-目标 Emacs server 不可连接或 ~mu4e~ 未运行时，services 直接运行 ~mu index~ 。自动同步只连接已有 Emacs server。Emacs 接受后通过本机 ~POST /mail/index/result/{id}~ 回报终态。成功回报 ~status: completed~ 和 ~database~ ，其中包含 ~program~ 、 ~home~ 及可选的 ~index~ 统计。失败回报 ~status: failed~ 和 ~error~ 。services 只接受当前待处理请求 ID 的一次回执。无法确认索引完成时，本轮保留最近一次的未读状态。命令行 ~mu~ 遇到数据库锁冲突时异步退避，最多重试四次。
+目标 Emacs server 不可连接或 ~mu4e~ 未运行时，services 直接运行 ~mu index~ 。自动同步只连接已有 Emacs server。Emacs 接受后通过本机 ~POST /mail/index/result/{id}~ 回报进度及终态。进度回报包含 ~status: running~ 和 ~index~ ，其中包含非负整数 ~checked~ 、 ~updated~ 及可选的 ~cleaned_up~ 。services 将变化的计数写入同步进度，连续相同的计数只写入一次。成功回报包含 ~status: completed~ 和 ~database~ ，其中包含 ~program~ 、 ~home~ 及可选的 ~index~ 统计。失败回报包含 ~status: failed~ 和 ~error~ 。services 按索引请求 ID 接收进度和一次终态，终态后或 ID 不匹配时返回 ~404 mail-index-request-not-found~ 。无法确认索引完成时，本轮保留最近一次的未读状态。命令行 ~mu~ 遇到数据库锁冲突时异步退避，最多重试四次。
 
 services 汇总同轮的同步、索引和未读查询错误，通过告警模块发布 ~mail.sync~ 供托盘菜单查看。命令失败时从 stderr 提取已知诊断，例如 IMAP 主机与端口、DNS、连接超时、TLS、认证、配置行号和本地索引错误。告警使用提取后的诊断，避免输出包含凭据的原始命令错误。整轮成功或关闭自动同步后清理告警。点击托盘告警可打开 ~mbsync~ 配置。
 
@@ -842,11 +845,13 @@ mu4e 在查看邮件、更新标记、移动或删除邮件完成后，异步调
 
 本机和已绑定设备可通过 ~POST /mail/sync~ 提交空请求体，服务返回 ~202~ 和 ~{"api_version":"1","id":"<uuid>"}~ 。关闭自动同步时仍可手动触发。已排队或开始的同步与手动请求合并，返回同一个任务 ID。完成一轮同步后，已启用的定时任务从该轮结束起重新计时。
 
-~mail/sync_runs~ 发布当前同步和最近八轮任务的 ~id~ 与 ~phase~ 。手机从 ~GET /status~ 读取该数组，并按提交时返回的任务 ID 显示进度。
+本机托盘发送 ~Accept: text/event-stream~ ，已绑定手机使用 iroh 的 ~response_mode: "sse"~ ，服务返回 ~202~ 及进度事件流。每个事件名为 ~sync~ ， ~data~ 字段包含当前任务的 JSON 快照 ~{"api_version":"1","sync":{...}}~ 。服务先发送请求受理时的快照，再发送阶段、下载和索引消息更新，短时间内的多次更新可合并到一个快照。服务发送完成或失败快照后关闭响应。多个客户端可订阅同一任务，取消一条订阅仅关闭对应的流。 [[file:service-client.org::*SSE 远程请求][手机 SSE 请求]]
 
-本机 ~GET /mail/sync/{id}~ 返回 ~200~ 和包含 ~api_version~ 、 ~sync~ 的 JSON。~sync~ 包含 ~id~ 、 ~phase~ 、 ~messages~ 和 ~error~ 。~phase~ 依次为 ~queued~ 、 ~downloading~ 、 ~indexing~ 、 ~refreshing~ ，最终为 ~completed~ 或 ~failed~ 。失败时 ~error~ 为诊断文本，其余时候为 ~null~ 。~messages~ 按收到顺序保留最近 64 条索引消息。直接执行 ~mu index~ 时实时显示 stdout 和 stderr 的输出行。复用 ~mu4e~ 时在索引完成后显示检查、更新和清理计数。进度条按阶段推进。
+~mail/sync_runs~ 发布当前同步和最近八轮任务的 ~id~ 与 ~phase~ 。手机使用 ~GET /status~ 查询该数组，可在仅支持 JSON 的电脑上查看同步阶段，也可在流中断后按任务 ID 恢复进度。
 
-services 在内存保留当前轮次和最近八轮结果。托盘仅在点击「立即同步邮件」时前置进度窗口。定时同步及 Loki 发起的 mu4e 索引在后台运行。关闭进度窗口后，已受理的同步继续运行。未知或已清理的任务返回 ~404 mail-sync-not-found~ 。
+本机 ~GET /mail/sync/{id}~ 返回 ~200~ 和包含 ~api_version~ 、 ~sync~ 的 JSON。~sync~ 包含 ~id~ 、 ~phase~ 、 ~messages~ 和 ~error~ 。~phase~ 依次为 ~queued~ 、 ~downloading~ 、 ~indexing~ 、 ~refreshing~ ，最终为 ~completed~ 或 ~failed~ 。失败时 ~error~ 为诊断文本，其余时候为 ~null~ 。~messages~ 按收到顺序保留最近 64 条下载及索引消息。下载阶段用 ~mbsync -V~ 从 stdout 和 stderr 提取邮箱处理阶段、邮件计数、最终同步统计和已知诊断。配置路径、存储和邮箱名称只映射为通用阶段说明。直接执行 ~mu index~ 时实时显示 stdout 和 stderr 的输出行。复用 ~mu4e~ 时显示索引期间和完成时回报的检查、更新和清理计数。进度条按阶段推进。
+
+services 在内存保留当前轮次和最近八轮结果。托盘仅在点击「立即同步邮件」时前置进度窗口。定时同步及 Loki 发起的 mu4e 索引在后台运行。未知或已清理的任务返回 ~404 mail-sync-not-found~ 。
 
 ** 邮件配置与草稿
 

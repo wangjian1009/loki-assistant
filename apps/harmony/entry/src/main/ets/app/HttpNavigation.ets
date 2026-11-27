@@ -1,5 +1,6 @@
-import { HttpResponder } from 'liblokiworkspace.so'
 import { NavigatorManager, NavigationResult, parseNavigationPath } from './NavigatorManager'
+
+type HttpResponder = (status: number, body: string) => void
 
 interface NavigationErrorBody {
   error: NavigationErrorDetail

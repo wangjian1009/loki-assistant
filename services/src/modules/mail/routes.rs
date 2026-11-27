@@ -1,21 +1,54 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State, rejection::JsonRejection},
-    http::{StatusCode, header::CACHE_CONTROL},
+    http::{
+        HeaderMap, StatusCode,
+        header::{ACCEPT, CACHE_CONTROL, VARY},
+    },
     response::{IntoResponse, Response},
 };
+use futures_util::{StreamExt, stream};
 use loki_services_macros::loki_api;
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{MailService, sync::IndexResult};
+use super::{MailService, progress::Snapshot, sync::IndexUpdate};
 use crate::{
-    http::error::{API_VERSION, ErrorSource, response},
+    http::{
+        error::{API_VERSION, ErrorSource, response},
+        sse::{self, RemoteSse, SseEvent},
+    },
     modules::emacs::error_response,
 };
+
+#[derive(Serialize, JsonSchema)]
+struct SyncEvent {
+    api_version: &'static str,
+    sync: Snapshot,
+}
+
+#[derive(Serialize)]
+struct SyncAccepted {
+    api_version: &'static str,
+    id: Uuid,
+}
+
+impl SyncEvent {
+    fn new(sync: Snapshot) -> Self {
+        Self {
+            api_version: API_VERSION,
+            sync,
+        }
+    }
+}
+
+impl SseEvent for SyncEvent {
+    const EVENT: &'static str = "sync";
+}
 
 #[loki_api(
     module = "mail",
@@ -23,17 +56,17 @@ use crate::{
     id = "index-result",
     method = "POST",
     path = "/mail/index/result/{id}",
-    summary = "接收 Emacs 邮件索引结果",
-    description = "接收已发起的索引任务的最终结果。"
+    summary = "接收 Emacs 邮件索引进度和结果",
+    description = "接收已发起的索引任务的统计更新和最终结果。"
 )]
 async fn index_result(
     State(service): State<Arc<MailService>>,
     Path(id): Path<String>,
-    result: Result<Json<IndexResult>, JsonRejection>,
+    result: Result<Json<IndexUpdate>, JsonRejection>,
 ) -> Result<Json<Value>, Response> {
     let id = Uuid::parse_str(&id).map_err(|_| invalid("邮件索引请求 ID 无效。"))?;
-    let Json(result) = result.map_err(|_| invalid("邮件索引结果无效。"))?;
-    if !service.sync_progress.receive_index_result(id, result).await {
+    let Json(result) = result.map_err(|_| invalid("邮件索引进度或结果无效。"))?;
+    if !service.sync_progress.receive_index_update(id, result).await {
         return Err(response(
             StatusCode::NOT_FOUND,
             ErrorSource::Business,
@@ -51,17 +84,60 @@ async fn index_result(
     method = "POST",
     path = "/mail/sync",
     access = "paired",
+    sse_event = SyncEvent,
     summary = "立即同步邮件",
-    description = "开始一轮同步，或返回当前同步任务的 ID。"
+    description = "开始或加入当前邮件同步任务。可请求 SSE 进度，默认返回任务 ID。"
 )]
-async fn start_sync(State(service): State<Arc<MailService>>) -> Response {
-    let id = service.sync_progress.request().await;
+async fn start_sync(
+    State(service): State<Arc<MailService>>,
+    remote: Option<Extension<RemoteSse>>,
+    headers: HeaderMap,
+) -> Response {
+    let (initial, updates) = service.sync_progress.request().await;
+    let body = if accepts_progress(&headers) {
+        let updates = stream::unfold(updates, |mut updates| async {
+            updates.changed().await.ok()?;
+            let sync = updates.borrow_and_update().clone();
+            Some((sync, updates))
+        });
+        let events = stream::iter([initial]).chain(updates).map(SyncEvent::new);
+        sse::response(events, remote.map(|Extension(remote)| remote))
+    } else {
+        Json(SyncAccepted {
+            api_version: API_VERSION,
+            id: initial.id,
+        })
+        .into_response()
+    };
     (
         StatusCode::ACCEPTED,
-        [(CACHE_CONTROL, "no-store")],
-        Json(json!({"api_version": API_VERSION, "id": id})),
+        [(CACHE_CONTROL, "no-store"), (VARY, "Accept")],
+        body,
     )
         .into_response()
+}
+
+fn accepts_progress(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value.split(',').any(|range| {
+                let mut parts = range.split(';');
+                let media_type = parts.next().unwrap_or_default().trim();
+                media_type.eq_ignore_ascii_case(sse::MEDIA_TYPE)
+                    && parts
+                        .filter_map(|param| param.trim().split_once('='))
+                        .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                        .is_none_or(|(_, quality)| {
+                            quality
+                                .trim()
+                                .parse::<f32>()
+                                .is_ok_and(|value| value > 0.0 && value <= 1.0)
+                        })
+            })
+        })
 }
 
 #[loki_api(
@@ -88,11 +164,7 @@ async fn sync_progress(
             "找不到该邮件同步任务。",
         );
     };
-    (
-        [(CACHE_CONTROL, "no-store")],
-        Json(json!({"api_version": API_VERSION, "sync": sync})),
-    )
-        .into_response()
+    ([(CACHE_CONTROL, "no-store")], Json(SyncEvent::new(sync))).into_response()
 }
 
 #[loki_api(

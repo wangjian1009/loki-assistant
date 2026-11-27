@@ -1,7 +1,6 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit'
 import { deviceInfo } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
-import { HttpResponder } from 'liblokiworkspace.so'
 import { Application } from '../app/Application'
 import { handleNavigation } from '../app/HttpNavigation'
 import { NavigatorManager, launchPath } from '../app/NavigatorManager'
@@ -41,13 +40,16 @@ export default class EntryAbility extends UIAbility {
       if (this.httpEnabled) {
         await application.prepare()
         if (this.application !== application || !this.httpEnabled) return
-        await application.workspace.startHttpServer((method: string, body: string, respond: HttpResponder): void => {
+        const workspace = await application.workspace.open()
+        if (this.application !== application || !this.httpEnabled) return
+        workspace.startHttpServer(8787, (id: string, method: string, body: string): void => {
+          const respond = (status: number, response: string): void => { workspace.respondHttp(id, status, response) }
           handleNavigation(navigator, method, body, respond).catch((error: Error): void => {
             console.error('处理 HTTP 导航失败：' + error.message)
           })
         })
       } else {
-        await application.workspace.stopHttpServer()
+        await (await application.workspace.open()).stopHttpServer()
       }
     }).catch((error: Error): void => {
       console.error('切换调试 HTTP 服务失败：' + error.message)

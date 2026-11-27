@@ -43,6 +43,10 @@ pub struct ModuleSummary {
 pub struct ApiMetadata {
     /// 访问范围。`local` 限本机，`paired` 允许本机和已绑定设备调用。
     pub access: String,
+    /// 是否支持通过 SSE 读取响应。远端还需满足访问范围。
+    pub supports_sse: bool,
+    /// 事件名称和各事件的 JSON 数据结构。
+    pub sse_events: Vec<SseEventMetadata>,
     /// API 在所属模块中的标识。
     pub id: String,
     /// HTTP 请求方法，例如 `GET`。
@@ -69,6 +73,8 @@ impl ApiMetadata {
     pub fn new(id: &str, method: &str, path: &str, summary: &str, description: &str) -> Self {
         Self {
             access: "local".to_owned(),
+            supports_sse: false,
+            sse_events: Vec::new(),
             id: id.to_owned(),
             method: method.to_owned(),
             path: path.to_owned(),
@@ -94,6 +100,12 @@ impl ApiMetadata {
         self.parameters = parameters;
         self
     }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SseEventMetadata {
+    pub event: &'static str,
+    pub data_schema: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

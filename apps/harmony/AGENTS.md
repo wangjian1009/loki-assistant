@@ -8,13 +8,15 @@
 - `entry/src/main/ets/pages/Index.ets` 展示当前电脑的连接和设备详情。无当前目标时引导前往 `pages/Devices.ets`，该页负责用 Scan Kit 扫码添加电脑、选择唯一 Network 目标和处理绑定失败记录。`pages/Settings.ets` 负责手机名称编辑。三个页面共用 `components/AppPage.ets` 的左侧导航。`ets/app/Application.ets` 管理电脑列表、手机名称、目标选择、绑定结果与完整配置持久化。
 - `ets/app/NavigatorManager.ets` 统一管理首屏、应用内导航和完整的逻辑页面路径。EntryAbility 在加载主窗口前解析 Want，首屏只加载路径的末级页面，逐级返回时再加载尚未显示的父页面。Want 和 Debug 导航测试接口使用 `Index`、`Devices`、`Settings` 页面名称，由 NavigatorManager 转换为 ArkUI 页面路径。测试服务通过 `httpApiEnabled` 临时启停，仅监听设备回环地址。
 - Rust `Workspace` 创建 Tokio runtime 与唯一 `Arc<Network>`，不从应用数据中自动选择目标。调试 HTTP 监听与连接由同一个 Workspace 持有，导航请求经 NAPI 交给 ArkTS，`GET /service/…` 复用当前 Network 与绑定凭据。`storage.rs` 只解释本机随机身份，其余 JSON 由应用层解释，沿用私有 `devices.json`、`0600` 权限与原子替换；损坏禁止覆盖，私钥不向 ArkTS 导出。
-- `Network` 只设置一个 `Service`，提供 `set_service()`、`service()` 和异步 `request()`，不提供公开 `bind()` 或确认方法。未绑定配置中的 `auto_binding` 交给 Network 自动异步执行，成功保存凭据、失败保存错误，结果通过 `service()` 获取。业务保存返回的完整 `endpoint_id/relay_url/relay_token/binding`，下次读取后重新设置恢复连接。不得按请求重建 Workspace、查找全局 Network 或维护多个 Network 目标。
+- `Network` 只设置一个 `Service`，提供 `set_service()`、`service()`、异步 `request()` 和 `request_sse()`，不提供公开 `bind()` 或确认方法。未绑定配置中的 `auto_binding` 交给 Network 自动异步执行，成功保存凭据、失败保存错误，结果通过 `service()` 获取。业务保存返回的完整 `endpoint_id/relay_url/relay_token/binding`，下次读取后重新设置恢复连接。不得按请求重建 Workspace、查找全局 Network 或维护多个 Network 目标。
 - `BindingState` 使用 `Unbound` / `Binding` / `Failed { error }` / `Bound { credential }` 数据 Union，凭据由电脑绑定接口签发并用于每次业务请求，不能以业务布尔值或绑定时间代替。只有绑定接口允许不携带凭据；状态查询也必须验证身份和 token。
 - `ResponsError` 是直接返回的数据 Union，分为未设置、未绑定、网络、取消、Services 和参数错误，各分支分别定义 reason。ArkTS 请求采用成功/错误回调，直接返回 Union，不包装成 Error 类。
-- `network.rs` 提供单目标通信与绑定；`pairing.rs` 校验邀请；`error.rs` 定义错误；`workspace.rs` 提供实例分发和生命周期；`cpp/workspace.cpp` 只提供 NAPI 桥接。完整配置供业务存储，凭据不进入 UI、错误、监控或日志，Rust Debug 隐藏凭据。
+- `library/service-proxy` 提供网络绑定、请求与响应类型、缓存以及泛型监听。邮件和 Slack 各自定义服务端交互与业务类型；HarmonyOS 的界面组件分别位于 `ets/features/mail/`、`ets/features/slack/`。应用内 `workspace.rs` 负责实例和生命周期，`rust/src/napi.rs` 用 Rust 宏导出 NAPI 绑定。完整配置供业务存储，凭据不进入 UI、错误、监控或日志，Rust Debug 隐藏凭据。
+- NAPI 只向 UI 暴露 Rust 已声明的类型和方法，由 `apps/harmony/` 内的 Rust 宏生成绑定及 ArkTS 类型声明。每个导出的类型和方法与 Rust 声明一一对应，保留所属类型、参数、返回值、错误及回调语义。
+- NAPI 仅负责跨语言值转换、Rust 对象句柄与回调转发。禁止在绑定中新增业务字段、合并或拆分 Rust 方法、以字符串操作名代替显式方法，或加入业务校验、状态管理和流程编排。业务规则、状态结构和生命周期由对应的 Rust 模块定义。
 - `Workspace.stop()` 先同步通知网络关闭，再等待未完成请求取消回调并释放 runtime；NAPI 取消和停止信号不等待异步工作线程。停止须幂等，停止后不隐式重新打开。
-- 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。当前设备页通过 `GET /status` 读取电脑名称、设备类型、Slack 和邮件状态。点击「立即同步邮件」调用 `POST /mail/sync`，按返回的任务 ID 从状态快照读取同步进度。名称和类型仅用于展示。
-- 界面只显示离线、绑定中、绑定失败、在线。只轮询当前选中电脑，绑定中每轮结束后间隔 1 秒读取 Service，其他情况每轮结束后 20 秒刷新；后台停止。失败错误来自 Service 的 ResponsError，提示删除后重新扫码绑定；删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
+- 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。服务代理通过一次 `GET /status` 更新电脑名称、设备类型、Slack 和邮件状态。邮件业务通过代理发起 `POST /mail/sync`，优先从 SSE 事件接收进度，必要时按任务 ID 查询状态快照。名称和类型仅用于展示。
+- 界面只显示离线、绑定中、绑定失败、在线。界面注册服务代理监听，退到后台时解除。代理有订阅时只刷新当前选中电脑，绑定中每轮结束后间隔 1 秒，已绑定时每轮结束后间隔 20 秒。失败错误来自 Service 的 ResponsError，提示删除后重新扫码绑定；删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
 
 - `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。
 - `bundleName` 为 `cc.github.wangjian1009.assistant`，由 `AppScope/app.json5` 定义。

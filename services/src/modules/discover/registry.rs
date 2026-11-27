@@ -1,6 +1,6 @@
 use linkme::distributed_slice;
 
-use super::model::{ApiMetadata, ModuleMetadata};
+use super::model::{ApiMetadata, ModuleMetadata, SseEventMetadata};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleRegistration {
@@ -13,6 +13,7 @@ pub struct ModuleRegistration {
 #[derive(Clone, Copy, Debug)]
 pub struct ApiDescriptor {
     pub access: &'static str,
+    pub sse_event: Option<fn() -> SseEventMetadata>,
     pub module_id: &'static str,
     pub id: &'static str,
     pub method: &'static str,
@@ -58,7 +59,7 @@ pub(super) fn metadata_for(remote: bool) -> Vec<ModuleMetadata> {
         .filter(|api| !remote || api.access == "paired")
     {
         if let Some(module) = modules.iter_mut().find(|module| module.id == api.module_id) {
-            module.apis.push(
+            let mut metadata =
                 ApiMetadata::new(api.id, api.method, api.path, api.summary, api.description)
                     .with_access(api.access)
                     .with_parameters(
@@ -72,8 +73,12 @@ pub(super) fn metadata_for(remote: bool) -> Vec<ModuleMetadata> {
                                 description: parameter.description.to_owned(),
                             })
                             .collect(),
-                    ),
-            );
+                    );
+            if let Some(event) = api.sse_event {
+                metadata.supports_sse = true;
+                metadata.sse_events.push(event());
+            }
+            module.apis.push(metadata);
         }
     }
     if remote {

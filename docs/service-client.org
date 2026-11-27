@@ -1,19 +1,21 @@
-#+TITLE: Workspace 与 Network 统一访问接口
+#+TITLE: Workspace 与 ServiceProxy 统一访问接口
 
 * 实现与职责
 
-手机应用通过 ~Workspace~ 持有唯一 ~Network~ 。Rust 不再提供 DeviceManager 或多设备集合；ArkTS ~Application~ 管理电脑列表、手机名称、目标选择和持久化，业务请求始终发给 Network 当前唯一的 Service。
+~library/service-proxy~ 提供平台无关的 Rust 服务代理。HarmonyOS 的 ~Workspace~ 创建 Tokio runtime 和共享的 ~Network~ 、 ~ServiceProxy~ 。ArkTS ~Application~ 管理电脑列表、手机名称、目标选择和持久化。业务数据来自当前绑定的唯一 Service。
 
 | 对象 | 职责 |
 |------+------|
 | Rust ~Workspace~ | 创建 Tokio runtime 和一个 Network，持有本机随机身份及通用私有存储适配，不选择电脑 |
 | ~Network~ | 设置唯一 Service，查询当前绑定数据和错误，自动绑定、认证请求、连接复用、超时和取消 |
+| ~ServiceProxy~ | 缓存当前目标的 API、配置和状态元数据，缓存配置和状态数据，发布类型化订阅更新 |
 | ~Service~ | 当前电脑 Endpoint ID、中继配置以及携带协议凭据的绑定状态 |
+| ~mail~ 和 ~slack~ | 声明各自的请求及业务数据类型，消费代理的数据快照和事件 |
 | ArkTS ~Application~ | 管理多台电脑、选择、名称、状态展示与完整配置持久化 |
 | ~HttpDispatcher~ | 电脑端将认证后的通用请求转为进程内 HTTP 调用 |
-| NAPI | 复用原生 Workspace；异步执行请求，直接转交结果与 ResponsError Union |
+| NAPI | 由 Rust 宏导出对象和方法，转换参数与返回值并转发回调 |
 
-手机业务 → Network.request → iroh → 电脑 Network 身份和凭据校验 → 进程内 HTTP request → 现有 Axum handler → 响应回调。
+手机业务 → ServiceProxy → Network → iroh → 电脑身份与凭据校验 → 进程内 Axum Router → 业务 handler。
 
 * 创建、绑定与恢复
 
@@ -56,8 +58,8 @@ interface Service {
 ~network.service()~ 是本地查询，返回完整配置、绑定状态、绑定错误与运行时代次，未设置时返回 None / null。业务获取并持久化成功配置，下次重新设置：
 
 #+begin_src typescript
-await workspace.network.setService(savedService)
-const current = await workspace.network.service()
+workspace.setService(savedService)
+const current = workspace.service()
 // 保存 endpoint_id、relay_url、relay_token、binding，以及仍在绑定时的 auto_binding。
 // generation 仅用于当前进程关联，不作为授权依据。
 #+end_src
@@ -68,17 +70,25 @@ Network 不读写多设备列表；应用保留完整配置和随机手机身份
 
 * 界面状态
 
-设备页面仅展示四种状态：离线、绑定中、绑定失败、在线。~binding~ 对应绑定中，~failed~ 显示 Service 保存的具体错误，并提示“请删除此设备后重新扫码绑定”。~bound~ 仅表示持有绑定票据，在线必须由实际认证请求确定；网络失败显示离线，不删除有效票据。绑定中每轮结束后间隔 1 秒查询本地 Service，其他状态每轮结束后间隔 20 秒刷新，后台停止轮询。
+设备页面展示离线、绑定中、绑定失败和在线。~binding~ 对应绑定中，~failed~ 显示 Service 保存的具体错误，并提示“请删除此设备后重新扫码绑定”。已绑定目标通过认证状态请求确认在线。网络失败时显示离线，保留绑定凭据。
+
+* 代理缓存与订阅
+
+~ServiceProxy~ 使用 ~generation~ 隔离切换前后的电脑数据。切换目标时清空上一个目标的快照与缓存。API 元数据按模块读取 ~GET /discover/modules/{module_id}~ ，配置元数据使用 ~GET /meta~ ，状态元数据使用 ~GET /stats/meta~ 。读取配置值时由 ~refresh_config~ 查询 ~GET /data/{module_id}~ ， ~cached_config~ 返回该目标已缓存的配置。代理从同一次 ~GET /status~ 获得电脑状态以及邮件、Slack 等已公开的业务状态。
+
+~ServiceProxy::listen~ 接收返回类型化数据的快照投影和更新回调。订阅先收到当前快照，后续在投影结果变化时回调。~ServiceSnapshot::status<T>~ 将对应模块状态反序列化为业务类型。HarmonyOS 首页订阅设备状态，邮件和 Slack 卡片分别调用 Rust ~Mail::watch_status~ 和 ~Slack::watch_status~ 。卡片移除时调用 ~StatusSubscription::cancel~ 并释放模块句柄。代理在有订阅时跟踪目标变化和刷新状态，绑定中以 1 秒为间隔，已绑定目标以 20 秒为间隔。界面可请求即时刷新，后台结束首页订阅。
+
+邮件模块定义同步请求、普通响应、进度事件与状态投影。任务进度优先来自 SSE，普通 JSON 请求和断流后通过共享状态快照中的 ~mail/sync_runs~ 查询。Slack 首页数据从同一个快照恢复为类型化对象。
 
 * 异步请求与取消
 
-Rust ~network.request<T>(request, options, on_success, on_error)~ 立即返回 ~RequestHandle~ ，异步触发一个成功或错误回调。请求填写 method、path、query 和 JSON body，不传目标、ALPN 或 token。
+Rust ~network.request(request, options, on_success, on_error)~ 立即返回 ~RequestHandle~ ，异步触发一个成功或错误回调。~ServiceRequest<B>~ 包含 method、path、query 和可经 Serde 编码的 body，成功回调接收 ~ServiceResponse<T>~ 。业务模块定义 ~B~ 和 ~T~ ，Network 使用当前绑定的目标及凭据。
 
 #+begin_src typescript
-const handle = workspace.network.request({
-  method: 'GET', path: '/status'
-}, (response) => {
-  // status、request_id、body 和 generation 保留；状态中包含电脑 name / device_type。
+const handle = workspace.network().request({
+  method: 'GET', path: '/status', query: []
+}, { timeout_ms: 10000 }, (response) => {
+  // data 对应 Rust ServiceResponse::data，其中包含电脑 name 和 device_type。
 }, (error: ResponsError) => {
   // 直接按 kind 和该分支自己的 reason 分流，不包装成 Error 类。
 })
@@ -130,24 +140,87 @@ pub struct DispatchRequest {
     pub path: String,
     pub query: Vec<QueryParameter>,
     pub body: Option<serde_json::Value>,
+    pub response_mode: ResponseMode,
 }
 
-pub struct DispatchResponse {
-    pub status: http::StatusCode,
-    pub body: serde_json::Value,
+pub enum ResponseMode {
+    Json,
+    Sse,
 }
 
-pub type DispatchFuture = Pin<Box<dyn Future<Output = DispatchResponse> + Send>>;
+pub type DispatchFuture = Pin<Box<dyn Future<Output = axum::response::Response> + Send>>;
 pub trait RequestDispatcher: Send + Sync {
     fn dispatch(&self, context: RequestContext, request: DispatchRequest) -> DispatchFuture;
 }
 #+end_src
 
-HttpDispatcher 构造 HTTP request，编码 query 和 body，将认证后的设备 Endpoint ID 注入 Axum 请求扩展以及 ~x-loki-device~ 和 ~x-loki-remote-devices~ 请求头，然后调用 Router 并读取 HTTP 状态与 JSON body。
+HttpDispatcher 构造 HTTP request，编码 query 和 body，将认证后的设备 Endpoint ID 注入 Axum 请求扩展以及 ~x-loki-device~ 和 ~x-loki-remote-devices~ 请求头，再调用 Router。Network 按响应模式写回普通 JSON 或事件帧。
 
 Services 组合根通过 ~attach_remote~ 注入基于 Weak 引用的 Router 工厂。请求使用现有业务实例，不形成 Network → Router → Services 的永久循环持有，也不复制 handler。~peer_id~ 只来自 iroh 已认证连接，不能从请求 JSON 或 HTTP header 伪造。
 
 API 使用 ~#[loki_api(access = "paired")]~ 显式开放给绑定设备，默认 ~local~ 。未开放的接口返回 ~remote-api-forbidden~ 。配置项和状态项各自声明远端访问范围。[[file:control-center-services.org::*通用 services 请求通道][通用 services 请求通道]]
+
+* SSE 远程请求
+
+** 手机 Rust 接口
+
+~Network::request_sse~ 使用当前配置的唯一 ~Service~ 和绑定凭据发送 SSE 请求。核心层根据业务提供的事件类型通过 Serde 恢复对象。事件类型由各业务模块维护。
+
+#+begin_src rust
+pub struct SseRequestOptions {
+    pub open_timeout: Duration,
+    pub idle_timeout: Duration,
+}
+
+pub struct SseEvent<T> {
+    pub event: String,
+    pub data: T,
+    pub id: Option<String>,
+}
+
+pub enum SseUpdate<E> {
+    Opened(ServiceResponse<()>),
+    Event(E),
+}
+
+pub trait SseEventType: DeserializeOwned {
+    fn supported(&self) -> bool { true }
+}
+
+impl Network {
+    pub fn request_sse<E: SseEventType + Send + 'static>(
+        &self,
+        request: ServiceRequest<impl Serialize + Send + Sync + 'static>,
+        options: SseRequestOptions,
+        on_update: impl FnMut(SseUpdate<E>) + Send + 'static,
+        on_end: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
+    ) -> RequestHandle;
+}
+#+end_src
+
+~Opened~ 包含 HTTP 状态码、请求 ID 和目标代次，在成功响应且媒体类型为 ~text/event-stream~ 时首先送达。之后依序回调已通过业务类型解码的事件。邮件事件类型接收未知事件名并通过 ~SseEventType::supported()~ 跳过，Serde 按业务定义忽略未知字段。无效 JSON 或已知事件的数据无法解码时，核心层结束请求并返回 ~invalid_response~ 。心跳只更新空闲计时。
+
+~on_end~ 恰好调用一次。正常结束传入 ~Ok(())~ ，HTTP 拒绝、异常断开、超时或显式取消传入现有的 ~ResponsError~ 。~RequestHandle.cancel()~ 取消该条流，切换目标与 ~Workspace.stop()~ 取消该目标的在途流。ArkTS Workspace 保留回调顺序，业务按 ~generation~ 丢弃旧目标的事件。业务负责决定是否重新订阅。
+
+** iroh 帧
+
+~loki-assistant/services/1~ 的请求 JSON 用可选字段 ~response_mode: "sse"~ 选择 SSE，缺省为单次 JSON 响应。流式请求复用原有 QUIC 连接，每次申请一条双向 stream。请求发完后关闭手机到电脑的送端，电脑通过该 stream 的反向送端返回响应。
+
+电脑验证 Endpoint ID、绑定凭据、HTTP 方法和路由访问范围。路由同时声明 ~access = "paired"~ 和 SSE 事件类型时，服务端生成 ~Accept: text/event-stream~ 并调用现有 Axum Router。手机可通过 ~GET /discover/modules/{module_id}~ 查询路由元数据。 [[file:core-module-interface.org::*模块与 API 元数据][API 元数据]]
+
+每帧包含 4 字节大端长度和对应长度的 UTF-8 JSON。首帧包含 ~api_version~ 、 ~request_id~ 、 ~status~ 和 ~content_type~ 。成功时 ~content_type~ 为 ~text/event-stream~ ，后续每帧含事件名 ~event~ 、JSON 数据 ~data~ 和可选的事件标识 ~id~ 。失败时 ~content_type~ 为 ~application/json~ ，首帧中的 ~body~ 包含标准错误对象，随后由 FIN 结束。QUIC 数据块可以跨越 JSON 帧边界。
+
+#+begin_src json
+{"event":"sync","data":{"api_version":"1","sync":{"id":"550e8400-e29b-41d4-a716-446655440000","phase":"queued","messages":[],"error":null}}}
+#+end_src
+
+~open_timeout~ 默认 10 秒，覆盖发起请求到读取首帧。~idle_timeout~ 默认 40 秒，限制两次收到数据的间隔。持续无事件时，电脑每隔 15 秒发送一个零长度帧作为心跳。响应头上限 16 KiB，事件帧上限 1 MiB。电脑通过 FIN 正常结束响应，编码或写入失败时 reset stream。取消或解绑时关闭订阅流并释放额度。慢客户端依赖 QUIC 背压，邮件服务合并缓冲中的最新快照。 [[file:control-center-services.org::*通用 services 请求通道][请求额度与错误]]
+
+** 邮件同步接入
+
+- 邮件模块声明创建同步的请求、JSON 响应和 SSE 事件类型。~POST /mail/sync~ 可选择 SSE 或普通 JSON。流中首个事件发送任务快照，后续更新及结束语义与本机托盘一致。 [[file:control-center-services.org::*手动同步与进度][邮件同步响应]]
+- 手机通过发现接口检查 ~POST /mail/sync~ 的 ~supports_sse~ 。旧电脑可以用普通 JSON 请求同步。通过 ~GET /status~ 的 ~mail/sync_runs~ 按任务 ID 查询进度，适用于普通 JSON 或事件流中断后的状态恢复。
+- 应用进入后台后结束首页的状态订阅。切换电脑时旧目标的请求与事件流会被取消，旧电脑继续执行已开始的同步。
 
 * 设备名称与类型
 

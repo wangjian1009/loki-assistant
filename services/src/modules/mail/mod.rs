@@ -4,6 +4,9 @@ mod routes;
 mod status;
 mod sync;
 
+#[cfg(test)]
+pub(super) use sync::tests::relay_test_sync_router;
+
 use std::{path::PathBuf, sync::Arc};
 
 use axum::Router;

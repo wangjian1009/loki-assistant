@@ -1,6 +1,34 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::LazyLock};
+
+use regex::Regex;
 
 const MAX_DETAILS: usize = 3;
+
+pub(super) fn mbsync_progress(line: &str) -> Option<String> {
+    static COUNTS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"^(?:(?:far|near|master|slave) side: [0-9]+ messages, [0-9]+ recent|",
+            r"Channels: [0-9]+ +Boxes: [0-9]+",
+            r"(?: +(?:Far|Near|Master|Slave): \+[0-9]+ \*[0-9]+ (?:#[0-9]+ )?-[0-9]+){2})$",
+        ))
+        .expect("mbsync 计数格式有效")
+    });
+    if COUNTS.is_match(line) {
+        return Some(line.into());
+    }
+    // 不把配置路径、存储名称或邮箱名称从详细输出复制到进度。
+    let status = match line {
+        "Synchronizing..." => "正在同步邮件。",
+        _ if line.starts_with("Reading configuration file ") => "正在读取同步配置。",
+        _ if line.starts_with("Channel ") => "正在处理同步通道。",
+        _ if line.starts_with("Opening ") && line.contains(" store ") => "正在打开邮件存储。",
+        _ if line.starts_with("Opening ") && line.contains(" box ") => "正在打开邮箱。",
+        _ if line.starts_with("Loading ") && line.ends_with(" box...") => "正在读取邮箱中的邮件。",
+        _ if line.starts_with("Connecting to ") => "正在连接 IMAP 服务器。",
+        _ => return mbsync_detail(line),
+    };
+    Some(status.into())
+}
 
 pub(super) fn with_detail(mut message: String, command: &str, stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);

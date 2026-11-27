@@ -24,7 +24,7 @@
       (let ((loki-assistant-mail-inbox-bookmark-key ?x))
         (should-error (loki-assistant-mail-open-inbox) :type 'user-error)))))
 
-(ert-deftest loki-assistant-test-mail-index-waits-and-sends-only-final-result ()
+(ert-deftest loki-assistant-test-mail-index-reports-progress-and-one-final-result ()
   (let ((loki-assistant-mail--index-job nil)
         (mu4e--server-process 'test-mu)
         (mu4e--server-indexing t)
@@ -56,17 +56,24 @@
       (funcall tick)
       (funcall tick)
       (should (equal starts '(started)))
-      (loki-assistant-mail--handle-index-reply #'ignore
-       '(:info index :status running :checked 2 :updated 1))
-      (should-not results)
+      (dotimes (_ 2)
+        (loki-assistant-mail--handle-index-reply #'ignore
+         '(:info index :status running :checked 2 :updated 1)))
+      (should (equal results
+                     '(("POST" "/mail/index/result/fixture"
+                        ((status . "running") (index (checked . 2) (updated . 1)))))))
+      (should loki-assistant-mail--index-job)
       (dotimes (_ 2)
         (loki-assistant-mail--handle-index-reply #'ignore
          '(:info index :status complete :checked 20 :updated 1 :cleaned-up 0)))
-      (should (equal results
+      (should (equal (car results)
+                     '("POST" "/mail/index/result/fixture"
+                       ((status . "completed")
+                        (database (program . "/opt/mu") (home . "/test/mail")
+                                  (index (checked . 20) (updated . 1) (cleaned_up . 0)))))))
+      (should (equal (cdr results)
                      '(("POST" "/mail/index/result/fixture"
-                        ((status . "completed")
-                         (database (program . "/opt/mu") (home . "/test/mail")
-                                   (index (checked . 20) (updated . 1) (cleaned_up . 0))))))))
+                        ((status . "running") (index (checked . 2) (updated . 1)))))))
       (should (eq cancelled 'test-timer))
       (should-not loki-assistant-mail--index-job))))
 

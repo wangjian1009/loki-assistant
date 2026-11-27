@@ -454,6 +454,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         .router()
         .merge(crate::modules::discover::Module::new().router())
         .merge(fixture.status.router())
+        .merge(crate::modules::mail::relay_test_sync_router())
         .merge(crate::modules::password::Module::new(None).router())
         .merge(
             crate::modules::emacs::Module::new(
@@ -847,6 +848,8 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         );
     }
     check_remote_metadata_and_permissions(network.clone(), &fixture, &remote_config_service).await;
+    check_service_proxy(network.clone()).await;
+    check_remote_sse(&network).await;
     let missing = channel_request(network.clone(), ServiceRequest::get("/missing"))
         .await
         .unwrap_err();
@@ -898,6 +901,170 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     relay.shutdown().await.unwrap();
 }
 
+async fn check_service_proxy(network: Arc<loki_mobile_network::network::Network>) {
+    use loki_mobile_network::{
+        mail::{Mail, MailActivity, MailStatus, MailSyncPhase},
+        service_proxy::{
+            ConfigBasicType, ConfigDataType, ConfigSource, ServiceProxy, StatusSchema,
+        },
+        slack::SlackStatus,
+    };
+
+    let proxy = ServiceProxy::new(network, tokio::runtime::Handle::current());
+    let generation = proxy.snapshot().generation;
+    let (api, config, status) = tokio::try_join!(
+        proxy.api_metadata(generation, "mail"),
+        proxy.config_metadata(generation),
+        proxy.status_metadata(generation),
+    )
+    .unwrap();
+    assert_eq!(api.apis.len(), 1);
+    let sync = &api.apis[0];
+    assert_eq!(sync.id, "sync");
+    assert_eq!(sync.method, "POST");
+    assert_eq!(sync.path, "/mail/sync");
+    assert!(sync.supports_sse);
+    assert_eq!(sync.sse_events[0].event, "sync");
+    assert_eq!(sync.sse_events[0].data_schema["type"], "object");
+
+    let network_config = config
+        .modules
+        .iter()
+        .find(|module| module.id == "network")
+        .unwrap();
+    assert_eq!(network_config.items.len(), 1);
+    assert_eq!(network_config.items[0].key, "relay_url");
+    assert!(matches!(
+        network_config.items[0].data_type,
+        ConfigDataType::Basic(ConfigBasicType::String)
+    ));
+    assert_eq!(network_config.items[0].attributes["remote_access"], "read");
+    assert!(
+        proxy
+            .cached_config(generation, "network")
+            .unwrap()
+            .is_none()
+    );
+    let values = proxy.refresh_config(generation, "network").await.unwrap();
+    assert_eq!(values.values["relay_url"].value, "");
+    assert!(matches!(
+        values.values["relay_url"].source,
+        ConfigSource::Default
+    ));
+    let cached = proxy.cached_config(generation, "network").unwrap().unwrap();
+    assert_eq!(
+        cached.values["relay_url"].value,
+        values.values["relay_url"].value
+    );
+
+    assert!(status.modules.iter().all(|module| module.id != "emacs"));
+    let mail_status = status
+        .modules
+        .iter()
+        .find(|module| module.id == "mail")
+        .unwrap();
+    let runs = mail_status
+        .items
+        .iter()
+        .find(|item| item.key == "sync_runs")
+        .unwrap();
+    assert!(runs.remote_access);
+    assert!(matches!(runs.schema, StatusSchema::Array { .. }));
+
+    let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let listener = proxy.listen(
+        |snapshot| {
+            (
+                MailStatus::from_snapshot(snapshot).zip(SlackStatus::from_snapshot(snapshot)),
+                MailActivity::from_snapshot(snapshot),
+            )
+        },
+        move |status| updates.send(status).is_ok(),
+    );
+    let (mail, slack) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let (Some(status), _) = received.recv().await.unwrap() {
+                break status;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(mail.unread_count, Some(3));
+    assert_eq!(mail.unread_subjects, ["测试邮件"]);
+    assert_eq!(slack.unread_previews[0].preview, "新消息");
+
+    let target = proxy.snapshot().endpoint_id.unwrap();
+    Mail::new(proxy).start_sync(&target).unwrap();
+    let sync = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, activity) = received.recv().await.unwrap();
+            if let Some(sync) = activity.and_then(|activity| activity.sync)
+                && sync.progress.phase == MailSyncPhase::Completed
+            {
+                break sync;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    listener.abort();
+    assert_eq!(sync.messages, ["同步测试邮件。"]);
+}
+
+async fn check_remote_sse(network: &loki_mobile_network::network::Network) {
+    use loki_mobile_network::network::{
+        ResponsError, ServiceRequest, SseEvent, SseRequestOptions, SseUpdate,
+    };
+
+    let (updates, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let (end, completed) = tokio::sync::oneshot::channel();
+    let _request = network.request_sse::<SseEvent<TestEvent>>(
+        ServiceRequest::get("/network-test/events"),
+        SseRequestOptions::default(),
+        move |update| updates.send(update).unwrap(),
+        move |result| end.send(result).unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let SseUpdate::Opened(head) = events.recv().await.unwrap() else {
+            panic!("首帧应是响应头");
+        };
+        assert_eq!(head.status, 200);
+        for text in ["同步开始", "已完成"] {
+            let SseUpdate::Event(event) = events.recv().await.unwrap() else {
+                panic!("响应头之后应收到事件");
+            };
+            assert_eq!(event.event, "test");
+            assert_eq!(event.data.text, text);
+        }
+        completed.await.unwrap().unwrap();
+        assert!(events.recv().await.is_none());
+    })
+    .await
+    .unwrap();
+
+    for (path, status, code) in [
+        ("/network/session", 406, "sse-not-supported"),
+        ("/network/peers", 403, "remote-api-forbidden"),
+    ] {
+        let (end, completed) = tokio::sync::oneshot::channel();
+        let _request = network.request_sse::<SseEvent<TestEvent>>(
+            ServiceRequest::get(path),
+            SseRequestOptions::default(),
+            |_| panic!("失败响应不应回调事件"),
+            move |result| end.send(result).unwrap(),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(10), completed)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(error, ResponsError::Services(error) if error.status == status && error.code == code)
+        );
+    }
+}
+
 async fn check_remote_metadata_and_permissions(
     network: Arc<loki_mobile_network::network::Network>,
     fixture: &Fixture,
@@ -927,6 +1094,11 @@ async fn check_remote_metadata_and_permissions(
     fixture
         .status
         .publish("service", "name", json!("测试电脑"))
+        .await
+        .unwrap();
+    fixture
+        .status
+        .publish("service", "device_type", json!("computer"))
         .await
         .unwrap();
     fixture
@@ -1161,6 +1333,35 @@ async fn query_channel(
     headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
     echo_channel(id, query, headers, axum::body::Bytes::new()).await
+}
+
+#[derive(Debug, schemars::JsonSchema, serde::Serialize, serde::Deserialize)]
+struct TestEvent {
+    text: String,
+}
+
+impl crate::http::sse::SseEvent for TestEvent {
+    const EVENT: &'static str = "test";
+}
+
+#[loki_services_macros::loki_api(
+    module = "network-test",
+    mount = "()",
+    id = "events",
+    method = "GET",
+    path = "/network-test/events",
+    access = "paired",
+    sse_event = TestEvent,
+    summary = "测试流式 HTTP 通道",
+    description = "验证编码后的 SSE 事件可由手机恢复为对象。"
+)]
+async fn event_channel(
+    remote: Option<axum::Extension<crate::http::sse::RemoteSse>>,
+) -> axum::response::Response {
+    let events = futures_util::stream::iter(
+        ["同步开始", "已完成"].map(|text| TestEvent { text: text.into() }),
+    );
+    crate::http::sse::response(events, remote.map(|axum::Extension(remote)| remote))
 }
 
 #[loki_services_macros::loki_api(

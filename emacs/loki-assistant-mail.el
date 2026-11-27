@@ -36,7 +36,7 @@
   :group 'loki-assistant)
 
 (cl-defstruct loki-assistant-mail--index-job
-  id process deadline timer started)
+  id process deadline timer started last-counts)
 
 (defvar loki-assistant-mail--index-job nil
   "当前由 services 委托给 Emacs 的索引任务。")
@@ -73,28 +73,41 @@ INDEX-INFO 非空时附带索引计数。"
         (when (natnump removed)
           `((cleaned_up . ,removed))))))
 
+(defun loki-assistant-mail--report-index (job result)
+  "将 JOB 的索引进度或最终 RESULT 异步回报给 services。"
+  (require 'loki-assistant)
+  (loki-assistant-request
+   "POST" (format "/mail/index/result/%s" (loki-assistant-mail--index-job-id job))
+   :body result :timeout 5
+   :callback
+   (lambda (response)
+     (unless (or (plist-get response :ok)
+                 (equal (plist-get response :error-code) "mail-index-request-not-found"))
+       (message "邮件索引回报失败：%s" (plist-get response :error-message))))))
+
+(defun loki-assistant-mail--report-index-progress (job info)
+  "从 INFO 取出已变化的计数并回报给 JOB。"
+  (when (and (natnump (plist-get info :checked))
+             (natnump (plist-get info :updated)))
+    (let ((counts (loki-assistant-mail--index-counts info)))
+      (unless (equal counts (loki-assistant-mail--index-job-last-counts job))
+        (setf (loki-assistant-mail--index-job-last-counts job) counts)
+        (loki-assistant-mail--report-index job `((status . "running") (index . ,counts)))))))
+
 (defun loki-assistant-mail--finish-index (job result)
   "结束 JOB，并将最终 RESULT 异步回报给 services。"
   (when (eq job loki-assistant-mail--index-job)
     (when-let* ((timer (loki-assistant-mail--index-job-timer job)))
       (cancel-timer timer))
     (setq loki-assistant-mail--index-job nil)
-    (require 'loki-assistant)
-    (loki-assistant-request
-     "POST" (format "/mail/index/result/%s" (loki-assistant-mail--index-job-id job))
-     :body result :timeout 5
-     :callback
-     (lambda (response)
-       (unless (or (plist-get response :ok)
-                   (equal (plist-get response :error-code) "mail-index-request-not-found"))
-         (message "邮件索引结果回报失败：%s" (plist-get response :error-message)))))))
+    (loki-assistant-mail--report-index job result)))
 
 (defun loki-assistant-mail--fail-index (job reason)
   "结束 JOB，并回报失败原因 REASON。"
   (loki-assistant-mail--finish-index job `((status . "failed") (error . ,reason))))
 
 (defun loki-assistant-mail--handle-index-reply (handler info)
-  "静默处理 services 索引的 INFO，完成时发送最终结果。"
+  "静默处理 services 索引的 INFO，并回报当前计数或最终结果。"
   (let ((job loki-assistant-mail--index-job))
     (if (and job (loki-assistant-mail--index-job-started job)
              (eq (loki-assistant-mail--index-job-process job) mu4e--server-process)
@@ -102,12 +115,15 @@ INDEX-INFO 非空时附带索引计数。"
         (let ((mu4e-hide-index-messages t))
           (unwind-protect
               (funcall handler info)
-            (when (eq (plist-get info :status) 'complete)
-              (condition-case err
-                  (loki-assistant-mail--finish-index
-                   job `((status . "completed")
-                         (database . ,(loki-assistant-mail--database info))))
-                (error (loki-assistant-mail--fail-index job (error-message-string err)))))))
+            (pcase (plist-get info :status)
+              ('running
+               (loki-assistant-mail--report-index-progress job info))
+              ('complete
+               (condition-case err
+                   (loki-assistant-mail--finish-index
+                    job `((status . "completed")
+                          (database . ,(loki-assistant-mail--database info))))
+                 (error (loki-assistant-mail--fail-index job (error-message-string err))))))))
       (funcall handler info))))
 
 (defun loki-assistant-mail--advance-index (job)

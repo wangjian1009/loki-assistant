@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 pub mod error;
+pub mod sse;
 
 /// 请求通过已认证的远端入口进入。
 #[derive(Clone, Copy)]
