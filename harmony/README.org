@@ -4,11 +4,11 @@
 
 这是 Loki Assistant 的 HarmonyOS 手机执行中心工程，使用 Stage 模式和 ArkTS，Rust/NAPI 提供 iroh 设备通信。首页显示当前电脑的连接、设备信息、未读消息和邮件同步进度。左侧菜单提供当前设备、设备管理和设置。跨设备同步与后台常驻仍在规划中。
 
-桌面和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。桌面使用系统裁切的分层图标，启动窗口使用静态 PNG。根目录 ~make export-icons~ 将资源导出到 ~AppScope/resources/base/media/~ ，构建直接使用仓库中的导出资源。 [[file:../../docs/icon-design.org][图标设计]]
+桌面和启动窗口使用项目统一的“对话中的 L”图标，与 macOS 应用共用仓库根目录 ~resources/icons/~ 的 SVG 母版。桌面使用系统裁切的分层图标，启动窗口使用静态 PNG。根目录 ~make export-icons~ 将资源导出到 ~AppScope/resources/base/media/~ ，构建直接使用仓库中的导出资源。 [[file:../docs/icon-design.org][图标设计]]
 
 * 设备管理
 
-点击顶部的菜单按钮展开左侧菜单。设备信息卡显示选中电脑的名称和连接状态。点击状态行可在同一张卡片内展开或收起详情，查看最近检查时间、设备类型、绑定时间和设备标识。没有当前设备时，可点击“前往设备管理”添加电脑或选择已有电脑。设计稿见 [[file:../../design/harmony/device-management.fig][HarmonyOS 设备管理]]。
+点击顶部的菜单按钮展开左侧菜单。设备信息卡显示选中电脑的名称和连接状态。点击状态行可在同一张卡片内展开或收起详情，查看最近检查时间、设备类型、绑定时间和设备标识。没有当前设备时，可点击“前往设备管理”添加电脑或选择已有电脑。设计稿见 [[file:../design/harmony/device-management.fig][HarmonyOS 设备管理]]。
 
 在当前设备页顶部下拉并松手，可立即为选中电脑重新订阅状态。刷新面板监听独立的刷新事件，在「当前设备」标题下方显示同步进度和结果。成功状态显示 1 秒，失败状态显示 2 秒，随后自动收起。
 
@@ -26,15 +26,15 @@
 
 扫码后应用将电脑配置设置到 Network，由 Network 自动绑定，不再调用独立绑定接口。电脑二维码有效期为 300 秒，成功绑定后立即从有效队列移除；再次使用同一二维码提示过期。绑定成功后获得 token，除内部绑定握手外，所有远程请求都必须校验身份和 token。失败结果保存在 Service，界面提示删除后扫描新二维码，不保留待确认或重试恢复状态。
 
-手机随机身份、电脑配置和协议签发的凭据保存在应用私有目录的 ~devices.json~ ，使用 ~0600~ 权限和原子替换；成功或失败后清除一次性邀请，显示数据不包含凭据。协议见 [[file:../../docs/control-center-services.org::*扫码绑定][扫码绑定]]。
+手机随机身份、电脑配置和协议签发的凭据保存在应用私有目录的 ~devices.json~ ，使用 ~0600~ 权限和原子替换；成功或失败后清除一次性邀请，显示数据不包含凭据。协议见 [[file:../docs/control-center-services.org::*扫码绑定][扫码绑定]]。
 
 手机应用层 Application 管理多台电脑、名称、目标选择和持久化；Rust Workspace 只构造唯一 Network，不提供 devices 管理模块。Network 只持有当前一个 Service，绑定后可获取完整配置，由应用保存，下次启动重新设置到 Network 即可在请求时恢复连接。旧记录缺少新协议 token 时保留手机身份并提示重新扫码。
 
-邮件和 Slack 的界面组件分别位于 ~ets/features/mail~ 和 ~ets/features/slack~ 。请求、响应和事件类型与服务代理由 [[file:../../library/service-proxy/Cargo.toml][loki-service-proxy]] 定义。
+邮件和 Slack 的界面组件分别位于 ~ets/features/mail~ 和 ~ets/features/slack~ 。请求、响应和事件类型与服务代理由 [[file:../library/service-proxy/Cargo.toml][loki-service-proxy]] 定义。
 
 ArkTS 通过原生 ~Workspace~ 获取 ~Network~ 、 ~Mail~ 和 ~Slack~ 对象。Rust 宏生成 NAPI 导出和方法声明，绑定转换参数与返回值并转发回调。邮件和 Slack 卡片分别向各自的 Rust 对象订阅状态。
 
-通用调试接口 ~Network.request()~ 接收 ~ServiceRequest~ 、 ~RequestOptions~ 以及成功和错误回调。错误直接使用 ~ResponsError~ Union，分别表示未设置、未绑定、网络失败、取消、Services 拒绝与参数错误；各分支独立定义原因。Workspace 停止时取消请求并等待回调，不删除已保存绑定。接口、分发与生命周期见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
+通用调试接口 ~Network.request()~ 接收 ~ServiceRequest~ 、 ~RequestOptions~ 以及成功和错误回调。错误直接使用 ~ResponsError~ Union，分别表示未设置、未绑定、网络失败、取消、Services 拒绝与参数错误；各分支独立定义原因。Workspace 停止时取消请求并等待回调，不删除已保存绑定。接口、分发与生命周期见 [[file:../docs/service-client.org][Workspace 与 Network 接口]]。
 
 * 构建与运行
 
@@ -91,7 +91,7 @@ make run HDC_TARGET="$TEST_DEVICE" HTTP_API_ENABLED=false
 
 GET 返回从根到当前页的完整 ~pages~ 。PUT 接收相同结构并设置页面路径，每一项的 ~url~ 填写页面名称。与启动参数一样，PUT 只加载末级页面。窗口未就绪返回 HTTP 503，跳转进行中或设置页正在编辑名称时 PUT 返回 HTTP 409，无效页面路径返回 HTTP 400。
 
-~GET /service/network/session~ 去掉 ~/service~ 前缀后，通过当前 Network 向选中的电脑发起 ~GET /network/session~ 。其他查询路径按同一规则映射，保留查询参数的顺序和重复项。电脑按已有绑定和接口访问范围处理请求。成功时使用电脑返回的 HTTP 状态码和 JSON 响应体，失败时返回 ~ResponsError~ JSON。电脑拒绝保留其状态码，未选择电脑或请求已取消返回 503，未绑定返回 403，网络超时返回 504，其他通信错误返回 502。协议见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
+~GET /service/network/session~ 去掉 ~/service~ 前缀后，通过当前 Network 向选中的电脑发起 ~GET /network/session~ 。其他查询路径按同一规则映射，保留查询参数的顺序和重复项。电脑按已有绑定和接口访问范围处理请求。成功时使用电脑返回的 HTTP 状态码和 JSON 响应体，失败时返回 ~ResponsError~ JSON。电脑拒绝保留其状态码，未选择电脑或请求已取消返回 503，未绑定返回 403，网络超时返回 504，其他通信错误返回 502。协议见 [[file:../docs/service-client.org][Workspace 与 Network 接口]]。
 
 ~POST /api/v1/device/refresh~ 请求立即刷新当前选中的电脑，接受请求时返回 HTTP 202。当前设备页的刷新面板通过刷新事件显示进度与结果。调试 HTTP 服务由 Rust 的 ~loki-service-proxy~ 提供，Workspace 负责启停。
 

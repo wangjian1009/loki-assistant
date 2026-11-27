@@ -15,7 +15,8 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 
 ## 顶层目录职责
 
-- `apps/`：可独立运行的客户端应用与命令行程序。
+- `apps/`：可独立运行的电脑平台客户端应用与命令行程序。
+- `harmony/`：HarmonyOS 手机助手。
 - `library/`：可由多个应用复用的库。
 - `chrome-plugin/`：Chrome Manifest V3 插件，按功能提供浏览器入口。
 - `center/`：预留的应用编排与唤起层。
@@ -30,7 +31,7 @@ Loki Assistant 是个人使用的助理程序，为手机与电脑协同工作�
 ## 操作入口
 
 - 根目录 `Makefile` 统一提供开发操作，执行 `make help` 查看入口。
-- Makefile 编排 apps 下客户端和 services 的构建、测试、运行与清理；Mac 源码列表与构建设置由各应用的 `CMakeLists.txt` 管理。
+- Makefile 编排 `apps/`、`harmony/` 和 `services/` 的构建、测试、运行与清理；Mac 源码列表与构建设置由各应用的 `CMakeLists.txt` 管理。
 - 新增常用操作时同步 Makefile 帮助和相关 `README.org`，不在文档中另行维护一套重复的操作流程。
 - `make test` 包含 Mac XCTest 与 services workspace 测试。
 

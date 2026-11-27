@@ -265,39 +265,39 @@ release:
 	"$(CMAKE)" --build "$(RELEASE_BUILD_DIR)" --config Release
 
 harmony-help:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" help
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" help
 
 harmony-deps:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" deps
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" deps
 
 harmony-check-sdk:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" check-sdk
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" check-sdk
 
 harmony-build:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" build
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" build
 
 harmony-test:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" test
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" test
 
 harmony-install:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" install
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" install
 
 harmony-run:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" run
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" run
 
 deploy: harmony-deploy
 
 harmony-deploy:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" deploy
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" deploy
 
 harmony-devices:
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" devices
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" devices
 
 harmony-clean:
 	@if [ -f "$(TEST_BUILD_DIR)/CMakeCache.txt" ]; then \
 	  "$(CMAKE)" --build "$(TEST_BUILD_DIR)" --config "$(CONFIG)" --target clean; \
 	fi
-	$(MAKE) -C "$(PROJECT_ROOT)/apps/harmony" clean
+	$(MAKE) -C "$(PROJECT_ROOT)/harmony" clean
 
 clean:
 	@if [ -f "$(BUILD_DIR)/CMakeCache.txt" ]; then \

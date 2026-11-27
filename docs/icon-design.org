@@ -23,8 +23,8 @@ Chrome 插件使用专用彩色母版，L 与气泡放大 45% 并上移居中，
 - [[file:../apps/center/mac/Resources/AppIcon/loki-assistant-menu-v1.png][菜单栏 20 × 20 PNG（20 pt @1x）]]
 - [[file:../resources/icons/loki-assistant-menu-v1.svg][公共菜单栏单色 SVG 母版]]
 - [[file:../apps/center/mac/Resources/AppIcon/loki-assistant-menu-v1@2x.png][菜单栏 40 × 40 PNG（20 pt @2x）]]
-- [[file:../apps/harmony/AppScope/resources/base/media/app_layered_icon.json][HarmonyOS 桌面分层图标]]
-- [[file:../apps/harmony/AppScope/resources/base/media/app_icon.png][HarmonyOS 启动图标]]
+- [[file:../harmony/AppScope/resources/base/media/app_layered_icon.json][HarmonyOS 桌面分层图标]]
+- [[file:../harmony/AppScope/resources/base/media/app_icon.png][HarmonyOS 启动图标]]
 - [[file:../chrome-plugin/extension/icons/icon-128.png][Chrome 插件 128 × 128 PNG]]
 - [[file:../resources/icons/loki-assistant-chrome-v1.svg][Chrome 插件专用 SVG 母版]]
 

@@ -1,6 +1,6 @@
 ## 职责
 
-`apps/harmony/` 承载 Loki Assistant 的 HarmonyOS 手机执行中心。应用通过 Stage 模式 ArkTS 提供手机端入口，通过 iroh 与电脑完成扫码绑定和状态查询；业务 HTTP 服务在电脑本机提供。
+`harmony/` 承载 Loki Assistant 的 HarmonyOS 手机助手。应用通过 Stage 模式 ArkTS 提供手机端入口，通过 iroh 与电脑完成扫码绑定和状态查询；业务 HTTP 服务在电脑本机提供。
 
 ## 约定
 
@@ -13,14 +13,14 @@
 - `BindingState` 使用 `Unbound` / `Binding` / `Failed { error }` / `Bound { credential }` 数据 Union，凭据由电脑绑定接口签发并用于每次业务请求，不能以业务布尔值或绑定时间代替。只有绑定接口允许不携带凭据；状态查询也必须验证身份和 token。
 - `ResponsError` 是直接返回的数据 Union，分为未设置、未绑定、网络、取消、Services 和参数错误，各分支分别定义 reason。ArkTS 请求采用成功/错误回调，直接返回 Union，不包装成 Error 类。
 - `library/service-proxy` 提供网络绑定、请求与响应类型、缓存以及泛型监听。邮件和 Slack 各自定义服务端交互与业务类型；HarmonyOS 的界面组件分别位于 `ets/features/mail/`、`ets/features/slack/`。应用内 `workspace.rs` 负责实例和生命周期，`rust/src/napi.rs` 用 Rust 宏导出 NAPI 绑定。完整配置供业务存储，凭据不进入 UI、错误、监控或日志，Rust Debug 隐藏凭据。
-- NAPI 只向 UI 暴露 Rust 已声明的类型和方法，由 `apps/harmony/` 内的 Rust 宏生成绑定及 ArkTS 类型声明。每个导出的类型和方法与 Rust 声明一一对应，保留所属类型、参数、返回值、错误及回调语义。
+- NAPI 只向 UI 暴露 Rust 已声明的类型和方法，由 `harmony/` 内的 Rust 宏生成绑定及 ArkTS 类型声明。每个导出的类型和方法与 Rust 声明一一对应，保留所属类型、参数、返回值、错误及回调语义。
 - NAPI 仅负责跨语言值转换、Rust 对象句柄与回调转发。禁止在绑定中新增业务字段、合并或拆分 Rust 方法、以字符串操作名代替显式方法，或加入业务校验、状态管理和流程编排。业务规则、状态结构和生命周期由对应的 Rust 模块定义。
 - `Workspace.stop()` 先同步通知网络关闭，再等待未完成请求取消回调并释放 runtime；NAPI 取消和停止信号不等待异步工作线程。停止须幂等，停止后不隐式重新打开。
 - 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。服务代理订阅 `GET /status` 的 SSE 流，同步电脑名称、设备类型、Slack 和邮件状态。邮件业务通过代理发起 `POST /mail/sync`，优先从邮件 SSE 接收进度，必要时由共享状态订阅跟踪任务。名称和类型仅用于展示。
 - 界面只显示离线、绑定中、绑定失败、在线。界面注册服务代理监听，退到后台时解除。代理监听绑定结果，且有本地观察者时为当前选中电脑维持一条状态流。relay 断开、电脑连接关闭或状态流中断后发布离线状态，relay 可用时重新订阅。失败错误来自 Service 的 ResponsError，提示删除后重新扫码绑定；删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
 
 - `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。
-- `bundleName` 为 `cc.github.wangjian1009.assistant`，由 `AppScope/app.json5` 定义。
+- `bundleName` 使用在华为开发者后台登记的应用包名 `cc.github.wangjian1009.assistant`，由 `AppScope/app.json5` 定义。
 - 应用和 Ability 引用 `$media:app_layered_icon`，由系统裁切桌面图标的底板。启动窗口引用静态 `$media:app_icon`。图标 PNG 由根目录 `make export-icons` 从 `resources/icons/` 公共母版导出，不手工编辑。
 - 使用 DevEco Studio 内置 Hvigor 构建；常用操作统一维护在本目录 `Makefile` 和根目录 `Makefile` 中。
 - 构建产物、Hvigor 缓存和依赖目录不提交到仓库。

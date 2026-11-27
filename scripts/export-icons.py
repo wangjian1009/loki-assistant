@@ -85,7 +85,7 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     sources = root / "resources" / "icons"
     mac_resources = Path("apps/center/mac/Resources")
-    harmony_media = Path("apps/harmony/AppScope/resources/base/media")
+    harmony_media = Path("harmony/AppScope/resources/base/media")
     chrome_icons = Path("chrome-plugin/extension/icons")
     with tempfile.TemporaryDirectory(prefix="loki-icon-export-") as temporary:
         staging = Path(temporary)
