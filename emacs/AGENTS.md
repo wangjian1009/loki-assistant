@@ -33,6 +33,9 @@
 
 `loki-spawn-next!` 新建后继时递增目标标题末尾的连续阿拉伯数字，保留前缀与补零位宽；没有数字后缀则保留原标题。每次执行都创建新任务，不维护后继关联或查找已有后继；重新完成会再次创建，标题只根据当前目标递增，不扫描其他兄弟任务的编号。
 
+## Emacs配置文件
+编辑 ~/workspace/org-roam/personal/emacs配置文件.org 并利用 emacs tangle 机制刷新 ~/.emacs
+
 ## elisp 编码规范
 - 'if-let' =>  'if-let*'
 - 'when-let' => 'when-let*' or 'and-let*'
