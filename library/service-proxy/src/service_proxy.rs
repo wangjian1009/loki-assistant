@@ -30,6 +30,13 @@ pub struct ServiceSnapshot {
     local: StatusValues,
 }
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceRefreshStep {
+    Registering,
+    Querying,
+}
+
 impl ServiceSnapshot {
     pub fn status<T: DeserializeOwned>(&self, module: &str) -> Option<T> {
         let values = self.status.as_ref()?.get(module)?;
@@ -453,6 +460,36 @@ impl ServiceProxy {
 
     pub async fn refresh_status(&self) -> ServiceSnapshot {
         self.refresh_status_inner(None).await
+    }
+
+    pub async fn refresh_device(
+        &self,
+        endpoint: &str,
+        progress: impl Fn(DeviceRefreshStep),
+    ) -> Result<(), ResponsError> {
+        let (generation, binding) = self.network.with_target(|generation, target, closed| {
+            if closed {
+                return Err(ResponsError::from(CancelledReason::NetworkClosed));
+            }
+            let (id, binding) = target.ok_or(NotConfiguredReason::ServiceNotSet)?;
+            if id.to_string() != endpoint {
+                return Err(CancelledReason::ServiceChanged.into());
+            }
+            Ok((generation, binding))
+        })?;
+        if matches!(binding, BindingState::Binding) {
+            progress(DeviceRefreshStep::Registering);
+        }
+        self.network.wait_for_binding(generation).await?;
+        progress(DeviceRefreshStep::Querying);
+        let snapshot = self.refresh_status_for(generation).await?;
+        if let Some(error) = snapshot.error {
+            return Err(error);
+        }
+        if snapshot.status.is_none() {
+            return Err(NetworkReason::InvalidResponse.into());
+        }
+        Ok(())
     }
 
     pub(crate) async fn refresh_status_for(

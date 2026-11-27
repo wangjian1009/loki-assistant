@@ -1,5 +1,8 @@
 import { common } from '@kit.AbilityKit'
-import { Application, ComputerDevice, StatusDetail, statusDetails } from '../app/Application'
+import { Application, ComputerDevice } from '../app/Application'
+import { DeviceRefresh } from '../components/DeviceRefresh'
+import { StatusDetail, statusDetails } from '../components/DeviceStatus'
+import { OtherDeviceStatus } from '../components/OtherDeviceStatus'
 import { MailCard } from '../features/mail/MailCard'
 import { SlackCard } from '../features/slack/SlackCard'
 import { StatusSubscription } from '../workspace/ServiceStatus'
@@ -18,7 +21,6 @@ struct Index {
   @State private loaded: boolean = false
   @State private errorMessage: string = ''
   @State private showBusiness: boolean = false
-  @State private showOtherStatus: boolean = false
   @State private otherStatus: StatusDetail[] = []
   private application?: Application
   private visible: boolean = false
@@ -47,7 +49,6 @@ struct Index {
     this.detailsOpen = false
     this.showBusiness = false
     this.otherStatus = []
-    this.showOtherStatus = false
     this.stopWatching()
   }
 
@@ -80,7 +81,6 @@ struct Index {
 
   private updateCurrent(computers: ComputerDevice[]): void {
     const next = computers.find((computer: ComputerDevice) => computer.active)
-    if (next?.endpoint_id !== this.current?.endpoint_id) { this.showOtherStatus = false }
     this.current = next
     this.showBusiness = this.visible && this.foreground && next?.status === 'online'
     const status = next?.dashboard?.status
@@ -111,14 +111,6 @@ struct Index {
       if (version === this.subscriptionVersion) { this.errorMessage = (error as Error).message }
     } finally {
       if (version === this.subscriptionVersion) { this.working = false }
-    }
-  }
-
-  private async refreshDevices(): Promise<void> {
-    try {
-      await this.application?.refresh()
-    } catch (error) {
-      this.errorMessage = (error as Error).message
     }
   }
 
@@ -169,12 +161,6 @@ struct Index {
         .borderRadius(12).backgroundColor(this.detailsOpen ? BORDER : Color.Transparent)
         .accessibilityDescription(this.detailsOpen ? '收起设备详情' : '展开设备详情')
         .onClick(() => { this.detailsOpen = !this.detailsOpen })
-
-      Button({ type: ButtonType.Normal }) {
-        SymbolGlyph($r('sys.symbol.arrow_clockwise')).fontSize(24).fontColor([ACCENT])
-      }.width(48).height(48).padding(0).borderRadius(8).backgroundColor(Color.Transparent)
-        .enabled(!this.working).onClick(() => { this.refreshDevices() })
-        .accessibilityText('刷新连接状态')
     } else {
       Text('当前设备').fontSize(22).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
         .padding({ left: 4 })
@@ -257,55 +243,31 @@ struct Index {
   }
 
   @Builder
-  private otherStatusCard() {
-    Column() {
-      Button({ type: ButtonType.Normal }) {
-        Row({ space: 12 }) {
-          Text('其他设备状态').fontSize(18).fontWeight(FontWeight.Medium)
-            .fontColor(PRIMARY_TEXT).layoutWeight(1)
-          SymbolGlyph(this.showOtherStatus ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
-            .fontSize(14).fontColor([SECONDARY_TEXT]).accessibilityLevel('no')
-        }.width('100%')
-      }.width('100%').constraintSize({ minHeight: 48 }).padding({ left: 14, right: 14 })
-        .backgroundColor(Color.Transparent)
-        .accessibilityDescription(this.showOtherStatus ? '收起其他设备状态' : '展开其他设备状态')
-        .onClick(() => { this.showOtherStatus = !this.showOtherStatus })
-      if (this.showOtherStatus) {
-        Column() {
-          ForEach(this.otherStatus, (detail: StatusDetail) => {
-            Divider().color(BORDER).strokeWidth(0.5)
-            Column({ space: 4 }) {
-              Text(detail.label).fontSize(14).fontColor(SECONDARY_TEXT).wordBreak(WordBreak.BREAK_ALL)
-              Text(detail.value).fontSize(15).fontColor(PRIMARY_TEXT).lineHeight(22).wordBreak(WordBreak.BREAK_ALL)
-            }.width('100%').alignItems(HorizontalAlign.Start).padding({ top: 10, bottom: 10 })
-          }, (detail: StatusDetail) => JSON.stringify(detail))
-        }.width('100%').padding({ left: 14, right: 14, bottom: 4 })
+  private deviceContent() {
+    Column({ space: 12 }) {
+      if (this.current && this.detailsOpen) {
+        this.deviceDetails(this.current)
       }
-    }.width('100%').backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
+      this.feedback()
+      if (this.loaded && !this.current) {
+        this.emptyDevices()
+      }
+      if (this.showBusiness && this.application) {
+        MailCard({ workspace: this.application.workspace })
+        SlackCard({ workspace: this.application.workspace })
+        OtherDeviceStatus({ details: this.otherStatus, endpointId: this.current?.endpoint_id ?? '' })
+      }
+    }.width('100%').padding({ left: this.current ? 12 : 24, right: this.current ? 12 : 24,
+      top: this.current ? 6 : 16, bottom: 24 })
   }
 
   @Builder
   private pageContent() {
-    Scroll() {
-      Column({ space: 12 }) {
-        if (this.current && this.detailsOpen) {
-          this.deviceDetails(this.current)
-        }
-        this.feedback()
-        if (this.loaded && !this.current) {
-          this.emptyDevices()
-        }
-        if (this.showBusiness && this.application) {
-          MailCard({ workspace: this.application.workspace })
-          SlackCard({ workspace: this.application.workspace })
-          if (this.otherStatus.length > 0) {
-            this.otherStatusCard()
-          }
-        }
-      }.width('100%').padding({ left: this.current ? 12 : 24, right: this.current ? 12 : 24,
-        top: this.current ? 6 : 16, bottom: 24 })
-    }.width('100%').constraintSize({ maxWidth: 560 }).layoutWeight(1).align(Alignment.Top)
-      .scrollBar(BarState.Auto).scrollBarColor('#4D576B').scrollBarWidth(3)
+    DeviceRefresh({
+      workspace: () => this.application?.workspace,
+      endpointId: this.foreground ? this.current?.endpoint_id ?? '' : '',
+      content: () => { this.deviceContent() }
+    })
   }
 
   build() {

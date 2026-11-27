@@ -762,6 +762,39 @@ impl Network {
         self.inner.changed.subscribe()
     }
 
+    pub(crate) async fn wait_for_binding(&self, generation: u64) -> Result<(), ResponsError> {
+        let mut targets = self.target_changes();
+        loop {
+            let done = self.inner.done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            let result = self.with_target(|current, target, closed| {
+                if closed {
+                    return Some(Err(CancelledReason::NetworkClosed.into()));
+                }
+                if current != generation {
+                    return Some(Err(CancelledReason::ServiceChanged.into()));
+                }
+                match target.map(|(_, binding)| binding) {
+                    Some(BindingState::Bound { .. }) => Some(Ok(())),
+                    Some(BindingState::Binding) => None,
+                    Some(BindingState::Failed { error }) => Some(Err(error)),
+                    Some(BindingState::Unbound) => {
+                        Some(Err(NotBoundReason::BindingRequired.into()))
+                    }
+                    None => Some(Err(NotConfiguredReason::ServiceNotSet.into())),
+                }
+            });
+            if let Some(result) = result {
+                return result;
+            }
+            tokio::select! {
+                _ = &mut done => {}
+                _ = targets.changed() => {}
+            }
+        }
+    }
+
     pub(crate) fn with_target<T>(
         &self,
         read: impl FnOnce(u64, Option<(EndpointId, BindingState)>, bool) -> T,

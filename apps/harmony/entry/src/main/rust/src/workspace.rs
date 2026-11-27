@@ -5,7 +5,7 @@ use crate::{
 };
 use loki_service_proxy::{
     mail::Mail,
-    service_proxy::{ComputerStatus, ServiceProxy, ServiceSnapshot},
+    service_proxy::{ComputerStatus, DeviceRefreshStep, ServiceProxy, ServiceSnapshot},
 };
 use serde_json::Value;
 #[cfg(not(target_env = "ohos"))]
@@ -59,6 +59,11 @@ impl From<&ServiceSnapshot> for DashboardUpdate {
 pub struct ApplicationData {
     pub state: serde_json::Map<String, Value>,
     pub endpoint_id: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct DeviceRefreshResult {
+    pub error: Option<ResponsError>,
 }
 
 #[derive(serde::Deserialize)]
@@ -178,8 +183,14 @@ impl Workspace {
         crate::pairing::Invitation::decode(payload)
     }
 
-    pub fn request_refresh(&self) {
-        self.proxy.request_refresh();
+    pub async fn refresh_device(
+        &self,
+        endpoint: &str,
+        progress: impl Fn(DeviceRefreshStep),
+    ) -> DeviceRefreshResult {
+        DeviceRefreshResult {
+            error: self.proxy.refresh_device(endpoint, progress).await.err(),
+        }
     }
 
     pub fn open_mail(&self) -> Mail {

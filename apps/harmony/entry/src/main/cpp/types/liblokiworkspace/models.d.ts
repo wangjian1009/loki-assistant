@@ -91,6 +91,8 @@ export interface StatusSnapshot {
   status: Object | null
   service: ServiceDeviceStatus | null
 }
+export type DeviceRefreshStep = 'registering' | 'querying'
+export interface DeviceRefreshResult { error: ResponsError | null }
 export type MailSyncPhase = 'queued' | 'downloading' | 'indexing' | 'refreshing' | 'completed' | 'failed' | 'unknown'
 export interface MailSyncProgress { id: string; phase: MailSyncPhase }
 export interface MailSyncSnapshot extends MailSyncProgress { messages: string[]; error: string | null }

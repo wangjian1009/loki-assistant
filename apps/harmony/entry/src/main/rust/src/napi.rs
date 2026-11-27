@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use napi_derive_ohos::napi;
 use napi_ohos::{
     Env, Error, Result, Status,
-    bindgen_prelude::{FnArgs, Function, Object},
+    bindgen_prelude::{FnArgs, Function, Object, PromiseRaw},
     threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
 };
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::{
         RequestHandle as RustRequestHandle, RequestOptions as RustRequestOptions, ResponsError,
         ServiceRequest as RustServiceRequest,
     },
-    service_proxy::StatusSubscription as RustStatusSubscription,
+    service_proxy::{DeviceRefreshStep, StatusSubscription as RustStatusSubscription},
     slack::{Slack as RustSlack, SlackStatusChanged},
     workspace::ServiceConfiguration,
 };
@@ -97,9 +97,32 @@ impl Workspace {
         blocking(move || workspace.save_state(state)).await
     }
 
-    #[napi]
-    pub fn request_refresh(&self) {
-        self.inner.request_refresh();
+    #[napi(
+        ts_args_type = "endpoint: string, progress: (step: DeviceRefreshStep) => void",
+        ts_return_type = "Promise<DeviceRefreshResult>"
+    )]
+    pub fn refresh_device<'env>(
+        &self,
+        env: &'env Env,
+        endpoint: String,
+        progress: Function<'_, Value, ()>,
+    ) -> Result<PromiseRaw<'env, Value>> {
+        let progress = progress
+            .build_threadsafe_function()
+            .callee_handled::<false>()
+            .weak::<true>()
+            .build()?;
+        let workspace = self.inner.clone();
+        env.spawn_future(async move {
+            let result = workspace
+                .refresh_device(&endpoint, move |step: DeviceRefreshStep| {
+                    if let Ok(value) = js_value(step) {
+                        progress.call(value, NonBlocking);
+                    }
+                })
+                .await;
+            js_value(result)
+        })
     }
 
     #[napi(ts_args_type = "changed: (snapshot: StatusSnapshot) => void")]

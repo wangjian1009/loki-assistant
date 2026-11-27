@@ -69,7 +69,6 @@ function fixture(initial = {}) {
           network() { return network; },
           loadState() { return invoke(handle, 'load_state'); },
           async saveState(state) { invoke(handle, 'save_state', state); },
-          requestRefresh() { invoke(handle, 'refresh_status'); },
           watchStatus(send) { return watchStatus(handle, 'device', send); },
           openMail() {
             return {
@@ -259,7 +258,7 @@ test('应用保存多台电脑，Network 只恢复选中的一个目标', async 
 
 test('一次获取全部开放状态并展示新增状态，手动同步复用托盘路径', async () => {
   const { control, create, load } = fixture();
-  const { statusDetails } = load(path.join(etsRoot, 'app/Application.ets'));
+  const { statusDetails } = load(path.join(etsRoot, 'components/DeviceStatus.ets'));
   const { app, workspace } = create();
   const taskId = '12345678-1234-1234-1234-123456789abc';
   control.statusSnapshot = {
