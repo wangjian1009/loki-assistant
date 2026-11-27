@@ -1,4 +1,5 @@
-import { ACCENT, BORDER, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE } from '../../components/AppPage'
+import { ACCENT, BODY_SIZE, BORDER, CONTENT_GAP, META_SIZE, PAGE_INSET, PANEL_RADIUS, PRIMARY_TEXT,
+  SECONDARY_TEXT, SECTION_SIZE, SURFACE, TOUCH_SIZE } from '../../components/AppPage'
 import { Slack, SlackPreview, SlackStatus, SlackStatusChanged, StatusSubscription } from 'liblokiworkspace.so'
 import { Workspace } from '../../workspace/Workspace'
 
@@ -44,27 +45,27 @@ export struct SlackCard {
   }
 
   build() {
-    Column({ space: 10 }) {
-      Text('Slack 新消息').fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+    Column({ space: CONTENT_GAP }) {
+      Text('Slack 新消息').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
       if (this.slack?.unread_previews?.length) {
         ForEach(this.slack.unread_previews.slice(0, this.expanded ? 20 : 2), (item: SlackPreview, index: number) => {
           if (index > 0) { Divider().color(BORDER).strokeWidth(0.5) }
-          Column({ space: 4 }) {
-            Text(item.title).fontSize(16).fontColor(PRIMARY_TEXT).fontWeight(FontWeight.Medium)
+          Column({ space: 2 }) {
+            Text(item.title).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT).fontWeight(FontWeight.Medium)
               .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(`${item.team_name} · ${item.unread_count} 条未读`).fontSize(14).fontColor(SECONDARY_TEXT).lineHeight(21)
-            Text(item.preview).fontSize(14).fontColor(PRIMARY_TEXT).lineHeight(21)
+            Text(`${item.team_name} · ${item.unread_count} 条未读`).fontSize(META_SIZE).fontColor(SECONDARY_TEXT)
+            Text(item.preview).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
           }.width('100%').alignItems(HorizontalAlign.Start)
         }, (item: SlackPreview) => `${item.id}:${item.unread_count}:${item.preview}`)
         if (this.slack.unread_previews.length > 2) {
           Button(this.expanded ? '收起' : '查看更多 Slack 消息', { type: ButtonType.Normal })
-            .height(44).padding({ left: 0, right: 12 }).backgroundColor(Color.Transparent)
-            .fontSize(14).fontColor(ACCENT).onClick(() => { this.expanded = !this.expanded })
+            .constraintSize({ minHeight: TOUCH_SIZE }).padding({ left: 0, right: PAGE_INSET }).backgroundColor(Color.Transparent)
+            .fontSize(BODY_SIZE).fontColor(ACCENT).onClick(() => { this.expanded = !this.expanded })
         }
       } else {
-        Text(this.errorMessage || '暂无未读消息').fontSize(14).fontColor(SECONDARY_TEXT).lineHeight(21)
+        Text(this.errorMessage || '暂无未读消息').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
       }
-    }.width('100%').alignItems(HorizontalAlign.Start).padding(14)
-      .backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(PAGE_INSET)
+      .backgroundColor(SURFACE).borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
   }
 }

@@ -4,8 +4,9 @@ import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { Application, ComputerDevice } from '../app/Application'
 import { StatusSubscription } from '../workspace/ServiceStatus'
 import { NavigatorManager, PageName } from '../app/NavigatorManager'
-import { ACCENT, ACCENT_TEXT, AppPage, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE,
-  setSystemColors } from '../components/AppPage'
+import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET,
+  PAGE_MAX_WIDTH, PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SELECTED_SURFACE, SURFACE,
+  TOUCH_SIZE, setSystemColors } from '../components/AppPage'
 
 @Entry
 @Component
@@ -130,90 +131,104 @@ struct Devices {
   }
 
   @Builder
-  private computerCard(computer: ComputerDevice) {
-    Column({ space: 12 }) {
-      Row({ space: 12 }) {
+  private computerRow(computer: ComputerDevice) {
+    Column({ space: 4 }) {
+      Row({ space: CONTENT_GAP }) {
         Stack() {
-          Image($r('sys.media.ohos_ic_public_device_matebook')).width(22).height(22).fillColor(ACCENT)
-        }.width(44).height(44).borderRadius(12).backgroundColor('#303951')
-        Column({ space: 4 }) {
-          Text(computer.name).fontSize(17).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
+          Image($r('sys.media.ohos_ic_public_device_matebook')).width(18).height(18).fillColor(ACCENT)
+        }.width(32).height(32).borderRadius(8).backgroundColor(SELECTED_SURFACE).flexShrink(0)
+        Column({ space: 2 }) {
+          Text(computer.name).fontSize(BODY_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
             .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
           Text(`${computer.endpoint_id.slice(0, 8)}…${computer.endpoint_id.slice(-8)}`)
-            .fontSize(12).fontColor(SECONDARY_TEXT)
+            .fontSize(META_SIZE).fontColor(SECONDARY_TEXT).maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-        if (computer.active) {
-          Text('当前设备').fontSize(12).fontWeight(FontWeight.Medium).fontColor(ACCENT)
-            .padding({ left: 8, right: 8, top: 5, bottom: 5 }).borderRadius(8).backgroundColor('#303951')
+        if (computer.active || computer.status === 'binding') {
+          Column({ space: 2 }) {
+            if (computer.active) {
+              Text('当前设备').fontSize(META_SIZE).fontWeight(FontWeight.Medium).fontColor(ACCENT)
+            }
+            if (computer.status === 'binding') {
+              Text('绑定中').fontSize(META_SIZE).fontColor('#F5CF92')
+            }
+          }.alignItems(HorizontalAlign.End).flexShrink(0)
+        } else if (computer.status !== 'binding_failed') {
+          Button('设为当前设备', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(ACCENT)
+            .constraintSize({ minHeight: TOUCH_SIZE, maxWidth: '40%' })
+            .padding({ left: CONTENT_GAP, right: CONTENT_GAP }).borderRadius(8)
+            .backgroundColor(SELECTED_SURFACE).enabled(!this.working)
+            .onClick(() => {
+              this.updateDevices('正在切换设备', (application: Application) => application.select(computer.endpoint_id))
+            })
         }
-      }.width('100%')
+      }.width('100%').constraintSize({ minHeight: TOUCH_SIZE })
       if (computer.status === 'binding_failed') {
-        Text(computer.detail).fontSize(14).lineHeight(22).fontColor(ERROR_TEXT).width('100%')
-        Button('删除设备', { type: ButtonType.Normal }).fontSize(14).fontColor(ERROR_TEXT)
-          .height(44).borderRadius(12).backgroundColor('#523437').enabled(!this.working)
+        Text(computer.detail).fontSize(BODY_SIZE).fontColor(ERROR_TEXT).width('100%')
+        Button('删除设备', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(ERROR_TEXT)
+          .constraintSize({ minHeight: TOUCH_SIZE }).borderRadius(8).backgroundColor('#523437').enabled(!this.working)
           .onClick(() => {
             this.updateDevices('正在删除设备', (application: Application) => application.remove(computer.endpoint_id))
           })
-      } else if (computer.status === 'binding') {
-        Text('绑定中').fontSize(14).fontColor('#F5CF92')
-      } else if (!computer.active) {
-        Button('设为当前设备', { type: ButtonType.Normal }).fontSize(14).fontColor(ACCENT)
-          .height(44).borderRadius(12).backgroundColor('#303951').enabled(!this.working)
-          .onClick(() => {
-            this.updateDevices('正在切换设备', (application: Application) => application.select(computer.endpoint_id))
-          })
       }
-    }.width('100%').padding(16).alignItems(HorizontalAlign.Start)
-      .backgroundColor(computer.active ? '#222735' : SURFACE).borderRadius(16)
-      .border({ width: 1, color: computer.active ? '#515F80' : BORDER })
+    }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET, top: 6, bottom: 6 })
+      .alignItems(HorizontalAlign.Start).backgroundColor(computer.active ? '#222735' : SURFACE)
   }
 
   @Builder
   private pageContent() {
     Scroll() {
-      Column({ space: 12 }) {
+      Column({ space: CONTENT_GAP }) {
         if (this.progress !== '') {
-          Row({ space: 10 }) {
+          Row({ space: CONTENT_GAP }) {
             LoadingProgress().width(16).height(16).color(ACCENT)
-            Text(this.progress).fontSize(14).fontColor(SECONDARY_TEXT)
+            Text(this.progress).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
           }.width('100%')
         }
         if (this.errorMessage !== '') {
-          Column({ space: 8 }) {
-            Text(this.errorMessage).fontSize(14).lineHeight(22).fontColor(ERROR_TEXT).width('100%')
+          Column({ space: CONTENT_GAP }) {
+            Text(this.errorMessage).fontSize(BODY_SIZE).fontColor(ERROR_TEXT).width('100%')
             if (!this.loaded) {
-              Button('重新读取').fontSize(14).fontColor(ERROR_TEXT).height(44).backgroundColor('#523437')
+              Button('重新读取').fontSize(BODY_SIZE).fontColor(ERROR_TEXT)
+                .constraintSize({ minHeight: TOUCH_SIZE }).backgroundColor('#523437')
                 .enabled(!this.working).onClick(() => { this.loadDevices() })
             }
-          }.width('100%').padding(16).alignItems(HorizontalAlign.Start)
-            .backgroundColor('#362529').borderRadius(16)
+          }.width('100%').padding(PAGE_INSET).alignItems(HorizontalAlign.Start)
+            .backgroundColor('#362529').borderRadius(PANEL_RADIUS)
         }
         if (this.loaded) {
-          Text('电脑列表').fontSize(18).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
+          Text('电脑列表').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
           if (this.computers.length === 0) {
-            Column({ space: 8 }) {
-              Text('还没有配置电脑').fontSize(17).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
-              Text('在电脑上新增设备，再扫描电脑显示的绑定二维码。')
-                .fontSize(14).lineHeight(22).fontColor(SECONDARY_TEXT)
-            }.width('100%').padding(16).alignItems(HorizontalAlign.Start)
-              .backgroundColor(SURFACE).borderRadius(16).border({ width: 1, color: BORDER })
+            Column({ space: CONTENT_GAP }) {
+              Text('还没有配置电脑').fontSize(BODY_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+              Text('在电脑上生成绑定二维码后扫码。')
+                .fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+            }.width('100%').padding(PAGE_INSET).alignItems(HorizontalAlign.Start)
+              .backgroundColor(SURFACE).borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
           } else {
-            ForEach(this.computers, (computer: ComputerDevice) => {
-              this.computerCard(computer)
-            }, (computer: ComputerDevice) =>
-              JSON.stringify([computer.endpoint_id, computer.name, computer.active, computer.status, computer.detail]))
+            Column() {
+              ForEach(this.computers, (computer: ComputerDevice, index: number) => {
+                if (index > 0) {
+                  Divider().color(BORDER).strokeWidth(0.5)
+                }
+                this.computerRow(computer)
+              }, (computer: ComputerDevice, index: number) =>
+                JSON.stringify([index, computer.endpoint_id, computer.name, computer.active, computer.status, computer.detail]))
+            }.width('100%').borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER }).clip(true)
           }
         }
-      }.width('100%').padding({ left: 24, right: 24, top: 8, bottom: 24 }).alignItems(HorizontalAlign.Start)
-    }.width('100%').constraintSize({ maxWidth: 560 }).layoutWeight(1).align(Alignment.Top)
+      }.width('100%').padding(PAGE_INSET).alignItems(HorizontalAlign.Start)
+    }.width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH }).layoutWeight(1).align(Alignment.Top)
       .scrollBar(BarState.Auto).scrollBarColor('#4D576B').scrollBarWidth(3)
 
     Column() {
-      Divider().color(BORDER)
-      Button('扫码添加设备', { type: ButtonType.Normal }).width('100%').height(52).borderRadius(16)
-        .fontSize(16).fontWeight(FontWeight.Bold).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
-        .margin({ top: 12 }).enabled(this.loaded && !this.working).onClick(() => { this.addDevice() })
-    }.width('100%').constraintSize({ maxWidth: 560 }).padding({ left: 24, right: 24, bottom: 12 })
+      Divider().color(BORDER).strokeWidth(0.5)
+      Button('扫码添加设备', { type: ButtonType.Normal }).width('100%')
+        .constraintSize({ minHeight: TOUCH_SIZE }).borderRadius(PANEL_RADIUS)
+        .fontSize(BODY_SIZE).fontWeight(FontWeight.Medium).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
+        .margin({ top: CONTENT_GAP }).enabled(this.loaded && !this.working).onClick(() => { this.addDevice() })
+    }.width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH })
+      .padding({ left: PAGE_INSET, right: PAGE_INSET, bottom: PAGE_INSET })
   }
 
   build() {

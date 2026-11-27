@@ -10,6 +10,17 @@ export const SECONDARY_TEXT: string = '#A8B1C4'
 export const ACCENT: string = '#C2CCFF'
 export const ACCENT_TEXT: string = '#182143'
 export const ERROR_TEXT: string = '#FFB4B1'
+export const SELECTED_SURFACE: string = '#282F42'
+
+export const TITLE_SIZE: number = 18
+export const SECTION_SIZE: number = 16
+export const BODY_SIZE: number = 14
+export const META_SIZE: number = 12
+export const TOUCH_SIZE: number = 44
+export const PAGE_INSET: number = 12
+export const CONTENT_GAP: number = 8
+export const PANEL_RADIUS: number = 10
+export const PAGE_MAX_WIDTH: number = 560
 
 export function setSystemColors(context: common.UIAbilityContext): void {
   window.getLastWindow(context).then((mainWindow) => {
@@ -54,43 +65,39 @@ export struct AppPage {
 
   @Builder
   private sectionTitle() {
-    Text(SECTION_TITLES[this.page]).fontSize(28).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
+    Text(SECTION_TITLES[this.page]).fontSize(TITLE_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
   }
 
   @Builder
   private sidebarItem(page: PageName, icon: Resource) {
     Button({ type: ButtonType.Normal }) {
-      Row({ space: 12 }) {
+      Row({ space: CONTENT_GAP }) {
         if (page === PageName.Index) {
           Image(icon).width(18).height(18).fillColor(this.page === page ? ACCENT : SECONDARY_TEXT)
         } else {
           SymbolGlyph(icon).fontSize(18).fontColor([this.page === page ? ACCENT : SECONDARY_TEXT])
         }
-        Text(SECTION_TITLES[page]).fontSize(16).fontWeight(this.page === page ? FontWeight.Bold : FontWeight.Medium)
+        Text(SECTION_TITLES[page]).fontSize(BODY_SIZE).fontWeight(FontWeight.Medium)
           .fontColor(this.page === page ? ACCENT : PRIMARY_TEXT)
-      }.width('100%').padding({ left: 14, right: 14 })
-    }.width('100%').height(48).padding(0).borderRadius(12)
-      .backgroundColor(this.page === page ? '#303951' : Color.Transparent)
+      }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET })
+    }.width('100%').constraintSize({ minHeight: TOUCH_SIZE }).padding(0).borderRadius(PANEL_RADIUS)
+      .backgroundColor(this.page === page ? SELECTED_SURFACE : Color.Transparent)
       .accessibilitySelected(this.page === page).onClick(() => { this.goTo(page) })
   }
 
   build() {
     Stack({ alignContent: Alignment.Start }) {
       Column() {
-        Row({ space: this.page === PageName.Index ? 4 : 12 }) {
+        Row() {
           Button({ type: ButtonType.Normal }) {
             this.menuIcon()
-          }.width(this.page === PageName.Index ? 48 : 44).height(this.page === PageName.Index ? 48 : 44)
-            .padding(0).borderRadius(14).backgroundColor(this.page === PageName.Index ? Color.Transparent : SURFACE)
+          }.width(TOUCH_SIZE).height(TOUCH_SIZE).padding(0)
+            .borderRadius(PANEL_RADIUS).backgroundColor(Color.Transparent)
             .accessibilityText('打开侧边栏').onClick(() => { this.sidebarOpen = true })
           this.header()
-        }.width('100%').constraintSize({ maxWidth: 560 })
-          .height(this.page === PageName.Index ? 64 : 76)
-          .padding(this.page === PageName.Index ? { left: 4, right: 4 } : { left: 24, right: 24 })
-          .backgroundColor(this.page === PageName.Index ? SURFACE : Color.Transparent)
-        if (this.page === PageName.Index) {
-          Divider().color(BORDER).strokeWidth(0.5).width('100%').constraintSize({ maxWidth: 560 })
-        }
+        }.width('100%').constraintSize({ minHeight: 52, maxWidth: PAGE_MAX_WIDTH })
+          .padding({ left: 4, right: PAGE_INSET, top: 4, bottom: 4 })
+        Divider().color(BORDER).strokeWidth(0.5).width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH })
 
         this.content()
       }.width('100%').height('100%')
@@ -101,18 +108,19 @@ export struct AppPage {
           .width('100%').height('100%').borderRadius(0).backgroundColor('#99000000')
           .accessibilityText('关闭侧边栏').onClick(() => { this.sidebarOpen = false })
 
-        Column({ space: 8 }) {
-          Row({ space: 8 }) {
-            Text('Loki Assistant').fontSize(20).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT).layoutWeight(1)
-            Button('关闭', { type: ButtonType.Normal }).fontSize(13).fontColor(SECONDARY_TEXT)
-              .height(44).padding({ left: 8, right: 8 }).backgroundColor(Color.Transparent)
+        Column({ space: 4 }) {
+          Row({ space: CONTENT_GAP }) {
+            Text('Loki Assistant').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium)
+              .fontColor(PRIMARY_TEXT).layoutWeight(1)
+            Button('关闭', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+              .constraintSize({ minHeight: TOUCH_SIZE, minWidth: TOUCH_SIZE })
+              .padding({ left: CONTENT_GAP, right: CONTENT_GAP }).backgroundColor(Color.Transparent)
               .accessibilityText('关闭侧边栏').onClick(() => { this.sidebarOpen = false })
-          }.width('100%').padding({ left: 14, bottom: 12 })
+          }.width('100%').padding({ left: PAGE_INSET, bottom: CONTENT_GAP })
           this.sidebarItem(PageName.Index, $r('sys.media.ohos_ic_public_device_matebook'))
           this.sidebarItem(PageName.Devices, $r('sys.symbol.list_bullet'))
           this.sidebarItem(PageName.Settings, $r('sys.symbol.gearshape_fill'))
-        }.width('80%').constraintSize({ maxWidth: 280 }).height('100%')
-          .padding({ left: 14, right: 14, top: 16, bottom: 16 })
+        }.width('80%').constraintSize({ maxWidth: 256 }).height('100%').padding(PAGE_INSET)
           .backgroundColor(SURFACE).alignItems(HorizontalAlign.Start)
       }
     }.width('100%').height('100%').backgroundColor(PAGE_BACKGROUND)

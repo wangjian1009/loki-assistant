@@ -1,6 +1,7 @@
 import { DeviceRefreshStep } from 'liblokiworkspace.so'
 import { Workspace } from '../workspace/Workspace'
-import { ACCENT, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE } from './AppPage'
+import { ACCENT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET, PAGE_MAX_WIDTH,
+  PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE } from './AppPage'
 
 @Component
 export struct DeviceRefresh {
@@ -53,35 +54,37 @@ export struct DeviceRefresh {
       this.phase = 'failure'
       this.message = (error as Error).message || '无法同步设备状态'
     }
-    this.timer = setTimeout(() => { this.reset() }, 5000)
+    this.timer = setTimeout(() => { this.reset() }, this.phase === 'success' ? 1000 : 2000)
   }
 
   @Builder
   private progress() {
     Column({ space: 4 }) {
       if (this.phase === 'running') {
-        Row({ space: 8 }) {
+        Row({ space: CONTENT_GAP }) {
           LoadingProgress().width(16).height(16).color(ACCENT).accessibilityLevel('no')
-          Text(this.message).fontSize(14).fontColor(PRIMARY_TEXT)
+          Text(this.message).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
         }
       } else {
         Text(this.phase === 'success' ? '设备同步成功' : '设备同步失败')
-          .fontSize(14).fontWeight(FontWeight.Medium)
+          .fontSize(BODY_SIZE).fontWeight(FontWeight.Medium)
           .fontColor(this.phase === 'success' ? '#9AE2B9' : ERROR_TEXT)
         if (this.phase === 'failure') {
-          Text(this.message).width('100%').fontSize(13).lineHeight(17).fontColor(SECONDARY_TEXT)
+          Text(this.message).width('100%').fontSize(META_SIZE).fontColor(SECONDARY_TEXT)
             .textAlign(TextAlign.Center).maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
       }
-    }.width('100%').height(88).padding({ left: 16, right: 16 })
+    }.width('100%').constraintSize({ minHeight: 48 }).padding(CONTENT_GAP)
       .justifyContent(FlexAlign.Center).backgroundColor(SURFACE)
-      .borderRadius(10).border({ width: 0.5, color: BORDER })
+      .borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
   }
 
   build() {
     Column() {
       if (this.phase !== 'idle') {
-        this.progress()
+        Column() {
+          this.progress()
+        }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET, top: CONTENT_GAP })
       }
       Scroll(this.scroller) {
         this.content()
@@ -98,6 +101,6 @@ export struct DeviceRefresh {
             })
             .onActionCancel(() => { this.startedAtTop = false })
         )
-    }.width('100%').constraintSize({ maxWidth: 560 }).layoutWeight(1).align(Alignment.Top)
+    }.width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH }).layoutWeight(1).align(Alignment.Top)
   }
 }

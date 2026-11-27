@@ -1,4 +1,5 @@
-import { ACCENT, ACCENT_TEXT, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE } from '../../components/AppPage'
+import { ACCENT, ACCENT_TEXT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET,
+  PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SURFACE, TOUCH_SIZE } from '../../components/AppPage'
 import { Mail, MailActivity, MailStatus, MailStatusChanged, StatusSubscription } from 'liblokiworkspace.so'
 import { Workspace } from '../../workspace/Workspace'
 import { mailSyncPhaseText } from './MailModel'
@@ -78,43 +79,43 @@ export struct MailCard {
   }
 
   build() {
-    Column({ space: 10 }) {
-      Row({ space: 8 }) {
-        Column({ space: 4 }) {
-          Text('邮件收件箱').fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+    Column({ space: CONTENT_GAP }) {
+      Row({ space: CONTENT_GAP }) {
+        Column({ space: 2 }) {
+          Text('邮件收件箱').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
           if (typeof this.mail?.unread_count === 'number') {
-            Text(`${this.mail.unread_count} 封未读`).fontSize(14).fontColor(SECONDARY_TEXT).lineHeight(21)
+            Text(`${this.mail.unread_count} 封未读`).fontSize(META_SIZE).fontColor(SECONDARY_TEXT)
           }
         }.alignItems(HorizontalAlign.Start).layoutWeight(1)
         Button('立即同步邮件', { type: ButtonType.Normal })
-          .constraintSize({ minHeight: 44 }).padding({ left: 12, right: 12 }).borderRadius(10)
-          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
-          .enabled(!this.syncing()).onClick(() => { this.startSync() })
+          .constraintSize({ minHeight: TOUCH_SIZE }).padding({ left: PAGE_INSET, right: PAGE_INSET }).borderRadius(PANEL_RADIUS)
+          .fontSize(BODY_SIZE).fontWeight(FontWeight.Medium).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
+          .flexShrink(0).enabled(!this.syncing()).onClick(() => { this.startSync() })
       }.width('100%')
       if (this.syncMessage()) {
-        Text(this.syncMessage()).fontSize(14)
+        Text(this.syncMessage()).fontSize(BODY_SIZE)
           .fontColor(this.errorMessage || this.activity?.error || this.activity?.sync?.phase === 'failed' ? ERROR_TEXT : SECONDARY_TEXT)
       }
       if (this.activity?.sync?.error) {
-        Text(this.activity.sync.error).fontSize(14).fontColor(ERROR_TEXT).lineHeight(21)
+        Text(this.activity.sync.error).fontSize(BODY_SIZE).fontColor(ERROR_TEXT)
       } else if (this.syncing() && this.activity?.sync?.messages?.length) {
         Text(this.activity.sync.messages[this.activity.sync.messages.length - 1])
-          .fontSize(14).fontColor(SECONDARY_TEXT).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+          .fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       if (this.mail?.unread_subjects?.length) {
         ForEach(this.mail.unread_subjects.slice(0, this.expanded ? 20 : 2), (subject: string) => {
           Divider().color(BORDER).strokeWidth(0.5)
-          Text(subject).fontSize(15).fontColor(PRIMARY_TEXT).lineHeight(22)
+          Text(subject).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
         }, (subject: string, index: number) => `${index}:${subject}`)
         if (this.mail.unread_subjects.length > 2) {
           Button(this.expanded ? '收起' : '查看更多邮件', { type: ButtonType.Normal })
-            .height(44).padding({ left: 0, right: 12 }).backgroundColor(Color.Transparent)
-            .fontSize(14).fontColor(ACCENT).onClick(() => { this.expanded = !this.expanded })
+            .constraintSize({ minHeight: TOUCH_SIZE }).padding({ left: 0, right: PAGE_INSET }).backgroundColor(Color.Transparent)
+            .fontSize(BODY_SIZE).fontColor(ACCENT).onClick(() => { this.expanded = !this.expanded })
         }
       } else if (this.mail?.unread_count == null) {
-        Text('等待电脑更新邮件索引').fontSize(14).fontColor(SECONDARY_TEXT).lineHeight(21)
+        Text('等待电脑更新邮件索引').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
       }
-    }.width('100%').alignItems(HorizontalAlign.Start).padding(14)
-      .backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(PAGE_INSET)
+      .backgroundColor(SURFACE).borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
   }
 }

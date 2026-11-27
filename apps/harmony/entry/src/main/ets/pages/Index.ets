@@ -7,8 +7,9 @@ import { MailCard } from '../features/mail/MailCard'
 import { SlackCard } from '../features/slack/SlackCard'
 import { StatusSubscription } from '../workspace/ServiceStatus'
 import { NavigatorManager, NavigationResult, PageName } from '../app/NavigatorManager'
-import { ACCENT, ACCENT_TEXT, AppPage, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE,
-  setSystemColors } from '../components/AppPage'
+import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE,
+  PAGE_INSET, PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SELECTED_SURFACE, SURFACE, TITLE_SIZE,
+  TOUCH_SIZE, setSystemColors } from '../components/AppPage'
 
 @Entry
 @Component
@@ -146,55 +147,54 @@ struct Index {
     if (this.current) {
       Button({ type: ButtonType.Normal }) {
         Row({ space: 8 }) {
-          Text(this.current.name).fontSize(22).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+          Text(this.current.name).fontSize(TITLE_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
           if (this.current.status === 'online' || this.current.status === 'offline') {
             Row({ space: 4 }) {
               Circle().width(6).height(6).fill(this.statusColor(this.current))
-              Text(this.statusText(this.current)).fontSize(11).fontColor(this.statusColor(this.current))
+              Text(this.statusText(this.current)).fontSize(META_SIZE).fontColor(this.statusColor(this.current))
             }.flexShrink(0)
           }
           SymbolGlyph(this.detailsOpen ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
             .fontSize(12).fontColor([SECONDARY_TEXT]).flexShrink(0).accessibilityLevel('no')
         }
-      }.layoutWeight(1).height(48).padding({ left: 4, right: 8 }).align(Alignment.Start)
-        .borderRadius(12).backgroundColor(this.detailsOpen ? BORDER : Color.Transparent)
+      }.layoutWeight(1).constraintSize({ minHeight: TOUCH_SIZE }).padding({ left: 4, right: CONTENT_GAP }).align(Alignment.Start)
+        .borderRadius(PANEL_RADIUS).backgroundColor(this.detailsOpen ? SELECTED_SURFACE : Color.Transparent)
         .accessibilityDescription(this.detailsOpen ? '收起设备详情' : '展开设备详情')
         .onClick(() => { this.detailsOpen = !this.detailsOpen })
     } else {
-      Text('当前设备').fontSize(22).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
-        .padding({ left: 4 })
+      Text('当前设备').fontSize(TITLE_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
     }
   }
 
   @Builder
   private detailRow(label: string, value: string) {
-    Row({ space: 16 }) {
-      Text(label).fontSize(16).fontColor(SECONDARY_TEXT).layoutWeight(1)
-      Text(value).fontSize(16).fontColor(PRIMARY_TEXT).textAlign(TextAlign.End)
+    Row({ space: PAGE_INSET }) {
+      Text(label).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT).layoutWeight(1)
+      Text(value).fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT).textAlign(TextAlign.End)
         .constraintSize({ maxWidth: '64%' })
-    }.width('100%').constraintSize({ minHeight: 44 }).padding({ top: 8, bottom: 8 })
+    }.width('100%').constraintSize({ minHeight: 36 }).padding({ top: 6, bottom: 6 })
   }
 
   @Builder
   private deviceDetails(computer: ComputerDevice) {
-    Column({ space: 12 }) {
+    Column({ space: CONTENT_GAP }) {
       Column() {
         Row() {
-          Text('连接').fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT).layoutWeight(1)
+          Text('连接').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT).layoutWeight(1)
           if (computer.status === 'binding' || computer.status === 'binding_failed') {
-            Text(this.statusText(computer)).fontSize(14).fontColor(this.statusColor(computer))
+            Text(this.statusText(computer)).fontSize(BODY_SIZE).fontColor(this.statusColor(computer))
           }
         }.width('100%')
         this.detailRow('最近检查', this.checkedTime(computer))
         if (computer.status !== 'online') {
-          Text(computer.detail).width('100%').fontSize(15).lineHeight(22).fontColor(SECONDARY_TEXT)
+          Text(computer.detail).width('100%').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
         }
       }.width('100%').alignItems(HorizontalAlign.Start)
 
       Divider().color(BORDER).strokeWidth(0.5)
       Column() {
-        Text('设备信息').fontSize(18).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+        Text('设备信息').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
         this.detailRow('设备类型', computer.device_type === 'computer' ? '电脑' : '移动端')
         if (computer.bound_at !== null) {
           Divider().color(BORDER).strokeWidth(0.5)
@@ -203,48 +203,48 @@ struct Index {
         Divider().color(BORDER).strokeWidth(0.5)
         this.detailRow('设备标识', `${computer.endpoint_id.slice(0, 8)}…${computer.endpoint_id.slice(-8)}`)
       }.width('100%').alignItems(HorizontalAlign.Start)
-    }.width('100%').padding(12).backgroundColor(SURFACE).borderRadius(10).border({ width: 0.5, color: BORDER })
+    }.width('100%').padding(PAGE_INSET).backgroundColor(SURFACE).borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
   }
 
   @Builder
   private feedback() {
     if (this.errorMessage !== '') {
       Column({ space: 8 }) {
-        Text(this.errorMessage).width('100%').fontSize(14).lineHeight(22).fontColor(ERROR_TEXT)
+        Text(this.errorMessage).width('100%').fontSize(BODY_SIZE).fontColor(ERROR_TEXT)
         if (!this.loaded) {
-          Button('重新读取').fontSize(14).fontColor(ERROR_TEXT).height(44).backgroundColor('#523437')
+          Button('重新读取').fontSize(BODY_SIZE).fontColor(ERROR_TEXT).constraintSize({ minHeight: TOUCH_SIZE }).backgroundColor('#523437')
             .enabled(!this.working).onClick(() => { this.loadDevices() })
         }
-      }.width('100%').padding(16).alignItems(HorizontalAlign.Start)
-        .backgroundColor('#362529').borderRadius(16)
+      }.width('100%').padding(PAGE_INSET).alignItems(HorizontalAlign.Start)
+        .backgroundColor('#362529').borderRadius(PANEL_RADIUS)
     }
     if (this.working && !this.loaded) {
       Row({ space: 10 }) {
         LoadingProgress().width(16).height(16).color(ACCENT)
-        Text('正在读取当前设备').fontSize(14).fontColor(SECONDARY_TEXT)
+        Text('正在读取当前设备').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
       }.width('100%')
     }
   }
 
   @Builder
   private emptyDevices() {
-    Column({ space: 14 }) {
+    Column({ space: CONTENT_GAP }) {
       Stack() {
-        Image($r('sys.media.ohos_ic_public_device_matebook')).width(38).height(38).fillColor(ACCENT)
-      }.width(76).height(76).borderRadius(24).backgroundColor('#303951')
-      Text('暂无当前设备').fontSize(22).fontWeight(FontWeight.Bold).fontColor(PRIMARY_TEXT)
-      Text('前往设备管理添加电脑，或选择一台已配置的电脑。')
-        .fontSize(14).fontColor(SECONDARY_TEXT).textAlign(TextAlign.Center).lineHeight(23)
-      Button('前往设备管理', { type: ButtonType.Normal }).height(44).borderRadius(12)
-        .fontSize(15).fontWeight(FontWeight.Bold).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
+        Image($r('sys.media.ohos_ic_public_device_matebook')).width(24).height(24).fillColor(ACCENT)
+      }.width(44).height(44).borderRadius(PANEL_RADIUS).backgroundColor(SELECTED_SURFACE)
+      Text('暂无当前设备').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
+      Text('扫码添加电脑，或选择已配置的电脑。')
+        .fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT).textAlign(TextAlign.Center)
+      Button('前往设备管理', { type: ButtonType.Normal }).constraintSize({ minHeight: TOUCH_SIZE }).borderRadius(PANEL_RADIUS)
+        .fontSize(BODY_SIZE).fontWeight(FontWeight.Bold).fontColor(ACCENT_TEXT).backgroundColor(ACCENT)
         .onClick(() => { this.openDevices() })
-    }.width('100%').padding({ left: 16, right: 16, top: 40, bottom: 40 })
-      .backgroundColor(SURFACE).borderRadius(22).border({ width: 1, color: BORDER })
+    }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET, top: 24, bottom: 24 })
+      .backgroundColor(SURFACE).borderRadius(PANEL_RADIUS).border({ width: 0.5, color: BORDER })
   }
 
   @Builder
   private deviceContent() {
-    Column({ space: 12 }) {
+    Column({ space: CONTENT_GAP }) {
       if (this.current && this.detailsOpen) {
         this.deviceDetails(this.current)
       }
@@ -257,8 +257,7 @@ struct Index {
         SlackCard({ workspace: this.application.workspace })
         OtherDeviceStatus({ details: this.otherStatus, endpointId: this.current?.endpoint_id ?? '' })
       }
-    }.width('100%').padding({ left: this.current ? 12 : 24, right: this.current ? 12 : 24,
-      top: this.current ? 6 : 16, bottom: 24 })
+    }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET, top: CONTENT_GAP, bottom: PAGE_INSET })
   }
 
   @Builder

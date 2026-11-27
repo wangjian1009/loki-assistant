@@ -1,7 +1,8 @@
 import { bundleManager, common } from '@kit.AbilityKit'
 import { Application } from '../app/Application'
 import { NavigatorManager, NavigationResult, PageName } from '../app/NavigatorManager'
-import { ACCENT, ACCENT_TEXT, AppPage, BORDER, ERROR_TEXT, PRIMARY_TEXT, SECONDARY_TEXT, SURFACE,
+import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_BACKGROUND,
+  PAGE_INSET, PAGE_MAX_WIDTH, PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SURFACE, TOUCH_SIZE,
   setSystemColors } from '../components/AppPage'
 
 @Entry
@@ -96,35 +97,35 @@ struct Settings {
 
   @Builder
   private nameEditor() {
-    Column({ space: 20 }) {
-      Row({ space: 12 }) {
-        Text('手机名称').fontSize(22).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT).layoutWeight(1)
-        Button('取消', { type: ButtonType.Normal }).fontSize(15).fontColor(SECONDARY_TEXT)
+    Column({ space: PAGE_INSET }) {
+      Row({ space: CONTENT_GAP }) {
+        Text('手机名称').fontSize(SECTION_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT).layoutWeight(1)
+        Button('取消', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+          .constraintSize({ minHeight: TOUCH_SIZE, minWidth: TOUCH_SIZE })
           .backgroundColor(Color.Transparent).enabled(!this.working)
           .onClick(() => { this.editing = false })
-        Button(this.working ? '保存中' : '保存', { type: ButtonType.Capsule })
-          .height(36).fontSize(15).fontWeight(FontWeight.Medium)
+        Button(this.working ? '保存中' : '保存', { type: ButtonType.Normal })
+          .constraintSize({ minHeight: TOUCH_SIZE, minWidth: TOUCH_SIZE }).borderRadius(PANEL_RADIUS)
+          .fontSize(BODY_SIZE).fontWeight(FontWeight.Medium)
           .fontColor(ACCENT_TEXT).backgroundColor(ACCENT).enabled(!this.working)
           .onClick(() => { this.saveName() })
       }.width('100%')
       TextInput({ text: this.draftName, placeholder: '请输入手机名称' })
-        .maxLength(128).enabled(!this.working).height(52)
-        .fontSize(18).fontColor(PRIMARY_TEXT).placeholderColor('#969894')
-        .backgroundColor('#414341').borderRadius(12).caretColor(ACCENT)
+        .maxLength(128).enabled(!this.working).constraintSize({ minHeight: TOUCH_SIZE })
+        .fontSize(SECTION_SIZE).fontColor(PRIMARY_TEXT).placeholderColor(SECONDARY_TEXT)
+        .backgroundColor(PAGE_BACKGROUND).border({ width: 0.5, color: BORDER })
+        .borderRadius(PANEL_RADIUS).caretColor(ACCENT)
         .onChange((value: string) => { this.draftName = value; this.editError = '' })
         .enterKeyType(EnterKeyType.Done).onSubmit(() => { this.saveName() })
-      Text('用于在电脑上显示手机名称，保存后将在下次绑定时使用。')
-        .fontSize(14).fontColor(SECONDARY_TEXT).lineHeight(22).width('100%')
-      if (this.editError !== '') {
-        Text(this.editError).fontSize(14).fontColor(ERROR_TEXT).width('100%')
-      }
-    }.padding({ left: 24, right: 24, top: 12, bottom: 24 }).width('100%')
+      Text(this.editError || '名称将在下次绑定时展示给电脑。')
+        .fontSize(BODY_SIZE).fontColor(this.editError ? ERROR_TEXT : SECONDARY_TEXT).width('100%')
+    }.padding({ left: PAGE_INSET, right: PAGE_INSET, top: CONTENT_GAP, bottom: PAGE_INSET }).width('100%')
   }
 
   @Builder
   private sectionTitle(title: string) {
-    Text(title).fontSize(14).fontColor(SECONDARY_TEXT)
-      .width('100%').padding({ left: 14, top: 16, bottom: 12 })
+    Text(title).fontSize(META_SIZE).fontWeight(FontWeight.Medium).fontColor(SECONDARY_TEXT)
+      .width('100%').padding({ left: PAGE_INSET, top: PAGE_INSET, bottom: CONTENT_GAP })
   }
 
   @Builder
@@ -133,48 +134,55 @@ struct Settings {
       Column() {
         this.sectionTitle('设备')
         Column() {
-          Row({ space: 16 }) {
-            Image($r('sys.media.ohos_ic_public_edit')).width(22).height(22).fillColor('#AAAFA9')
-            Text('手机名称').fontSize(18).fontColor(PRIMARY_TEXT).layoutWeight(1)
-            Text(this.loaded ? this.deviceName : '正在读取').fontSize(15).fontColor(SECONDARY_TEXT)
+          Row({ space: CONTENT_GAP }) {
+            Image($r('sys.media.ohos_ic_public_edit')).width(16).height(16).fillColor(SECONDARY_TEXT)
+            Text('手机名称').fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT).layoutWeight(1)
+            Text(this.loaded ? this.deviceName : '正在读取').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
               .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).constraintSize({ maxWidth: '45%' })
-            SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(13).fontColor([SECONDARY_TEXT])
-          }.height(68).width('100%').padding({ left: 18, right: 20 })
+            SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(META_SIZE).fontColor([SECONDARY_TEXT])
+          }.constraintSize({ minHeight: TOUCH_SIZE }).width('100%')
+            .padding({ left: PAGE_INSET, right: PAGE_INSET, top: 6, bottom: 6 })
             .enabled(this.loaded && !this.working).onClick(() => { this.editName() })
             .accessibilityGroup(true).accessibilityText(`手机名称，${this.deviceName}，点击修改`)
           Divider().color(BORDER).strokeWidth(0.5)
-          Row({ space: 16 }) {
-            Image($r('sys.media.ohos_ic_public_device_phone')).width(22).height(22).fillColor('#AAAFA9')
-            Text('设备类型').fontSize(18).fontColor(PRIMARY_TEXT).layoutWeight(1)
-            Text('移动端').fontSize(15).fontColor(SECONDARY_TEXT)
-          }.height(68).width('100%').padding({ left: 18, right: 20 })
-        }.width('100%').backgroundColor(SURFACE).borderRadius(18).clip(true)
-        Text('名称将在下次绑定时展示给电脑。').fontSize(12).fontColor('#8F938D')
-          .width('100%').padding({ left: 14, top: 12 })
+          Row({ space: CONTENT_GAP }) {
+            Image($r('sys.media.ohos_ic_public_device_phone')).width(16).height(16).fillColor(SECONDARY_TEXT)
+            Text('设备类型').fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT).layoutWeight(1)
+            Text('移动端').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+          }.constraintSize({ minHeight: TOUCH_SIZE }).width('100%')
+            .padding({ left: PAGE_INSET, right: PAGE_INSET, top: 6, bottom: 6 })
+        }.width('100%').backgroundColor(SURFACE).borderRadius(PANEL_RADIUS).clip(true)
+        Text('名称将在下次绑定时展示给电脑。').fontSize(META_SIZE).fontColor(SECONDARY_TEXT)
+          .width('100%').padding({ left: PAGE_INSET, top: CONTENT_GAP })
 
         this.sectionTitle('应用程序')
-        Row({ space: 16 }) {
-          SymbolGlyph($r('sys.symbol.info_circle')).fontSize(22).fontColor(['#AAAFA9'])
-          Text('应用版本').fontSize(18).fontColor(PRIMARY_TEXT).layoutWeight(1)
-          Text(this.version).fontSize(15).fontColor(SECONDARY_TEXT)
-        }.height(68).width('100%').padding({ left: 18, right: 20 })
-          .backgroundColor(SURFACE).borderRadius(18)
+        Row({ space: CONTENT_GAP }) {
+          SymbolGlyph($r('sys.symbol.info_circle')).fontSize(16).fontColor([SECONDARY_TEXT])
+          Text('应用版本').fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT).layoutWeight(1)
+          Text(this.version).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+        }.constraintSize({ minHeight: TOUCH_SIZE }).width('100%')
+          .padding({ left: PAGE_INSET, right: PAGE_INSET, top: 6, bottom: 6 })
+          .backgroundColor(SURFACE).borderRadius(PANEL_RADIUS)
 
         if (this.working && !this.loaded) {
           LoadingProgress().width(24).height(24).color(ACCENT).margin({ top: 24 })
         }
         if (this.errorMessage !== '') {
-          Text(this.errorMessage).fontSize(14).fontColor(ERROR_TEXT).width('100%').margin({ top: 20 })
+          Text(this.errorMessage).fontSize(BODY_SIZE).fontColor(ERROR_TEXT).width('100%').margin({ top: PAGE_INSET })
           if (!this.loaded) {
-            Button('重新读取').fontColor(ACCENT).backgroundColor(SURFACE)
+            Button('重新读取').fontSize(BODY_SIZE).fontColor(ACCENT).backgroundColor(SURFACE)
+              .constraintSize({ minHeight: TOUCH_SIZE })
               .enabled(!this.working).onClick(() => { this.loadSettings() })
           }
         }
         if (this.notice !== '') {
-          Text(this.notice).fontSize(14).fontColor('#B5CFAE').width('100%').padding({ left: 14, top: 20 })
+          Text(this.notice).fontSize(BODY_SIZE).fontColor('#B5CFAE').width('100%')
+            .padding({ left: PAGE_INSET, top: PAGE_INSET })
         }
-      }.width('100%').padding({ left: 24, right: 24, bottom: 36 }).alignItems(HorizontalAlign.Start)
-    }.layoutWeight(1).width('100%').constraintSize({ maxWidth: 560 }).align(Alignment.Top).scrollBar(BarState.Auto)
+      }.width('100%').padding({ left: PAGE_INSET, right: PAGE_INSET, bottom: PAGE_INSET })
+        .alignItems(HorizontalAlign.Start)
+    }.layoutWeight(1).width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH }).align(Alignment.Top)
+      .scrollBar(BarState.Auto)
   }
 
   build() {
