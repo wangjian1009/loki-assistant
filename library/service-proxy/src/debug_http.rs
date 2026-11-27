@@ -1,8 +1,9 @@
 use crate::{
     error::{InvalidRequestReason, NetworkReason, ResponsError},
     network::{Network, QueryParameter, RequestHandle, RequestOptions, ServiceRequest},
+    service_proxy::ServiceProxy,
 };
-use http::{Method, Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, header, uri::PathAndQuery};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     body::{Bytes, Incoming},
@@ -28,34 +29,99 @@ use tokio::{
 };
 
 type HttpResponse = Response<Full<Bytes>>;
-type UiDispatch = dyn Fn(u64, &str, &str) -> bool + Send + Sync;
+pub type HttpDispatch = dyn Fn(u64, &str, &str) -> bool + Send + Sync;
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) struct HttpServer {
-    pub(crate) address: SocketAddr,
-    ui: Arc<UiBridge>,
+const DEVICE_REFRESH_PATH: &str = "/api/v1/device/refresh";
+
+#[derive(Default)]
+pub struct HttpRoutes {
+    handlers: Mutex<HashMap<String, Arc<HttpRoute>>>,
+}
+
+struct HttpRoute {
+    methods: Vec<Method>,
+    allow: String,
+    dispatch: Box<HttpDispatch>,
+}
+
+impl HttpRoutes {
+    pub fn register(
+        &self,
+        path: &str,
+        methods: &[String],
+        dispatch: Box<HttpDispatch>,
+    ) -> Result<(), String> {
+        let path_and_query = path
+            .parse::<PathAndQuery>()
+            .map_err(|_| "调试 HTTP 路径无效")?;
+        if !path.starts_with('/')
+            || path.starts_with("//")
+            || path.contains(['?', '#'])
+            || path_and_query.path() != path
+        {
+            return Err("调试 HTTP 路径必须是绝对路径".into());
+        }
+        if path == DEVICE_REFRESH_PATH || path.starts_with("/service/") {
+            return Err("路径已由调试 HTTP 服务使用".into());
+        }
+        if methods.is_empty() {
+            return Err("请指定至少一个 HTTP 方法".into());
+        }
+        let methods = methods
+            .iter()
+            .map(|method| Method::from_bytes(method.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "调试 HTTP 方法无效")?;
+        let allow = methods
+            .iter()
+            .map(Method::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let route = Arc::new(HttpRoute {
+            methods,
+            allow,
+            dispatch,
+        });
+        self.handlers.lock().unwrap().insert(path.to_owned(), route);
+        Ok(())
+    }
+
+    pub fn clear(&self) {
+        self.handlers.lock().unwrap().clear();
+    }
+
+    fn find(&self, path: &str) -> Option<Arc<HttpRoute>> {
+        self.handlers.lock().unwrap().get(path).cloned()
+    }
+}
+
+pub struct HttpServer {
+    pub address: SocketAddr,
+    ui: Arc<HttpBridge>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 
 impl HttpServer {
-    pub(crate) fn start(
+    pub fn start(
         runtime: &tokio::runtime::Handle,
         network: Arc<Network>,
+        proxy: Arc<ServiceProxy>,
         port: u16,
-        dispatch: Box<UiDispatch>,
+        routes: Arc<HttpRoutes>,
     ) -> std::io::Result<Self> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let address = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let _runtime = runtime.enter();
         let listener = TcpListener::from_std(listener)?;
-        let ui = Arc::new(UiBridge {
-            dispatch,
+        let ui = Arc::new(HttpBridge {
+            routes,
             pending: Mutex::new(HashMap::new()),
         });
         let (shutdown, stopped) = oneshot::channel();
-        let task = runtime.spawn(serve(listener, network, ui.clone(), stopped));
+        let task = runtime.spawn(serve(listener, network, proxy, ui.clone(), stopped));
         Ok(Self {
             address,
             ui,
@@ -64,11 +130,11 @@ impl HttpServer {
         })
     }
 
-    pub(crate) fn is_running(&self) -> bool {
+    pub fn is_running(&self) -> bool {
         self.shutdown.is_some() && !self.task.is_finished()
     }
 
-    pub(crate) fn respond(&self, id: u64, status: u16, body: &str) {
+    pub fn respond(&self, id: u64, status: u16, body: &str) {
         if let Some(sender) = self.ui.pending.lock().unwrap().remove(&id) {
             let status = StatusCode::from_u16(status)
                 .ok()
@@ -85,13 +151,13 @@ impl HttpServer {
         }
     }
 
-    pub(crate) fn begin_stop(&mut self) {
+    pub fn begin_stop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
     }
 
-    pub(crate) async fn stop(mut self) {
+    pub async fn stop(mut self) {
         self.begin_stop();
         let _ = (&mut self.task).await;
     }
@@ -106,7 +172,8 @@ impl Drop for HttpServer {
 async fn serve(
     listener: TcpListener,
     network: Arc<Network>,
-    ui: Arc<UiBridge>,
+    proxy: Arc<ServiceProxy>,
+    ui: Arc<HttpBridge>,
     mut stopped: oneshot::Receiver<()>,
 ) {
     let mut connections = JoinSet::new();
@@ -118,9 +185,10 @@ async fn serve(
             accepted = listener.accept(), if connections.len() < 32 => {
                 let Ok((stream, _)) = accepted else { break };
                 let network = network.clone();
+                let proxy = proxy.clone();
                 let ui = ui.clone();
                 connections.spawn(async move {
-                    let handler = service_fn(move |request| request_http(request, network.clone(), ui.clone()));
+                    let handler = service_fn(move |request| request_http(request, network.clone(), proxy.clone(), ui.clone()));
                     let _ = http1::Builder::new()
                         .keep_alive(false)
                         .timer(TokioTimer::new())
@@ -138,33 +206,18 @@ async fn serve(
 async fn request_http(
     request: Request<Incoming>,
     network: Arc<Network>,
-    ui: Arc<UiBridge>,
+    proxy: Arc<ServiceProxy>,
+    ui: Arc<HttpBridge>,
 ) -> Result<HttpResponse, Infallible> {
     let path = request.uri().path();
-    let response = if path == "/api/v1/ui/navigation" {
-        match *request.method() {
-            Method::GET => ui.request("GET", "").await,
-            Method::PUT => match tokio::time::timeout(
-                Duration::from_secs(5),
-                Limited::new(request.into_body(), 8192).collect(),
-            )
-            .await
-            {
-                Ok(Ok(body)) => match std::str::from_utf8(&body.to_bytes()) {
-                    Ok(body) => ui.request("PUT", body).await,
-                    Err(_) => error(
-                        StatusCode::BAD_REQUEST,
-                        "invalidInput",
-                        "请求体必须为 UTF-8",
-                    ),
-                },
-                Ok(Err(failure)) if failure.is::<http_body_util::LengthLimitError>() => {
-                    error(StatusCode::PAYLOAD_TOO_LARGE, "invalidInput", "请求过大")
-                }
-                Ok(Err(_)) => error(StatusCode::BAD_REQUEST, "invalidInput", "读取请求体失败"),
-                Err(_) => error(StatusCode::REQUEST_TIMEOUT, "unavailable", "读取请求体超时"),
-            },
-            _ => method_not_allowed("GET, PUT"),
+    let response = if path == DEVICE_REFRESH_PATH {
+        if request.method() == Method::POST {
+            match proxy.refresh_device(None) {
+                Ok(()) => json_response(StatusCode::ACCEPTED, json!({"accepted": true})),
+                Err(failure) => request_error(failure),
+            }
+        } else {
+            method_not_allowed("POST")
         }
     } else if let Some(path) = path
         .strip_prefix("/service/")
@@ -183,10 +236,55 @@ async fn request_http(
         } else {
             method_not_allowed("GET")
         }
+    } else if let Some(route) = ui.routes.find(path) {
+        if route.methods.contains(request.method()) {
+            let method = request.method().clone();
+            match read_body(request).await {
+                Ok(body) => ui.request(&route, method.as_str(), &body).await,
+                Err(response) => response,
+            }
+        } else {
+            method_not_allowed(&route.allow)
+        }
     } else {
         error(StatusCode::NOT_FOUND, "notFound", "接口不存在")
     };
     Ok(response)
+}
+
+async fn read_body(request: Request<Incoming>) -> Result<String, HttpResponse> {
+    if matches!(*request.method(), Method::GET | Method::HEAD) {
+        return Ok(String::new());
+    }
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        Limited::new(request.into_body(), 8192).collect(),
+    )
+    .await;
+    match body {
+        Ok(Ok(body)) => String::from_utf8(body.to_bytes().to_vec()).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "invalidInput",
+                "请求体必须为 UTF-8",
+            )
+        }),
+        Ok(Err(failure)) if failure.is::<http_body_util::LengthLimitError>() => Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalidInput",
+            "请求过大",
+        )),
+        Ok(Err(_)) => Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalidInput",
+            "读取请求体失败",
+        )),
+        Err(_) => Err(error(
+            StatusCode::REQUEST_TIMEOUT,
+            "unavailable",
+            "读取请求体超时",
+        )),
+    }
 }
 
 async fn query_service(network: &Network, request: ServiceRequest) -> HttpResponse {
@@ -203,28 +301,7 @@ async fn query_service(network: &Network, request: ServiceRequest) -> HttpRespon
         },
         move |failure| {
             if let Some(sender) = sender.lock().unwrap().take() {
-                let status = match &failure {
-                    ResponsError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
-                    ResponsError::NotBound(_) => StatusCode::FORBIDDEN,
-                    ResponsError::Cancelled(_) => StatusCode::SERVICE_UNAVAILABLE,
-                    ResponsError::Services(failure) => {
-                        StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY)
-                    }
-                    ResponsError::Network(failure) => match failure.reason {
-                        NetworkReason::ConnectTimeout | NetworkReason::RequestTimeout => {
-                            StatusCode::GATEWAY_TIMEOUT
-                        }
-                        _ => StatusCode::BAD_GATEWAY,
-                    },
-                    ResponsError::InvalidRequest(failure)
-                        if failure.reason == InvalidRequestReason::RequestTooLarge =>
-                    {
-                        StatusCode::PAYLOAD_TOO_LARGE
-                    }
-                    ResponsError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-                };
-                let body = serde_json::to_value(failure).expect("请求错误可序列化为 JSON");
-                let _ = sender.send(json_response(status, body));
+                let _ = sender.send(request_error(failure));
             }
         },
     ));
@@ -237,6 +314,31 @@ async fn query_service(network: &Network, request: ServiceRequest) -> HttpRespon
     })
 }
 
+fn request_error(failure: ResponsError) -> HttpResponse {
+    let status = match &failure {
+        ResponsError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ResponsError::NotBound(_) => StatusCode::FORBIDDEN,
+        ResponsError::Cancelled(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ResponsError::Services(failure) => {
+            StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY)
+        }
+        ResponsError::Network(failure) => match failure.reason {
+            NetworkReason::ConnectTimeout | NetworkReason::RequestTimeout => {
+                StatusCode::GATEWAY_TIMEOUT
+            }
+            _ => StatusCode::BAD_GATEWAY,
+        },
+        ResponsError::InvalidRequest(failure)
+            if failure.reason == InvalidRequestReason::RequestTooLarge =>
+        {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        ResponsError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+    };
+    let body = serde_json::to_value(failure).expect("请求错误可序列化为 JSON");
+    json_response(status, body)
+}
+
 struct CancelOnDrop(RequestHandle);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -244,18 +346,18 @@ impl Drop for CancelOnDrop {
     }
 }
 
-struct UiBridge {
-    dispatch: Box<UiDispatch>,
+struct HttpBridge {
+    routes: Arc<HttpRoutes>,
     pending: Mutex<HashMap<u64, oneshot::Sender<HttpResponse>>>,
 }
 
-impl UiBridge {
-    async fn request(&self, method: &str, body: &str) -> HttpResponse {
+impl HttpBridge {
+    async fn request(&self, route: &HttpRoute, method: &str, body: &str) -> HttpResponse {
         let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, sender);
-        let _cleanup = PendingUi { bridge: self, id };
-        if (self.dispatch)(id, method, body) {
+        let _cleanup = PendingResponse { bridge: self, id };
+        if (route.dispatch)(id, method, body) {
             if let Ok(Ok(response)) = tokio::time::timeout(Duration::from_secs(15), receiver).await
             {
                 return response;
@@ -269,25 +371,26 @@ impl UiBridge {
     }
 }
 
-struct PendingUi<'a> {
-    bridge: &'a UiBridge,
+struct PendingResponse<'a> {
+    bridge: &'a HttpBridge,
     id: u64,
 }
-impl Drop for PendingUi<'_> {
+impl Drop for PendingResponse<'_> {
     fn drop(&mut self) {
         self.bridge.pending.lock().unwrap().remove(&self.id);
     }
 }
 
-fn method_not_allowed(allowed: &'static str) -> HttpResponse {
+fn method_not_allowed(allowed: &str) -> HttpResponse {
     let mut response = error(
         StatusCode::METHOD_NOT_ALLOWED,
         "invalidInput",
         "不支持此请求方法",
     );
-    response
-        .headers_mut()
-        .insert(header::ALLOW, header::HeaderValue::from_static(allowed));
+    response.headers_mut().insert(
+        header::ALLOW,
+        header::HeaderValue::from_str(allowed).expect("已验证的 HTTP 方法"),
+    );
     response
 }
 

@@ -92,8 +92,10 @@ export interface StatusSnapshot {
   status: Object | null
   service: ServiceDeviceStatus | null
 }
-export type DeviceRefreshStep = 'registering' | 'querying'
-export interface DeviceRefreshResult { error: ResponsError | null }
+export type DeviceRefreshEvent = { endpoint_id: string, generation: number } & (
+  | { phase: 'registering' | 'reconnecting' | 'querying' | 'succeeded' }
+  | { phase: 'failed', error: ResponsError }
+)
 export type MailSyncPhase = 'queued' | 'downloading' | 'indexing' | 'refreshing' | 'completed' | 'failed' | 'unknown'
 export interface MailSyncProgress { id: string; phase: MailSyncPhase }
 export interface MailSyncSnapshot extends MailSyncProgress { messages: string[]; error: string | null }
@@ -131,9 +133,11 @@ export class Workspace {
   openSlack(): Slack
   loadState(): ApplicationData
   saveState(state: Object): Promise<void>
-  refreshDevice(endpoint: string, progress: (step: DeviceRefreshStep) => void): Promise<DeviceRefreshResult>
+  refreshDevice(endpoint: string): void
+  watchRefresh(changed: (event: DeviceRefreshEvent) => void): StatusSubscription
   watchStatus(changed: (snapshot: StatusSnapshot) => void): StatusSubscription
-  startHttpServer(port: number, dispatch: HttpDispatch): string
+  registerHttpRoute(path: string, methods: string[], dispatch: HttpDispatch): void
+  startHttpServer(port: number): string
   respondHttp(id: string, status: number, body: string): void
   stopHttpServer(): Promise<void>
   setService(configuration: ServiceConfiguration): void

@@ -363,3 +363,58 @@ fn binding_in_progress_is_single_and_cancelled_on_switch_or_shutdown() {
     workspace.execute("stop", "");
     assert!(network.service().is_none());
 }
+
+#[test]
+fn debug_http_dispatches_registered_paths_and_methods() {
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+    };
+
+    let fixture = Fixture::new();
+    let workspace = Arc::new(fixture.workspace());
+    let responder = Arc::downgrade(&workspace);
+    workspace
+        .register_http_route(
+            "/test/custom",
+            &["GET".into(), "POST".into()],
+            Box::new(move |id, method, body| {
+                let Some(workspace) = responder.upgrade() else {
+                    return false;
+                };
+                let response = json!({ "method": method, "body": body });
+                workspace.respond_http(id, 200, &response.to_string());
+                true
+            }),
+        )
+        .unwrap();
+    let address = workspace.start_http_server(0).unwrap();
+    let request = |method: &str, path: &str, body: &str| {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    let response = request("POST", "/test/custom", "已注册");
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 200"));
+    assert_eq!(
+        serde_json::from_str::<Value>(body).unwrap(),
+        json!({
+            "method": "POST", "body": "已注册"
+        })
+    );
+    let response = request("PUT", "/test/custom", "");
+    assert!(response.starts_with("HTTP/1.1 405"));
+    assert!(response.contains("allow: GET, POST"));
+    assert!(request("GET", "/api/v1/ui/navigation", "").starts_with("HTTP/1.1 404"));
+}

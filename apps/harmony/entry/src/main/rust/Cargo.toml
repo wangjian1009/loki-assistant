@@ -10,9 +10,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
 http = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 loki-service-proxy = { path = "../../../../../../library/service-proxy" }
 serde = { version = "1", features = ["derive"] }

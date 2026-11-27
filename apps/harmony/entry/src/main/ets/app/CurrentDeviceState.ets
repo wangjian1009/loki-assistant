@@ -34,6 +34,20 @@ export class CurrentDeviceState {
     this.loading = false
   }
 
+  async refresh(): Promise<void> {
+    const endpoint = this.current?.endpoint_id
+    const workspace = this.workspace
+    if (!this.active || !endpoint || !workspace) { return }
+    try {
+      const native = await workspace.open()
+      if (this.active && this.current?.endpoint_id === endpoint) {
+        native.refreshDevice(endpoint)
+      }
+    } catch (_) {
+      console.error('无法发起当前设备刷新')
+    }
+  }
+
   collapseDetails(): boolean {
     if (!this.detailsOpen) { return false }
     this.detailsOpen = false

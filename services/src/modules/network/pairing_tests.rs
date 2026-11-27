@@ -740,7 +740,7 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
     assert_eq!(restored.data["device_type"], "computer");
     assert!(!restored.data["name"].as_str().unwrap().is_empty());
     assert!(!restored.data.to_string().contains(&token));
-    let debug_address = workspace.start_http_server(0, |_, _, _| false).unwrap();
+    let debug_address = workspace.start_http_server(0).unwrap();
     let (status, body) = mobile_http(debug_address, "/service/network/session").await;
     assert_eq!(status, 200);
     assert_eq!(body, restored.data);

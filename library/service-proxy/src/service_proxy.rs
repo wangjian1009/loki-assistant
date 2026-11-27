@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, oneshot, watch},
+    sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -32,11 +32,22 @@ pub struct ServiceSnapshot {
     status_revision: u64,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeviceRefreshStep {
+#[derive(Clone, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum DeviceRefreshPhase {
     Registering,
+    Reconnecting,
     Querying,
+    Succeeded,
+    Failed { error: ResponsError },
+}
+
+#[derive(Clone, Serialize)]
+pub struct DeviceRefreshEvent {
+    pub endpoint_id: String,
+    pub generation: u64,
+    #[serde(flatten)]
+    pub phase: DeviceRefreshPhase,
 }
 
 impl ServiceSnapshot {
@@ -331,23 +342,74 @@ pub struct ServiceProxy {
     runtime: tokio::runtime::Handle,
     state: watch::Sender<ServiceSnapshot>,
     requested: Arc<Notify>,
+    refresh_requests: watch::Sender<Option<u64>>,
+    refresh_events: broadcast::Sender<DeviceRefreshEvent>,
     refresh_gate: AsyncMutex<()>,
     cache: Mutex<Cache>,
 }
 
+struct StatusRefresh {
+    endpoint_id: String,
+    generation: u64,
+    deadline: tokio::time::Instant,
+    events: broadcast::Sender<DeviceRefreshEvent>,
+    _observer: watch::Receiver<ServiceSnapshot>,
+}
+
+impl StatusRefresh {
+    fn publish(&self, phase: DeviceRefreshPhase) {
+        let _ = self.events.send(DeviceRefreshEvent {
+            endpoint_id: self.endpoint_id.clone(),
+            generation: self.generation,
+            phase,
+        });
+    }
+}
+
+fn refresh_deadline(
+    refresh: Option<&StatusRefresh>,
+) -> impl std::future::Future<Output = ()> + use<> {
+    let deadline = refresh.map(|request| request.deadline);
+    async move {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+struct StatusStream {
+    request: CancelOnDrop,
+    ended: oneshot::Receiver<Result<(), ResponsError>>,
+}
+
+impl StatusStream {
+    async fn close(stream: &mut Option<Self>) {
+        if let Some(stream) = stream.take() {
+            stream.request.0.cancel();
+            let _ = stream.ended.await;
+        }
+    }
+}
+
 impl ServiceProxy {
     pub fn new(network: Arc<Network>, runtime: tokio::runtime::Handle) -> Arc<Self> {
+        let (refresh_requests, requests) = watch::channel(None);
         let proxy = Arc::new(Self {
             network,
             runtime,
             state: watch::Sender::new(ServiceSnapshot::default()),
             requested: Arc::new(Notify::new()),
+            refresh_requests,
+            refresh_events: broadcast::channel(16).0,
             refresh_gate: AsyncMutex::new(()),
             cache: Mutex::new(Cache::default()),
         });
         let worker = Arc::downgrade(&proxy);
         let targets = proxy.network.target_changes();
-        proxy.runtime.spawn(Self::monitor(worker, targets));
+        proxy
+            .runtime
+            .spawn(Self::monitor(worker, targets, requests));
         proxy
     }
 
@@ -462,78 +524,177 @@ impl ServiceProxy {
         });
     }
 
-    async fn monitor(proxy: Weak<Self>, mut targets: watch::Receiver<u64>) {
+    async fn monitor(
+        proxy: Weak<Self>,
+        mut targets: watch::Receiver<u64>,
+        mut requests: watch::Receiver<Option<u64>>,
+    ) {
+        let mut refresh: Option<StatusRefresh> = None;
+        let mut stream = None;
         while let Some(current) = proxy.upgrade() {
             targets.borrow_and_update();
             current.sync_target();
-            let (generation, closed, binding) =
-                current.network.with_target(|generation, target, closed| {
-                    (generation, closed, target.map(|(_, binding)| binding))
-                });
+            let (generation, target, closed) = current
+                .network
+                .with_target(|generation, target, closed| (generation, target, closed));
             if closed {
+                if let Some(request) = refresh.take() {
+                    request.publish(DeviceRefreshPhase::Failed {
+                        error: CancelledReason::NetworkClosed.into(),
+                    });
+                }
                 break;
+            }
+            if refresh
+                .as_ref()
+                .is_some_and(|request| request.generation != generation)
+                && let Some(request) = refresh.take()
+            {
+                request.publish(DeviceRefreshPhase::Failed {
+                    error: CancelledReason::ServiceChanged.into(),
+                });
             }
             let observed = current.state.receiver_count() > 0;
             let requested = current.requested.clone();
             let state = current.state.clone();
             let network = current.network.clone();
+            let events = current.refresh_events.clone();
+            drop(current);
+
             let work = async {
-                match binding {
+                match target.as_ref().map(|(_, binding)| binding) {
                     Some(BindingState::Binding) => {
-                        let _ = network.wait_for_binding(generation).await;
+                        tokio::select! {
+                            _ = network.wait_for_binding(generation) => {}
+                            _ = refresh_deadline(refresh.as_ref()) => {
+                                if let Some(request) = refresh.take() {
+                                    request.publish(DeviceRefreshPhase::Failed { error: NetworkReason::RequestTimeout.into() });
+                                }
+                            }
+                        }
                     }
                     Some(BindingState::Bound { .. }) => {
-                        Self::watch_status(&proxy, &network, generation).await;
+                        Self::watch_status(&proxy, &network, generation, &mut stream, &mut refresh)
+                            .await;
                     }
                     Some(BindingState::Failed { error }) => {
+                        if let Some(request) = refresh.take() {
+                            request.publish(DeviceRefreshPhase::Failed {
+                                error: error.clone(),
+                            });
+                        }
                         if let Some(current) = proxy.upgrade() {
-                            current.apply_status(generation, None, Err(error));
+                            current.apply_status(generation, None, Err(error.clone()));
                         }
                         std::future::pending().await
                     }
                     _ => std::future::pending().await,
                 }
             };
-            drop(current);
             tokio::select! {
                 biased;
                 result = targets.changed() => { if result.is_err() { break; } }
+                result = async {
+                    loop {
+                        requests.changed().await?;
+                        if *requests.borrow_and_update() == Some(generation) {
+                            break Ok::<(), watch::error::RecvError>(());
+                        }
+                    }
+                } => {
+                    if result.is_err() { break; }
+                    if let Some((endpoint, binding)) = target {
+                        let request = StatusRefresh {
+                            generation,
+                            endpoint_id: endpoint.to_string(),
+                            deadline: tokio::time::Instant::now() + RequestOptions::default().timeout,
+                            events,
+                            _observer: state.subscribe(),
+                        };
+                        if matches!(binding, BindingState::Binding) {
+                            request.publish(DeviceRefreshPhase::Registering);
+                        }
+                        refresh = Some(request);
+                    }
+                }
                 _ = requested.notified() => {}
                 _ = state.closed(), if observed => {}
                 _ = work, if observed => {}
             }
+            StatusStream::close(&mut stream).await;
         }
+        StatusStream::close(&mut stream).await;
     }
 
-    async fn watch_status(proxy: &Weak<Self>, network: &Network, generation: u64) {
+    async fn watch_status(
+        proxy: &Weak<Self>,
+        network: &Network,
+        generation: u64,
+        stream: &mut Option<StatusStream>,
+        refresh: &mut Option<StatusRefresh>,
+    ) {
         let mut retry = Duration::from_secs(1);
+        if let Some(request) = refresh.as_ref() {
+            request.publish(DeviceRefreshPhase::Reconnecting);
+        }
         loop {
-            let (mut error, received) = match network.wait_for_relay(generation).await {
-                Ok(()) => Self::subscribe_status(proxy, network, generation).await,
+            let relay = tokio::select! {
+                result = network.wait_for_relay(generation) => result,
+                _ = refresh_deadline(refresh.as_ref()) => Err(NetworkReason::RequestTimeout.into()),
+            };
+            let (mut error, received) = match relay {
+                Ok(()) => {
+                    if let Some(request) = refresh.as_ref() {
+                        request.publish(DeviceRefreshPhase::Querying);
+                    }
+                    Self::subscribe_status(proxy, network, generation, stream, refresh).await
+                }
                 Err(error) => (error, false),
             };
+            StatusStream::close(stream).await;
             if matches!(&error, ResponsError::Services(error) if error.code == "sse-not-supported")
             {
                 // 旧服务使用单次查询，连接状态仍由网络事件更新。
                 let Some(current) = proxy.upgrade() else {
                     return;
                 };
-                let result = current.refresh_status_for(generation).await;
-                drop(current);
-                error = match result.and_then(|snapshot| snapshot.error.map_or(Ok(()), Err)) {
-                    Ok(()) => network.wait_for_link_loss(generation).await,
-                    Err(error) => error,
+                let result = tokio::select! {
+                    result = current.request::<StatusResponse>(generation, ServiceRequest::get("/status")) => {
+                        result.and_then(|response| response.data.into_status())
+                    }
+                    _ = refresh_deadline(refresh.as_ref()) => Err(NetworkReason::RequestTimeout.into()),
+                };
+                error = match result {
+                    Ok(status) => {
+                        current.apply_status(generation, None, Ok(status));
+                        if let Some(request) = refresh.take() {
+                            request.publish(DeviceRefreshPhase::Succeeded);
+                        }
+                        drop(current);
+                        network.wait_for_link_loss(generation).await
+                    }
+                    Err(failure) => failure,
                 };
             }
             let revoked = matches!(&error, ResponsError::NotBound(_));
             let cancelled = matches!(&error, ResponsError::Cancelled(_));
+            let manual_failure = if let Some(request) = refresh.take() {
+                request.publish(DeviceRefreshPhase::Failed {
+                    error: error.clone(),
+                });
+                true
+            } else {
+                false
+            };
             if cancelled {
                 return;
             }
             let Some(current) = proxy.upgrade() else {
                 return;
             };
-            current.apply_status(generation, None, Err(error));
+            if !manual_failure || revoked {
+                current.apply_status(generation, None, Err(error));
+            }
             if revoked {
                 return;
             }
@@ -550,10 +711,12 @@ impl ServiceProxy {
         proxy: &Weak<Self>,
         network: &Network,
         generation: u64,
+        stream: &mut Option<StatusStream>,
+        refresh: &mut Option<StatusRefresh>,
     ) -> (ResponsError, bool) {
         let (updates, mut snapshots) = watch::channel(None);
-        let (done, mut ended) = oneshot::channel();
-        let _request = CancelOnDrop(network.request_sse_for::<StatusEvent>(
+        let (done, ended) = oneshot::channel();
+        let request = CancelOnDrop(network.request_sse_for::<StatusEvent>(
             Some(generation),
             ServiceRequest::get("/status"),
             SseRequestOptions::default(),
@@ -567,6 +730,7 @@ impl ServiceProxy {
                 let _ = done.send(result);
             },
         ));
+        let active = stream.insert(StatusStream { request, ended });
         let mut received = false;
         loop {
             let result = tokio::select! {
@@ -579,6 +743,9 @@ impl ServiceProxy {
                         match result {
                             Ok(status) => {
                                 current.apply_status(generation, None, Ok(status));
+                                if let Some(request) = refresh.take() {
+                                    request.publish(DeviceRefreshPhase::Succeeded);
+                                }
                                 received = true;
                             }
                             Err(error) => return (error, received),
@@ -586,8 +753,12 @@ impl ServiceProxy {
                     }
                     continue;
                 }
-                result = &mut ended => result,
+                _ = refresh_deadline(refresh.as_ref()) => {
+                    return (NetworkReason::RequestTimeout.into(), received);
+                }
+                result = &mut active.ended => result,
             };
+            stream.take();
             let error = result
                 .ok()
                 .and_then(Result::err)
@@ -600,34 +771,42 @@ impl ServiceProxy {
         self.refresh_status_inner(None).await
     }
 
-    pub async fn refresh_device(
-        &self,
-        endpoint: &str,
-        progress: impl Fn(DeviceRefreshStep),
-    ) -> Result<(), ResponsError> {
-        let (generation, binding) = self.network.with_target(|generation, target, closed| {
+    pub fn refresh_device(&self, endpoint: Option<&str>) -> Result<(), ResponsError> {
+        self.network.with_target(|generation, target, closed| {
             if closed {
-                return Err(ResponsError::from(CancelledReason::NetworkClosed));
+                return Err(CancelledReason::NetworkClosed.into());
             }
             let (id, binding) = target.ok_or(NotConfiguredReason::ServiceNotSet)?;
-            if id.to_string() != endpoint {
+            if endpoint.is_some_and(|endpoint| id.to_string() != endpoint) {
                 return Err(CancelledReason::ServiceChanged.into());
             }
-            Ok((generation, binding))
-        })?;
-        if matches!(binding, BindingState::Binding) {
-            progress(DeviceRefreshStep::Registering);
-        }
-        self.network.wait_for_binding(generation).await?;
-        progress(DeviceRefreshStep::Querying);
-        let snapshot = self.refresh_status_for(generation).await?;
-        if let Some(error) = snapshot.error {
-            return Err(error);
-        }
-        if snapshot.status.is_none() {
-            return Err(NetworkReason::InvalidResponse.into());
-        }
-        Ok(())
+            if matches!(binding, BindingState::Unbound) {
+                return Err(NotBoundReason::BindingRequired.into());
+            }
+            self.refresh_requests.send_replace(Some(generation));
+            Ok(())
+        })
+    }
+
+    pub fn watch_refresh(
+        &self,
+        mut changed: impl FnMut(DeviceRefreshEvent) -> bool + Send + 'static,
+    ) -> StatusSubscription {
+        let mut events = self.refresh_events.subscribe();
+        let task = self.runtime.spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        if !changed(event) {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        StatusSubscription { task }
     }
 
     pub(crate) async fn refresh_status_for(

@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use napi_derive_ohos::napi;
 use napi_ohos::{
     Env, Error, Result, Status,
-    bindgen_prelude::{FnArgs, Function, Object, PromiseRaw},
+    bindgen_prelude::{FnArgs, Function, Object},
     threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
 };
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::{
         RequestHandle as RustRequestHandle, RequestOptions as RustRequestOptions, ResponsError,
         ServiceRequest as RustServiceRequest,
     },
-    service_proxy::{DeviceRefreshStep, StatusSubscription as RustStatusSubscription},
+    service_proxy::{DeviceRefreshEvent, StatusSubscription as RustStatusSubscription},
     slack::{Slack as RustSlack, SlackStatusChanged},
     workspace::ServiceConfiguration,
 };
@@ -97,32 +97,14 @@ impl Workspace {
         blocking(move || workspace.save_state(state)).await
     }
 
-    #[napi(
-        ts_args_type = "endpoint: string, progress: (step: DeviceRefreshStep) => void",
-        ts_return_type = "Promise<DeviceRefreshResult>"
-    )]
-    pub fn refresh_device<'env>(
-        &self,
-        env: &'env Env,
-        endpoint: String,
-        progress: Function<'_, Value, ()>,
-    ) -> Result<PromiseRaw<'env, Value>> {
-        let progress = progress
-            .build_threadsafe_function()
-            .callee_handled::<false>()
-            .weak::<true>()
-            .build()?;
-        let workspace = self.inner.clone();
-        env.spawn_future(async move {
-            let result = workspace
-                .refresh_device(&endpoint, move |step: DeviceRefreshStep| {
-                    if let Ok(value) = js_value(step) {
-                        progress.call(value, NonBlocking);
-                    }
-                })
-                .await;
-            js_value(result)
-        })
+    #[napi]
+    pub fn refresh_device(&self, env: Env, endpoint: String) -> Result<()> {
+        typed_result(env, self.inner.refresh_device(&endpoint))
+    }
+
+    #[napi(ts_args_type = "changed: (event: DeviceRefreshEvent) => void")]
+    pub fn watch_refresh(&self, changed: Function<'_, Value, ()>) -> Result<StatusSubscription> {
+        subscribe::<DeviceRefreshEvent>(changed, |changed| self.inner.watch_refresh(changed))
     }
 
     #[napi(ts_args_type = "changed: (snapshot: StatusSnapshot) => void")]
@@ -130,24 +112,36 @@ impl Workspace {
         subscribe(changed, |changed| self.inner.watch_status(changed))
     }
 
-    #[napi(ts_args_type = "port: number, dispatch: HttpDispatch")]
-    pub fn start_http_server(
+    #[napi(ts_args_type = "path: string, methods: string[], dispatch: HttpDispatch")]
+    pub fn register_http_route(
         &self,
-        port: u16,
+        path: String,
+        methods: Vec<String>,
         dispatch: Function<'_, FnArgs<(String, String, String)>, ()>,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let dispatch = dispatch
             .build_threadsafe_function()
             .callee_handled::<false>()
             .weak::<true>()
             .build()?;
         self.inner
-            .start_http_server(port, move |id, method, body| {
-                dispatch.call(
-                    (id.to_string(), method.to_owned(), body.to_owned()).into(),
-                    NonBlocking,
-                ) == Status::Ok
-            })
+            .register_http_route(
+                &path,
+                &methods,
+                Box::new(move |id, method, body| {
+                    dispatch.call(
+                        (id.to_string(), method.to_owned(), body.to_owned()).into(),
+                        NonBlocking,
+                    ) == Status::Ok
+                }),
+            )
+            .map_err(Error::from_reason)
+    }
+
+    #[napi]
+    pub fn start_http_server(&self, port: u16) -> Result<String> {
+        self.inner
+            .start_http_server(port)
             .map(|address| address.to_string())
             .map_err(Error::from_reason)
     }

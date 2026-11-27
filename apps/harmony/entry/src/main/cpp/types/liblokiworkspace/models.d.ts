@@ -91,8 +91,10 @@ export interface StatusSnapshot {
   status: Object | null
   service: ServiceDeviceStatus | null
 }
-export type DeviceRefreshStep = 'registering' | 'querying'
-export interface DeviceRefreshResult { error: ResponsError | null }
+export type DeviceRefreshEvent = { endpoint_id: string, generation: number } & (
+  | { phase: 'registering' | 'reconnecting' | 'querying' | 'succeeded' }
+  | { phase: 'failed', error: ResponsError }
+)
 export type MailSyncPhase = 'queued' | 'downloading' | 'indexing' | 'refreshing' | 'completed' | 'failed' | 'unknown'
 export interface MailSyncProgress { id: string; phase: MailSyncPhase }
 export interface MailSyncSnapshot extends MailSyncProgress { messages: string[]; error: string | null }

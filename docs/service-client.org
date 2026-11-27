@@ -76,7 +76,9 @@ Network 不读写多设备列表；应用保留完整配置和随机手机身份
 
 ~ServiceProxy~ 使用 ~generation~ 隔离切换前后的电脑数据。切换目标时清空上一个目标的快照与缓存。API 元数据按模块读取 ~GET /discover/modules/{module_id}~ ，配置元数据使用 ~GET /meta~ ，状态元数据使用 ~GET /stats/meta~ 。读取配置值时由 ~refresh_config~ 查询 ~GET /data/{module_id}~ ， ~cached_config~ 返回该目标已缓存的配置。代理用同一条 ~GET /status~ SSE 流同步电脑状态以及邮件、Slack 等已公开的业务状态。
 
-~ServiceProxy::listen~ 接收返回类型化数据的快照投影和更新回调。订阅先收到当前快照，后续在投影结果变化时回调。~ServiceSnapshot::status<T>~ 将对应模块状态反序列化为业务类型。HarmonyOS 首页订阅设备状态，邮件和 Slack 卡片分别调用 Rust ~Mail::watch_status~ 和 ~Slack::watch_status~ 。卡片移除时调用 ~StatusSubscription::cancel~ 并释放模块句柄。代理监听绑定结果，并在有本地订阅时为当前已绑定的电脑维持一条 SSE 流。首条 ~status~ 事件同步全量快照，随后由服务端推送变化。本地 relay 断开、对端 QUIC 连接关闭或 SSE 流中断都会使设备状态转为离线。代理在 relay 可用时退避重连，重新订阅后以首帧同步最新状态。停止最后一个本地订阅时释放状态流。界面仍可请求即时查询，切到后台时结束首页订阅。旧服务明确返回 ~sse-not-supported~ 时可读取一次 JSON 快照，连接状态继续由网络事件更新。
+~ServiceProxy::listen~ 接收返回类型化数据的快照投影和更新回调。订阅先收到当前快照，后续在投影结果变化时回调。~ServiceSnapshot::status<T>~ 将对应模块状态反序列化为业务类型。HarmonyOS 首页订阅设备状态，邮件和 Slack 卡片分别调用 Rust ~Mail::watch_status~ 和 ~Slack::watch_status~ 。卡片移除时调用 ~StatusSubscription::cancel~ 并释放模块句柄。代理监听绑定结果，并在有本地订阅时为当前已绑定的电脑维持一条 SSE 流。首条 ~status~ 事件同步全量快照，随后由服务端推送变化。本地 relay 断开、对端 QUIC 连接关闭或 SSE 流中断都会使设备状态转为离线。代理在 relay 可用时退避重连，重新订阅后以首帧同步最新状态。停止最后一个本地订阅时释放状态流。切到后台时结束首页订阅。旧服务明确返回 ~sse-not-supported~ 时可读取一次 JSON 快照，连接状态继续由网络事件更新。
+
+发起设备刷新时，代理取消当前状态流并立即建立新的 ~GET /status~ SSE 流。新流的首个有效快照通过现有状态订阅交给设备、邮件和 Slack 界面。刷新面板独立订阅 ~Workspace.watchRefresh~ ，按事件显示注册、重连、同步和结束结果。刷新进度和本次刷新错误由这条订阅报告。下拉和本地调试 HTTP 的 ~POST /api/v1/device/refresh~ 共用这套流程。
 
 邮件模块定义同步请求、普通响应、进度事件与状态投影。任务进度优先来自邮件 SSE。收到普通 JSON 响应或邮件事件流中断后，代理从共享状态订阅的 ~mail/sync_runs~ 同步任务进度。Slack 首页数据从同一个快照恢复为类型化对象。
 

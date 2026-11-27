@@ -1,29 +1,35 @@
-import { DeviceRefreshStep } from 'liblokiworkspace.so'
+import { DeviceRefreshEvent, StatusSubscription } from 'liblokiworkspace.so'
 import { Workspace } from '../workspace/Workspace'
 import { ACCENT, BODY_SIZE, CONTENT_GAP, ERROR_TEXT, SECONDARY_TEXT } from './AppPage'
 
 @Component
 export struct DeviceRefresh {
   workspace: () => Workspace | undefined = () => undefined
-  @Prop @Watch('targetChanged') endpointId: string = ''
-  @Prop @Watch('requestRefresh') refreshRequest: number = 0
+  @Prop @Watch('activeChanged') active: boolean = false
+  @Prop @Watch('reset') endpointId: string = ''
   @State private phase: 'idle' | 'running' | 'success' | 'failure' = 'idle'
   @State private message: string = ''
   private timer: number = -1
   private version: number = 0
+  private subscription?: StatusSubscription
 
-  aboutToDisappear(): void { this.reset() }
+  aboutToAppear(): void { this.activeChanged() }
 
-  private targetChanged(): void {
+  aboutToDisappear(): void { this.stop() }
+
+  private activeChanged(): void {
+    this.stop()
+    if (this.active) { this.listen() }
+  }
+
+  private stop(): void {
+    this.version += 1
+    this.subscription?.cancel()
+    this.subscription = undefined
     this.reset()
   }
 
-  private requestRefresh(): void {
-    this.sync()
-  }
-
   private reset(): void {
-    this.version += 1
     if (this.timer !== -1) {
       clearTimeout(this.timer)
       this.timer = -1
@@ -32,29 +38,48 @@ export struct DeviceRefresh {
     this.message = ''
   }
 
-  private async sync(): Promise<void> {
+  private async listen(): Promise<void> {
     const workspace = this.workspace()
-    if (!this.endpointId || !workspace || this.phase !== 'idle') { return }
-    const version = ++this.version
-    this.phase = 'running'
-    this.message = '正在连接电脑…'
-    const endpoint = this.endpointId
+    if (!workspace) { return }
+    const version = this.version
     try {
       const native = await workspace.open()
       if (version !== this.version) { return }
-      const result = await native.refreshDevice(endpoint, (step: DeviceRefreshStep) => {
-        if (version !== this.version || this.phase !== 'running') { return }
-        this.message = step === 'registering' ? '设备注册中…' : '状态查询中…'
+      this.subscription = native.watchRefresh((event: DeviceRefreshEvent) => {
+        if (version === this.version && event.endpoint_id === this.endpointId) {
+          this.update(event)
+        }
       })
-      if (version !== this.version) { return }
-      this.phase = result.error ? 'failure' : 'success'
-      this.message = result.error?.message ?? ''
-    } catch (error) {
-      if (version !== this.version) { return }
-      this.phase = 'failure'
-      this.message = (error as Error).message || '无法同步设备状态'
+    } catch (_) {
+      console.error('无法订阅设备刷新事件')
     }
-    this.timer = setTimeout(() => { this.reset() }, this.phase === 'success' ? 1000 : 2000)
+  }
+
+  private update(event: DeviceRefreshEvent): void {
+    this.reset()
+    switch (event.phase) {
+      case 'registering':
+        this.phase = 'running'
+        this.message = '设备注册中…'
+        break
+      case 'reconnecting':
+        this.phase = 'running'
+        this.message = '正在重连电脑…'
+        break
+      case 'querying':
+        this.phase = 'running'
+        this.message = '正在同步设备状态…'
+        break
+      case 'succeeded':
+        this.phase = 'success'
+        this.timer = setTimeout(() => { this.reset() }, 1000)
+        break
+      case 'failed':
+        this.phase = 'failure'
+        this.message = event.error.message
+        this.timer = setTimeout(() => { this.reset() }, 2000)
+        break
+    }
   }
 
   build() {

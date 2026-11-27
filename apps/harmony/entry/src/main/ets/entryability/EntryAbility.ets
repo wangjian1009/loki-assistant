@@ -2,7 +2,7 @@ import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit'
 import { deviceInfo } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
 import { Application } from '../app/Application'
-import { handleNavigation } from '../app/HttpNavigation'
+import { registerNavigationRoute } from '../app/HttpNavigation'
 import { NavigatorManager, launchPath } from '../app/NavigatorManager'
 import { Workspace } from '../workspace/Workspace'
 import { DEBUG } from 'BuildProfile'
@@ -42,12 +42,8 @@ export default class EntryAbility extends UIAbility {
         if (this.application !== application || !this.httpEnabled) return
         const workspace = await application.workspace.open()
         if (this.application !== application || !this.httpEnabled) return
-        workspace.startHttpServer(8787, (id: string, method: string, body: string): void => {
-          const respond = (status: number, response: string): void => { workspace.respondHttp(id, status, response) }
-          handleNavigation(navigator, method, body, respond).catch((error: Error): void => {
-            console.error('处理 HTTP 导航失败：' + error.message)
-          })
-        })
+        registerNavigationRoute(workspace, navigator)
+        workspace.startHttpServer(8787)
       } else {
         await (await application.workspace.open()).stopHttpServer()
       }

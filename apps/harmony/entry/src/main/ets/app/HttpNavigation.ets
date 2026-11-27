@@ -1,3 +1,4 @@
+import { Workspace } from 'liblokiworkspace.so'
 import { NavigatorManager, NavigationResult, parseNavigationPath } from './NavigatorManager'
 
 type HttpResponder = (status: number, body: string) => void
@@ -14,6 +15,17 @@ interface NavigationErrorDetail {
 function navigationError(respond: HttpResponder, status: number, code: string, message: string): void {
   const body: NavigationErrorBody = { error: { code, message } }
   respond(status, JSON.stringify(body))
+}
+
+export function registerNavigationRoute(workspace: Workspace, navigator: NavigatorManager): void {
+  workspace.registerHttpRoute('/api/v1/ui/navigation', ['GET', 'PUT'],
+    (id: string, method: string, body: string): void => {
+      const respond = (status: number, response: string): void => { workspace.respondHttp(id, status, response) }
+      handleNavigation(navigator, method, body, respond).catch((error: Error): void => {
+        console.error('处理 HTTP 导航失败：' + error.message)
+        navigationError(respond, 500, 'internalError', '处理导航请求失败')
+      })
+    })
 }
 
 export async function handleNavigation(navigator: NavigatorManager, method: string, body: string,

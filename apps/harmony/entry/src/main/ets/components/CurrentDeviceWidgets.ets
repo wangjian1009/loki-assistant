@@ -18,7 +18,6 @@ export struct CurrentDeviceWidgets {
   @State private order: CurrentDeviceWidget[] = currentDeviceOrder()
   @State private orderReady: boolean = false
   @State private orderError: string = ''
-  @State private refreshRequest: number = 0
   @State private editAngle: number = 0
   private readonly scroller: Scroller = new Scroller()
   private startedAtTop: boolean = false
@@ -109,8 +108,8 @@ export struct CurrentDeviceWidgets {
     Column() {
       DeviceRefresh({
         workspace: () => this.device.workspace,
-        endpointId: this.device.active ? this.device.current?.endpoint_id ?? '' : '',
-        refreshRequest: this.refreshRequest
+        active: this.device.active,
+        endpointId: this.device.current?.endpoint_id ?? ''
       })
       List({ scroller: this.scroller, space: CONTENT_GAP }) {
         if (this.adjustingOrder && this.orderError) {
@@ -155,7 +154,7 @@ export struct CurrentDeviceWidgets {
               this.startedAtTop = !this.adjustingOrder && this.scroller.currentOffset().yOffset <= 0
             })
             .onActionEnd((event: GestureEvent) => {
-              if (this.startedAtTop && !this.adjustingOrder && event.offsetY >= 72) { this.refreshRequest += 1 }
+              if (this.startedAtTop && !this.adjustingOrder && event.offsetY >= 72) { this.device.refresh() }
               this.startedAtTop = false
             })
             .onActionCancel(() => { this.startedAtTop = false })

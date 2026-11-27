@@ -1,11 +1,13 @@
 use crate::{
-    http_server::HttpServer,
     network::{AutoBinding, BindingState, InvalidRequestReason, Network, ResponsError, Service},
     storage,
 };
 use loki_service_proxy::{
+    debug_http::{HttpDispatch, HttpRoutes, HttpServer},
     mail::Mail,
-    service_proxy::{ComputerStatus, DeviceRefreshStep, ServiceProxy, ServiceSnapshot},
+    service_proxy::{
+        ComputerStatus, DeviceRefreshEvent, ServiceProxy, ServiceSnapshot, StatusSubscription,
+    },
 };
 use serde_json::Value;
 #[cfg(not(target_env = "ohos"))]
@@ -61,11 +63,6 @@ pub struct ApplicationData {
     pub endpoint_id: String,
 }
 
-#[derive(serde::Serialize)]
-pub struct DeviceRefreshResult {
-    pub error: Option<ResponsError>,
-}
-
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfiguration {
@@ -88,6 +85,7 @@ pub struct Workspace {
     stop_gate: tokio::sync::Mutex<()>,
     stop_executor: Mutex<()>,
     http: Mutex<Option<HttpServer>>,
+    http_routes: Arc<HttpRoutes>,
 }
 impl Workspace {
     /// 初始化只读取本机存储，不连接预设服务器；统一持有执行环境。
@@ -116,6 +114,7 @@ impl Workspace {
             stop_gate: tokio::sync::Mutex::new(()),
             stop_executor: Mutex::new(()),
             http: Mutex::new(None),
+            http_routes: Arc::new(HttpRoutes::default()),
         })
     }
     pub fn network(&self) -> Arc<Network> {
@@ -183,14 +182,15 @@ impl Workspace {
         crate::pairing::Invitation::decode(payload)
     }
 
-    pub async fn refresh_device(
+    pub fn refresh_device(&self, endpoint: &str) -> Result<(), ResponsError> {
+        self.proxy.refresh_device(Some(endpoint))
+    }
+
+    pub fn watch_refresh(
         &self,
-        endpoint: &str,
-        progress: impl Fn(DeviceRefreshStep),
-    ) -> DeviceRefreshResult {
-        DeviceRefreshResult {
-            error: self.proxy.refresh_device(endpoint, progress).await.err(),
-        }
+        changed: impl FnMut(DeviceRefreshEvent) -> bool + Send + 'static,
+    ) -> StatusSubscription {
+        self.proxy.watch_refresh(changed)
     }
 
     pub fn open_mail(&self) -> Mail {
@@ -201,12 +201,21 @@ impl Workspace {
         loki_service_proxy::slack::Slack::new(self.proxy.clone())
     }
 
-    /// 使用当前工作空间的 Network 监听设备回环地址，端口 0 由系统分配。
-    pub fn start_http_server(
+    pub fn register_http_route(
         &self,
-        port: u16,
-        dispatch: impl Fn(u64, &str, &str) -> bool + Send + Sync + 'static,
-    ) -> Result<SocketAddr, String> {
+        path: &str,
+        methods: &[String],
+        dispatch: Box<HttpDispatch>,
+    ) -> Result<(), String> {
+        let _server = self.http.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err("工作空间已停止".into());
+        }
+        self.http_routes.register(path, methods, dispatch)
+    }
+
+    /// 使用当前工作空间的 Network 监听设备回环地址，端口 0 由系统分配。
+    pub fn start_http_server(&self, port: u16) -> Result<SocketAddr, String> {
         let _guard = self.stop_executor.lock().unwrap();
         let mut server = self.http.lock().unwrap();
         if self.stopping.load(Ordering::SeqCst) {
@@ -215,8 +224,14 @@ impl Workspace {
         if let Some(active) = server.as_ref().filter(|server| server.is_running()) {
             return Ok(active.address);
         }
-        let started = HttpServer::start(&self.executor, self.network(), port, Box::new(dispatch))
-            .map_err(|error| format!("无法启动调试 HTTP 服务：{error}"))?;
+        let started = HttpServer::start(
+            &self.executor,
+            self.network(),
+            self.proxy.clone(),
+            port,
+            self.http_routes.clone(),
+        )
+        .map_err(|error| format!("无法启动调试 HTTP 服务：{error}"))?;
         let address = started.address;
         *server = Some(started);
         Ok(address)
@@ -238,7 +253,9 @@ impl Workspace {
     pub fn begin_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.network.begin_shutdown();
-        if let Some(server) = self.http.lock().unwrap().as_mut() {
+        let mut http = self.http.lock().unwrap();
+        self.http_routes.clear();
+        if let Some(server) = http.as_mut() {
             server.begin_stop();
         }
     }

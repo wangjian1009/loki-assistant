@@ -1,4 +1,3 @@
-mod http_server;
 pub use loki_service_proxy::{error, mail, network, pairing, service_proxy, slack};
 mod storage;
 mod workspace;

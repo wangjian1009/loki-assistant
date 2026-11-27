@@ -2412,9 +2412,6 @@ name = "loki-mobile-network"
 version = "0.1.0"
 dependencies = [
  "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "iroh",
  "libc",
  "loki-service-proxy",
@@ -2433,6 +2430,9 @@ name = "loki-service-proxy"
 version = "0.1.0"
 dependencies = [
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "serde",
  "serde_json",
