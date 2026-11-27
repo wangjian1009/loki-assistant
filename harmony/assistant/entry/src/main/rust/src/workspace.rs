@@ -3,7 +3,7 @@ use crate::{
     storage,
 };
 use loki_service_proxy::{
-    agent_shell::AgentShell,
+    agent_shell::{AgentShell, AgentShellSession},
     debug_http::{HttpDispatch, HttpRoutes, HttpServer},
     mail::Mail,
     service_proxy::{
@@ -43,6 +43,7 @@ pub struct DashboardUpdate {
     error: Option<ResponsError>,
     status: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>>,
     service: Option<ComputerStatus>,
+    agent_shell_sessions: Option<Vec<AgentShellSession>>,
 }
 
 impl From<&ServiceSnapshot> for DashboardUpdate {
@@ -54,6 +55,7 @@ impl From<&ServiceSnapshot> for DashboardUpdate {
             error: snapshot.error.clone(),
             status: snapshot.status.clone(),
             service: ComputerStatus::from_snapshot(snapshot),
+            agent_shell_sessions: AgentShellSession::from_snapshot(snapshot),
         }
     }
 }

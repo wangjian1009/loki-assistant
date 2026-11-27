@@ -362,6 +362,44 @@ impl AgentShell {
             self.inner.watch_status(changed)
         })
     }
+
+    #[napi(
+        ts_args_type = "sessionId: string, changed: (event: AgentShellConversationEvent) => void, ended: (error: ResponsError | null) => void"
+    )]
+    pub fn watch_conversation(
+        &self,
+        env: Env,
+        session_id: String,
+        changed: Function<'_, Value, ()>,
+        ended: Function<'_, Value, ()>,
+    ) -> Result<RequestHandle> {
+        let changed = changed
+            .build_threadsafe_function()
+            .callee_handled::<false>()
+            .weak::<true>()
+            .build()?;
+        let ended = ended
+            .build_threadsafe_function()
+            .callee_handled::<false>()
+            .weak::<true>()
+            .build()?;
+        let handle = self.inner.watch_conversation(
+            session_id,
+            move |event| {
+                if let Ok(value) = js_value(event) {
+                    changed.call(value, NonBlocking);
+                }
+            },
+            move |result| {
+                if let Ok(value) = js_value(result.err()) {
+                    ended.call(value, NonBlocking);
+                }
+            },
+        );
+        Ok(RequestHandle {
+            inner: Some(typed_result(env, handle)?),
+        })
+    }
 }
 
 #[napi]

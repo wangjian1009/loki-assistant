@@ -8,30 +8,30 @@
 
 * 当前模块
 
-| 模块 | 职责 | 状态 |
-|------+------|------|
-| ~runtime~ | 服务进程启动配置、运行状态和 Services 持有 | 已实现 |
-| ~services~ | 业务模块组合和路由组合 | 已实现 |
-| ~http~ | loopback HTTP server | 已实现 |
-| ~modules/discover~ | 编译期模块/API 描述和发现接口 | 已实现 |
-| [[file:config-module.org][modules/config]] | 配置模型、数据读写和变更通知 | 已实现基础能力及元数据通知接入点 |
-| ~modules/control_center~ | 控制中心配置和菜单栏登录启动 | 已实现 |
-| ~modules/emacs~ | emacsclient gateway、buffer 查询和激活、Emacs 通知转换 | 已实现 |
-| ~modules/xbloom~ | 通过 Emacs 查询 Org 配方库与日记，保存日记配方 | 已实现 |
-| ~modules/doc~ | 提交网页全文、按 Org ID 查询文档和管理稍后阅读 | 已实现 |
-| ~modules/llm~ | 转发 Codex 和 Claude HTTP 请求，管理本机客户端绑定及用量 | 已实现 |
-| ~modules/status~ | 通用状态发布、内存存储与查询 | 已实现 |
-| ~modules/alert~ | 发布和清理活跃告警，变更时触发系统通知 | 已实现 |
-| ~modules/mail~ | 同步 Maildir、更新 mu 索引、通知新邮件及转交 Emacs 撰写草稿 | 已实现 |
-| ~modules/network~ | 本地身份、中转注册、绑定邀请和设备绑定 | 已实现 |
-| ~modules/service~ | 配置 HTTP 监听端口，发布本机名称、设备类型和进程启动时间 | 已实现 |
-| ~modules/password~ | 枚举本地密码库条目并解密 OpenPGP 文件 | 已实现，只读 |
-| [[file:slack.org][modules/slack]] | 工作区注册、实时消息接收、提及和私信通知、消息查询和发送 | 已实现首期与网页会话接入 |
-| ~modules/notification~ | 通用系统通知、应用内跳转封装和提交回执 | 已实现 |
-| ~modules/health~ | 服务健康检查 | 已实现 |
-| ~platform/macos~ | 托盘登录启动的 LaunchAgent 管理 | 已实现基础能力 |
-| ~apps/center~ | 菜单栏显示 services 状态 | 已实现最小入口 |
-| ~emacs/loki-assistant-config.el~ | Customize 风格的服务配置管理 | 已实现 |
+| 模块                             | 职责                                                        | 状态                             |
+|----------------------------------+-------------------------------------------------------------+----------------------------------|
+| ~runtime~                        | 服务进程启动配置、运行状态和 Services 持有                  | 已实现                           |
+| ~services~                       | 业务模块组合和路由组合                                      | 已实现                           |
+| ~http~                           | loopback HTTP server                                        | 已实现                           |
+| ~modules/discover~               | 编译期模块/API 描述和发现接口                               | 已实现                           |
+| [[file:config-module.org][modules/config]]                   | 配置模型、数据读写和变更通知                                | 已实现基础能力及元数据通知接入点 |
+| ~modules/control_center~         | 控制中心配置和菜单栏登录启动                                | 已实现                           |
+| ~modules/emacs~                  | emacsclient gateway、buffer 查询和激活、Emacs 通知转换      | 已实现                           |
+| ~modules/xbloom~                 | 通过 Emacs 查询 Org 配方库与日记，保存日记配方              | 已实现                           |
+| ~modules/doc~                    | 提交网页全文、按 Org ID 查询文档和管理稍后阅读              | 已实现                           |
+| ~modules/llm~                    | 转发 Codex 和 Claude HTTP 请求，管理本机客户端绑定及用量    | 已实现                           |
+| ~modules/status~                 | 通用状态发布、内存存储与查询                                | 已实现                           |
+| ~modules/alert~                  | 发布和清理活跃告警，变更时触发系统通知                      | 已实现                           |
+| ~modules/mail~                   | 同步 Maildir、更新 mu 索引、通知新邮件及转交 Emacs 撰写草稿 | 已实现                           |
+| ~modules/network~                | 本地身份、中转注册、绑定邀请和设备绑定                      | 已实现                           |
+| ~modules/service~                | 配置 HTTP 监听端口，发布本机名称、设备类型和进程启动时间    | 已实现                           |
+| ~modules/password~               | 枚举本地密码库条目并解密 OpenPGP 文件                       | 已实现，只读                     |
+| [[file:slack.org][modules/slack]]                    | 工作区注册、实时消息接收、提及和私信通知、消息查询和发送    | 已实现首期与网页会话接入         |
+| ~modules/notification~           | 通用系统通知、应用内跳转封装和提交回执                      | 已实现                           |
+| ~modules/health~                 | 服务健康检查                                                | 已实现                           |
+| ~platform/macos~                 | 托盘登录启动的 LaunchAgent 管理                             | 已实现基础能力                   |
+| ~apps/center~                    | 菜单栏显示 services 状态                                    | 已实现最小入口                   |
+| ~emacs/loki-assistant-config.el~ | Customize 风格的服务配置管理                                | 已实现                           |
 
 services 绑定监听地址后写入 ~~/.assistant/service~ JSON pfile，客户端通过该文件获取实际监听的地址和端口，再请求 HTTP 接口。配置中心的 ~service.http_port~ 为 1 至 65535 的整数，默认值为 47321，在下次启动时生效。环境变量 ~LOKI_ASSISTANT_HTTP_ADDR~ 优先。固定端口被占用时，services 通过菜单栏应用发送系统通知并以启动失败退出。此类通知在 HTTP 服务启动前交付。
 
@@ -927,7 +927,7 @@ Emacs 使用相同的本机上报入口提交 ~emacs/agent_shell~ 。每次发�
 
 | 字段 | 类型 | 含义 |
 |------+------|------|
-| ~id~ | string | Emacs 分配的临时会话标识，在该会话打开期间保持稳定。 |
+| ~id~ | string | Emacs buffer 的原始名称，在同一 Emacs 实例内唯一。重命名后以新名称上报。 |
 | ~title~ | string，可选 | Agent Shell 会话标题的首行，供设备展示。标题可能源自首条提示，Emacs 去除首尾空白并限制为 96 个字符（包括省略号）。标题尚未生成或不可用时省略。 |
 | ~phase~ | string | 当前执行阶段，取值见下表。 |
 | ~stop_reason~ | string，可选 | 标准化停止原因，取值为 ~end_turn~ 、 ~max_tokens~ 、 ~max_turn_requests~ 、 ~refusal~ 、 ~cancelled~ 或 ~other~ 。 |
@@ -944,8 +944,27 @@ Emacs 使用相同的本机上报入口提交 ~emacs/agent_shell~ 。每次发�
 | ~disconnected~ | 与 Agent 的连接已关闭。 |
 
 #+begin_src json
-{"emacs":{"agent_shell":[{"id":"session-1","title":"整理会话列表","phase":"waiting_input"},{"id":"session-2","phase":"completed","stop_reason":"end_turn"}]}}
+{"emacs":{"agent_shell":[{"id":"*Codex: 项目/会话*","title":"整理会话列表","phase":"waiting_input"},{"id":"*Codex: 个人*","phase":"completed","stop_reason":"end_turn"}]}}
 #+end_src
+
+** Agent Shell 会话订阅
+
+~GET /agent-shell/sessions/{session_id}/events~ 读取指定的打开会话。取状态项 ~emacs/agent_shell~ 的 ~id~ ，按 UTF-8 字节进行单一路径段的百分号编码。空格、斜线和引号分别编码为 ~%20~ 、 ~%2F~ 和 ~%22~ 。本机使用 ~Accept: text/event-stream~ ，已绑定手机通过通用 services 请求的 ~response_mode: "sse"~ 订阅。每条订阅占用一个 SSE 并发额度，响应带 ~Cache-Control: no-store~ 。现有设备状态订阅继续提供会话列表和执行阶段。 [[*通用 services 请求通道][远端 SSE 与认证]]
+
+事件名均为 ~agent-shell~ 。事件的 ~data~ 为 JSON object，包含 ~api_version: "1"~ 、 ~session_id~ 、非负整数 ~revision~ 和 ~kind~ 。
+
+| ~kind~ | 附加字段 | 客户端行为 |
+|--------+----------+------------|
+| ~snapshot~ | ~blocks~ | 用当前批次初始化或替换已显示的内容。 |
+| ~update~ | ~blocks~ | 按数组顺序处理，已有 ~id~ 的内容在原位替换，新 ~id~ 追加。 |
+| ~closed~ | 无 | 会话已关闭，结束订阅。 |
+| ~error~ | ~message~ | 读取会话失败，显示错误并结束订阅。 |
+
+~blocks~ 为会话内容块数组。每个块包含字符串 ~id~ 、 ~kind~ 和 ~text~ ，可带字符串 ~title~ 。当前块类型包括 ~user~ 、 ~assistant~ 、 ~thought~ 、 ~tool~ 、 ~permission~ 和 ~system~ 。它们分别表示用户消息、Agent 回复、思考片段、工具调用、权限请求和系统内容。块传递用于显示的文本，客户端可按 ~kind~ 设置样式。
+
+首次连接和重连均以 ~snapshot~ 开始。较长历史会在首个快照后通过多个 ~update~ 批次补齐，各更新携带递增的 ~revision~ 。Emacs 重建内容或重置版本记录后会发送新的 ~snapshot~ ，后续批次继续补齐。断开订阅即可停止后续读取。
+
+services 通过配置中的 Emacs server 用固定入口 ~loki-assistant-agent-shell-stream-read~ 读取会话，buffer 名称作为数据参数传入。名称编码无效返回 400 ~invalid-request~ ，以普通 JSON 模式调用返回 406 ~agent-shell-stream-required~ ，会话找不到返回 404 ~agent-shell-session-not-found~ 。连接尚未建立时，网关不可用、响应无效或超时分别返回 503、502 或 504，并使用标准错误响应。会话内容从当前 Emacs buffer 取得，覆盖编辑器中已经提交和接收的可读内容。
 
 ** 打开 Emacs 应用
 

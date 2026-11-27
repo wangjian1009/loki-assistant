@@ -1,10 +1,9 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit'
-import { deviceInfo } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
 import { Application } from '../app/Application'
 import { registerNavigationRoute } from '../app/HttpNavigation'
 import { NavigatorManager, launchPath } from '../app/NavigatorManager'
-import { Workspace } from '../workspace/Workspace'
+import { sharedApplication } from '../app/SharedApplication'
 import { DEBUG } from 'BuildProfile'
 
 export default class EntryAbility extends UIAbility {
@@ -56,7 +55,9 @@ export default class EntryAbility extends UIAbility {
     this.navigator.detach()
     const application = this.application
     this.application = undefined
-    application?.stop().catch(() => {})
+    if (application && this.httpEnabled) {
+      application.workspace.open().then(workspace => workspace.stopHttpServer()).catch(() => {})
+    }
   }
 
   onForeground(): void {
@@ -69,7 +70,7 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     if (!this.application) {
-      this.application = new Application(new Workspace(this.context.filesDir), deviceInfo.marketName || 'HarmonyOS 手机')
+      this.application = sharedApplication(this.context.filesDir)
     }
     AppStorage.setOrCreate('lokiApplication', this.application)
     AppStorage.setOrCreate('lokiNavigator', this.navigator)

@@ -85,6 +85,7 @@ export interface ServiceResponse {
 
 export interface ServiceDeviceStatus { name: string; device_type: 'computer' }
 export interface StatusSnapshot {
+  agent_shell_sessions: AgentShellSession[] | null
   generation: number
   endpoint_id: string | null
   checked_at: number
@@ -124,6 +125,12 @@ export interface SlackStatusChanged { generation: number; status: SlackStatus | 
 export type AgentShellPhase = 'idle' | 'starting' | 'running' | 'waiting_input' | 'completed' |
   'cancelled' | 'failed' | 'disconnected' | 'unknown'
 export interface AgentShellSession { id: string; title: string | null; phase: AgentShellPhase; stop_reason: string | null }
+export interface AgentShellBlock { id: string; kind: string; title: string | null; text: string }
+export type AgentShellConversationEvent = { session_id: string; revision: number } & (
+  { kind: 'snapshot' | 'update'; blocks: AgentShellBlock[] } |
+  { kind: 'closed' } |
+  { kind: 'error'; message: string | null }
+)
 
 export interface WorkspaceOptions {
   directory: string
@@ -185,6 +192,7 @@ export class Slack {
 export class AgentShell {
   private constructor()
   watchStatus(changed: (sessions: AgentShellSession[] | null) => void): StatusSubscription
+  watchConversation(sessionId: string, changed: (event: AgentShellConversationEvent) => void, ended: (error: ResponsError | null) => void): RequestHandle
 }
 
 export class StatusSubscription {

@@ -85,6 +85,96 @@ fn wire(envelope: Value) -> CommandOutput {
     }
 }
 
+#[tokio::test]
+async fn agent_shell_stream_sends_snapshot_increment_and_closure() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let session_id = "*中文 会话/\"quoted\"..*";
+    let encoded = "%2A%E4%B8%AD%E6%96%87%20%E4%BC%9A%E8%AF%9D%2F%22quoted%22%2E%2E%2A";
+    let batch = |value: Value| {
+        Ok(wire(json!({
+            "result": serde_json::to_string(&STANDARD.encode(value.to_string())).unwrap()
+        })))
+    };
+    let (emacs, runner, _) = service(vec![
+        batch(json!({"kind": "snapshot", "revision": 0, "blocks": []})),
+        batch(json!({"kind": "update", "revision": 1, "blocks": [
+                {"id": "message-1", "kind": "assistant", "text": "第一条消息\n第二行"}
+        ]})),
+        batch(json!({"kind": "missing"})),
+    ]);
+    let response = routes::router(emacs)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/agent-shell/sessions/{encoded}/events"))
+                .extension(crate::http::sse::RemoteSse)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let frames = to_bytes(response.into_body(), 4096).await.unwrap();
+    let mut remaining = &frames[..];
+    let mut messages = Vec::new();
+    while !remaining.is_empty() {
+        let length = u32::from_be_bytes(remaining[..4].try_into().unwrap()) as usize;
+        let (json, tail) = remaining[4..].split_at(length);
+        messages.push(serde_json::from_slice::<Value>(json).unwrap());
+        remaining = tail;
+    }
+    assert_eq!(messages.len(), 3);
+    assert!(messages.iter().all(|event| event["event"] == "agent-shell"));
+    assert_eq!(
+        messages[0]["data"],
+        json!({
+            "api_version": "1", "session_id": session_id,
+            "kind": "snapshot", "revision": 0, "blocks": []
+        })
+    );
+    assert_eq!(messages[1]["data"]["kind"], "update");
+    assert_eq!(
+        messages[1]["data"]["blocks"][0]["text"],
+        "第一条消息\n第二行"
+    );
+    assert_eq!(messages[2]["data"]["kind"], "closed");
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let lisp_argument = STANDARD.encode(session_id);
+    for ((_, args), cursor) in calls.iter().zip(["nil", "0", "1"]) {
+        assert!(args[3].contains(&format!(r#"base64-decode-string \"{lisp_argument}\""#)));
+        assert!(args[3].contains(&format!(
+            "loki-assistant-agent-shell-stream-read name {cursor}"
+        )));
+        assert!(!args[3].contains(session_id));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_stream_validates_request_before_reading_emacs() {
+    let (emacs, runner, _) = service(vec![]);
+    let router = routes::router(emacs);
+    for (session, expected) in [
+        ("%FF", StatusCode::BAD_REQUEST),
+        ("%22%29", StatusCode::NOT_ACCEPTABLE),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/agent-shell/sessions/{session}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+}
+
 fn service(
     outputs: Vec<Result<CommandOutput, EmacsError>>,
 ) -> (Arc<EmacsService>, Arc<FakeRunner>, Arc<ConfigService>) {
@@ -442,7 +532,21 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 11);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 12);
+            let conversation = body["apis"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|api| api["id"] == "agent-shell-events")
+                .unwrap();
+            assert_eq!(conversation["method"], "GET");
+            assert_eq!(
+                conversation["path"],
+                "/agent-shell/sessions/{session_id}/events"
+            );
+            assert_eq!(conversation["access"], "paired");
+            assert_eq!(conversation["supports_sse"], true);
+            assert_eq!(conversation["sse_events"][0]["event"], "agent-shell");
             let open_app = body["apis"]
                 .as_array()
                 .unwrap()

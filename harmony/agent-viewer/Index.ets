@@ -1,1 +1,1 @@
-export { AgentViewerScreen } from './src/main/ets/AgentViewerScreen'
+export { AgentViewerScreen, ViewerSession, ViewerBlock } from './src/main/ets/AgentViewerScreen'

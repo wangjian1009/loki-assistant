@@ -31,6 +31,7 @@
 (require 'agent-shell)
 (require 'image)
 (require 'loki-assistant-monitor)
+(autoload 'loki-assistant-agent-shell-stream-read "loki-assistant-agent-shell-stream")
 (require 'subr-x)
 
 (declare-function agent-shell--get-files-context "agent-shell")
@@ -347,10 +348,6 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
 
 ;;; 执行状态
 
-(defvar loki-assistant-agent-shell--status-prefix
-  (substring (secure-hash 'sha256 (format "%s:%s:%s" (current-time) (emacs-pid) (random))) 0 16))
-(defvar loki-assistant-agent-shell--status-counter 0)
-(defvar-local loki-assistant-agent-shell--status-id nil)
 (defvar-local loki-assistant-agent-shell--status-subscription nil)
 (defvar-local loki-assistant-agent-shell--outcome nil)
 
@@ -398,7 +395,7 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
          (reason (and (equal phase (car loki-assistant-agent-shell--outcome))
                       (cdr loki-assistant-agent-shell--outcome)))
          (title (loki-assistant-agent-shell--status-title)))
-    `((id . ,loki-assistant-agent-shell--status-id)
+    `((id . ,(buffer-name))
       (phase . ,phase)
       ,@(when title `((title . ,title)))
       ,@(when reason `((stop_reason . ,reason))))))
@@ -429,11 +426,7 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
          (loki-assistant-status-trigger-sync))))))
 
 (defun loki-assistant-agent-shell--subscribe-status ()
-  "为当前会话分配不透明标识并订阅执行事件。"
-  (unless loki-assistant-agent-shell--status-id
-    (setq loki-assistant-agent-shell--status-id
-          (format "%s-%x" loki-assistant-agent-shell--status-prefix
-                  (cl-incf loki-assistant-agent-shell--status-counter))))
+  "订阅当前 Agent Shell buffer 的执行事件。"
   (unless loki-assistant-agent-shell--status-subscription
     (let ((buffer (current-buffer)))
       (setq loki-assistant-agent-shell--status-subscription

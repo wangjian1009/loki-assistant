@@ -799,6 +799,22 @@ async fn real_relay_handshake_authenticates_phone_identity_and_persists_binding(
         serde_json::from_str::<Value>(echoed.data["body"].as_str().unwrap()).unwrap(),
         json!({"value":"手机请求"})
     );
+    let encoded_buffer = "%2A%E4%B8%AD%E6%96%87%20%E4%BC%9A%E8%AF%9D%2F%22quoted%22%2E%2E%2A";
+    let echoed_buffer = channel_request(
+        network.clone(),
+        ServiceRequest::get(format!("/network-test/echo/{encoded_buffer}")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(echoed_buffer.data["id"], "*中文 会话/\"quoted\"..*");
+    let response = channel_request(
+        network.clone(),
+        ServiceRequest::get(format!("/agent-shell/sessions/{encoded_buffer}/events")),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(response, ResponsError::Services(error)
+            if error.status == 406 && error.code == "agent-shell-stream-required"));
     request.body = None;
     assert_eq!(
         channel_request(network.clone(), request.clone())

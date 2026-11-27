@@ -535,6 +535,8 @@ fn service_status_metadata() -> StatusModuleMetadata {
 
 Emacs 上报时通过本机 ~POST /emacs/receiver/status~ 调用 ~publish_many_validated~ 。已绑定设备可读取 ~emacs/agent_shell~ 会话状态数组，数组项可包含会话标题 ~title~ 。 [[file:control-center-services.org::*Agent Shell 执行状态][Agent Shell 状态字段与访问范围]]
 
+~GET /agent-shell/sessions/{session_id}/events~ 是 Emacs 模块声明的 ~paired~ SSE 接口。事件名为 ~agent-shell~ ，事件数据通过 ~sse_events~ 公布。设备用状态数组中的原始 buffer 名选择订阅目标，并在请求路径中将名称编码为单一路径段。会话正文由该订阅维护。 [[file:control-center-services.org::*Agent Shell 会话订阅][Agent Shell 会话订阅协议]]
+
 *** 响应示例
 ~GET /stats/meta~ 的响应节选，展示 ~service~ 模块。
 

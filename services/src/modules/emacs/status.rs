@@ -46,7 +46,7 @@ fn emacs_status_metadata() -> StatusModuleMetadata {
                             Field::new(
                                 "id",
                                 "会话标识",
-                                "由 Emacs 分配的临时会话标识。",
+                                "Emacs buffer 的名称，同一实例内唯一。",
                                 StatusSchema::string(),
                             ),
                             Field {

@@ -1,3 +1,4 @@
+mod agent_shell;
 pub mod config;
 pub(crate) mod json_request;
 mod mail;
