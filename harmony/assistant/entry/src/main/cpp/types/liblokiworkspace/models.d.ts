@@ -83,19 +83,18 @@ export interface ServiceResponse {
 }
 
 export interface ServiceDeviceStatus { name: string; device_type: 'computer' }
+export type DeviceConnection = 'checking' | 'local_network_unavailable' | 'relay_unavailable' | 'computer_offline' | 'online'
 export interface StatusSnapshot {
   agent_shell_sessions: AgentShellSession[] | null
   generation: number
   endpoint_id: string | null
   checked_at: number
+  connection: DeviceConnection
+  reconnecting: boolean
   error: ResponsError | null
   status: Object | null
   service: ServiceDeviceStatus | null
 }
-export type DeviceRefreshEvent = { endpoint_id: string, generation: number } & (
-  | { phase: 'registering' | 'reconnecting' | 'querying' | 'succeeded' }
-  | { phase: 'failed', error: ResponsError }
-)
 export type MailSyncPhase = 'queued' | 'downloading' | 'indexing' | 'refreshing' | 'completed' | 'failed' | 'unknown'
 export interface MailSyncProgress { id: string; phase: MailSyncPhase }
 export interface MailSyncSnapshot extends MailSyncProgress { messages: string[]; error: string | null }

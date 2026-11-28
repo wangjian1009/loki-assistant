@@ -2,6 +2,7 @@ import { AgentShellSession, StatusSubscription } from 'liblokiworkspace.so'
 import { common } from '@kit.AbilityKit'
 import { AgentShellStatusIcon } from 'agent_viewer'
 import { CurrentDeviceState } from '../../app/CurrentDeviceState'
+import { deviceConnectionAppearance } from '../../components/DeviceConnection'
 import { BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, PAGE_INSET, PANEL_RADIUS,
   PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SURFACE } from '../../components/AppPage'
 import { Workspace } from '../../workspace/Workspace'
@@ -58,7 +59,7 @@ export struct AgentShellPanel {
   private emptyMessage(): string {
     if (!this.device.current) return this.device.loaded ? '请选择一台电脑' : '正在读取设备状态'
     if (!this.device.hasStatus) return '正在读取设备状态'
-    if (this.device.current.status !== 'online') return '电脑上线后显示会话状态'
+    if (this.device.current.status !== 'online') return deviceConnectionAppearance(this.device.current.status).label
     return this.errorMessage || (this.sessions ? '暂无会话' : '尚未收到会话状态')
   }
 

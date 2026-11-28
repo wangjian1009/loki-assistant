@@ -36,7 +36,8 @@ struct AgentViewer {
   @State private selected: string = ''
   @State private notice: ConversationNotice = { text: '正在读取会话' }
   @State private conversationKey: number = 0
-  @State private deviceStatus: string = 'offline'
+  @State private deviceStatus: string = 'inactive'
+  @State private deviceReconnecting: boolean = false
   @State private imagePreview: string = ''
   @State private pendingAction: SessionAction | '' = ''
   @State private creationOpen: boolean = false
@@ -164,13 +165,14 @@ struct AgentViewer {
           this.blocks = []
           this.conversationKey += 1
         }
-        this.deviceStatus = current?.status ?? 'offline'
+        this.deviceStatus = current?.status ?? 'inactive'
+        this.deviceReconnecting = current?.reconnecting ?? false
         if (!current || !this.deviceOnline()) {
           this.resetAgentRequest()
           if (current && this.selected) {
             if (!this.conversation) this.openConversation()
           } else {
-            this.notice = { text: current ? '电脑上线后显示会话' : '请在设备管理中选择一台电脑' }
+            this.notice = { text: current ? deviceConnectionAppearance(current.status).label : '请在设备管理中选择一台电脑' }
           }
         } else {
           this.loadAgents(endpointId)
@@ -726,7 +728,8 @@ struct AgentViewer {
         if (this.creationError) {
           Text(this.creationError).fontSize(BODY_SIZE).fontColor(ERROR_TEXT).width('100%')
         } else if (!this.deviceOnline()) {
-          Text('电脑离线').fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT).width('100%')
+          Text(deviceConnectionAppearance(this.deviceStatus).label).fontSize(BODY_SIZE).fontColor(SECONDARY_TEXT)
+            .width('100%')
         }
         Button(this.creationActionLabel(), { type: ButtonType.Normal }).height(48).width('100%')
           .fontColor(ACCENT_TEXT).fontWeight(FontWeight.Medium).backgroundColor(ACCENT).borderRadius(PANEL_RADIUS)
@@ -851,6 +854,7 @@ struct AgentViewer {
         sessionActions: () => { this.sessionMenu() },
         connectionColor: deviceConnectionAppearance(this.deviceStatus).color,
         connectionLabel: deviceConnectionAppearance(this.deviceStatus).label,
+        reconnecting: this.deviceReconnecting,
         parseDocument: renderDocument,
         conversationKey: this.conversationKey,
         onSelect: (id: string): void => { this.select(id) },

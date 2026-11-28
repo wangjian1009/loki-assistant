@@ -1,7 +1,6 @@
 use crate::{
     error::{InvalidRequestReason, NetworkReason, ResponsError},
     network::{Network, QueryParameter, RequestHandle, RequestOptions, ServiceRequest},
-    service_proxy::ServiceProxy,
 };
 use http::{Method, Request, Response, StatusCode, header, uri::PathAndQuery};
 use http_body_util::{BodyExt, Full, Limited};
@@ -32,8 +31,6 @@ type HttpResponse = Response<Full<Bytes>>;
 pub type HttpDispatch = dyn Fn(u64, &str, &str) -> bool + Send + Sync;
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
-const DEVICE_REFRESH_PATH: &str = "/api/v1/device/refresh";
-
 #[derive(Default)]
 pub struct HttpRoutes {
     handlers: Mutex<HashMap<String, Arc<HttpRoute>>>,
@@ -62,7 +59,7 @@ impl HttpRoutes {
         {
             return Err("调试 HTTP 路径必须是绝对路径".into());
         }
-        if path == DEVICE_REFRESH_PATH || path.starts_with("/service/") {
+        if path.starts_with("/service/") {
             return Err("路径已由调试 HTTP 服务使用".into());
         }
         if methods.is_empty() {
@@ -107,7 +104,6 @@ impl HttpServer {
     pub fn start(
         runtime: &tokio::runtime::Handle,
         network: Arc<Network>,
-        proxy: Arc<ServiceProxy>,
         port: u16,
         routes: Arc<HttpRoutes>,
     ) -> std::io::Result<Self> {
@@ -121,7 +117,7 @@ impl HttpServer {
             pending: Mutex::new(HashMap::new()),
         });
         let (shutdown, stopped) = oneshot::channel();
-        let task = runtime.spawn(serve(listener, network, proxy, ui.clone(), stopped));
+        let task = runtime.spawn(serve(listener, network, ui.clone(), stopped));
         Ok(Self {
             address,
             ui,
@@ -172,7 +168,6 @@ impl Drop for HttpServer {
 async fn serve(
     listener: TcpListener,
     network: Arc<Network>,
-    proxy: Arc<ServiceProxy>,
     ui: Arc<HttpBridge>,
     mut stopped: oneshot::Receiver<()>,
 ) {
@@ -185,10 +180,9 @@ async fn serve(
             accepted = listener.accept(), if connections.len() < 32 => {
                 let Ok((stream, _)) = accepted else { break };
                 let network = network.clone();
-                let proxy = proxy.clone();
                 let ui = ui.clone();
                 connections.spawn(async move {
-                    let handler = service_fn(move |request| request_http(request, network.clone(), proxy.clone(), ui.clone()));
+                    let handler = service_fn(move |request| request_http(request, network.clone(), ui.clone()));
                     let _ = http1::Builder::new()
                         .keep_alive(false)
                         .timer(TokioTimer::new())
@@ -206,20 +200,10 @@ async fn serve(
 async fn request_http(
     request: Request<Incoming>,
     network: Arc<Network>,
-    proxy: Arc<ServiceProxy>,
     ui: Arc<HttpBridge>,
 ) -> Result<HttpResponse, Infallible> {
     let path = request.uri().path();
-    let response = if path == DEVICE_REFRESH_PATH {
-        if request.method() == Method::POST {
-            match proxy.refresh_device(None) {
-                Ok(()) => json_response(StatusCode::ACCEPTED, json!({"accepted": true})),
-                Err(failure) => request_error(failure),
-            }
-        } else {
-            method_not_allowed("POST")
-        }
-    } else if let Some(path) = path
+    let response = if let Some(path) = path
         .strip_prefix("/service/")
         .filter(|path| !path.is_empty())
     {

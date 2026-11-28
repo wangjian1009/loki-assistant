@@ -89,7 +89,6 @@ curl --fail-with-body -X PUT http://127.0.0.1:18787/api/v1/ui/navigation \
   -d '{"pages":[{"url":"Index"},{"url":"Settings"}]}'
 
 curl --fail-with-body http://127.0.0.1:18787/service/network/session
-curl --fail-with-body -X POST http://127.0.0.1:18787/api/v1/device/refresh
 
 make run HDC_TARGET="$TEST_DEVICE" HTTP_API_ENABLED=false
 "$HDC_BIN" -t "$TEST_DEVICE" fport rm tcp:18787 tcp:8787
@@ -99,7 +98,7 @@ GET 返回从根到当前页的完整 ~pages~ 。PUT 接收相同结构并设置
 
 ~GET /service/network/session~ 去掉 ~/service~ 前缀后，通过当前 Network 向选中的电脑发起 ~GET /network/session~ 。其他查询路径按同一规则映射，保留查询参数的顺序和重复项。电脑按已有绑定和接口访问范围处理请求。成功时使用电脑返回的 HTTP 状态码和 JSON 响应体，失败时返回 ~ResponsError~ JSON。电脑拒绝保留其状态码，未选择电脑或请求已取消返回 503，未绑定返回 403，网络超时返回 504，其他通信错误返回 502。协议见 [[file:../../docs/service-client.org][Workspace 与 Network 接口]]。
 
-~POST /api/v1/device/refresh~ 请求立即刷新当前选中的电脑，接受请求时返回 HTTP 202。当前设备页的刷新面板通过刷新事件显示进度与结果。调试 HTTP 服务由 Rust 的 ~loki-service-proxy~ 提供，Workspace 负责启停。
+电脑状态由代理自动重连并订阅，恢复后在状态流首帧同步最新快照。调试 HTTP 服务由 Rust 的 ~loki-service-proxy~ 提供，Workspace 负责启停。
 
 * 调试签名
 

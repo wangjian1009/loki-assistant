@@ -26,7 +26,9 @@ function fixture(initial = {}) {
       : null;
     const snapshot = { generation: handle.generation, endpoint_id: service?.endpoint_id ?? null,
       checked_at: status || failure ? 123 : 0, error: failure ?? null, status,
-      service: status?.service ?? null };
+      service: status?.service ?? null,
+      connection: control.connection ?? (status ? 'online' : failure ? 'computer_offline' : 'checking'),
+      reconnecting: control.reconnecting ?? false };
     for (const watch of handle.watchers) {
       if (watch.scope === 'device') watch.send(clone(snapshot));
       if (watch.scope === 'mail') watch.send(clone({ generation: snapshot.generation,
@@ -289,10 +291,32 @@ test('应用保存多台电脑，Network 只恢复选中的一个目标', async 
   assert.ok(!JSON.stringify(views).includes('relay-secret')); assert.ok(!JSON.stringify(views).includes(credential.token));
   await app.stop(); ({ app, workspace } = fixtureState.create());
   assert.equal(await (await workspace.open()).service(), null);
-  views = await app.list(); assert.equal(views[1].status, 'offline');
+  views = await app.list(); assert.equal(views[1].status, 'checking');
   assert.equal((await (await workspace.open()).service()).binding.credential.token, credential.token);
   assert.equal((await observedDevices(app))[1].status, 'online');
   await app.select(id(1)); assert.equal((await (await workspace.open()).service()).endpoint_id, id(1));
+});
+
+test('设备界面以代理连接状态为准，断线时隐藏缓存面板', async () => {
+  const { control, create } = fixture();
+  const { app } = create();
+  await app.addService(JSON.stringify(invitation(1)));
+  assert.equal((await observedDevices(app))[0].status, 'online');
+
+  for (const connection of ['local_network_unavailable', 'relay_unavailable', 'computer_offline']) {
+    control.connection = connection;
+    control.reconnecting = connection !== 'local_network_unavailable';
+    const [view] = await observedDevices(app);
+    assert.equal(view.status, connection);
+    assert.equal(view.reconnecting, control.reconnecting);
+    assert.equal(view.dashboard, undefined);
+  }
+
+  control.connection = 'online';
+  control.reconnecting = false;
+  const [view] = await observedDevices(app);
+  assert.equal(view.status, 'online');
+  assert.equal(view.dashboard.service.name, '工作电脑');
 });
 
 test('一次获取全部开放状态，手动同步复用托盘路径', async () => {
@@ -364,7 +388,7 @@ test('绑定失败记录在 Service，提示删除后重新扫码，不保留待
 test('未选择的旧多设备记录不自动连接，损坏凭据不覆盖', async () => {
   const record = number => ({ endpoint_id: id(number), relay_url: 'https://relay.example/', relay_token: 'secret', bound_at: 1, pending: null });
   let fixtureState = fixture({ computers: [record(1), record(2)] }); let { app, workspace } = fixtureState.create();
-  assert.ok((await app.list()).every(view => view.status === 'offline'));
+  assert.ok((await app.list()).every(view => view.status === 'inactive'));
   assert.equal(await (await workspace.open()).service(), null); assert.equal(fixtureState.control.writes, 0);
   fixtureState = fixture({ computers: [record(1)], selected_endpoint_id: null });
   ({ app, workspace } = fixtureState.create());

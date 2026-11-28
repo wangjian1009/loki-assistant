@@ -53,6 +53,56 @@ fn unreachable_service(key: &SecretKey, id: iroh::EndpointId) -> Service {
     .unwrap()
     .with_binding(bound())
 }
+
+#[test]
+fn status_observers_share_reconnect_and_receive_its_result() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace();
+    let network = workspace.network();
+    let computer = SecretKey::generate().public();
+    // 让中转接受 TCP 连接但不完成握手，确保第二个订阅在重连期间加入。
+    let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let service = Service::new(
+        SecretKey::generate(),
+        computer,
+        format!("http://{}/", relay.local_addr().unwrap()),
+        "test-token".into(),
+    )
+    .unwrap()
+    .with_binding(bound());
+    workspace.set_local_network_available(false);
+    network.set_service(service).unwrap();
+    let watch = || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let subscription = workspace
+            .watch_status(move |view| tx.send(serde_json::to_value(view).unwrap()).is_ok());
+        (subscription, rx)
+    };
+    let next = |rx: &std::sync::mpsc::Receiver<Value>, connection: &str, reconnecting: bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let value = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            if value["connection"] == connection && value["reconnecting"] == reconnecting {
+                return value;
+            }
+        }
+    };
+    let (_first, first) = watch();
+    next(&first, "local_network_unavailable", false);
+    workspace.set_local_network_available(true);
+    let started = next(&first, "checking", true);
+    let (_joined, joined) = watch();
+    assert_eq!(next(&joined, "checking", true), started);
+    drop(relay);
+    let failure = next(&first, "relay_unavailable", false);
+    assert_eq!(next(&joined, "relay_unavailable", false), failure);
+    next(&first, "relay_unavailable", true);
+    workspace.set_local_network_available(false);
+    next(&first, "local_network_unavailable", false);
+    next(&joined, "local_network_unavailable", false);
+}
 fn request(
     network: &Network,
     timeout: Duration,

@@ -1,13 +1,16 @@
-import { AutoBinding, BindingState, ResponsError, StatusSnapshot } from 'liblokiworkspace.so'
+import { AutoBinding, BindingState, DeviceConnection, ResponsError, StatusSnapshot } from 'liblokiworkspace.so'
 import { DeviceType, Service, Workspace } from '../workspace/Workspace'
 import { StatusSubscription } from '../workspace/ServiceStatus'
+
+export type ComputerConnectionStatus = DeviceConnection | 'binding' | 'binding_failed' | 'inactive'
 
 export interface ComputerDevice {
   endpoint_id: string
   name: string
   device_type: DeviceType
   bound_at: number | null
-  status: string
+  status: ComputerConnectionStatus
+  reconnecting: boolean
   detail: string
   checked_at: number
   active: boolean
@@ -126,22 +129,25 @@ export class Application {
       return {
         endpoint_id: computer.endpoint_id, name: computer.name, device_type: computer.device_type,
         bound_at: computer.binding.status === 'bound' ? computer.binding.credential.bound_at : null,
-        status: failed ? 'binding_failed' : active && computer.binding.status === 'binding' ? 'binding' : 'offline',
+        status: failed ? 'binding_failed' : !active ? 'inactive' : computer.binding.status === 'binding' ? 'binding' : 'checking',
         detail: failed ? `${bindingError?.message}；${BINDING_FAILED_DETAIL}` : active && computer.binding.status === 'binding' ?
           '正在与电脑建立绑定' : active ? '等待检查电脑状态' : '选择此电脑以连接',
-        checked_at: 0, active: active, binding_error: bindingError
+        checked_at: 0, active: active, reconnecting: false, binding_error: bindingError
       }
     })
     const snapshot = this.latestStatus
     const view = devices.find((device: ComputerDevice) => device.active && device.endpoint_id === snapshot?.endpoint_id)
     if (view && snapshot) {
       view.checked_at = snapshot.checked_at
-      if (!snapshot.error && snapshot.service) {
-        view.status = 'online'
-        view.detail = '电脑服务可用'
-        view.dashboard = snapshot
-      } else if (snapshot.error && view.status !== 'binding_failed') {
-        view.detail = snapshot.error.message
+      if (view.status !== 'binding' && view.status !== 'binding_failed') {
+        view.status = snapshot.connection
+        view.reconnecting = snapshot.reconnecting
+        if (view.status === 'online' && snapshot.service) {
+          view.detail = '电脑服务可用'
+          view.dashboard = snapshot
+        } else {
+          view.detail = view.status === 'computer_offline' ? snapshot.error?.message ?? '' : ''
+        }
       }
     }
     return devices
@@ -241,7 +247,7 @@ export class Application {
           (snapshot.endpoint_id !== null && snapshot.generation !== generation)) { return }
         const selected = this.state.computers.find((item: ComputerRecord) => item.endpoint_id === snapshot.endpoint_id)
         const computer = snapshot.service
-        if (selected && !snapshot.error && computer && validName(computer.name) &&
+        if (selected && snapshot.connection === 'online' && computer && validName(computer.name) &&
           (selected.name !== computer.name || selected.device_type !== computer.device_type)) {
           const state = copy(this.state)
           const record = state.computers.find((item: ComputerRecord) => item.endpoint_id === selected.endpoint_id)

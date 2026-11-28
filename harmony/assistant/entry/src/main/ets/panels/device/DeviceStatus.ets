@@ -22,7 +22,12 @@ export struct DeviceStatus {
         Text(this.device.current?.name ?? '').fontSize(TITLE_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
         Row({ space: 4 }) {
-          Circle().width(6).height(6).fill(deviceConnectionAppearance(this.device.current?.status ?? '').color)
+          if (this.device.current?.reconnecting) {
+            LoadingProgress().width(12).height(12).color(SECONDARY_TEXT)
+              .accessibilityText('正在重新连接')
+          } else {
+            Circle().width(6).height(6).fill(deviceConnectionAppearance(this.device.current?.status ?? '').color)
+          }
           Text(deviceConnectionAppearance(this.device.current?.status ?? '').label).fontSize(META_SIZE)
             .fontColor(deviceConnectionAppearance(this.device.current?.status ?? '').color)
         }.flexShrink(0)
@@ -32,7 +37,8 @@ export struct DeviceStatus {
     }.width('100%').constraintSize({ minHeight: 48 }).padding({ left: PAGE_INSET, right: PAGE_INSET })
       .borderRadius(PANEL_RADIUS).backgroundColor(Color.Transparent)
       .accessibilityText(`${this.device.current?.name ?? ''}，${deviceConnectionAppearance(this.device.current?.status ?? '').label}`)
-      .accessibilityDescription(this.device.detailsOpen ? '收起设备详情' : '展开设备详情')
+      .accessibilityDescription((this.device.current?.reconnecting ? '正在重新连接，' : '') +
+        (this.device.detailsOpen ? '收起设备详情' : '展开设备详情'))
       .onClick(() => { this.device.detailsOpen = !this.device.detailsOpen })
   }
 

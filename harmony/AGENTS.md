@@ -41,7 +41,7 @@
 - NAPI 仅负责跨语言值转换、Rust 对象句柄与回调转发。禁止在绑定中新增业务字段、合并或拆分 Rust 方法、以字符串操作名代替显式方法，或加入业务校验、状态管理和流程编排。业务规则、状态结构和生命周期由对应的 Rust 模块定义。
 - `Workspace.stop()` 先同步通知网络关闭，再等待未完成请求取消回调并释放 runtime；NAPI 取消和停止信号不等待异步工作线程。停止须幂等，停止后不隐式重新打开。
 - 手机绑定时上报在设置页编辑的本机显示名称和 `device_type: mobile`。服务代理订阅 `GET /status` 的 SSE 流，同步电脑名称、设备类型、Slack 和邮件状态。邮件业务通过代理发起 `POST /mail/sync`，优先从邮件 SSE 接收进度，必要时由共享状态订阅跟踪任务。名称和类型仅用于展示。
-- 界面只显示离线、绑定中、绑定失败、在线。界面注册服务代理监听，退到后台时解除。代理监听绑定结果，且有本地观察者时为当前选中电脑维持一条状态流。relay 断开、电脑连接关闭或状态流中断后发布离线状态，relay 可用时重新订阅。失败错误来自 Service 的 ResponsError，提示删除后重新扫码绑定；删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
+- 界面显示绑定阶段和服务代理提供的连接状态。HarmonyOS 只向 Workspace 上报默认网络可用性，Rust 代理区分本机无网络、中转不可用和电脑不在线。界面订阅代理的连接过程和状态快照，退到后台时解除。有本地观察者时，代理为当前选中电脑维持一条状态流，自动重连并以首帧同步最新状态。新观察者加入进行中的连接。绑定失败来自 Service 的 ResponsError，提示删除后重新扫码绑定。删除当前记录清除 Network，保存失败保留原记录。不存在待确认状态或旧邀请重试恢复；自动绑定结束后清除一次性 `auto_binding`，失败结果持久化后不自动重试。
 
 - `scripts/build-device-network.sh` 使用 Rust `aarch64-unknown-linux-ohos` 与 DevEco NDK 构建 ARM64 `liblokiworkspace.so`。`make test` 测试真实应用层代码与 Rust 网络模块；services 的真实 relay 测试调用手机接口，验证凭据和 HTTP 分发。
 - `bundleName` 使用在华为开发者后台登记的应用包名 `cc.github.wangjian1009.assistant`，由 `AppScope/app.json5` 定义。

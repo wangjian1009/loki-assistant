@@ -9,7 +9,7 @@ use loki_service_proxy::{
     debug_http::{HttpDispatch, HttpRoutes, HttpServer},
     mail::Mail,
     service_proxy::{
-        ComputerStatus, DeviceRefreshEvent, ServiceProxy, ServiceSnapshot, StatusSubscription,
+        ComputerStatus, DeviceConnection, ServiceProxy, ServiceSnapshot, StatusSubscription,
     },
 };
 use serde_json::Value;
@@ -42,6 +42,8 @@ pub struct DashboardUpdate {
     generation: u64,
     endpoint_id: Option<String>,
     checked_at: u64,
+    connection: DeviceConnection,
+    reconnecting: bool,
     error: Option<ResponsError>,
     status: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>>,
     service: Option<ComputerStatus>,
@@ -54,6 +56,8 @@ impl From<&ServiceSnapshot> for DashboardUpdate {
             generation: snapshot.generation,
             endpoint_id: snapshot.endpoint_id.clone(),
             checked_at: snapshot.checked_at,
+            connection: snapshot.connection,
+            reconnecting: snapshot.reconnecting,
             error: snapshot.error.clone(),
             status: snapshot.status.clone(),
             service: ComputerStatus::from_snapshot(snapshot),
@@ -194,15 +198,8 @@ impl Workspace {
         crate::pairing::Invitation::decode(payload)
     }
 
-    pub fn refresh_device(&self, endpoint: &str) -> Result<(), ResponsError> {
-        self.proxy.refresh_device(Some(endpoint))
-    }
-
-    pub fn watch_refresh(
-        &self,
-        changed: impl FnMut(DeviceRefreshEvent) -> bool + Send + 'static,
-    ) -> StatusSubscription {
-        self.proxy.watch_refresh(changed)
+    pub fn set_local_network_available(&self, available: bool) {
+        self.proxy.set_local_network_available(available);
     }
 
     pub fn open_mail(&self) -> Mail {
@@ -248,7 +245,6 @@ impl Workspace {
         let started = HttpServer::start(
             &self.executor,
             self.network(),
-            self.proxy.clone(),
             port,
             self.http_routes.clone(),
         )
@@ -349,7 +345,7 @@ impl Workspace {
     pub fn watch_status(
         &self,
         notify: impl FnMut(DashboardUpdate) -> bool + Send + 'static,
-    ) -> loki_service_proxy::service_proxy::StatusSubscription {
+    ) -> StatusSubscription {
         self.proxy
             .subscribe(|snapshot| DashboardUpdate::from(snapshot), notify)
     }

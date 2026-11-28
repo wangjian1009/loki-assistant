@@ -290,7 +290,7 @@ services 每次从当前绑定关系验证已认证的远端 Endpoint ID 和绑�
 
 应用只将扫码得到的 Service 配置和 ~auto_binding{invitation,device_name}~ 设置到 Network；Network 自动异步绑定，不提供公开的绑定或确认方法。绑定中和失败状态均保存在 Service，失败的 ~error~ 是 ResponsError Union，界面可读取详细原因。绑定成功或失败后清除一次性邀请，业务保存最新完整配置。
 
-手机界面展示“离线、绑定中、绑定失败、在线”。失败状态可持久化恢复，用户删除记录后可重新扫码绑定。首页通过 ServiceProxy 订阅当前电脑状态，后台结束该订阅。私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。 [[file:service-client.org::*代理缓存与订阅][手机代理缓存与订阅]]
+手机界面显示绑定阶段、在线状态和分层连接故障。绑定失败可持久化恢复，用户删除记录后可重新扫码绑定。首页通过 ServiceProxy 订阅当前电脑状态，后台结束该订阅。私钥不向 ArkTS 导出，中继信息和凭据只供应用私有存储，不进入 UI、错误或日志。 [[file:service-client.org::*代理缓存与订阅][手机代理缓存与订阅]]
 
 手机可在设置页修改自身名称，并在后续绑定时上报新名称和 ~device_type: mobile~ 。Mac 上的 services 优先使用系统设置中的电脑名称，其他平台使用 hostname。电脑名称和设备类型发布到 ~service/name~ 和 ~service/device_type~ ，手机通过 ~GET /status~ 读取并缓存。名称和类型仅用于展示。
 

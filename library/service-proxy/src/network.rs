@@ -799,10 +799,34 @@ impl Network {
     pub(crate) async fn wait_for_relay(&self, generation: u64) -> Result<(), ResponsError> {
         let service = self.service_for_generation(generation)?;
         let endpoint = service.endpoint().await?;
-        tokio::select! {
-            _ = endpoint.closed() => Err(NetworkReason::ConnectFailed.into()),
-            _ = endpoint.online() => Ok(()),
+        let mut relays = endpoint.home_relay_status();
+        let mut status = relays.get();
+        loop {
+            if status.iter().any(|relay| relay.is_connected()) {
+                return Ok(());
+            }
+            if status.iter().any(|relay| relay.last_error().is_some()) {
+                return Err(NetworkReason::ConnectFailed.into());
+            }
+            status = tokio::select! {
+                _ = endpoint.closed() => return Err(NetworkReason::ConnectFailed.into()),
+                result = relays.updated() => result.map_err(|_| NetworkReason::ConnectFailed)?,
+            };
         }
+    }
+
+    pub(crate) async fn relay_connected(&self, generation: u64) -> bool {
+        let Ok(service) = self.service_for_generation(generation) else {
+            return false;
+        };
+        let endpoint = service.endpoint.lock().await;
+        endpoint.as_ref().is_some_and(|endpoint| {
+            endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|relay| relay.is_connected())
+        })
     }
 
     pub(crate) async fn wait_for_link_loss(&self, generation: u64) -> ResponsError {

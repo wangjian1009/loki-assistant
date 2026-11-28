@@ -4,6 +4,7 @@ import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { Application, ComputerDevice } from '../app/Application'
 import { StatusSubscription } from '../workspace/ServiceStatus'
 import { NavigatorManager } from '../app/NavigatorManager'
+import { deviceConnectionAppearance } from '../components/DeviceConnection'
 import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET,
   PAGE_MAX_WIDTH, PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SELECTED_SURFACE, SURFACE,
   TOUCH_SIZE, setSystemColors } from '../components/AppPage'
@@ -147,9 +148,8 @@ struct Devices {
             if (computer.active) {
               Text('当前设备').fontSize(META_SIZE).fontWeight(FontWeight.Medium).fontColor(ACCENT)
             }
-            if (computer.status === 'binding') {
-              Text('绑定中').fontSize(META_SIZE).fontColor('#F5CF92')
-            }
+            Text(deviceConnectionAppearance(computer.status).label).fontSize(META_SIZE)
+              .fontColor(deviceConnectionAppearance(computer.status).color)
           }.alignItems(HorizontalAlign.End).flexShrink(0)
         } else if (computer.status !== 'binding_failed') {
           Button('设为当前设备', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(ACCENT)

@@ -4,7 +4,6 @@ import { CurrentDeviceState } from '../app/CurrentDeviceState'
 import { DeviceLayoutStore } from '../app/DeviceLayoutStore'
 import { ACCENT, BODY_SIZE, CONTENT_GAP, ERROR_TEXT, PAGE_INSET, PAGE_MAX_WIDTH,
   PANEL_RADIUS, PRIMARY_TEXT, SURFACE, TOUCH_SIZE } from './AppPage'
-import { DeviceRefresh } from './DeviceRefresh'
 
 @Component
 export struct CurrentDeviceWidgets {
@@ -14,8 +13,6 @@ export struct CurrentDeviceWidgets {
   @State private layout: ItemLayout = { order: [], hidden: [] }
   @State private orderReady: boolean = false
   @State private orderError: string = ''
-  private readonly scroller: Scroller = new Scroller()
-  private startedAtTop: boolean = false
   private layoutStore?: DeviceLayoutStore
 
   aboutToAppear(): void {
@@ -105,12 +102,7 @@ export struct CurrentDeviceWidgets {
 
   build() {
     Column() {
-      DeviceRefresh({
-        workspace: () => this.device.workspace,
-        active: this.device.active,
-        endpointId: this.device.current?.endpoint_id ?? ''
-      })
-      List({ scroller: this.scroller, space: CONTENT_GAP }) {
+      List({ space: CONTENT_GAP }) {
         if (this.editing && this.orderError) {
           ListItem() {
             Column({ space: CONTENT_GAP }) {
@@ -173,17 +165,6 @@ export struct CurrentDeviceWidgets {
       }.width('100%').layoutWeight(1)
         .padding({ top: CONTENT_GAP, bottom: PAGE_INSET })
         .edgeEffect(EdgeEffect.None).scrollBar(BarState.Auto).scrollBarColor('#4D576B').scrollBarWidth(3)
-        .parallelGesture(
-          PanGesture({ direction: PanDirection.Down })
-            .onActionStart(() => {
-              this.startedAtTop = !this.editing && this.scroller.currentOffset().yOffset <= 0
-            })
-            .onActionEnd((event: GestureEvent) => {
-              if (this.startedAtTop && !this.editing && event.offsetY >= 72) { this.device.refresh() }
-              this.startedAtTop = false
-            })
-            .onActionCancel(() => { this.startedAtTop = false })
-        )
     }.width('100%').constraintSize({ maxWidth: PAGE_MAX_WIDTH }).layoutWeight(1)
       .padding({ left: PAGE_INSET, right: PAGE_INSET })
   }

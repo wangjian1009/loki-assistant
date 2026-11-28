@@ -195,6 +195,7 @@ export struct AgentViewerScreen {
   @Prop connected: boolean = false
   @Prop connectionColor: string = SECONDARY
   @Prop connectionLabel: string = '离线'
+  @Prop reconnecting: boolean = false
   @Link preview: string
   @BuilderParam sessionActions?: () => void
   onSelect: (id: string) => void = () => {}
@@ -412,8 +413,13 @@ export struct AgentViewerScreen {
     Column({ space: 2 }) {
       Row({ space: 10 }) {
         Row({ space: 6 }) {
-          Circle().width(6).height(6).fill(this.connectionColor).flexShrink(0)
-            .accessibilityText('设备' + this.connectionLabel)
+          if (this.reconnecting) {
+            LoadingProgress().width(12).height(12).color(this.connectionColor).flexShrink(0)
+              .accessibilityText('设备' + this.connectionLabel + '，正在重新连接')
+          } else {
+            Circle().width(6).height(6).fill(this.connectionColor).flexShrink(0)
+              .accessibilityText('设备' + this.connectionLabel)
+          }
           if (this.selected(this.headerSession(interactive))?.agentId) {
             AgentAvatar({ name: this.agent(this.headerSession(interactive))?.name ??
               this.selected(this.headerSession(interactive))?.agentId ?? '',
@@ -439,8 +445,9 @@ export struct AgentViewerScreen {
         Row({ space: 10 }) {
           Row({ space: 5 }) {
             AgentShellStatusIcon({ phase: this.headerPhase(interactive), iconSize: 12 })
-            Text(this.connected ? agentShellAppearance(this.headerPhase(interactive)).label : '电脑离线')
-              .fontSize(12).fontColor(agentShellAppearance(this.headerPhase(interactive)).color)
+            Text(this.connected ? agentShellAppearance(this.headerPhase(interactive)).label : this.connectionLabel)
+              .fontSize(12).fontColor(this.connected ? agentShellAppearance(this.headerPhase(interactive)).color :
+                this.connectionColor)
           }.layoutWeight(1)
           if (this.sessions.length > 1) {
             Row({ space: 5 }) {

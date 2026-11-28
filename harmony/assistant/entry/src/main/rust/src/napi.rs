@@ -20,7 +20,7 @@ use crate::{
         RequestHandle as RustRequestHandle, RequestOptions as RustRequestOptions, ResponsError,
         ServiceRequest as RustServiceRequest,
     },
-    service_proxy::{DeviceRefreshEvent, StatusSubscription as RustStatusSubscription},
+    service_proxy::StatusSubscription as RustStatusSubscription,
     slack::{Slack as RustSlack, SlackStatusChanged},
     workspace::ServiceConfiguration,
 };
@@ -153,13 +153,8 @@ impl Workspace {
     }
 
     #[napi]
-    pub fn refresh_device(&self, env: Env, endpoint: String) -> Result<()> {
-        typed_result(env, self.inner.refresh_device(&endpoint))
-    }
-
-    #[napi(ts_args_type = "changed: (event: DeviceRefreshEvent) => void")]
-    pub fn watch_refresh(&self, changed: Function<'_, Value, ()>) -> Result<StatusSubscription> {
-        subscribe::<DeviceRefreshEvent>(changed, |changed| self.inner.watch_refresh(changed))
+    pub fn set_local_network_available(&self, available: bool) {
+        self.inner.set_local_network_available(available);
     }
 
     #[napi(ts_args_type = "changed: (snapshot: StatusSnapshot) => void")]
