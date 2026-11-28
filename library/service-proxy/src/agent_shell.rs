@@ -30,7 +30,7 @@ pub struct AgentShellSession {
     pub stop_reason: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AgentShellBlock {
     pub id: String,
     pub kind: String,

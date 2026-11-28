@@ -400,6 +400,16 @@ impl AgentShell {
         })
     }
 
+    #[napi(ts_return_type = "Promise<AgentShellBlock[]>")]
+    pub async fn preview_conversation(&self, session_id: String) -> Result<Value> {
+        let blocks = self
+            .conversations
+            .preview(session_id)
+            .await
+            .map_err(|_| Error::from_reason("无法读取相邻会话"))?;
+        js_value(blocks)
+    }
+
     #[napi(ts_return_type = "Promise<ResponsError | null>")]
     pub async fn send_message(&self, session_id: String, text: String) -> Result<Value> {
         js_value(self.inner.send_message(&session_id, text).await.err())

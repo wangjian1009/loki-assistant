@@ -1,5 +1,5 @@
 import { KeyboardAvoidMode } from '@kit.ArkUI'
-import { AgentViewerScreen, ViewerBlock, ViewerSession } from 'agent_viewer'
+import { AgentViewerScreen, ViewerBlock, ViewerSession, ViewerSessionPreview } from 'agent_viewer'
 import { AgentShell, AgentShellBlock, AgentShellSession, AgentShellConversationView, ConversationSubscription,
   renderDocument, ResponsError } from 'liblokiworkspace.so'
 import { Application, ComputerDevice } from '../app/Application'
@@ -22,6 +22,7 @@ struct AgentViewer {
   @StorageLink('lokiAgentSessionRequest') @Watch('applySessionRequest') private sessionRequest: string = ''
   @State private sessions: ViewerSession[] = []
   @State private blocks: ViewerBlock[] = []
+  @State private adjacentViews: ViewerSessionPreview[] = []
   @State private selected: string = ''
   @State private notice: string = '正在读取会话'
   @State private conversationKey: number = 0
@@ -37,6 +38,8 @@ struct AgentViewer {
   private shell?: AgentShell
   private devices?: DeviceSubscription
   private conversation?: ConversationSubscription
+  private readonly previewsLoading: Set<string> = new Set()
+  private previewVersion: number = 0
 
   private deviceOnline(): boolean { return this.deviceStatus === 'online' }
 
@@ -92,6 +95,7 @@ struct AgentViewer {
       this.detachConversation()
       this.devices?.cancel()
       this.devices = undefined
+      this.resetAdjacentViews()
     }
   }
 
@@ -112,6 +116,7 @@ struct AgentViewer {
         const endpointId = current?.endpoint_id ?? ''
         if (endpointId !== this.endpointId) {
           this.detachConversation()
+          this.resetAdjacentViews()
           this.endpointId = endpointId
           this.sessions = []
           this.selected = ''
@@ -151,6 +156,7 @@ struct AgentViewer {
     }))
     if (this.sessions.length === 0) {
       this.detachConversation()
+      this.resetAdjacentViews()
       if (this.selected) this.conversationKey += 1
       this.selected = ''
       this.blocks = []
@@ -166,6 +172,7 @@ struct AgentViewer {
     } else if (!this.conversation) {
       this.openConversation()
     }
+    this.loadAdjacentViews()
   }
 
   private detachConversation(): void {
@@ -176,11 +183,54 @@ struct AgentViewer {
 
   private select(sessionId: string): void {
     if (this.selected === sessionId) return
+    const incoming = this.adjacentViews.find(view => view.sessionId === sessionId)
+    const outgoing = this.selected && this.blocks.length > 0
+      ? { sessionId: this.selected, blocks: this.blocks } as ViewerSessionPreview : undefined
     this.detachConversation()
     this.selected = sessionId
-    this.blocks = []
+    this.blocks = incoming?.blocks ?? []
+    this.notice = incoming ? (this.blocks.length ? '' : '暂无会话内容') : '正在读取会话'
+    if (outgoing) {
+      this.adjacentViews = [...this.adjacentViews.filter(view => view.sessionId !== outgoing.sessionId), outgoing]
+    }
     this.conversationKey += 1
     this.openConversation()
+    this.loadAdjacentViews()
+  }
+
+  private resetAdjacentViews(): void {
+    this.previewVersion += 1
+    this.previewsLoading.clear()
+    this.adjacentViews = []
+  }
+
+  private adjacentIds(): string[] {
+    const position = this.sessions.findIndex(session => session.id === this.selected)
+    if (position < 0) return []
+    return this.sessions.slice(Math.max(0, position - 1), position + 2)
+      .filter(session => session.id !== this.selected).map(session => session.id)
+  }
+
+  private loadAdjacentViews(): void {
+    const shell = this.shell
+    if (!shell || !this.active || !this.deviceOnline()) return
+    const ids = this.adjacentIds()
+    this.adjacentViews = this.adjacentViews.filter(view => ids.includes(view.sessionId))
+    for (const id of ids) {
+      if (this.previewsLoading.has(id) || this.adjacentViews.some(view => view.sessionId === id)) continue
+      this.previewsLoading.add(id)
+      const version = this.previewVersion
+      shell.previewConversation(id).then((blocks: AgentShellBlock[]) => {
+        if (version === this.previewVersion && this.adjacentIds().includes(id)) {
+          this.adjacentViews = [...this.adjacentViews.filter(view => view.sessionId !== id),
+            { sessionId: id, blocks: blocks.map(viewerBlock) }]
+        }
+      }).catch(() => {
+        // 会话切换后仍使用常规订阅获取正文。
+      }).finally(() => {
+        if (version === this.previewVersion) this.previewsLoading.delete(id)
+      })
+    }
   }
 
   private async submit(text: string): Promise<string> {
@@ -243,13 +293,13 @@ struct AgentViewer {
     }.accessibilityLevel('no')
   }
 
-  private readImage(source: string): Promise<string> {
+  private readImage(source: string, session: string = this.selected): Promise<string> {
     const directory = AppStorage.get<string>('lokiAgentImageCache')
     const shell = this.shell
-    if (!directory || !shell || !this.selected || !this.deviceOnline()) {
+    if (!directory || !shell || !session || !this.deviceOnline()) {
       return Promise.reject(new Error('电脑未连接'))
     }
-    return shell.cacheImage(directory, this.selected, source)
+    return shell.cacheImage(directory, session, source)
   }
 
   private openConversation(): void {
@@ -257,7 +307,7 @@ struct AgentViewer {
     const session = this.selected
     if (!shell || !session || !this.active) return
     this.detachConversation()
-    this.notice = '正在读取会话'
+    if (!this.blocks.length) this.notice = '正在读取会话'
     const version = this.streamVersion
     try {
       this.conversation = shell.observeConversation(session, (view: AgentShellConversationView) => {
@@ -269,10 +319,12 @@ struct AgentViewer {
   }
 
   private receive(view: AgentShellConversationView, session: string): void {
-    this.blocks = view.blocks.map(viewerBlock)
+    if (view.phase !== 'loading' || !this.blocks.length) {
+      this.blocks = view.blocks.map(viewerBlock)
+    }
     switch (view.phase) {
       case 'loading':
-        this.notice = '正在读取会话'
+        if (!this.blocks.length) this.notice = '正在读取会话'
         break
       case 'ready':
         this.notice = this.blocks.length ? '' : '暂无会话内容'
@@ -302,7 +354,8 @@ struct AgentViewer {
         .expandSafeArea([SafeAreaType.SYSTEM, SafeAreaType.CUTOUT], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         .hitTestBehavior(HitTestMode.None)
       AgentViewerScreen({ title: $r('app.string.agent_viewer_title'), sessionId: this.selected,
-        sessions: this.sessions, blocks: this.blocks, notice: this.notice, connected: this.deviceOnline(),
+        sessions: this.sessions, adjacentViews: this.adjacentViews, blocks: this.blocks, notice: this.notice,
+        connected: this.deviceOnline(),
         preview: $imagePreview,
         sessionActions: () => { this.sessionMenu() },
         connectionColor: deviceConnectionAppearance(this.deviceStatus).color,
@@ -311,7 +364,7 @@ struct AgentViewer {
         conversationKey: this.conversationKey,
         onSelect: (id: string): void => { this.select(id) },
         onSend: (value: string): Promise<string> => this.submit(value),
-        readImage: (source: string): Promise<string> => this.readImage(source),
+        readImage: (source: string, session?: string): Promise<string> => this.readImage(source, session),
         onRetry: (): void => { this.openConversation() } })
     }.width('100%').height('100%')
   }

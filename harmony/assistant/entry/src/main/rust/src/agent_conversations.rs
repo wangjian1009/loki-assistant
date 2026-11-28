@@ -208,6 +208,63 @@ impl ConversationSubscriptions {
         })))
     }
 
+    #[cfg(target_env = "ohos")]
+    pub(crate) async fn preview(
+        &self,
+        session: String,
+    ) -> Result<Vec<AgentShellBlock>, ResponsError> {
+        let generation = self.proxy.snapshot().generation;
+        {
+            let scope = self.conversations.lock().unwrap();
+            let scope = scope.as_ref().ok_or(CancelledReason::UserRequested)?;
+            if scope.generation == generation
+                && let Some(entry) = scope.entries.get(&session)
+            {
+                let state = entry.view.borrow();
+                if state.phase == ConversationPhase::Ready || !state.blocks.is_empty() {
+                    return Ok(state.view().blocks.to_vec());
+                }
+            }
+        }
+        let shell = AgentShell::new(self.proxy.clone());
+        let (send, mut events) = mpsc::unbounded_channel();
+        let updates = send.clone();
+        let _request = StreamRequest(shell.watch_conversation_for(
+            generation,
+            session,
+            false,
+            move |event| {
+                let _ = updates.send(Ok(event));
+            },
+            move |result| {
+                if let Err(error) = result {
+                    let _ = send.send(Err(error));
+                }
+            },
+        )?);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            let (publish, view) = watch::channel(ConversationState::default());
+            let mut history = ConversationHistory::default();
+            while let Some(event) = events.recv().await {
+                let event = event?;
+                if !matches!(
+                    event.update,
+                    AgentShellConversationUpdate::Snapshot { .. }
+                        | AgentShellConversationUpdate::Update { .. }
+                ) || !history.receive(event, &publish)
+                {
+                    return Err(crate::error::NetworkReason::InvalidResponse.into());
+                }
+                if history.initialized {
+                    return Ok(view.borrow().view().blocks.to_vec());
+                }
+            }
+            Err(crate::error::NetworkReason::InvalidResponse.into())
+        })
+        .await
+        .map_err(|_| ResponsError::from(crate::error::NetworkReason::RequestTimeout))?
+    }
+
     pub(crate) fn close(&self) {
         self.conversations.lock().unwrap().take();
     }
