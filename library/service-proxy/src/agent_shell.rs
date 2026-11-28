@@ -44,6 +44,8 @@ pub struct AgentShellBlock {
 pub struct AgentShellConversationEvent {
     pub session_id: String,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_end_revision: Option<u64>,
     #[serde(flatten)]
     pub update: AgentShellConversationUpdate,
 }
@@ -97,30 +99,77 @@ impl AgentShell {
         &self,
         session_id: String,
         full: bool,
+        changed: impl FnMut(AgentShellConversationEvent) + Send + 'static,
+        ended: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
+    ) -> Result<RequestHandle, ResponsError> {
+        let generation = self.proxy.snapshot().generation;
+        self.watch_conversation_for(generation, session_id, full, changed, ended)
+    }
+
+    pub fn watch_conversation_for(
+        &self,
+        generation: u64,
+        session_id: String,
+        full: bool,
         mut changed: impl FnMut(AgentShellConversationEvent) + Send + 'static,
         ended: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
     ) -> Result<RequestHandle, ResponsError> {
+        let query = (!full).then(|| QueryParameter {
+            name: "recent".into(),
+            value: "10".into(),
+        });
+        self.watch_conversation_with(
+            generation,
+            session_id,
+            query,
+            move |update| {
+                if let SseUpdate::Event(event) = update {
+                    changed(event);
+                }
+            },
+            ended,
+        )
+    }
+
+    pub fn watch_conversation_from(
+        &self,
+        generation: u64,
+        session_id: String,
+        after: Option<u64>,
+        changed: impl FnMut(SseUpdate<AgentShellConversationEvent>) + Send + 'static,
+        ended: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
+    ) -> Result<RequestHandle, ResponsError> {
+        let query = after.map(|revision| QueryParameter {
+            name: "after".into(),
+            value: revision.to_string(),
+        });
+        self.watch_conversation_with(generation, session_id, query, changed, ended)
+    }
+
+    fn watch_conversation_with(
+        &self,
+        generation: u64,
+        session_id: String,
+        query: Option<QueryParameter>,
+        mut changed: impl FnMut(SseUpdate<AgentShellConversationEvent>) + Send + 'static,
+        ended: impl FnOnce(Result<(), ResponsError>) + Send + 'static,
+    ) -> Result<RequestHandle, ResponsError> {
         let path = Self::session_path(&session_id)?;
-        let generation = self.proxy.snapshot().generation;
         let mut request = ServiceRequest::get(format!("{path}/events"));
-        if !full {
-            request.query.push(QueryParameter {
-                name: "recent".into(),
-                value: "10".into(),
-            });
-        }
+        request.query.extend(query);
         Ok(self
             .proxy
             .request_sse::<SseEvent<AgentShellConversationEvent>>(
                 generation,
                 request,
-                move |update| {
-                    if let SseUpdate::Event(event) = update
-                        && event.event == "agent-shell"
-                        && event.data.session_id == session_id
+                move |update| match update {
+                    SseUpdate::Opened(response) => changed(SseUpdate::Opened(response)),
+                    SseUpdate::Event(event)
+                        if event.event == "agent-shell" && event.data.session_id == session_id =>
                     {
-                        changed(event.data);
+                        changed(SseUpdate::Event(event.data));
                     }
+                    _ => {}
                 },
                 ended,
             ))

@@ -292,6 +292,79 @@
             (should (equal (alist-get 'kind update) "update"))
             (should (equal (alist-get 'text (car (alist-get 'blocks update))) "回答更新"))))))))
 
+(ert-deftest loki-assistant-agent-shell-stream-publishes-submitted-image-attachments ()
+  (require 'loki-assistant-agent-shell-stream)
+  (let* ((image (make-temp-file "截图 (测试) " nil ".png"))
+         (png (base64-decode-string
+               "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1sAAAAASUVORK5CYII="))
+         (encoded (url-hexify-string image)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'no-conversion))
+            (write-region png nil image nil 'silent))
+          (dolist (variant '(plain structured steered))
+            (with-temp-buffer
+              (let* ((buffer (current-buffer))
+                     (inhibit-read-only t)
+                     (context (propertize (format "@\"%s\"" image)
+                                          'display (list 'image :file image)
+                                          'agent-shell-context-image t))
+                     (history (concat "请查看" context))
+                     end)
+                (pcase variant
+                  ('structured
+                   (insert (propertize history
+                                       'agent-shell-ui-section 'body
+                                       'agent-shell-ui-state '((:qualified-id . "test-user_message_chunk")))))
+                  ('steered
+                   (insert (propertize
+                            (concat (propertize "QA> " 'field 'output)
+                                    (propertize "[steer] " 'agent-shell-steer-prefix t)
+                                    history)
+                            'read-only t
+                            'agent-shell-ui-state '((:qualified-id . "test-steered-user_message_chunk")))))
+                  ('plain (insert (propertize history 'read-only t))))
+                (setq end (point))
+                (insert (propertize "尚未提交" 'read-only t))
+                (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list buffer)))
+                          ((symbol-function 'agent-shell--live-prompt-start) (lambda () end)))
+                  (let* ((snapshot (json-parse-string (loki-assistant-agent-shell-stream-read (buffer-name) nil)
+                                                      :object-type 'alist :array-type 'list))
+                         (row (car (alist-get 'blocks snapshot)))
+                         (attachment (json-parse-string
+                                      (loki-assistant-agent-shell-read-image (buffer-name) encoded)
+                                      :object-type 'alist)))
+                    (should (equal (alist-get 'kind row) "user"))
+                    (should (equal (alist-get 'text row) (format "请查看\n\n![图片](%s)" encoded)))
+                    (should (equal (alist-get 'mime attachment) "image/png"))
+                    (should (equal (base64-decode-string (alist-get 'data attachment)) png))))))))
+      (delete-file image))))
+
+(ert-deftest loki-assistant-agent-shell-stream-resume-resets-after-revision-range-changes ()
+  (require 'loki-assistant-agent-shell-stream)
+  (with-temp-buffer
+    (let ((buffer (current-buffer))
+          (fragment '((:qualified-id . "1-agent_message_chunk"))))
+      (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list buffer)))
+                ((symbol-function 'agent-shell--live-prompt-start) #'point-max))
+        (let* ((session (buffer-name))
+               (first (json-parse-string (loki-assistant-agent-shell-stream-read session nil)
+                                         :object-type 'alist))
+               (revision (alist-get 'revision first)))
+          (insert (propertize "新内容" 'agent-shell-ui-state fragment 'agent-shell-ui-section 'body))
+          (let* ((increment (json-parse-string (loki-assistant-agent-shell-stream-read session revision)
+                                               :object-type 'alist))
+                 (latest (alist-get 'revision increment)))
+            (should (equal (alist-get 'kind increment) "update"))
+            (should (= latest (1+ revision)))
+            (should (equal (loki-assistant-agent-shell-stream-read session latest) "null"))
+            (setq loki-assistant-agent-shell-stream--state nil)
+            (let ((replacement (json-parse-string (loki-assistant-agent-shell-stream-read session latest)
+                                                   :object-type 'alist)))
+              (should (equal (alist-get 'kind replacement) "snapshot"))
+              (should-not (= latest (alist-get 'revision replacement)))
+              (should (< (alist-get 'revision replacement) (ash 1 53))))))))))
+
 (ert-deftest loki-assistant-agent-shell-stream-preserves-folds-and-fragment-source ()
   (require 'loki-assistant-agent-shell-stream)
   (with-temp-buffer

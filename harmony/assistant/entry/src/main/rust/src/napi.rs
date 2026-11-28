@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     Workspace as RustWorkspace, WorkspaceOptions as RustWorkspaceOptions,
+    agent_conversations::{ConversationObserver, ConversationSubscriptions},
     agent_shell::{AgentShell as RustAgentShell, AgentShellSession},
     agent_shell_images::ImageCache,
     mail::{Mail as RustMail, MailStatusChanged},
@@ -104,6 +105,7 @@ impl Workspace {
         AgentShell {
             inner: Arc::new(self.inner.open_agent_shell()),
             images: self.agent_images.clone(),
+            conversations: self.inner.open_agent_conversations(),
         }
     }
 
@@ -366,6 +368,7 @@ impl Slack {
 pub struct AgentShell {
     inner: Arc<RustAgentShell>,
     images: Arc<ImageCache>,
+    conversations: Arc<ConversationSubscriptions>,
 }
 
 #[napi]
@@ -377,43 +380,23 @@ impl AgentShell {
         })
     }
 
-    #[napi(
-        ts_args_type = "sessionId: string, full: boolean, changed: (event: AgentShellConversationEvent) => void, ended: (error: ResponsError | null) => void"
-    )]
-    pub fn watch_conversation(
+    #[napi(ts_args_type = "sessionId: string, changed: (view: AgentShellConversationView) => void")]
+    pub fn observe_conversation(
         &self,
         env: Env,
         session_id: String,
-        full: bool,
         changed: Function<'_, Value, ()>,
-        ended: Function<'_, Value, ()>,
-    ) -> Result<RequestHandle> {
+    ) -> Result<ConversationSubscription> {
         let changed = changed
             .build_threadsafe_function()
             .callee_handled::<false>()
             .weak::<true>()
             .build()?;
-        let ended = ended
-            .build_threadsafe_function()
-            .callee_handled::<false>()
-            .weak::<true>()
-            .build()?;
-        let handle = self.inner.watch_conversation(
-            session_id,
-            full,
-            move |event| {
-                if let Ok(value) = js_value(event) {
-                    changed.call(value, NonBlocking);
-                }
-            },
-            move |result| {
-                if let Ok(value) = js_value(result.err()) {
-                    ended.call(value, NonBlocking);
-                }
-            },
-        );
-        Ok(RequestHandle {
-            inner: Some(typed_result(env, handle)?),
+        let observer = self.conversations.observe(session_id, move |view| {
+            js_value(view).is_ok_and(|value| changed.call(value, NonBlocking) == Status::Ok)
+        });
+        Ok(ConversationSubscription {
+            inner: typed_result(env, observer)?,
         })
     }
 
@@ -444,6 +427,19 @@ impl AgentShell {
     ) {
         self.images
             .close(std::path::Path::new(&cache_dir), &endpoint_id, &session_id);
+    }
+}
+
+#[napi]
+pub struct ConversationSubscription {
+    inner: ConversationObserver,
+}
+
+#[napi]
+impl ConversationSubscription {
+    #[napi]
+    pub fn cancel(&self) {
+        self.inner.cancel();
     }
 }
 

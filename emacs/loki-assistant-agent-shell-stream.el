@@ -29,14 +29,34 @@
 (defconst loki-assistant-agent-shell-stream--block-size 2048)
 (defconst loki-assistant-agent-shell-stream--batch-size 20)
 (defconst loki-assistant-agent-shell-stream--journal-limit 128)
+(defconst loki-assistant-agent-shell-stream--revision-bits 17)
+(defconst loki-assistant-agent-shell-stream--image-limit (* 1024 1024))
 
 (cl-defstruct loki-assistant-agent-shell-stream--state
-  tick blocks (revision 0) snapshot-index (batches (make-hash-table :test #'eql)))
+  tick blocks (revision 0) snapshot-index (batches (make-hash-table :test #'eql)) epoch-end)
 
 (defvar-local loki-assistant-agent-shell-stream--state nil)
 (defvar-local loki-assistant-agent-shell-stream--recent-state nil)
 (defvar-local loki-assistant-agent-shell-stream--init-subscription nil)
-(defvar loki-assistant-agent-shell-stream--epoch 0)
+(defvar-local loki-assistant-agent-shell-stream--clients nil)
+(defvar-local loki-assistant-agent-shell-stream--flush-timer nil)
+(defvar loki-assistant-agent-shell-stream--epoch-sequence nil)
+
+(defun loki-assistant-agent-shell-stream--reset-revision (state)
+  "为 STATE 启用新版本范围，避免重启后误用旧游标。"
+  (unless loki-assistant-agent-shell-stream--epoch-sequence
+    (let* ((seed (format "%s:%s:%s" before-init-time (emacs-pid) (random)))
+           (digest (secure-hash 'sha256 seed)))
+      ;; 版本只占 53 位，在 JavaScript 中也可精确表示。
+      (setq loki-assistant-agent-shell-stream--epoch-sequence
+            (string-to-number (substring digest 0 9) 16))))
+  (let* ((bits loki-assistant-agent-shell-stream--revision-bits)
+         (epoch-limit (ash 1 (- 53 bits)))
+         (epoch (setq loki-assistant-agent-shell-stream--epoch-sequence
+                      (mod (1+ loki-assistant-agent-shell-stream--epoch-sequence) epoch-limit)))
+         (start (ash epoch bits)))
+    (setf (loki-assistant-agent-shell-stream--state-revision state) start
+          (loki-assistant-agent-shell-stream--state-epoch-end state) (+ start (1- (ash 1 bits))))))
 
 (defun loki-assistant-agent-shell-stream--plain (text)
   "从 TEXT 去掉 UI 属性和非打印字符，保留换行。"
@@ -50,6 +70,42 @@
         ((string-match-p "permission\\|elicitation" id) "permission")
         ((string-match-p "activity\\|tool\\|exec" id) "tool")
         (t "system")))
+
+(defun loki-assistant-agent-shell-stream--user-text (start end &optional reconstruct)
+  "导出 START 到 END 的用户文本及附件。RECONSTRUCT 恢复正文的 Markdown。"
+  (let (parts)
+    (while (< start end)
+      (let* ((next (next-single-property-change start 'agent-shell-context-image nil end))
+             (image (get-text-property start 'agent-shell-context-image))
+             (display (and image (get-text-property start 'display)))
+             (file (when (eq (car-safe display) 'image)
+                     (plist-get (cdr display) :file))))
+        (when image
+          (setq next (next-single-property-change start 'display nil next)))
+        (push (cond
+               ((and (stringp file) (not (file-remote-p file)))
+                ;; 将路径作为一个 URL 编码，保留空格、非 ASCII 字符和括号。
+                (format "\n\n![图片](%s)\n\n" (url-hexify-string (expand-file-name file))))
+               ((and reconstruct (fboundp 'agent-shell-markdown-reconstruct))
+                (agent-shell-markdown-reconstruct start next))
+               (t (buffer-substring-no-properties start next)))
+              parts)
+        (setq start next)))
+    (apply #'concat (nreverse parts))))
+
+(defun loki-assistant-agent-shell-stream--submitted-user-text (start end)
+  "提取 START 到 END 中已冻结的提示正文，跳过提示符和 steer 标签。"
+  (let (parts)
+    (while (< start end)
+      (let ((next (min (next-single-property-change start 'field nil end)
+                       (next-single-property-change start 'read-only nil end)
+                       (next-single-property-change start 'agent-shell-steer-prefix nil end))))
+        (when (and (null (get-text-property start 'field))
+                   (get-text-property start 'read-only)
+                   (not (get-text-property start 'agent-shell-steer-prefix)))
+          (push (loki-assistant-agent-shell-stream--user-text start next) parts))
+        (setq start next)))
+    (apply #'concat (nreverse parts))))
 
 (defun loki-assistant-agent-shell-stream--fragment (from to state)
   "提取 FROM 到 TO 的片段 STATE 及其折叠信息。"
@@ -65,9 +121,10 @@
             ((or 'label-left 'label-right)
              (push (buffer-substring-no-properties from next) labels))
             ('body
-             (push (if (fboundp 'agent-shell-markdown-reconstruct)
-                       (agent-shell-markdown-reconstruct from next)
-                     (buffer-substring-no-properties from next))
+             (push (cond ((equal kind "user") (loki-assistant-agent-shell-stream--user-text from next t))
+                         ((fboundp 'agent-shell-markdown-reconstruct)
+                          (agent-shell-markdown-reconstruct from next))
+                         (t (buffer-substring-no-properties from next)))
                    body))
             ('indicator (setq indicator t)))
           (setq from next)))
@@ -97,20 +154,17 @@
       (while (< position end)
         (let* ((state (get-text-property position 'agent-shell-ui-state))
                (next (next-single-property-change position 'agent-shell-ui-state nil end))
+               (id (alist-get :qualified-id state))
                (fragment
-                (if (stringp (alist-get :qualified-id state))
+                (if (and (stringp id)
+                         (not (and (string-suffix-p "-steered-user_message_chunk" id)
+                                   (null (get-text-property position 'agent-shell-ui-section)))))
                     (loki-assistant-agent-shell-stream--fragment position next state)
-                  (let ((input position) parts)
-                    (while (< input next)
-                      (let ((limit (next-single-property-change input 'field nil next)))
-                        (when (and (null (get-text-property input 'field))
-                                   (get-text-property input 'read-only))
-                          (push (buffer-substring-no-properties input limit) parts))
-                        (setq input limit)))
-                    (let ((content (string-trim (loki-assistant-agent-shell-stream--plain
-                                                 (apply #'concat (nreverse parts))))))
-                      (unless (string-empty-p content)
-                        (list "submitted-user" "user" "" content nil nil)))))))
+                  (let ((content (string-trim
+                                  (loki-assistant-agent-shell-stream--plain
+                                   (loki-assistant-agent-shell-stream--submitted-user-text position next)))))
+                    (unless (string-empty-p content)
+                      (list (or id "submitted-user") "user" "" content nil nil))))))
           (when fragment
             (pcase-let ((`(,id ,kind ,title ,body ,group-id ,collapsed) fragment))
               ;; 位置会随前文更新而移动。使用片段标识与同名片段出现次序。
@@ -137,19 +191,29 @@
           (setq position next)))
       (nreverse rows))))
 
+(defun loki-assistant-agent-shell-stream--chunks (blocks)
+  "将 BLOCKS 分成可发送的批次，空会话也生成一个批次。"
+  (or (seq-partition blocks loki-assistant-agent-shell-stream--batch-size) (list nil)))
+
+(defun loki-assistant-agent-shell-stream--event (kind revision chunk &optional snapshot-end)
+  "构造 KIND、REVISION 和 CHUNK 的事件，附上快照结束版本 SNAPSHOT-END。"
+  `((kind . ,kind) (revision . ,revision) (blocks . ,(vconcat chunk))
+    ,@(when snapshot-end `((snapshot_end_revision . ,snapshot-end)))))
+
 (defun loki-assistant-agent-shell-stream--enqueue (state kind blocks)
   "在 STATE 中按批次追加 KIND 和 BLOCKS。"
   (when (equal kind "snapshot")
     (clrhash (loki-assistant-agent-shell-stream--state-batches state))
     (setf (loki-assistant-agent-shell-stream--state-snapshot-index state)
           (1+ (loki-assistant-agent-shell-stream--state-revision state))))
-  (let ((chunks (or (seq-partition blocks loki-assistant-agent-shell-stream--batch-size)
-                    (list nil))))
+  (let* ((chunks (loki-assistant-agent-shell-stream--chunks blocks))
+         (snapshot-end (when (equal kind "snapshot")
+                         (+ (loki-assistant-agent-shell-stream--state-revision state) (length chunks)))))
     (dolist (chunk chunks)
       (let ((revision (cl-incf (loki-assistant-agent-shell-stream--state-revision state))))
-        (puthash revision `((kind . ,kind) (revision . ,revision) (blocks . ,(vconcat chunk)))
+        (puthash revision (loki-assistant-agent-shell-stream--event kind revision chunk snapshot-end)
                  (loki-assistant-agent-shell-stream--state-batches state)))
-      (setq kind "update"))))
+      (setq kind "update" snapshot-end nil))))
 
 (defun loki-assistant-agent-shell-stream--recent (blocks count)
   "返回 BLOCKS 最后 COUNT 条逻辑片段，保留祖先和完整正文。"
@@ -181,6 +245,11 @@
               (unless (equal row (car rest)) (push (car rest) changes))
             (setq reset t))
           (setq rest (cdr rest)))
+        (let ((max-batches (max 1 (ceiling (length blocks) loki-assistant-agent-shell-stream--batch-size))))
+          (when (> (+ (loki-assistant-agent-shell-stream--state-revision state) max-batches)
+                   (loki-assistant-agent-shell-stream--state-epoch-end state))
+            (loki-assistant-agent-shell-stream--reset-revision state)
+            (setq reset t)))
         (cond
          ((or reset (not (loki-assistant-agent-shell-stream--state-snapshot-index state))
               (>= (hash-table-count (loki-assistant-agent-shell-stream--state-batches state))
@@ -192,24 +261,175 @@
         (setf (loki-assistant-agent-shell-stream--state-tick state) tick
               (loki-assistant-agent-shell-stream--state-blocks state) blocks)))))
 
+(defun loki-assistant-agent-shell-stream--current-state (recent)
+  "返回当前 buffer 的会话状态，RECENT 可限制记录条数。"
+  (let* ((slot (if recent 'loki-assistant-agent-shell-stream--recent-state
+                 'loki-assistant-agent-shell-stream--state))
+         (state (symbol-value slot)))
+    (unless (and state (ignore-errors (loki-assistant-agent-shell-stream--state-epoch-end state)))
+      ;; 已运行 Emacs 可能保留更新前格式的会话状态。
+      (setq state (set slot (make-loki-assistant-agent-shell-stream--state)))
+      (loki-assistant-agent-shell-stream--reset-revision state))
+    (loki-assistant-agent-shell-stream--refresh state recent)
+    state))
+
+(defun loki-assistant-agent-shell-stream--next-event (state revision)
+  "返回 STATE 自 REVISION 之后的下一批事件。"
+  (let* ((first (loki-assistant-agent-shell-stream--state-snapshot-index state))
+         (last (loki-assistant-agent-shell-stream--state-revision state))
+         (next (if (and revision (<= first revision last)) (1+ revision) first)))
+    (gethash next (loki-assistant-agent-shell-stream--state-batches state))))
+
+(defun loki-assistant-agent-shell-stream--session-buffer (session-id)
+  "按 SESSION-ID 寻找打开的 Agent Shell buffer。"
+  (when-let* ((buffer (get-buffer session-id))
+              ((memq buffer (agent-shell-buffers))))
+    buffer))
+
 (defun loki-assistant-agent-shell-stream-read (session-id revision &optional recent)
   "返回 SESSION-ID 自 REVISION 之后的一批可读会话事件 JSON。"
-  (let* ((candidate (get-buffer session-id))
-         (buffer (and candidate (memq candidate (agent-shell-buffers)) candidate)))
-    (if (not buffer)
-        (json-encode `((kind . ,(if revision "closed" "missing")) (revision . ,(or revision 0))))
+  (if-let* ((buffer (loki-assistant-agent-shell-stream--session-buffer session-id)))
       (with-current-buffer buffer
-        (let* ((slot (if recent 'loki-assistant-agent-shell-stream--recent-state
-                       'loki-assistant-agent-shell-stream--state))
-               (state (or (symbol-value slot)
-                          (set slot (make-loki-assistant-agent-shell-stream--state
-                                     :revision (ash (cl-incf loki-assistant-agent-shell-stream--epoch) 32))))))
-          (loki-assistant-agent-shell-stream--refresh state recent)
-          (let* ((first (loki-assistant-agent-shell-stream--state-snapshot-index state))
-                 (last (loki-assistant-agent-shell-stream--state-revision state))
-                 (next (if (and revision (<= first revision last)) (1+ revision) first))
-                 (batch (gethash next (loki-assistant-agent-shell-stream--state-batches state))))
-            (if batch (json-encode batch) "null")))))))
+        (let ((event (loki-assistant-agent-shell-stream--next-event
+                      (loki-assistant-agent-shell-stream--current-state recent) revision)))
+          (if event (json-encode event) "null")))
+    (json-encode `((kind . ,(if revision "closed" "missing")) (revision . ,(or revision 0))))))
+
+(defun loki-assistant-agent-shell-stream--begin-replay (client state)
+  "让 CLIENT 从 STATE 捕获一份完整的当前快照。"
+  (let* ((chunks (loki-assistant-agent-shell-stream--chunks
+                  (loki-assistant-agent-shell-stream--state-blocks state)))
+         (last (loki-assistant-agent-shell-stream--state-revision state))
+         (first (- (1+ last) (length chunks))))
+    (process-put client :replay chunks)
+    (process-put client :next first)
+    (process-put client :snapshot-end last)
+    (process-put client :first first)))
+
+(defun loki-assistant-agent-shell-stream--flush-client (client)
+  "发送 CLIENT 等待中的一批内容。"
+  (when (and (eq (process-status client) 'open) (process-get client :ready))
+    (let* ((revision (process-get client :revision))
+           (state (loki-assistant-agent-shell-stream--current-state (process-get client :recent)))
+           (first (loki-assistant-agent-shell-stream--state-snapshot-index state))
+           (last (loki-assistant-agent-shell-stream--state-revision state)))
+      (when (and (not (process-get client :replay))
+                 (not (and revision (<= first revision last))))
+        (loki-assistant-agent-shell-stream--begin-replay client state))
+      (when-let* ((event
+                   (if-let* ((chunks (process-get client :replay)))
+                       (let* ((next (process-get client :next))
+                              (snapshot (equal next (process-get client :first))))
+                         (process-put client :replay (cdr chunks))
+                         (process-put client :next (1+ next))
+                         (loki-assistant-agent-shell-stream--event
+                          (if snapshot "snapshot" "update") next (car chunks)
+                          (when snapshot (process-get client :snapshot-end))))
+                     (loki-assistant-agent-shell-stream--next-event state revision))))
+        (process-put client :ready nil)
+        (process-put client :revision (alist-get 'revision event))
+        (process-send-string client (concat (json-encode event) "\n"))))))
+
+(defun loki-assistant-agent-shell-stream--flush (buffer)
+  "提交 BUFFER 的变更并推送给等待下一批的订阅者。"
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq loki-assistant-agent-shell-stream--flush-timer nil)
+      (dolist (client loki-assistant-agent-shell-stream--clients)
+        (if (equal (buffer-name) (process-get client :session))
+            (condition-case nil
+                (loki-assistant-agent-shell-stream--flush-client client)
+              (error (delete-process client)))
+          (loki-assistant-agent-shell-stream--close-client client))))))
+
+(defun loki-assistant-agent-shell-stream--schedule-flush (&rest _)
+  "合并同一小段时间内的 buffer 变更。"
+  (unless loki-assistant-agent-shell-stream--flush-timer
+    (setq loki-assistant-agent-shell-stream--flush-timer
+          (run-at-time 0.03 nil #'loki-assistant-agent-shell-stream--flush (current-buffer)))))
+
+(defun loki-assistant-agent-shell-stream--close-client (client)
+  "向 CLIENT 发出关闭事件并断开连接。"
+  (ignore-errors
+    (process-send-string
+     client
+     (concat (json-encode `((kind . "closed") (revision . ,(or (process-get client :revision) 0)))) "\n")))
+  (delete-process client))
+
+(defun loki-assistant-agent-shell-stream--close-buffer ()
+  "关闭当前 buffer 的全部推送连接。"
+  (mapc #'loki-assistant-agent-shell-stream--close-client loki-assistant-agent-shell-stream--clients))
+
+(defun loki-assistant-agent-shell-stream--buffer-list-change ()
+  "通知订阅者当前 buffer 已改名。"
+  (dolist (client loki-assistant-agent-shell-stream--clients)
+    (unless (equal (buffer-name) (process-get client :session))
+      (loki-assistant-agent-shell-stream--close-client client))))
+
+(defun loki-assistant-agent-shell-stream--client-status (client _event)
+  "在 CLIENT 连接或离开时更新订阅。"
+  (when-let* ((buffer (process-get client :shell-buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (pcase (process-status client)
+        ('open
+         (when-let* ((token (process-get client :token)))
+           (process-put client :token nil)
+           (condition-case nil
+               (progn
+                 (process-send-string client (concat token "\n"))
+                 (process-put client :ready t)
+                 (loki-assistant-agent-shell-stream--schedule-flush))
+             (error (delete-process client)))))
+        ((or 'closed 'failed 'exit 'signal)
+         (setq loki-assistant-agent-shell-stream--clients
+               (delq client loki-assistant-agent-shell-stream--clients))
+         (unless loki-assistant-agent-shell-stream--clients
+           (remove-hook 'after-change-functions #'loki-assistant-agent-shell-stream--schedule-flush t)
+           (remove-hook 'kill-buffer-hook #'loki-assistant-agent-shell-stream--close-buffer t)
+           (remove-hook 'change-major-mode-hook #'loki-assistant-agent-shell-stream--close-buffer t)
+           (remove-hook 'buffer-list-update-hook #'loki-assistant-agent-shell-stream--buffer-list-change t)
+           (when (timerp loki-assistant-agent-shell-stream--flush-timer)
+             (cancel-timer loki-assistant-agent-shell-stream--flush-timer)
+             (setq loki-assistant-agent-shell-stream--flush-timer nil))))))))
+
+(defun loki-assistant-agent-shell-stream--client-input (client data)
+  "收到 CLIENT 的 DATA 确认后再推送下一批。"
+  (when-let* ((buffer (process-get client :shell-buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (if (equal data "\n")
+          (progn
+            (process-put client :ready t)
+            (loki-assistant-agent-shell-stream--schedule-flush))
+        (delete-process client)))))
+
+(defun loki-assistant-agent-shell-stream-subscribe (session-id port token &optional recent)
+  "向回环 PORT 的一次性 TOKEN 连接推送 SESSION-ID 的内容，可用 RECENT 限制初始范围。"
+  (loki-assistant-agent-shell-stream-resume session-id port token recent nil))
+
+(defun loki-assistant-agent-shell-stream-resume (session-id port token recent after)
+  "向回环 PORT 的一次性 TOKEN 连接推送 SESSION-ID 自 AFTER 之后的内容。
+RECENT 可限制会话范围。AFTER 为空或已失效时推送完整快照。"
+  (when-let* ((buffer (loki-assistant-agent-shell-stream--session-buffer session-id)))
+    (with-current-buffer buffer
+      (let ((client (make-network-process :name "loki-agent-shell-stream"
+                                          :buffer nil :host "127.0.0.1" :service port
+                                          :family 'ipv4 :nowait t :noquery t :coding 'utf-8-unix
+                                          :filter #'loki-assistant-agent-shell-stream--client-input
+                                          :sentinel #'loki-assistant-agent-shell-stream--client-status)))
+        (process-put client :shell-buffer buffer)
+        (process-put client :session session-id)
+        (process-put client :token token)
+        (process-put client :recent recent)
+        (process-put client :revision after)
+        (push client loki-assistant-agent-shell-stream--clients)
+        (add-hook 'after-change-functions #'loki-assistant-agent-shell-stream--schedule-flush nil t)
+        (add-hook 'kill-buffer-hook #'loki-assistant-agent-shell-stream--close-buffer nil t)
+        (add-hook 'change-major-mode-hook #'loki-assistant-agent-shell-stream--close-buffer nil t)
+        (add-hook 'buffer-list-update-hook #'loki-assistant-agent-shell-stream--buffer-list-change nil t)
+        (loki-assistant-agent-shell-stream--client-status client nil)
+        t))))
 
 (defun loki-assistant-agent-shell-stream--submit-with-draft (submit)
   "执行 SUBMIT 并将桌面草稿恢复到提交后的输入区。"
@@ -327,6 +547,36 @@
                                     "--resolve" (format "%s:%d:%s" host port address) "--" source))
             (buffer-string)))))))
 
+(defun loki-assistant-agent-shell-stream--local-image-bytes (file)
+  "读取本机 FILE，超限的 PNG 和 JPEG 使用符合传输上限的预览。"
+  (let ((size (file-attribute-size (file-attributes file)))
+        (format (pcase (downcase (or (file-name-extension file) ""))
+                  ((or "jpg" "jpeg") "jpeg")
+                  ("png" "png"))))
+    (cond
+     ((<= size loki-assistant-agent-shell-stream--image-limit)
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally file nil 0 loki-assistant-agent-shell-stream--image-limit)
+        (buffer-string)))
+     ((and format (eq system-type 'darwin) (file-executable-p "/usr/bin/sips"))
+      (let ((preview (make-temp-file "loki-agent-image-")))
+        (unwind-protect
+            (when (seq-some
+                   (lambda (dimension)
+                     (and (eq 0 (apply #'call-process "/usr/bin/sips" nil nil nil
+                                       "-Z" dimension "-s" "format" format
+                                       (append (when (equal format "jpeg") '("-s" "formatOptions" "75"))
+                                               (list file "--out" preview))))
+                          (<= 12 (file-attribute-size (file-attributes preview))
+                              loki-assistant-agent-shell-stream--image-limit)))
+                   '("1600" "1024" "640" "384"))
+              (with-temp-buffer
+                (set-buffer-multibyte nil)
+                (insert-file-contents-literally preview nil 0 loki-assistant-agent-shell-stream--image-limit)
+                (buffer-string)))
+          (delete-file preview)))))))
+
 (defun loki-assistant-agent-shell-stream--image-bytes (source)
   "读取 SOURCE 对应的图像字节。"
   (cond
@@ -345,10 +595,7 @@
                  (not (string-match-p "^[a-zA-Z][a-zA-Z0-9+.-]*:" path)))
         (let ((file (expand-file-name path)))
           (when (and (file-regular-p file) (file-readable-p file))
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (insert-file-contents-literally file nil 0 1048577)
-              (buffer-string)))))))))
+            (loki-assistant-agent-shell-stream--local-image-bytes file))))))))
 
 (defun loki-assistant-agent-shell-read-image (session-id source)
   "读取 SESSION-ID 的已提交内容中 SOURCE 指向的图片。"
@@ -357,7 +604,7 @@
     (with-current-buffer buffer
       (when-let* (((loki-assistant-agent-shell-stream--image-reference-p source))
                   (data (ignore-errors (loki-assistant-agent-shell-stream--image-bytes source)))
-                  ((<= 12 (length data) 1048576))
+                  ((<= 12 (length data) loki-assistant-agent-shell-stream--image-limit))
                   (mime (cond ((string-prefix-p (unibyte-string 137 80 78 71 13 10 26 10) data) "image/png")
                               ((string-prefix-p (unibyte-string 255 216 255) data) "image/jpeg")
                               ((or (string-prefix-p "GIF87a" data) (string-prefix-p "GIF89a" data)) "image/gif")

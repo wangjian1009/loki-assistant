@@ -132,8 +132,8 @@ export interface AgentShellBlock {
   parent_id: string | null
   collapsed: boolean | null
 }
-export type AgentShellConversationEvent = { session_id: string; revision: number } & (
-  { kind: 'snapshot' | 'update'; blocks: AgentShellBlock[] } |
-  { kind: 'closed' } |
-  { kind: 'error'; message: string | null }
-)
+export interface AgentShellConversationView {
+  phase: 'loading' | 'ready' | 'reconnecting' | 'closed' | 'error'
+  blocks: AgentShellBlock[]
+  message: string | null
+}

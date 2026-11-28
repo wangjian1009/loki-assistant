@@ -171,6 +171,183 @@ async fn agent_shell_stream_sends_snapshot_increment_and_closure() {
 }
 
 #[tokio::test]
+async fn agent_shell_stream_forwards_pushed_history_boundary_updates_and_closure() {
+    use futures_util::StreamExt;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    #[derive(Debug)]
+    struct PushRunner(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+    impl CommandRunner for PushRunner {
+        fn run<'a>(
+            &'a self,
+            _program: &'a str,
+            args: &'a [String],
+        ) -> ServiceFuture<'a, CommandOutput> {
+            Box::pin(async move {
+                // 通过受控 gateway 核对真实回环连接，第二次求值会使测试失败。
+                let live = self.0.lock().unwrap().take().expect("只应调用一次 gateway");
+                let pattern = regex::Regex::new(
+                    r#"loki-assistant-agent-shell-stream-subscribe name (\d+) \\"([0-9a-f]+)\\""#,
+                )
+                .unwrap();
+                let args = pattern.captures(&args[3]).unwrap();
+                let port: u16 = args[1].parse().unwrap();
+                let token = args[2].to_owned();
+                tokio::spawn(async move {
+                    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                    socket
+                        .write_all(format!("{token}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    socket.write_all(b"{\"kind\":\"snapshot\",\"revision\":10,\"snapshot_end_revision\":11,\"blocks\":[]}\n").await.unwrap();
+                    let mut ack = [0];
+                    socket.read_exact(&mut ack).await.unwrap();
+                    assert_eq!(ack, *b"\n");
+                    socket
+                        .write_all(b"{\"kind\":\"update\",\"revision\":11,\"blocks\":[]}\n")
+                        .await
+                        .unwrap();
+                    socket.read_exact(&mut ack).await.unwrap();
+                    live.await.unwrap();
+                    socket
+                        .write_all(b"{\"kind\":\"update\",\"revision\":12,\"blocks\":[]}\n")
+                        .await
+                        .unwrap();
+                    socket.read_exact(&mut ack).await.unwrap();
+                    socket
+                        .write_all(b"{\"kind\":\"closed\",\"revision\":12}\n")
+                        .await
+                        .unwrap();
+                });
+                Ok(wire(json!({"result":"t"})))
+            })
+        }
+    }
+
+    let (publish, live) = tokio::sync::oneshot::channel();
+    let emacs = Arc::new(EmacsService::with_runner(
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
+        default_notifications(),
+        default_status(),
+        Arc::new(PushRunner(Mutex::new(Some(live)))),
+        Duration::from_secs(1),
+    ));
+    let response = routes::router(emacs)
+        .oneshot(
+            Request::builder()
+                .uri("/agent-shell/sessions/session/events")
+                .extension(crate::http::sse::RemoteSse)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut frames = response.into_body().into_data_stream();
+    let snapshot = frames.next().await.unwrap().unwrap();
+    let snapshot: Value = serde_json::from_slice(&snapshot[4..]).unwrap();
+    assert_eq!(snapshot["data"]["snapshot_end_revision"], 11);
+    let replay = frames.next().await.unwrap().unwrap();
+    let replay: Value = serde_json::from_slice(&replay[4..]).unwrap();
+    assert_eq!(replay["data"]["revision"], 11);
+    publish.send(()).unwrap();
+    for (kind, revision) in [("update", 12), ("closed", 12)] {
+        let update = frames.next().await.unwrap().unwrap();
+        let update: Value = serde_json::from_slice(&update[4..]).unwrap();
+        assert_eq!(update["data"]["kind"], kind);
+        assert_eq!(update["data"]["revision"], revision);
+    }
+    assert!(frames.next().await.is_none());
+}
+
+#[tokio::test]
+async fn agent_shell_stream_resume_opens_before_next_update() {
+    use futures_util::StreamExt;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    #[derive(Debug)]
+    struct ResumeRunner(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+    impl CommandRunner for ResumeRunner {
+        fn run<'a>(
+            &'a self,
+            _program: &'a str,
+            args: &'a [String],
+        ) -> ServiceFuture<'a, CommandOutput> {
+            Box::pin(async move {
+                let live = self.0.lock().unwrap().take().expect("只应调用一次 gateway");
+                let pattern = regex::Regex::new(
+                    r#"loki-assistant-agent-shell-stream-resume name (\d+) \\"([0-9a-f]+)\\" nil 12\)"#,
+                )
+                .unwrap();
+                let args = pattern.captures(&args[3]).unwrap();
+                let port: u16 = args[1].parse().unwrap();
+                let token = args[2].to_owned();
+                tokio::spawn(async move {
+                    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                    socket
+                        .write_all(format!("{token}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    live.await.unwrap();
+                    socket
+                        .write_all(b"{\"kind\":\"update\",\"revision\":13,\"blocks\":[]}\n")
+                        .await
+                        .unwrap();
+                    let mut ack = [0];
+                    socket.read_exact(&mut ack).await.unwrap();
+                    assert_eq!(ack, *b"\n");
+                    socket
+                        .write_all(b"{\"kind\":\"closed\",\"revision\":13}\n")
+                        .await
+                        .unwrap();
+                });
+                Ok(wire(json!({"result":"resuming"})))
+            })
+        }
+    }
+
+    let (publish, live) = tokio::sync::oneshot::channel();
+    let emacs = Arc::new(EmacsService::with_runner(
+        EmacsConfig::new(Arc::new(ConfigService::new(test_metadata()))),
+        default_notifications(),
+        default_status(),
+        Arc::new(ResumeRunner(Mutex::new(Some(live)))),
+        Duration::from_secs(1),
+    ));
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        routes::router(emacs).oneshot(
+            Request::builder()
+                .uri("/agent-shell/sessions/session/events?after=12")
+                .extension(crate::http::sse::RemoteSse)
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("等待新内容时也应发送响应头")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    publish.send(()).unwrap();
+    let mut frames = response.into_body().into_data_stream();
+    for kind in ["update", "closed"] {
+        let frame = frames.next().await.unwrap().unwrap();
+        let data: Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(data["data"]["kind"], kind);
+        assert_eq!(data["data"]["revision"], 13);
+    }
+    assert!(frames.next().await.is_none());
+}
+
+#[tokio::test]
 async fn agent_shell_stream_keeps_recent_scope_across_revisions() {
     let (emacs, runner, _) = service(vec![
         conversation_reply(json!({"kind": "snapshot", "revision": 12, "blocks": []})),
@@ -333,6 +510,9 @@ async fn agent_shell_stream_validates_request_before_reading_emacs() {
         "recent=9",
         "recent=abc",
         "recent=10&recent=10",
+        "after=-1",
+        "after=18446744073709551616",
+        "after=5&after=5",
         "unknown=10",
     ] {
         let response = router

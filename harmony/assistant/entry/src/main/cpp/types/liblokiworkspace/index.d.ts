@@ -133,11 +133,11 @@ export interface AgentShellBlock {
   parent_id: string | null
   collapsed: boolean | null
 }
-export type AgentShellConversationEvent = { session_id: string; revision: number } & (
-  { kind: 'snapshot' | 'update'; blocks: AgentShellBlock[] } |
-  { kind: 'closed' } |
-  { kind: 'error'; message: string | null }
-)
+export interface AgentShellConversationView {
+  phase: 'loading' | 'ready' | 'reconnecting' | 'closed' | 'error'
+  blocks: AgentShellBlock[]
+  message: string | null
+}
 
 function renderDocument(source: string, format: string): string
 
@@ -201,10 +201,15 @@ export class Slack {
 export class AgentShell {
   private constructor()
   watchStatus(changed: (sessions: AgentShellSession[] | null) => void): StatusSubscription
-  watchConversation(sessionId: string, full: boolean, changed: (event: AgentShellConversationEvent) => void, ended: (error: ResponsError | null) => void): RequestHandle
+  observeConversation(sessionId: string, changed: (view: AgentShellConversationView) => void): ConversationSubscription
   sendMessage(sessionId: string, text: string): Promise<ResponsError | null>
   cacheImage(cacheDir: string, sessionId: string, source: string): Promise<string>
   clearSessionImages(cacheDir: string, endpointId: string, sessionId: string): Promise<void>
+}
+
+export class ConversationSubscription {
+  private constructor()
+  cancel(): void
 }
 
 export class StatusSubscription {

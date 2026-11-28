@@ -164,6 +164,19 @@ function request(network) {
   return new Promise(resolve => network.request({ method: 'GET', path: '/network/session', query: [] }, { timeout_ms: 10000 }, () => assert.fail('请求不得成功'), resolve));
 }
 
+test('会话展示保留已收到的问答，按消息 ID 合并正文续片', () => {
+  const { load } = fixture();
+  const { conversationRows } = load(path.join(__dirname, '../../agent-viewer/src/main/ets/ConversationLayout.ets'));
+  const block = (id, kind, text = id, parentId = '') => ({ id, kind, title: '', text, parentId, collapsed: null });
+  const question = block('问题', 'user');
+  const continuation = block('续片', 'continuation', '的续片', question.id);
+  const reply = block('回复', 'assistant');
+  const followUp = block('追问', 'user');
+  const rows = conversationRows([question, continuation, reply, followUp], new Map());
+  assert.deepEqual(rows.map(row => row.id), [question.id, reply.id, followUp.id]);
+  assert.equal(rows[0].text, '问题的续片');
+});
+
 async function observedDevices(app) {
   let subscription;
   try {

@@ -14,6 +14,11 @@ use futures_util::{StreamExt, stream};
 use loki_services_macros::loki_api;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+};
+use uuid::Uuid;
 
 use crate::http::{
     error::{ErrorSource, response as error_response},
@@ -26,6 +31,8 @@ use super::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PUSH_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_SOURCE_BYTES: usize = 4096;
 const MAX_IMAGE_BYTES: usize = 1024 * 1024;
@@ -46,10 +53,18 @@ struct ConversationBlock {
 #[derive(Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ConversationChange {
-    Snapshot { blocks: Vec<ConversationBlock> },
-    Update { blocks: Vec<ConversationBlock> },
+    Snapshot {
+        blocks: Vec<ConversationBlock>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_end_revision: Option<u64>,
+    },
+    Update {
+        blocks: Vec<ConversationBlock>,
+    },
     Closed,
-    Error { message: &'static str },
+    Error {
+        message: &'static str,
+    },
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -74,6 +89,7 @@ struct ConversationRead {
 #[serde(deny_unknown_fields)]
 struct ConversationQuery {
     recent: Option<u8>,
+    after: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +98,7 @@ enum EmacsConversationRead {
     Snapshot {
         revision: u64,
         blocks: Vec<ConversationBlock>,
+        snapshot_end_revision: Option<u64>,
     },
     Update {
         revision: u64,
@@ -159,7 +176,7 @@ fn conversation_session_id(
     access = "paired",
     sse_event = ConversationEvent,
     summary = "订阅 Agent Shell 会话内容",
-    description = "按状态中心公布的会话标识订阅会话内容。recent=10 从最近十条开始，省略时读取完整历史。快照之后按版本发送更新。"
+    description = "按状态中心公布的会话标识订阅内容。after 可指定已收到的最后版本，版本失效时返回快照。recent=10 从最近十条开始，省略时覆盖完整历史。"
 )]
 async fn conversation_events(
     State(emacs): State<Arc<EmacsService>>,
@@ -180,64 +197,210 @@ async fn conversation_events(
     let Query(query) = query
         .ok()
         .filter(|Query(query)| matches!(query.recent, None | Some(10)))
-        .ok_or_else(|| conversation_input_error("recent 只能取 10。"))?;
+        .ok_or_else(|| conversation_input_error("recent 只能取 10，after 必须是非负整数。"))?;
     let recent = query.recent.is_some();
 
-    let initial = read_conversation(&emacs, &session_id, None, recent)
+    let (initial, source) = open_conversation(emacs, &session_id, recent, query.after)
         .await
-        .map_err(ReadError::into_response)?
-        .ok_or_else(|| ReadError::InvalidResponse.into_response())?;
-    if !matches!(initial.change, ConversationChange::Snapshot { .. }) {
+        .map_err(ReadError::into_response)?;
+    if initial
+        .as_ref()
+        .is_some_and(|initial| !matches!(initial.change, ConversationChange::Snapshot { .. }))
+    {
         return Err(ReadError::InvalidResponse.into_response());
     }
-
-    let initial_event = ConversationEvent {
+    let revision = initial
+        .as_ref()
+        .map(|initial| initial.revision)
+        .or(query.after)
+        .ok_or_else(|| ReadError::InvalidResponse.into_response())?;
+    let initial_event = initial.map(|initial| ConversationEvent {
         api_version: API_VERSION,
         session_id: session_id.clone(),
         revision: initial.revision,
         change: initial.change,
-    };
-    let updates = stream::unfold(
-        Some((emacs, session_id, initial.revision, recent)),
-        |state| async move {
-            let (emacs, session_id, revision, recent) = state?;
-            let (next_revision, change) = loop {
-                match read_conversation(&emacs, &session_id, Some(revision), recent).await {
-                    Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
-                    Ok(Some(update)) => break (update.revision, update.change),
-                    Err(ReadError::Missing) => break (revision, ConversationChange::Closed),
-                    Err(error) => {
-                        break (
-                            revision,
-                            ConversationChange::Error {
-                                message: error.details().2,
-                            },
-                        );
-                    }
-                }
-            };
-            let continued = matches!(
-                change,
-                ConversationChange::Snapshot { .. } | ConversationChange::Update { .. }
-            );
-            let event = ConversationEvent {
-                api_version: API_VERSION,
-                session_id: session_id.clone(),
-                revision: next_revision,
-                change,
-            };
-            Some((
-                event,
-                continued.then_some((emacs, session_id, next_revision, recent)),
-            ))
-        },
-    );
-    let events = stream::iter([initial_event]).chain(updates);
+    });
+    let updates = stream::unfold(Some((source, session_id, revision)), |state| async move {
+        let (mut source, session_id, revision) = state?;
+        let (next_revision, change) = match source.next(&session_id, revision).await {
+            Ok(update) => (update.revision, update.change),
+            Err(ReadError::Missing) => (revision, ConversationChange::Closed),
+            Err(error) => (
+                revision,
+                ConversationChange::Error {
+                    message: error.details().2,
+                },
+            ),
+        };
+        let continued = matches!(
+            change,
+            ConversationChange::Snapshot { .. } | ConversationChange::Update { .. }
+        );
+        let event = ConversationEvent {
+            api_version: API_VERSION,
+            session_id: session_id.clone(),
+            revision: next_revision,
+            change,
+        };
+        Some((
+            event,
+            continued.then_some((source, session_id, next_revision)),
+        ))
+    });
+    let events = stream::iter(initial_event).chain(updates);
     Ok((
         [(CACHE_CONTROL, "no-store")],
         sse::response(events, remote.map(|Extension(remote)| remote)),
     )
         .into_response())
+}
+
+enum ConversationSource {
+    Push {
+        socket: BufReader<TcpStream>,
+        needs_ack: bool,
+    },
+    Poll {
+        emacs: Arc<EmacsService>,
+        recent: bool,
+    },
+}
+
+impl ConversationSource {
+    async fn next(
+        &mut self,
+        session_id: &str,
+        revision: u64,
+    ) -> Result<ConversationRead, ReadError> {
+        match self {
+            Self::Push { socket, needs_ack } => {
+                // 关闭事件可能已在读取缓冲区中，确认写入失败时仍读取最后一帧。
+                if *needs_ack {
+                    let _ = socket.get_mut().write_all(b"\n").await;
+                }
+                let event = read_pushed_event(socket, Some(revision)).await?;
+                *needs_ack = true;
+                Ok(event)
+            }
+            Self::Poll { emacs, recent } => loop {
+                if let Some(update) =
+                    read_conversation(emacs, session_id, Some(revision), *recent).await?
+                {
+                    return Ok(update);
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            },
+        }
+    }
+}
+
+async fn open_conversation(
+    emacs: Arc<EmacsService>,
+    session_id: &str,
+    recent: bool,
+    after: Option<u64>,
+) -> Result<(Option<ConversationRead>, ConversationSource), ReadError> {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|_| ReadError::Unavailable)?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| ReadError::Unavailable)?
+        .port();
+    let token = Uuid::new_v4().simple().to_string();
+    let name = STANDARD.encode(session_id);
+    let limit = if recent { " 10" } else { "" };
+    let read = conversation_read_expression("nil", limit);
+    let resume = after.map(|after| {
+        let scope = if recent { "10" } else { "nil" };
+        format!(
+            "((fboundp 'loki-assistant-agent-shell-stream-resume) \
+              (if (loki-assistant-agent-shell-stream-resume name {port} \"{token}\" {scope} {after}) 'resuming 'missing))"
+        )
+    }).unwrap_or_default();
+    let script = format!(
+        "(when (require 'loki-assistant-agent-shell nil t) \
+           (let ((name (decode-coding-string (base64-decode-string \"{name}\") 'utf-8))) \
+             (cond {resume} \
+                   ((fboundp 'loki-assistant-agent-shell-stream-subscribe) \
+                    (if (loki-assistant-agent-shell-stream-subscribe name {port} \"{token}\"{limit}) t 'missing)) \
+                   (t {read}))))"
+    );
+    let reply = eval_conversation(&emacs, &script).await?;
+    match reply.as_str() {
+        "missing" => Err(ReadError::Missing),
+        "t" | "resuming" => {
+            let mut socket = tokio::time::timeout(PUSH_CONNECT_TIMEOUT, async {
+                loop {
+                    let (socket, _) = listener
+                        .accept()
+                        .await
+                        .map_err(|_| ReadError::Unavailable)?;
+                    let mut socket = BufReader::new(socket);
+                    if let Ok(line) = read_push_line(&mut socket, token.len() + 1).await
+                        && line == [token.as_bytes(), b"\n"].concat()
+                    {
+                        return Ok::<_, ReadError>(socket);
+                    }
+                }
+            })
+            .await
+            .map_err(|_| ReadError::Timeout)??;
+            let first = if reply == "resuming" {
+                None
+            } else {
+                Some(
+                    tokio::time::timeout(
+                        PUSH_SNAPSHOT_TIMEOUT,
+                        read_pushed_event(&mut socket, None),
+                    )
+                    .await
+                    .map_err(|_| ReadError::Timeout)??,
+                )
+            };
+            let needs_ack = first.is_some();
+            Ok((first, ConversationSource::Push { socket, needs_ack }))
+        }
+        _ => {
+            let first =
+                decode_conversation_reply(&reply, None)?.ok_or(ReadError::InvalidResponse)?;
+            Ok((Some(first), ConversationSource::Poll { emacs, recent }))
+        }
+    }
+}
+
+async fn read_push_line(
+    socket: &mut BufReader<TcpStream>,
+    limit: usize,
+) -> Result<Vec<u8>, ReadError> {
+    let mut line = Vec::new();
+    socket
+        .take(limit as u64)
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|_| ReadError::Unavailable)?;
+    match line.last() {
+        Some(b'\n') => Ok(line),
+        Some(_) => Err(ReadError::InvalidResponse),
+        None => Err(ReadError::Unavailable),
+    }
+}
+
+async fn read_pushed_event(
+    socket: &mut BufReader<TcpStream>,
+    revision: Option<u64>,
+) -> Result<ConversationRead, ReadError> {
+    let line = read_push_line(socket, sse::EVENT_LIMIT).await?;
+    parse_conversation_reply(&line, revision)?.ok_or(ReadError::InvalidResponse)
+}
+
+fn conversation_read_expression(cursor: &str, limit: &str) -> String {
+    format!(
+        "(when (fboundp 'loki-assistant-agent-shell-stream-read) \
+           (let ((reply (loki-assistant-agent-shell-stream-read name {cursor}{limit}))) \
+             (when (stringp reply) \
+               (base64-encode-string (encode-coding-string reply 'utf-8) t))))"
+    )
 }
 
 async fn read_conversation(
@@ -249,23 +412,46 @@ async fn read_conversation(
     let cursor = revision.map_or_else(|| "nil".to_owned(), |revision| revision.to_string());
     let limit = if recent { " 10" } else { "" };
     let name = STANDARD.encode(session_id);
+    let read = conversation_read_expression(&cursor, limit);
     let script = format!(
         "(when (require 'loki-assistant-agent-shell nil t) \
-           (when (fboundp 'loki-assistant-agent-shell-stream-read) \
-             (let* ((name (decode-coding-string (base64-decode-string \"{name}\") 'utf-8)) \
-                    (reply (loki-assistant-agent-shell-stream-read name {cursor}{limit}))) \
-               (when (stringp reply) \
-                 (base64-encode-string (encode-coding-string reply 'utf-8) t)))))"
+           (let ((name (decode-coding-string (base64-decode-string \"{name}\") 'utf-8))) \
+             {read}))"
     );
-    let reply = conversation_gateway(emacs, &script)
-        .await?
-        .ok_or(ReadError::Unavailable)?;
+    decode_conversation_reply(&eval_conversation(emacs, &script).await?, revision)
+}
+
+fn decode_conversation_reply(
+    reply: &str,
+    revision: Option<u64>,
+) -> Result<Option<ConversationRead>, ReadError> {
+    let reply = decode_gateway_reply(reply)?.ok_or(ReadError::Unavailable)?;
+    parse_conversation_reply(&reply, revision)
+}
+
+fn parse_conversation_reply(
+    reply: &[u8],
+    revision: Option<u64>,
+) -> Result<Option<ConversationRead>, ReadError> {
     let read: Option<EmacsConversationRead> =
-        serde_json::from_slice(&reply).map_err(|_| ReadError::InvalidResponse)?;
+        serde_json::from_slice(reply).map_err(|_| ReadError::InvalidResponse)?;
     let Some(read) = read else { return Ok(None) };
     let (revision, change) = match read {
-        EmacsConversationRead::Snapshot { revision, blocks } => {
-            (revision, ConversationChange::Snapshot { blocks })
+        EmacsConversationRead::Snapshot {
+            revision,
+            blocks,
+            snapshot_end_revision,
+        } => {
+            if snapshot_end_revision.is_some_and(|end| end < revision) {
+                return Err(ReadError::InvalidResponse);
+            }
+            (
+                revision,
+                ConversationChange::Snapshot {
+                    blocks,
+                    snapshot_end_revision,
+                },
+            )
         }
         EmacsConversationRead::Update {
             revision: next,
@@ -288,7 +474,11 @@ async fn conversation_gateway(
     emacs: &EmacsService,
     script: &str,
 ) -> Result<Option<Vec<u8>>, ReadError> {
-    let reply = emacs
+    decode_gateway_reply(&eval_conversation(emacs, script).await?)
+}
+
+async fn eval_conversation(emacs: &EmacsService, script: &str) -> Result<String, ReadError> {
+    emacs
         .eval_running(script)
         .await
         .map_err(|error| match error {
@@ -296,11 +486,14 @@ async fn conversation_gateway(
             EmacsError::InvalidResponse(_) => ReadError::InvalidResponse,
             _ => ReadError::Unavailable,
         })?
-        .ok_or(ReadError::Unavailable)?;
+        .ok_or(ReadError::Unavailable)
+}
+
+fn decode_gateway_reply(reply: &str) -> Result<Option<Vec<u8>>, ReadError> {
     if reply == "nil" {
         return Ok(None);
     }
-    let reply: String = serde_json::from_str(&reply).map_err(|_| ReadError::InvalidResponse)?;
+    let reply: String = serde_json::from_str(reply).map_err(|_| ReadError::InvalidResponse)?;
     STANDARD
         .decode(reply)
         .map(Some)

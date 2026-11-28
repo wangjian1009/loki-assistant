@@ -1,4 +1,6 @@
 pub use loki_service_proxy::{agent_shell, error, mail, network, pairing, service_proxy, slack};
+#[cfg(any(target_env = "ohos", test))]
+mod agent_conversations;
 mod storage;
 mod workspace;
 pub use workspace::{Workspace, WorkspaceOptions};

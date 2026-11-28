@@ -1,6 +1,6 @@
 import { UIAbility, Want } from '@kit.AbilityKit'
 import { window } from '@kit.ArkUI'
-import { setSystemColors } from '../components/AppPage'
+import { PAGE_BACKGROUND, setSystemColors } from '../components/AppPage'
 import { sharedApplication } from '../app/SharedApplication'
 
 export default class AgentViewerAbility extends UIAbility {
@@ -19,6 +19,7 @@ export default class AgentViewerAbility extends UIAbility {
     AppStorage.setOrCreate('lokiAgentImageCache', this.context.cacheDir)
     AppStorage.setOrCreate('lokiApplication', sharedApplication(this.context.filesDir))
     windowStage.loadContent('pages/AgentViewer').then(() => {
+      windowStage.getMainWindowSync().setWindowBackgroundColor(PAGE_BACKGROUND)
       setSystemColors(this.context)
     }).catch((error: Error) => {
       console.error('打开AI 远程对话页面失败：' + error.message)

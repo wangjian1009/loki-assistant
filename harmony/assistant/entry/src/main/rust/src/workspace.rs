@@ -1,3 +1,5 @@
+#[cfg(target_env = "ohos")]
+use crate::agent_conversations::ConversationSubscriptions;
 use crate::{
     network::{AutoBinding, BindingState, InvalidRequestReason, Network, ResponsError, Service},
     storage,
@@ -81,6 +83,8 @@ pub struct Workspace {
     network: Arc<Network>,
     proxy: Arc<ServiceProxy>,
     mail: Mail,
+    #[cfg(target_env = "ohos")]
+    agent_conversations: Arc<ConversationSubscriptions>,
     storage: Mutex<(PathBuf, storage::Store)>,
     runtime: Mutex<Option<Runtime>>,
     executor: tokio::runtime::Handle,
@@ -107,6 +111,11 @@ impl Workspace {
         let proxy = ServiceProxy::new(network.clone(), runtime.handle().clone());
         let mail = Mail::new(proxy.clone());
         Ok(Self {
+            #[cfg(target_env = "ohos")]
+            agent_conversations: Arc::new(ConversationSubscriptions::new(
+                proxy.clone(),
+                runtime.handle().clone(),
+            )),
             network,
             proxy,
             mail,
@@ -204,6 +213,11 @@ impl Workspace {
         AgentShell::new(self.proxy.clone())
     }
 
+    #[cfg(target_env = "ohos")]
+    pub(crate) fn open_agent_conversations(&self) -> Arc<ConversationSubscriptions> {
+        self.agent_conversations.clone()
+    }
+
     pub fn open_slack(&self) -> loki_service_proxy::slack::Slack {
         loki_service_proxy::slack::Slack::new(self.proxy.clone())
     }
@@ -259,6 +273,8 @@ impl Workspace {
     /// 停止新操作并主动取消当前目标的所有请求。
     pub fn begin_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        #[cfg(target_env = "ohos")]
+        self.agent_conversations.close();
         self.network.begin_shutdown();
         let mut http = self.http.lock().unwrap();
         self.http_routes.clear();
@@ -345,6 +361,8 @@ fn failure(error: ResponsError) -> Value {
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
+        #[cfg(target_env = "ohos")]
+        self.agent_conversations.close();
         self.http.get_mut().unwrap().take();
         if let Some(runtime) = self.runtime.get_mut().unwrap().take() {
             let network = self.network.clone();

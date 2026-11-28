@@ -1,5 +1,6 @@
 import { CurrentDeviceState } from '../../app/CurrentDeviceState'
 import { NavigatorManager, NavigationResult, PageName } from '../../app/NavigatorManager'
+import { deviceConnectionAppearance } from '../../components/DeviceConnection'
 import { ACCENT, ACCENT_TEXT, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET, PANEL_RADIUS,
   PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SELECTED_SURFACE, SURFACE, TITLE_SIZE, TOUCH_SIZE } from '../../components/AppPage'
 
@@ -14,24 +15,6 @@ export struct DeviceStatus {
     }
   }
 
-  private statusText(status: string): string {
-    switch (status) {
-      case 'online': return '在线'
-      case 'binding': return '绑定中'
-      case 'binding_failed': return '绑定失败'
-      default: return '离线'
-    }
-  }
-
-  private statusColor(status: string): string {
-    switch (status) {
-      case 'online': return '#9AE2B9'
-      case 'binding': return '#F5CF92'
-      case 'binding_failed': return ERROR_TEXT
-      default: return SECONDARY_TEXT
-    }
-  }
-
   @Builder
   private summary() {
     Button({ type: ButtonType.Normal }) {
@@ -39,16 +22,16 @@ export struct DeviceStatus {
         Text(this.device.current?.name ?? '').fontSize(TITLE_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
         Row({ space: 4 }) {
-          Circle().width(6).height(6).fill(this.statusColor(this.device.current?.status ?? ''))
-          Text(this.statusText(this.device.current?.status ?? '')).fontSize(META_SIZE)
-            .fontColor(this.statusColor(this.device.current?.status ?? ''))
+          Circle().width(6).height(6).fill(deviceConnectionAppearance(this.device.current?.status ?? '').color)
+          Text(deviceConnectionAppearance(this.device.current?.status ?? '').label).fontSize(META_SIZE)
+            .fontColor(deviceConnectionAppearance(this.device.current?.status ?? '').color)
         }.flexShrink(0)
         SymbolGlyph(this.device.detailsOpen ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
           .fontSize(META_SIZE).fontColor([SECONDARY_TEXT]).flexShrink(0).accessibilityLevel('no')
       }.width('100%')
     }.width('100%').constraintSize({ minHeight: 48 }).padding({ left: PAGE_INSET, right: PAGE_INSET })
       .borderRadius(PANEL_RADIUS).backgroundColor(Color.Transparent)
-      .accessibilityText(`${this.device.current?.name ?? ''}，${this.statusText(this.device.current?.status ?? '')}`)
+      .accessibilityText(`${this.device.current?.name ?? ''}，${deviceConnectionAppearance(this.device.current?.status ?? '').label}`)
       .accessibilityDescription(this.device.detailsOpen ? '收起设备详情' : '展开设备详情')
       .onClick(() => { this.device.detailsOpen = !this.device.detailsOpen })
   }

@@ -955,7 +955,7 @@ Emacs 使用相同的本机上报入口提交 ~emacs/agent_shell~ 。每次发�
 
 | ~kind~ | 附加字段 | 客户端行为 |
 |--------+----------+------------|
-| ~snapshot~ | ~blocks~ | 用当前批次初始化或替换已显示的内容。 |
+| ~snapshot~ | ~blocks~ ，可选 ~snapshot_end_revision~ | 用当前批次初始化或替换会话内容。 |
 | ~update~ | ~blocks~ | 按数组顺序处理，已有 ~id~ 的内容在原位替换，新 ~id~ 追加。 |
 | ~closed~ | 无 | 会话已关闭，结束订阅。 |
 | ~error~ | ~message~ | 读取会话失败，显示错误并结束订阅。 |
@@ -964,11 +964,15 @@ Emacs 使用相同的本机上报入口提交 ~emacs/agent_shell~ 。每次发�
 
 超长正文可分为首块和若干 ~continuation~ 续片。续片的 ~parent_id~ 指向首块的 ~id~ ，客户端按顺序拼接各个续片的 ~text~ ，与首块一起显示和折叠。续片可以在后续的 ~update~ 批次到达。
 
-首次连接和重连均以 ~snapshot~ 开始。较长历史会在首个快照后通过多个 ~update~ 批次补齐，各更新携带递增的 ~revision~ 。Emacs 重建内容或重置版本记录后会发送新的 ~snapshot~ ，后续批次继续补齐。断开订阅即可停止后续读取。
+首次连接以 ~snapshot~ 开始。较长历史会在首个快照后通过多个 ~update~ 批次补齐，各更新携带连续递增的 ~revision~ 。当 ~snapshot_end_revision~ 存在时，版本小于或等于它的快照和随后批次构成该次完整历史，后续版本属于实时变更。Emacs 重建内容或重置版本记录后会发送新的 ~snapshot~ ，后续批次继续补齐。断开订阅会释放该路推送连接。
 
-手机默认使用 ~recent=10~ 订阅，以最近十条会话记录作为起点。记录包含其折叠组内容和正文续片。省略 ~recent~ 时从完整历史开始。已建立的订阅继续推送所选范围的后续更新。切换范围时关闭旧订阅，再按新范围读取快照。 ~recent~ 目前仅支持 ~10~ ，其他值返回 400 ~invalid-request~ 。
+查询参数 ~recent=10~ 以最近十条会话记录作为起点。记录包含其折叠组内容和正文续片。省略 ~recent~ 时从完整历史开始。已建立的订阅继续推送所选范围的后续更新。切换订阅范围时关闭旧订阅，再按新范围读取快照。 ~recent~ 目前仅支持 ~10~ ，其他值返回 400 ~invalid-request~ 。
 
-services 通过配置中的 Emacs server 用固定入口 ~loki-assistant-agent-shell-stream-read~ 读取会话，buffer 名称作为数据参数传入。名称编码无效返回 400 ~invalid-request~ ，以普通 JSON 模式调用返回 406 ~agent-shell-stream-required~ ，会话找不到返回 404 ~agent-shell-session-not-found~ 。连接尚未建立时，网关不可用、响应无效或超时分别返回 503、502 或 504，并使用标准错误响应。会话内容从当前 Emacs buffer 取得，覆盖编辑器中已经提交和接收的可读内容。
+客户端重连时可通过 ~after~ 传回同一会话、同一订阅范围内最后一次完整应用的非负整数版本。快照分批回放期间，客户端应用完整快照后才保存结束版本。有效游标可收到后续增量，已追平时立即打开事件流并等待新事件。版本超出保留范围、会话版本已更换或旧版 Emacs 扩展不支持续订时，服务发送当前快照。版本号仅表示会话游标，客户端以服务发出的版本为准。
+
+HarmonyOS 的进程级 Rust Workspace 订阅并在内存中维护完整会话。首次加载完整快照后，界面从当时最近一次用户输入开始显示，后续用户输入与回复在此范围内继续累积。滑动切换会话时，界面通过注册的底层回调取得缓存和后续变更。Workspace 在应用进程内持续维护已订阅的会话，重连时从缓存版本继续。会话关闭时取消其订阅并清理内存数据。
+
+services 通过配置中的 Emacs server 调用 ~loki-assistant-agent-shell-stream-subscribe~ 建立一次性回环连接。Emacs 在当前 buffer 内容变化时推送已提交和接收的可读内容。旧版 Emacs 扩展通过 ~loki-assistant-agent-shell-stream-read~ 兼容读取。buffer 名称作为数据参数传入。名称编码无效返回 400 ~invalid-request~ ，以普通 JSON 模式调用返回 406 ~agent-shell-stream-required~ ，会话找不到返回 404 ~agent-shell-session-not-found~ 。连接尚未建立时，网关不可用、响应无效或超时分别返回 503、502 或 504，并使用标准错误响应。
 
 ** Agent Shell 消息与图片
 

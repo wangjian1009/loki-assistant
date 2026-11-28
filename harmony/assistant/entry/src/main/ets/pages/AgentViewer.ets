@@ -1,8 +1,10 @@
 import { KeyboardAvoidMode } from '@kit.ArkUI'
 import { AgentViewerScreen, ViewerBlock, ViewerSession } from 'agent_viewer'
-import { AgentShell, AgentShellBlock, AgentShellSession, AgentShellConversationEvent, RequestHandle,
+import { AgentShell, AgentShellBlock, AgentShellSession, AgentShellConversationView, ConversationSubscription,
   renderDocument, ResponsError } from 'liblokiworkspace.so'
 import { Application, ComputerDevice } from '../app/Application'
+import { PAGE_BACKGROUND } from '../components/AppPage'
+import { deviceConnectionAppearance } from '../components/DeviceConnection'
 import { StatusSubscription as DeviceSubscription } from '../workspace/ServiceStatus'
 
 function viewerBlock(block: AgentShellBlock): ViewerBlock {
@@ -17,26 +19,22 @@ struct AgentViewer {
   @StorageLink('lokiAgentSessionRequest') @Watch('applySessionRequest') private sessionRequest: string = ''
   @State private sessions: ViewerSession[] = []
   @State private blocks: ViewerBlock[] = []
-  @State private deviceName: string = ''
   @State private selected: string = ''
   @State private notice: string = '正在读取会话'
   @State private conversationKey: number = 0
-  @State private full: boolean = false
-  @State private deviceOnline: boolean = false
+  @State private deviceStatus: string = 'offline'
+  @State private imagePreview: string = ''
   private pendingSessionId: string = ''
   private visible: boolean = false
   private active: boolean = false
   private lifetime: number = 0
   private streamVersion: number = 0
-  private revision: number = 0
-  private hasSnapshot: boolean = false
-  private streamEnded: boolean = false
-  private retryTimer: number = -1
-  private retryDelay: number = 500
   private endpointId: string = ''
   private shell?: AgentShell
   private devices?: DeviceSubscription
-  private conversation?: RequestHandle
+  private conversation?: ConversationSubscription
+
+  private deviceOnline(): boolean { return this.deviceStatus === 'online' }
 
   onPageShow(): void {
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE)
@@ -67,9 +65,16 @@ struct AgentViewer {
     this.foregroundChanged()
   }
 
+  onBackPress(): boolean {
+    if (!this.imagePreview) return false
+    this.imagePreview = ''
+    return true
+  }
+
   aboutToDisappear(): void {
     this.visible = false
     this.foregroundChanged()
+    this.shell = undefined
   }
 
   private foregroundChanged(): void {
@@ -80,10 +85,9 @@ struct AgentViewer {
     if (shouldWatch) {
       this.watch(lifetime)
     } else {
-      this.stopConversation()
+      this.detachConversation()
       this.devices?.cancel()
       this.devices = undefined
-      this.shell = undefined
     }
   }
 
@@ -97,25 +101,26 @@ struct AgentViewer {
       await application.prepare()
       const workspace = await application.workspace.open()
       if (lifetime !== this.lifetime) return
-      this.shell = workspace.openAgentShell()
+      if (!this.shell) this.shell = workspace.openAgentShell()
       const subscription = await application.watchDevices((devices: ComputerDevice[]) => {
         if (lifetime !== this.lifetime) return
         const current = devices.find(device => device.active)
         const endpointId = current?.endpoint_id ?? ''
         if (endpointId !== this.endpointId) {
-          this.stopConversation()
+          this.detachConversation()
           this.endpointId = endpointId
           this.sessions = []
           this.selected = ''
           this.blocks = []
           this.conversationKey += 1
         }
-        this.deviceName = current?.name ?? ''
-        this.deviceOnline = current?.status === 'online'
-        if (!current || !this.deviceOnline) {
-          this.stopConversation()
-          this.streamEnded = false
-          this.notice = current ? '电脑上线后显示会话' : '请在当前设备页选择一台电脑'
+        this.deviceStatus = current?.status ?? 'offline'
+        if (!current || !this.deviceOnline()) {
+          if (current && this.selected) {
+            if (!this.conversation) this.openConversation()
+          } else {
+            this.notice = current ? '电脑上线后显示会话' : '请在设备管理中选择一台电脑'
+          }
         } else {
           this.updateSessions(current.dashboard?.agent_shell_sessions ?? null)
         }
@@ -134,14 +139,14 @@ struct AgentViewer {
 
   private updateSessions(sessions: AgentShellSession[] | null): void {
     if (sessions === null) {
-      if (this.deviceOnline && !this.selected) this.notice = '尚未收到会话状态'
+      if (this.deviceOnline() && !this.selected) this.notice = '尚未收到会话状态'
       return
     }
     this.sessions = sessions.map((session, index): ViewerSession => ({
       id: session.id, title: session.title || '会话 ' + (index + 1), phase: session.phase
     }))
     if (this.sessions.length === 0) {
-      this.stopConversation()
+      this.detachConversation()
       if (this.selected) this.conversationKey += 1
       this.selected = ''
       this.blocks = []
@@ -154,37 +159,23 @@ struct AgentViewer {
       const first = this.sessions.find(session => session.phase === 'running' || session.phase === 'waiting_input')
         ?? this.sessions[0]
       this.select(first.id)
-    } else if (!this.conversation && !this.streamEnded && this.retryTimer === -1) {
+    } else if (!this.conversation) {
       this.openConversation()
     }
   }
 
-  private stopConversation(): void {
+  private detachConversation(): void {
     this.streamVersion += 1
-    if (this.retryTimer !== -1) {
-      clearTimeout(this.retryTimer)
-      this.retryTimer = -1
-    }
     this.conversation?.cancel()
     this.conversation = undefined
-    this.revision = 0
-    this.hasSnapshot = false
   }
 
   private select(sessionId: string): void {
     if (this.selected === sessionId) return
-    this.stopConversation()
+    this.detachConversation()
     this.selected = sessionId
-    this.full = false
     this.blocks = []
     this.conversationKey += 1
-    this.streamEnded = false
-    this.retryDelay = 500
-    this.openConversation()
-  }
-
-  private loadFull(): void {
-    this.full = true
     this.openConversation()
   }
 
@@ -204,7 +195,7 @@ struct AgentViewer {
   private readImage(source: string): Promise<string> {
     const directory = AppStorage.get<string>('lokiAgentImageCache')
     const shell = this.shell
-    if (!directory || !shell || !this.selected || !this.deviceOnline) {
+    if (!directory || !shell || !this.selected || !this.deviceOnline()) {
       return Promise.reject(new Error('电脑未连接'))
     }
     return shell.cacheImage(directory, this.selected, source)
@@ -212,93 +203,61 @@ struct AgentViewer {
 
   private openConversation(): void {
     const shell = this.shell
-    if (!shell || !this.selected || !this.active || !this.deviceOnline) return
-    this.stopConversation()
-    this.streamEnded = false
+    const session = this.selected
+    if (!shell || !session || !this.active) return
+    this.detachConversation()
     this.notice = '正在读取会话'
     const version = this.streamVersion
     try {
-      this.conversation = shell.watchConversation(this.selected, this.full, (event: AgentShellConversationEvent) => {
-        if (version === this.streamVersion && event.session_id === this.selected) this.receive(event)
-      }, (error: ResponsError | null) => {
-        if (version !== this.streamVersion) return
-        this.conversation = undefined
-        if (!this.streamEnded) this.reconnect(error)
+      this.conversation = shell.observeConversation(session, (view: AgentShellConversationView) => {
+        if (version === this.streamVersion && session === this.selected) this.receive(view, session)
       })
     } catch (_) {
       this.notice = '无法打开会话'
     }
   }
 
-  private receive(event: AgentShellConversationEvent): void {
-    if (event.kind === 'closed' || event.kind === 'error') {
-      if (event.kind === 'closed') {
+  private receive(view: AgentShellConversationView, session: string): void {
+    this.blocks = view.blocks.map(viewerBlock)
+    switch (view.phase) {
+      case 'loading':
+        this.notice = '正在读取会话'
+        break
+      case 'ready':
+        this.notice = this.blocks.length ? '' : '暂无会话内容'
+        break
+      case 'reconnecting':
+        this.notice = '会话连接中断，正在重连'
+        break
+      case 'closed': {
         const directory = AppStorage.get<string>('lokiAgentImageCache')
         if (directory) {
-          this.shell?.clearSessionImages(directory, this.endpointId, event.session_id).catch(() => {})
+          this.shell?.clearSessionImages(directory, this.endpointId, session).catch(() => {})
         }
-        this.blocks = []
         this.conversationKey += 1
+        this.notice = '会话已关闭'
+        break
       }
-      this.streamEnded = true
-      this.notice = event.kind === 'closed' ? '会话已关闭' : event.message || '无法读取会话'
-      return
+      case 'error':
+        this.notice = view.message || '无法读取会话'
+        break
     }
-    if (event.kind === 'snapshot') {
-      this.revision = event.revision
-      this.hasSnapshot = true
-      this.retryDelay = 500
-      this.blocks = event.blocks.map(viewerBlock)
-      this.notice = this.blocks.length ? '' : '暂无会话内容'
-      return
-    }
-    if (!this.hasSnapshot || event.revision !== this.revision + 1) {
-      this.stopConversation()
-      this.reconnect(null)
-      return
-    }
-    const next = this.blocks.slice()
-    const indices = new Map<string, number>()
-    next.forEach((block, index) => { indices.set(block.id, index) })
-    for (const block of event.blocks) {
-      const item = viewerBlock(block)
-      const index = indices.get(block.id)
-      if (index === undefined) {
-        indices.set(block.id, next.length)
-        next.push(item)
-      } else {
-        next[index] = item
-      }
-    }
-    this.revision = event.revision
-    this.blocks = next
-    this.notice = next.length ? '' : '暂无会话内容'
-  }
-
-  private reconnect(error: ResponsError | null): void {
-    if (error?.kind === 'services' && (error.status === 403 || error.status === 404)) {
-      this.notice = error.status === 404 ? '电脑上找不到此会话' : '电脑拒绝读取会话'
-      this.streamEnded = true
-      return
-    }
-    this.notice = '会话连接中断，正在重连'
-    if (!this.active || !this.deviceOnline) return
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = -1
-      this.openConversation()
-    }, this.retryDelay)
-    this.retryDelay = Math.min(this.retryDelay * 2, 5000)
   }
 
   build() {
-    Column() {
+    Stack() {
+      Column()
+        .width('100%').height('100%').backgroundColor(PAGE_BACKGROUND)
+        .expandSafeArea([SafeAreaType.SYSTEM, SafeAreaType.CUTOUT], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .hitTestBehavior(HitTestMode.None)
       AgentViewerScreen({ title: $r('app.string.agent_viewer_title'), sessionId: this.selected,
-        sessions: this.sessions, blocks: this.blocks, deviceName: this.deviceName, notice: this.notice,
-        full: this.full, connected: this.deviceOnline,
+        sessions: this.sessions, blocks: this.blocks, notice: this.notice, connected: this.deviceOnline(),
+        preview: $imagePreview,
+        connectionColor: deviceConnectionAppearance(this.deviceStatus).color,
+        connectionLabel: deviceConnectionAppearance(this.deviceStatus).label,
         parseDocument: renderDocument,
         conversationKey: this.conversationKey,
         onSelect: (id: string): void => { this.select(id) },
-        onFull: (): void => { this.loadFull() },
         onSend: (value: string): Promise<string> => this.submit(value),
         readImage: (source: string): Promise<string> => this.readImage(source),
         onRetry: (): void => { this.openConversation() } })
