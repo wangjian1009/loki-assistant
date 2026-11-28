@@ -3,7 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit'
 import { scanBarcode, scanCore } from '@kit.ScanKit'
 import { Application, ComputerDevice } from '../app/Application'
 import { StatusSubscription } from '../workspace/ServiceStatus'
-import { NavigatorManager, PageName } from '../app/NavigatorManager'
+import { NavigatorManager } from '../app/NavigatorManager'
 import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_INSET,
   PAGE_MAX_WIDTH, PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SELECTED_SURFACE, SURFACE,
   TOUCH_SIZE, setSystemColors } from '../components/AppPage'
@@ -12,7 +12,6 @@ import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEX
 @Component
 struct Devices {
   @StorageLink('lokiForeground') @Watch('onForegroundChanged') private foreground: boolean = true
-  @State private sidebarOpen: boolean = false
   @State private computers: ComputerDevice[] = []
   @State private loaded: boolean = false
   @State private working: boolean = false
@@ -33,7 +32,6 @@ struct Devices {
 
   onPageHide(): void {
     this.visible = false
-    this.sidebarOpen = false
     this.stopWatching()
   }
 
@@ -42,12 +40,12 @@ struct Devices {
   }
 
   onBackPress(): boolean {
-    if (this.sidebarOpen) {
-      this.sidebarOpen = false
-    } else {
-      AppStorage.get<NavigatorManager>('lokiNavigator')?.back()
-    }
+    this.goBack()
     return true
+  }
+
+  private goBack(): void {
+    AppStorage.get<NavigatorManager>('lokiNavigator')?.back()
   }
 
   private onForegroundChanged(): void {
@@ -233,7 +231,7 @@ struct Devices {
 
   build() {
     Stack() {
-      AppPage({ page: PageName.Devices, sidebarOpen: $sidebarOpen, content: () => { this.pageContent() } })
+      AppPage({ title: '设备管理', onBack: () => { this.goBack() }, content: () => { this.pageContent() } })
     }.width('100%').height('100%')
   }
 }

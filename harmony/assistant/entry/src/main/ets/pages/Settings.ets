@@ -1,6 +1,6 @@
 import { bundleManager, common } from '@kit.AbilityKit'
 import { Application } from '../app/Application'
-import { NavigatorManager, NavigationResult, PageName } from '../app/NavigatorManager'
+import { NavigatorManager, NavigationResult } from '../app/NavigatorManager'
 import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_BACKGROUND,
   PAGE_INSET, PAGE_MAX_WIDTH, PANEL_RADIUS, PRIMARY_TEXT, SECONDARY_TEXT, SECTION_SIZE, SURFACE, TOUCH_SIZE,
   setSystemColors } from '../components/AppPage'
@@ -8,7 +8,6 @@ import { ACCENT, ACCENT_TEXT, AppPage, BODY_SIZE, BORDER, CONTENT_GAP, ERROR_TEX
 @Entry
 @Component
 struct Settings {
-  @State private sidebarOpen: boolean = false
   @State private deviceName: string = ''
   @State private draftName: string = ''
   @State private version: string = '—'
@@ -33,7 +32,6 @@ struct Settings {
   }
 
   onPageHide(): void {
-    this.sidebarOpen = false
     this.stopWatching?.()
     this.stopWatching = undefined
   }
@@ -43,8 +41,7 @@ struct Settings {
   }
 
   onBackPress(): boolean {
-    if (this.sidebarOpen) this.sidebarOpen = false
-    else this.goBack()
+    this.goBack()
     return true
   }
 
@@ -187,7 +184,7 @@ struct Settings {
 
   build() {
     Stack() {
-      AppPage({ page: PageName.Settings, sidebarOpen: $sidebarOpen, content: () => { this.pageContent() } })
+      AppPage({ title: '设置', onBack: () => { this.goBack() }, content: () => { this.pageContent() } })
     }.width('100%').height('100%')
       .bindSheet($$this.editing, this.nameEditor(), {
         height: SheetSize.MEDIUM, backgroundColor: SURFACE,

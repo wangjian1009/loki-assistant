@@ -3,9 +3,12 @@ import { BusinessError } from '@kit.BasicServicesKit'
 import { productViewManager } from '@kit.StoreKit'
 import { ItemLayout, moveVisibleItem } from '../../app/CurrentDeviceLayout'
 import { DeviceLayoutStore } from '../../app/DeviceLayoutStore'
-import { ACCENT, BODY_SIZE, CONTENT_GAP, ERROR_TEXT, PAGE_INSET, PANEL_RADIUS, PRIMARY_TEXT,
+import { ACCENT, BODY_SIZE, CONTENT_GAP, ERROR_TEXT, META_SIZE, PAGE_BACKGROUND, PAGE_INSET, PANEL_RADIUS, PRIMARY_TEXT,
   SECONDARY_TEXT, SELECTED_SURFACE, SURFACE, TOUCH_SIZE } from '../../components/AppPage'
 import { AppLauncher, AppLauncherRegistry, appWant } from './AppLaunchers'
+
+const DESKTOP_ACTION_WIDTH: number = 52
+const EDIT_ACTIONS_WIDTH: number = 96
 
 @Component
 export struct AppLauncherPanel {
@@ -75,6 +78,7 @@ export struct AppLauncherPanel {
   }
 
   private async addToDesktop(app: AppLauncher): Promise<void> {
+    this.openedMenu = ''
     if (this.pinning) return
     this.pinning = true
     try {
@@ -107,11 +111,24 @@ export struct AppLauncherPanel {
     }
   }
 
+  private revealActions(app: AppLauncher, offset: number): void {
+    if (offset < -18) this.openedMenu = app.id
+    if (offset > 18) this.openedMenu = ''
+  }
+
+  private editActionsWidth(): number {
+    const count = this.apps().length
+    const tileWidth = (this.rowWidth - CONTENT_GAP * (count - 1)) / count
+    return tileWidth > 0 ? Math.min(EDIT_ACTIONS_WIDTH, tileWidth) : EDIT_ACTIONS_WIDTH
+  }
+
   @Builder
-  private desktopMenu(app: AppLauncher) {
-    Menu() {
-      MenuItem({ content: '添加到桌面' }).onClick(() => { this.addToDesktop(app) })
-    }
+  private desktopAction(app: AppLauncher) {
+    Button('桌面', { type: ButtonType.Normal }).fontSize(META_SIZE).fontColor(ACCENT)
+      .layoutWeight(1).constraintSize({ minHeight: TOUCH_SIZE }).padding(0)
+      .backgroundColor(PAGE_BACKGROUND).borderRadius(PANEL_RADIUS)
+      .accessibilityText('添加到桌面').accessibilityDescription(app.label)
+      .enabled(!this.pinning).onClick(() => { this.addToDesktop(app) })
   }
 
   private finishDrag(app: AppLauncher, offset: number): void {
@@ -152,16 +169,19 @@ export struct AppLauncherPanel {
   private editApp(app: AppLauncher) {
     Stack({ alignContent: Alignment.End }) {
       if (this.openedMenu === app.id) {
-        Button('删除', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(ERROR_TEXT)
-          .width(48).constraintSize({ minHeight: TOUCH_SIZE }).padding(0)
-          .backgroundColor('#49252D').borderRadius(PANEL_RADIUS)
-          .accessibilityDescription(app.label).onClick(() => { this.hide(app.id) })
+        Row() {
+          this.desktopAction(app)
+          Button('删除', { type: ButtonType.Normal }).fontSize(META_SIZE).fontColor(ERROR_TEXT)
+            .layoutWeight(1).constraintSize({ minHeight: TOUCH_SIZE }).padding(0)
+            .backgroundColor('#49252D').borderRadius(PANEL_RADIUS)
+            .accessibilityDescription(app.label).onClick(() => { this.hide(app.id) })
+        }.width(this.editActionsWidth())
       }
       Button({ type: ButtonType.Normal }) {
         this.appLabel(app)
       }.width('100%').padding(0).backgroundColor(SELECTED_SURFACE).borderRadius(PANEL_RADIUS)
-        .accessibilityText(app.label).accessibilityDescription('长按左右拖动，左滑删除')
-        .translate({ x: this.openedMenu === app.id ? -48 : 0 })
+        .accessibilityText(app.label).accessibilityDescription('长按左右拖动，左滑显示操作')
+        .translate({ x: this.openedMenu === app.id ? -this.editActionsWidth() : 0 })
         .priorityGesture(
           GestureGroup(GestureMode.Exclusive,
             GestureGroup(GestureMode.Sequence,
@@ -172,14 +192,33 @@ export struct AppLauncherPanel {
                 .onActionUpdate((event: GestureEvent) => { this.dragOffset = event.offsetX })
                 .onActionEnd((event: GestureEvent) => { this.finishDrag(app, event.offsetX) })
                 .onActionCancel(() => { this.resetGesture() })),
-            PanGesture({ direction: PanDirection.Horizontal, distance: 2 })
-              .onActionEnd((event: GestureEvent) => {
-                if (event.offsetX < -18) this.openedMenu = app.id
-                if (event.offsetX > 18) this.openedMenu = ''
-              })))
+            PanGesture({ direction: PanDirection.Horizontal, distance: 8 })
+              .onActionEnd((event: GestureEvent) => { this.revealActions(app, event.offsetX) })))
     }.layoutWeight(1).clip(true).borderRadius(PANEL_RADIUS)
       .translate({ x: this.dragged === app.id ? this.dragOffset : 0 })
       .zIndex(this.dragged === app.id ? 1 : 0)
+  }
+
+  @Builder
+  private launchApp(app: AppLauncher) {
+    Stack({ alignContent: Alignment.End }) {
+      if (this.openedMenu === app.id) {
+        Row() {
+          this.desktopAction(app)
+        }.width(DESKTOP_ACTION_WIDTH)
+      }
+      Button({ type: ButtonType.Normal }) {
+        this.appLabel(app)
+      }.width('100%').padding(0).backgroundColor(SELECTED_SURFACE).borderRadius(PANEL_RADIUS)
+        .accessibilityText(app.label).accessibilityDescription('左滑可添加到桌面')
+        .translate({ x: this.openedMenu === app.id ? -DESKTOP_ACTION_WIDTH : 0 })
+        .onClick(() => {
+          this.openedMenu = ''
+          this.openApp(app)
+        })
+    }.layoutWeight(1).clip(true).borderRadius(PANEL_RADIUS)
+      .gesture(PanGesture({ direction: PanDirection.Horizontal, distance: 8 })
+        .onActionEnd((event: GestureEvent) => { this.revealActions(app, event.offsetX) }))
   }
 
   build() {
@@ -192,12 +231,7 @@ export struct AppLauncherPanel {
             if (this.editing) {
               this.editApp(app)
             } else {
-              Button({ type: ButtonType.Normal }) {
-                this.appLabel(app)
-              }.layoutWeight(1).padding(0).backgroundColor(SELECTED_SURFACE).borderRadius(PANEL_RADIUS)
-                .accessibilityText(app.label).accessibilityDescription('长按可添加到桌面')
-                .onClick(() => { this.openApp(app) })
-                .bindContextMenu(this.desktopMenu(app), ResponseType.LongPress)
+              this.launchApp(app)
             }
           }, (app: AppLauncher) => app.id)
         }.width('100%').onAreaChange((_oldArea: Area, newArea: Area) => { this.rowWidth = Number(newArea.width) })

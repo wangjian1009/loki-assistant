@@ -1,12 +1,15 @@
+import { SymbolGlyphModifier } from '@kit.ArkUI'
 import { BODY_SIZE, PAGE_INSET, PANEL_RADIUS, PRIMARY_TEXT, SURFACE, TOUCH_SIZE } from './AppPage'
 
 const MENU_MAX_WIDTH: number = 280
 // 包含系统菜单项的左右内边距与末尾预留空间。
 const MENU_HORIZONTAL_PADDING: number = 48
+const MENU_ICON_SPACE: number = 28
 
 export interface PopupMenuItem {
   id: string
   label: ResourceStr
+  icon?: Resource
   enabled?: boolean
   action: () => void
 }
@@ -23,17 +26,19 @@ export struct PopupMenu {
     const measure = context.getMeasureUtils()
     let longest = 0
     for (const item of this.items) {
-      longest = Math.max(longest, measure.measureText({ textContent: item.label, fontSize: BODY_SIZE }))
+      const textWidth = context.px2vp(measure.measureText({ textContent: item.label, fontSize: BODY_SIZE }))
+      longest = Math.max(longest, textWidth + (item.icon ? MENU_ICON_SPACE : 0))
     }
     return Math.min(MENU_MAX_WIDTH, Math.max(TOUCH_SIZE,
-      Math.ceil(context.px2vp(longest)) + MENU_HORIZONTAL_PADDING))
+      Math.ceil(longest) + MENU_HORIZONTAL_PADDING))
   }
 
   @Builder
   private menu() {
     Menu() {
       ForEach(this.items, (item: PopupMenuItem) => {
-        MenuItem({ content: item.label })
+        MenuItem({ content: item.label, symbolStartIcon: item.icon ?
+          new SymbolGlyphModifier(item.icon).fontSize(18).fontColor([PRIMARY_TEXT]) : undefined })
           .contentFont({ size: BODY_SIZE }).contentFontColor(PRIMARY_TEXT)
           .enabled(item.enabled !== false)
           .onClick(() => { item.action() })

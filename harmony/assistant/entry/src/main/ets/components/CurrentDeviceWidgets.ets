@@ -131,6 +131,17 @@ export struct CurrentDeviceWidgets {
               }.width('100%').enabled(this.registry.get(widget).supportsEditing)
                 .accessibilityDescription(this.registry.get(widget).title + '，长按拖动，左滑删除')
             }.swipeAction({ end: { builder: () => { this.panelDelete(widget) } }, edgeEffect: SwipeEdgeEffect.None })
+              .onGestureRecognizerJudgeBegin((_event: BaseGestureEvent, current: GestureRecognizer,
+                recognizers: GestureRecognizer[]) => {
+                // 面板内部有横滑手势时，由内部控件处理这次横滑。
+                if (current.isBuiltIn() && current.getType() === GestureControl.GestureType.PAN_GESTURE &&
+                  recognizers.some((gesture: GestureRecognizer) =>
+                    !gesture.isBuiltIn() && gesture.getType() === GestureControl.GestureType.PAN_GESTURE &&
+                    (gesture as PanRecognizer).getDirection() === PanDirection.Horizontal)) {
+                  return GestureJudgeResult.REJECT
+                }
+                return GestureJudgeResult.CONTINUE
+              })
           }, (widget: string) => widget)
             .onMove((from: number, to: number) => { this.moveWidget(from, to) })
           if (this.layout.hidden.length > 0) {
@@ -148,8 +159,16 @@ export struct CurrentDeviceWidgets {
           ForEach(this.visibleOrder(), (widget: string) => {
             ListItem() {
               this.widget(this.registry.get(widget))
-            }
+            }.accessibilityDescription('长按编辑面板')
+              .gesture(LongPressGesture().onAction(() => { this.editing = true }))
           }, (widget: string) => widget)
+          if (this.visibleOrder().length === 0 && !this.editing) {
+            ListItem() {
+              Text('长按此处恢复面板').fontSize(BODY_SIZE).fontColor(PRIMARY_TEXT)
+                .width('100%').constraintSize({ minHeight: TOUCH_SIZE }).padding(PAGE_INSET)
+                .backgroundColor(SURFACE).borderRadius(PANEL_RADIUS)
+            }.gesture(LongPressGesture().onAction(() => { this.editing = true }))
+          }
         }
       }.width('100%').layoutWeight(1)
         .padding({ top: CONTENT_GAP, bottom: PAGE_INSET })

@@ -16,7 +16,7 @@
 
 - `pages/` 放置可独立打开的 ArkUI 页面，包括当前设备、设备管理、设置和由各自 UIAbility 打开的应用页面。每个页面在 `main_pages.json` 注册。
 - `panels/` 放置能注册到「当前设备」的插件及其专用代码，按设备信息、邮件、Slack、应用启动器和 Agent Shell 分别维护在 `device/`、`mail/`、`slack/`、`launcher/` 和 `agent-shell/`。
-- `components/` 放置页面共用组件和当前设备页的面板容器。面板排序、左滑删除及恢复由 `CurrentDeviceWidgets.ets` 统一负责。
+- `components/` 放置页面共用组件和当前设备页的面板容器。面板长按进入编辑、排序、左滑删除及恢复由 `CurrentDeviceWidgets.ets` 统一负责。
 - `app/` 放置应用状态、导航、布局存储、面板接口和注册入口。 `entryability/` 放置 UIAbility 入口及主窗口加载代码， `workspace/` 放置 Rust Workspace 的 ArkTS 适配。
 
 ### 依赖倒置
@@ -28,9 +28,9 @@
 ### 实现约定
 
 - `entry/src/main/ets/entryability/EntryAbility.ets` 是应用入口 Ability。
-- `entry/src/main/ets/pages/Index.ets` 提供当前设备页的导航和生命周期。`components/CurrentDeviceWidgets.ets` 通过面板注册表排列控件，负责面板拖动和 Preferences 保存。`app/CurrentDeviceLayout.ets` 处理旧版布局迁移、顺序和隐藏状态，`app/CurrentDeviceState.ets` 管理当前设备状态监听。`pages/Devices.ets` 负责用 Scan Kit 扫码添加电脑、选择唯一 Network 目标和处理绑定失败记录。`pages/Settings.ets` 负责手机名称编辑。三个页面共用 `components/AppPage.ets` 的左侧导航。`ets/app/Application.ets` 管理电脑列表、手机名称、目标选择、绑定结果与完整配置持久化。
+- `entry/src/main/ets/pages/Index.ets` 提供当前设备页的导航和生命周期。`components/CurrentDeviceWidgets.ets` 通过面板注册表排列控件，负责面板拖动和 Preferences 保存。`app/CurrentDeviceLayout.ets` 处理旧版布局迁移、顺序和隐藏状态，`app/CurrentDeviceState.ets` 管理当前设备状态监听。`pages/Devices.ets` 负责用 Scan Kit 扫码添加电脑、选择唯一 Network 目标和处理绑定失败记录。`pages/Settings.ets` 负责手机名称编辑。三个页面共用 `components/AppPage.ets` 的标题栏。首页右上角「更多」提供设备管理和设置，子页标题栏提供返回。`ets/app/Application.ets` 管理电脑列表、手机名称、目标选择、绑定结果与完整配置持久化。
 - `ets/app/NavigatorManager.ets` 统一管理首屏、应用内导航和完整的逻辑页面路径。EntryAbility 在加载主窗口前解析 Want，首屏只加载路径的末级页面，逐级返回时再加载尚未显示的父页面。Want 和 Debug 导航测试接口使用 `Index`、`Devices`、`Settings` 页面名称，由 NavigatorManager 转换为 ArkUI 页面路径。测试服务通过 `httpApiEnabled` 临时启停，仅监听设备回环地址。
-- `components/PopupMenu.ets` 提供可复用的弹出菜单。调用方传入触发内容和带稳定 ID 的菜单项，组件按菜单项文字测量宽度并统一外观。
+- `components/PopupMenu.ets` 提供可复用的弹出菜单。调用方传入触发内容和带稳定 ID 的菜单项，可为每项指定系统图标。组件按文字与图标测量宽度并统一外观。
 - 应用内入口与桌面快捷方式都使用显式 Want 启动各自的 Ability。业务页面由对应 HAR 提供。EntryAbility 管理手机助手导航，手机助手与 AI 远程对话通过 `app/SharedApplication.ets` 共用进程级 Workspace。
 - Rust `Workspace` 创建 Tokio runtime 与唯一 `Arc<Network>`，不从应用数据中自动选择目标。调试 HTTP 监听与连接由同一个 Workspace 持有，ArkTS 初始化时通过 `registerHttpRoute` 注册导航的路径、方法和处理函数，`GET /service/…` 复用当前 Network 与绑定凭据。`storage.rs` 只解释本机随机身份，其余 JSON 由应用层解释，沿用私有 `devices.json`、`0600` 权限与原子替换；损坏禁止覆盖，私钥不向 ArkTS 导出。
 - `Network` 只设置一个 `Service`，提供 `set_service()`、`service()`、异步 `request()` 和 `request_sse()`，不提供公开 `bind()` 或确认方法。未绑定配置中的 `auto_binding` 交给 Network 自动异步执行，成功保存凭据、失败保存错误，结果通过 `service()` 获取。业务保存返回的完整 `endpoint_id/relay_url/relay_token/binding`，下次读取后重新设置恢复连接。不得按请求重建 Workspace、查找全局 Network 或维护多个 Network 目标。

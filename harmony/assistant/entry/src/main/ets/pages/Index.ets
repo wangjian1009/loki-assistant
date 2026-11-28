@@ -2,8 +2,8 @@ import { common } from '@kit.AbilityKit'
 import { Application } from '../app/Application'
 import { createCurrentDevicePanels } from '../app/BuiltInPanels'
 import { CurrentDeviceState } from '../app/CurrentDeviceState'
-import { NavigatorManager, PageName } from '../app/NavigatorManager'
-import { ACCENT, AppPage, BODY_SIZE, CONTENT_GAP, PANEL_RADIUS, PRIMARY_TEXT, TITLE_SIZE, TOUCH_SIZE,
+import { NavigatorManager, NavigationResult, PageName } from '../app/NavigatorManager'
+import { ACCENT, AppPage, BODY_SIZE, CONTENT_GAP, PANEL_RADIUS, TOUCH_SIZE,
   setSystemColors } from '../components/AppPage'
 import { CurrentDeviceWidgets } from '../components/CurrentDeviceWidgets'
 import { PopupMenu } from '../components/PopupMenu'
@@ -13,7 +13,6 @@ import { PopupMenu } from '../components/PopupMenu'
 struct Index {
   @StorageLink('lokiForeground') @Watch('onForegroundChanged') private foreground: boolean = true
   @State private device: CurrentDeviceState = new CurrentDeviceState()
-  @State private sidebarOpen: boolean = false
   @State private editing: boolean = false
   private readonly panels = createCurrentDevicePanels()
   private visible: boolean = false
@@ -34,7 +33,6 @@ struct Index {
 
   onPageHide(): void {
     this.visible = false
-    this.sidebarOpen = false
     this.editing = false
     this.device.collapseDetails()
     this.device.deactivate()
@@ -46,10 +44,6 @@ struct Index {
   }
 
   onBackPress(): boolean {
-    if (this.sidebarOpen) {
-      this.sidebarOpen = false
-      return true
-    }
     if (this.editing) {
       this.editing = false
       return true
@@ -59,6 +53,14 @@ struct Index {
     if (!navigator || !navigator.canGoBack()) { return false }
     navigator.back()
     return true
+  }
+
+  private async openSection(page: PageName): Promise<void> {
+    const result = await AppStorage.get<NavigatorManager>('lokiNavigator')?.openSection(page)
+    if (result !== NavigationResult.Ok && result !== NavigationResult.Busy) {
+      try { this.getUIContext().getPromptAction().showToast({ message: '无法打开页面，请重试' }) }
+      catch (_) { console.error('无法显示页面打开失败提示') }
+    }
   }
 
   @Builder
@@ -76,8 +78,7 @@ struct Index {
   }
 
   @Builder
-  private pageHeader() {
-    Text('当前设备').fontSize(TITLE_SIZE).fontWeight(FontWeight.Medium).fontColor(PRIMARY_TEXT).layoutWeight(1)
+  private headerActions() {
     if (this.editing) {
       Button('完成', { type: ButtonType.Normal }).fontSize(BODY_SIZE).fontColor(ACCENT)
         .constraintSize({ minHeight: TOUCH_SIZE, minWidth: TOUCH_SIZE })
@@ -87,7 +88,12 @@ struct Index {
     } else {
       PopupMenu({
         accessibilityLabel: '更多',
-        items: [{ id: 'edit', label: '编辑', action: () => { this.editing = true } }],
+        items: [
+          { id: 'devices', label: '设备管理', icon: $r('sys.symbol.computer'),
+            action: () => { this.openSection(PageName.Devices) } },
+          { id: 'settings', label: '设置', icon: $r('sys.symbol.gearshape'),
+            action: () => { this.openSection(PageName.Settings) } }
+        ],
         trigger: () => { this.moreIcon() }
       })
     }
@@ -95,8 +101,8 @@ struct Index {
 
   build() {
     Stack() {
-      AppPage({ page: PageName.Index, sidebarOpen: $sidebarOpen,
-        header: () => { this.pageHeader() }, content: () => { this.pageContent() } })
+      AppPage({ title: $r('app.string.app_name'),
+        actions: () => { this.headerActions() }, content: () => { this.pageContent() } })
     }.width('100%').height('100%')
   }
 }
