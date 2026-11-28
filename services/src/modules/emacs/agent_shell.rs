@@ -37,6 +37,319 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_SOURCE_BYTES: usize = 4096;
 const MAX_IMAGE_BYTES: usize = 1024 * 1024;
 
+#[derive(Deserialize, Serialize)]
+struct SupportedAgent {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SupportedAgentsResponse {
+    api_version: &'static str,
+    agents: Vec<SupportedAgent>,
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
+    id = "agent-shell-list-agents",
+    method = "GET",
+    path = "/agent-shell/agents",
+    access = "paired",
+    summary = "列出 Agent Shell 支持的 Agent",
+    description = "列出 Emacs 能找到启动命令的 Agent，返回标识、显示名称和可用的 HTTPS 图标地址。"
+)]
+async fn list_agents(
+    State(emacs): State<Arc<EmacsService>>,
+) -> Result<Json<SupportedAgentsResponse>, Response> {
+    let mut agents: Vec<SupportedAgent> =
+        agent_shell_catalog(&emacs, "loki-assistant-agent-shell-list-agents").await?;
+    for agent in &mut agents {
+        if agent.id.trim().is_empty() || agent.name.trim().is_empty() {
+            return Err(ReadError::InvalidResponse.into_response());
+        }
+        agent.icon = agent
+            .icon
+            .as_deref()
+            .and_then(|icon| url::Url::parse(icon).ok())
+            .filter(|icon| icon.scheme() == "https" && icon.has_host())
+            .map(Into::into);
+    }
+    Ok(Json(SupportedAgentsResponse {
+        api_version: API_VERSION,
+        agents,
+    }))
+}
+
+#[derive(Deserialize, Serialize)]
+struct AgentShellProject {
+    id: String,
+    name: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct ProjectsResponse {
+    api_version: &'static str,
+    projects: Vec<AgentShellProject>,
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
+    id = "agent-shell-list-projects",
+    method = "GET",
+    path = "/agent-shell/projects",
+    access = "paired",
+    summary = "列出可开启 Agent Shell 会话的项目",
+    description = "按 Emacs project 的最近使用顺序返回符合条件的项目标识、名称和根目录绝对路径。"
+)]
+async fn list_projects(
+    State(emacs): State<Arc<EmacsService>>,
+) -> Result<Json<ProjectsResponse>, Response> {
+    let projects: Vec<AgentShellProject> =
+        agent_shell_catalog(&emacs, "loki-assistant-agent-shell-list-projects").await?;
+    if projects.iter().any(|project| {
+        !valid_creation_id(&project.id)
+            || project.name.trim().is_empty()
+            || !std::path::Path::new(&project.path).is_absolute()
+            || project.path.contains('\0')
+    }) {
+        return Err(ReadError::InvalidResponse.into_response());
+    }
+    Ok(Json(ProjectsResponse {
+        api_version: API_VERSION,
+        projects,
+    }))
+}
+
+async fn agent_shell_catalog<T: serde::de::DeserializeOwned>(
+    emacs: &EmacsService,
+    function: &'static str,
+) -> Result<T, Response> {
+    let script = format!(
+        "(when (require 'loki-assistant-agent-shell nil t) \
+           (when (fboundp '{function}) \
+             (let ((reply ({function}))) \
+               (when (stringp reply) \
+                 (base64-encode-string (encode-coding-string reply 'utf-8) t)))))"
+    );
+    agent_shell_reply(emacs, &script).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSessionRequest {
+    project_id: String,
+    agent_id: String,
+    resume_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SessionSelectionOutcome {
+    Created { session_id: String },
+    Listed { sessions: Vec<HistorySession> },
+    ProjectNotFound,
+    AgentNotFound,
+    HistoryUnsupported,
+    HistoryFailed,
+    HistorySessionNotFound,
+    HistoryTimeout,
+    Failed,
+    Unavailable,
+}
+
+impl SessionSelectionOutcome {
+    fn into_error(self) -> Response {
+        let (status, code, message) = match self {
+            Self::Created { .. } | Self::Listed { .. } => {
+                return ReadError::InvalidResponse.into_response();
+            }
+            Self::Unavailable => return ReadError::Unavailable.into_response(),
+            Self::HistoryTimeout => return ReadError::Timeout.into_response(),
+            Self::ProjectNotFound => (
+                StatusCode::NOT_FOUND,
+                "agent-shell-project-not-found",
+                "找不到可开启 Agent Shell 会话的项目。",
+            ),
+            Self::AgentNotFound => (
+                StatusCode::NOT_FOUND,
+                "agent-shell-agent-not-found",
+                "找不到所选 Agent。",
+            ),
+            Self::HistoryUnsupported => (
+                StatusCode::CONFLICT,
+                "agent-shell-history-unsupported",
+                "所选 Agent 不支持查询或继续历史会话。",
+            ),
+            Self::HistoryFailed => (
+                StatusCode::CONFLICT,
+                "agent-shell-history-failed",
+                "Emacs 无法读取所选 Agent 的历史会话。",
+            ),
+            Self::HistorySessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "agent-shell-history-session-not-found",
+                "找不到所选项目与 Agent 的历史会话。",
+            ),
+            Self::Failed => (
+                StatusCode::CONFLICT,
+                "agent-shell-create-failed",
+                "Emacs 无法开启所选 Agent 的会话。",
+            ),
+        };
+        error_response(status, ErrorSource::Business, code, message)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct HistorySession {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    project_id: String,
+    agent_id: String,
+}
+
+#[derive(Serialize)]
+struct HistoryResponse {
+    api_version: &'static str,
+    sessions: Vec<HistorySession>,
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
+    id = "agent-shell-list-history",
+    method = "GET",
+    path = "/agent-shell/history",
+    access = "paired",
+    summary = "列出 Agent Shell 历史会话",
+    description = "按项目标识和 Agent 配置标识查询可继续的历史会话。"
+)]
+async fn list_history(
+    State(emacs): State<Arc<EmacsService>>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Response, Response> {
+    let Query(query) = query
+        .ok()
+        .filter(|Query(query)| {
+            valid_creation_id(&query.project_id) && valid_creation_id(&query.agent_id)
+        })
+        .ok_or_else(|| conversation_input_error("请求须包含有效的项目和 Agent 标识。"))?;
+    let outcome: SessionSelectionOutcome = agent_shell_reply(
+        &emacs,
+        &conversation_call(
+            "loki-assistant-agent-shell-list-history",
+            &[
+                ("project_id", &query.project_id),
+                ("agent_id", &query.agent_id),
+            ],
+        ),
+    )
+    .await?;
+    match outcome {
+        SessionSelectionOutcome::Listed { sessions }
+            if sessions
+                .iter()
+                .all(|session| valid_creation_id(&session.id)) =>
+        {
+            Ok((
+                [(CACHE_CONTROL, "no-store")],
+                Json(HistoryResponse {
+                    api_version: API_VERSION,
+                    sessions,
+                }),
+            )
+                .into_response())
+        }
+        outcome => Err(outcome.into_error()),
+    }
+}
+
+#[derive(Serialize)]
+struct CreateSessionResponse {
+    api_version: &'static str,
+    session_id: String,
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
+    id = "agent-shell-create-session",
+    method = "POST",
+    path = "/agent-shell/sessions",
+    access = "paired",
+    summary = "创建或继续 Agent Shell 会话",
+    description = "按项目和 Agent 配置标识开启会话。提供历史会话标识时继续该会话。返回 Emacs buffer 名称。"
+)]
+async fn create_session(
+    State(emacs): State<Arc<EmacsService>>,
+    body: Result<Json<CreateSessionRequest>, JsonRejection>,
+) -> Result<Response, Response> {
+    let Json(body) = body
+        .ok()
+        .filter(|Json(body)| {
+            valid_creation_id(&body.project_id)
+                && valid_creation_id(&body.agent_id)
+                && body
+                    .resume_session_id
+                    .as_deref()
+                    .is_none_or(valid_creation_id)
+        })
+        .ok_or_else(|| conversation_input_error("项目、Agent 或历史会话标识无效。"))?;
+    let mut arguments = vec![
+        ("name", body.project_id.as_str()),
+        ("argument", body.agent_id.as_str()),
+    ];
+    if let Some(resume_session_id) = &body.resume_session_id {
+        arguments.push(("resume_id", resume_session_id));
+    }
+    let outcome: SessionSelectionOutcome = agent_shell_reply(
+        &emacs,
+        &conversation_call("loki-assistant-agent-shell-create-session", &arguments),
+    )
+    .await?;
+
+    match outcome {
+        SessionSelectionOutcome::Created { session_id } if !session_id.trim().is_empty() => Ok((
+            StatusCode::CREATED,
+            [(CACHE_CONTROL, "no-store")],
+            Json(CreateSessionResponse {
+                api_version: API_VERSION,
+                session_id,
+            }),
+        )
+            .into_response()),
+        outcome => Err(outcome.into_error()),
+    }
+}
+
+fn valid_creation_id(id: &str) -> bool {
+    !id.trim().is_empty() && !id.chars().any(char::is_control)
+}
+
+async fn agent_shell_reply<T: serde::de::DeserializeOwned>(
+    emacs: &EmacsService,
+    script: &str,
+) -> Result<T, Response> {
+    let reply = conversation_gateway(emacs, script)
+        .await
+        .and_then(|reply| reply.ok_or(ReadError::Unavailable))
+        .map_err(ReadError::into_response)?;
+    serde_json::from_slice(&reply).map_err(|_| ReadError::InvalidResponse.into_response())
+}
+
 #[derive(Deserialize, Serialize, JsonSchema)]
 struct ConversationBlock {
     id: String,
@@ -559,9 +872,8 @@ async fn submit_message(
     let outcome = conversation_gateway(
         &emacs,
         &conversation_call(
-            &session_id,
-            Some(&body.text),
             "loki-assistant-agent-shell-send-message",
+            &[("name", &session_id), ("argument", &body.text)],
         ),
     )
     .await
@@ -606,9 +918,8 @@ async fn restart_session(
     let outcome = conversation_gateway(
         &emacs,
         &conversation_call(
-            &session_id,
-            None,
             "loki-assistant-agent-shell-restart-session",
+            &[("name", &session_id)],
         ),
     )
     .await
@@ -653,7 +964,10 @@ async fn clear_buffer(
     let session_id = conversation_session_id(session_id)?;
     let outcome = conversation_gateway(
         &emacs,
-        &conversation_call(&session_id, None, "loki-assistant-agent-shell-clear-buffer"),
+        &conversation_call(
+            "loki-assistant-agent-shell-clear-buffer",
+            &[("name", &session_id)],
+        ),
     )
     .await
     .and_then(|reply| reply.ok_or(ReadError::Unavailable))
@@ -714,9 +1028,8 @@ async fn read_image(
     let reply = conversation_gateway(
         &emacs,
         &conversation_call(
-            &session_id,
-            Some(&query.source),
             "loki-assistant-agent-shell-read-image",
+            &[("name", &session_id), ("argument", &query.source)],
         ),
     )
     .await
@@ -771,25 +1084,21 @@ fn conversation_input_error(message: &'static str) -> Response {
     )
 }
 
-fn conversation_call(session_id: &str, argument: Option<&str>, function: &'static str) -> String {
-    let name = STANDARD.encode(session_id);
-    let (binding, argument) = argument.map_or_else(
-        || (String::new(), ""),
-        |value| {
-            let value = STANDARD.encode(value);
-            (
-                format!(
-                    "(argument (decode-coding-string (base64-decode-string \"{value}\") 'utf-8))"
-                ),
-                " argument",
-            )
-        },
-    );
+fn conversation_call(function: &'static str, arguments: &[(&'static str, &str)]) -> String {
+    let mut bindings = String::new();
+    let mut call_args = String::new();
+    for (name, value) in arguments {
+        let value = STANDARD.encode(value);
+        bindings.push_str(&format!(
+            "({name} (decode-coding-string (base64-decode-string \"{value}\") 'utf-8)) "
+        ));
+        call_args.push(' ');
+        call_args.push_str(name);
+    }
     format!(
         "(when (require 'loki-assistant-agent-shell nil t) \
            (when (fboundp '{function}) \
-             (let* ((name (decode-coding-string (base64-decode-string \"{name}\") 'utf-8)) \
-                    {binding} (reply ({function} name{argument}))) \
+             (let* ({bindings}(reply ({function}{call_args}))) \
                (base64-encode-string (encode-coding-string (or reply \"null\") 'utf-8) t))))"
     )
 }

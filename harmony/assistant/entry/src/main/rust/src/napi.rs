@@ -1,9 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use napi_derive_ohos::napi;
 use napi_ohos::{
     Env, Error, Result, Status,
-    bindgen_prelude::{FnArgs, Function, Object},
+    bindgen_prelude::{FnArgs, Function, Object, spawn},
     threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
 };
 use serde::Serialize;
@@ -27,6 +27,38 @@ use crate::{
 
 fn js_value(value: impl Serialize) -> Result<Value> {
     serde_json::to_value(value).map_err(|error| Error::from_reason(error.to_string()))
+}
+
+fn forward_request<T: Serialize + Send + 'static>(
+    request: impl Future<Output = std::result::Result<T, ResponsError>> + Send + 'static,
+    on_success: Function<'_, Value, ()>,
+    on_error: Function<'_, Value, ()>,
+) -> Result<()> {
+    let on_success = on_success
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build()?;
+    let on_error = on_error
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build()?;
+    spawn(async move {
+        match request.await {
+            Ok(data) => {
+                if let Ok(data) = js_value(data) {
+                    on_success.call(data, NonBlocking);
+                }
+            }
+            Err(error) => {
+                if let Ok(error) = js_value(error) {
+                    on_error.call(error, NonBlocking);
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 #[napi]
@@ -373,6 +405,85 @@ pub struct AgentShell {
 
 #[napi]
 impl AgentShell {
+    #[napi(ts_return_type = "Promise<AgentShellAgent[]>")]
+    pub async fn list_agents(&self, endpoint_id: String) -> Result<Value> {
+        let agents = self
+            .inner
+            .list_agents(&endpoint_id)
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        js_value(agents)
+    }
+
+    #[napi(
+        ts_args_type = "endpointId: string, onSuccess: (projects: AgentShellProject[]) => void, onError: (error: ResponsError) => void"
+    )]
+    pub fn list_projects(
+        &self,
+        endpoint_id: String,
+        on_success: Function<'_, Value, ()>,
+        on_error: Function<'_, Value, ()>,
+    ) -> Result<()> {
+        let shell = self.inner.clone();
+        forward_request(
+            async move { shell.list_projects(&endpoint_id).await },
+            on_success,
+            on_error,
+        )
+    }
+
+    #[napi(
+        ts_args_type = "endpointId: string, projectId: string, agentId: string, resumeSessionId: string | null, onSuccess: (sessionId: string) => void, onError: (error: ResponsError) => void"
+    )]
+    pub fn create_session(
+        &self,
+        endpoint_id: String,
+        project_id: String,
+        agent_id: String,
+        resume_session_id: Option<String>,
+        on_success: Function<'_, Value, ()>,
+        on_error: Function<'_, Value, ()>,
+    ) -> Result<()> {
+        let shell = self.inner.clone();
+        forward_request(
+            async move {
+                shell
+                    .create_session(
+                        &endpoint_id,
+                        &project_id,
+                        &agent_id,
+                        resume_session_id.as_deref(),
+                    )
+                    .await
+            },
+            on_success,
+            on_error,
+        )
+    }
+
+    #[napi(
+        ts_args_type = "endpointId: string, projectId: string, agentId: string, onSuccess: (sessions: AgentShellHistorySession[]) => void, onError: (error: ResponsError) => void"
+    )]
+    pub fn list_history(
+        &self,
+        endpoint_id: String,
+        project_id: String,
+        agent_id: String,
+        on_success: Function<'_, Value, ()>,
+        on_error: Function<'_, Value, ()>,
+    ) -> Result<()> {
+        let shell = self.inner.clone();
+        forward_request(
+            async move {
+                shell
+                    .list_history(&endpoint_id, &project_id, &agent_id)
+                    .await
+            },
+            on_success,
+            on_error,
+        )
+    }
+
     #[napi(ts_args_type = "changed: (sessions: AgentShellSession[] | null) => void")]
     pub fn watch_status(&self, changed: Function<'_, Value, ()>) -> Result<StatusSubscription> {
         subscribe::<Option<Vec<AgentShellSession>>>(changed, |changed| {

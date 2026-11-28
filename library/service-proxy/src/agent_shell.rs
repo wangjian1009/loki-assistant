@@ -25,9 +25,51 @@ pub enum AgentShellPhase {
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct AgentShellSession {
     pub id: String,
+    pub agent_id: Option<String>,
     pub title: Option<String>,
     pub phase: AgentShellPhase,
     pub stop_reason: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct AgentShellAgent {
+    pub id: String,
+    pub name: String,
+    pub icon: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentShellAgentsResponse {
+    agents: Vec<AgentShellAgent>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct AgentShellProject {
+    pub id: String,
+    pub name: String,
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentShellProjectsResponse {
+    projects: Vec<AgentShellProject>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct AgentShellHistorySession {
+    pub id: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentShellHistoryResponse {
+    sessions: Vec<AgentShellHistorySession>,
+}
+
+#[derive(Deserialize)]
+struct AgentShellCreatedSession {
+    session_id: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -85,6 +127,84 @@ pub struct AgentShell {
 impl AgentShell {
     pub fn new(proxy: Arc<ServiceProxy>) -> Self {
         Self { proxy }
+    }
+
+    pub async fn list_agents(&self, endpoint: &str) -> Result<Vec<AgentShellAgent>, ResponsError> {
+        let generation = self.proxy.bound_generation(endpoint)?;
+        Ok(self
+            .proxy
+            .request::<AgentShellAgentsResponse>(
+                generation,
+                ServiceRequest::get("/agent-shell/agents"),
+            )
+            .await?
+            .data
+            .agents)
+    }
+
+    pub async fn list_projects(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<AgentShellProject>, ResponsError> {
+        let generation = self.proxy.bound_generation(endpoint)?;
+        let response = self
+            .proxy
+            .request::<AgentShellProjectsResponse>(
+                generation,
+                ServiceRequest::get("/agent-shell/projects"),
+            )
+            .await?;
+        Ok(response.data.projects)
+    }
+
+    pub async fn create_session(
+        &self,
+        endpoint: &str,
+        project_id: &str,
+        agent_id: &str,
+        resume_session_id: Option<&str>,
+    ) -> Result<String, ResponsError> {
+        let generation = self.proxy.bound_generation(endpoint)?;
+        let mut body = serde_json::json!({ "project_id": project_id, "agent_id": agent_id });
+        if let Some(id) = resume_session_id {
+            body["resume_session_id"] = id.into();
+        }
+        let request = ServiceRequest {
+            method: Method::POST,
+            path: "/agent-shell/sessions".into(),
+            query: vec![],
+            body: Some(body),
+        };
+        let response = self
+            .proxy
+            .request::<AgentShellCreatedSession>(generation, request)
+            .await?;
+        Ok(response.data.session_id)
+    }
+
+    pub async fn list_history(
+        &self,
+        endpoint: &str,
+        project_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<AgentShellHistorySession>, ResponsError> {
+        let generation = self.proxy.bound_generation(endpoint)?;
+        let mut request = ServiceRequest::get("/agent-shell/history");
+        request.query = vec![
+            QueryParameter {
+                name: "project_id".into(),
+                value: project_id.into(),
+            },
+            QueryParameter {
+                name: "agent_id".into(),
+                value: agent_id.into(),
+            },
+        ];
+        let response = self
+            .proxy
+            .request::<AgentShellHistoryResponse>(generation, request)
+            .await?;
+        Ok(response.data.sessions)
     }
 
     pub fn watch_status(

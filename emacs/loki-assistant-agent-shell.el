@@ -30,7 +30,9 @@
 
 (require 'agent-shell)
 (require 'image)
+(require 'json)
 (require 'loki-assistant-monitor)
+(require 'project)
 (autoload 'loki-assistant-agent-shell-stream-read "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-stream-subscribe "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-stream-resume "loki-assistant-agent-shell-stream")
@@ -38,6 +40,8 @@
 (autoload 'loki-assistant-agent-shell-restart-session "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-clear-buffer "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-read-image "loki-assistant-agent-shell-stream")
+(autoload 'loki-assistant-agent-shell-list-history "loki-assistant-agent-shell-history")
+(autoload 'loki-assistant-agent-shell-resume-session "loki-assistant-agent-shell-history")
 (require 'subr-x)
 
 (declare-function agent-shell--get-files-context "agent-shell")
@@ -354,6 +358,107 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
 
 ;;; 执行状态
 
+(defun loki-assistant-agent-shell--config-id (config)
+  "返回 CONFIG 的 Agent 标识字符串。"
+  (let ((id (map-elt config :identifier)))
+    (cond ((and id (symbolp id)) (symbol-name id))
+          ((and (stringp id) (not (string-blank-p id))) id))))
+
+(defun loki-assistant-agent-shell--icon-url (name)
+  "根据 Agent Shell 的图标配置 NAME 返回 HTTPS 地址。"
+  (when (stringp name)
+    (cond ((string-prefix-p "https://" name t) name)
+          ((string-match-p "\\`[[:alnum:]_-]+\\.png\\'" name)
+           (concat "https://unpkg.com/@lobehub/icons-static-png@latest/dark/" name)))))
+
+(defun loki-assistant-agent-shell--agent-configs ()
+  "返回已配置的 Agent 标识与配置的映射。"
+  (let* ((configs (if (functionp agent-shell-agent-configs)
+                      (funcall agent-shell-agent-configs)
+                    agent-shell-agent-configs))
+         (seen (make-hash-table :test 'equal))
+         entries)
+    (dolist (entry configs)
+      (when-let* ((config (if (functionp entry) (ignore-errors (funcall entry)) entry))
+                  (id (loki-assistant-agent-shell--config-id config))
+                  (name (map-elt config :buffer-name))
+                  ((and (stringp name) (not (string-blank-p name)) (not (gethash id seen)))))
+        (puthash id t seen)
+        (push (cons id config) entries)))
+    (nreverse entries)))
+
+(defun loki-assistant-agent-shell--executable-p (config)
+  "判断 Emacs 能否找到 CONFIG 的启动命令。"
+  (with-temp-buffer
+    (setq-local agent-shell--state (agent-shell--make-state :agent-config config))
+    (condition-case nil
+        (when-let* ((maker (map-elt config :client-maker))
+                    (client (funcall maker (current-buffer)))
+                    (command (map-elt client :command))
+                    ((and (stringp command) (not (string-empty-p command)))))
+          (executable-find command t))
+      (error nil))))
+
+(defun loki-assistant-agent-shell-list-agents ()
+  "返回已找到启动命令的 Agent，编码为 JSON 数组。"
+  (json-serialize
+   (vconcat
+    (cl-loop for (id . config) in (loki-assistant-agent-shell--agent-configs)
+             when (loki-assistant-agent-shell--executable-p config)
+             collect (let ((name (substring-no-properties (map-elt config :buffer-name)))
+                           (icon (loki-assistant-agent-shell--icon-url (map-elt config :icon-name))))
+                       `((id . ,id) (name . ,name) ,@(when icon `((icon . ,icon)))))))))
+
+(defun loki-assistant-agent-shell--projects ()
+  "按最近使用顺序返回含有 .agent-shell 目录的本地项目。"
+  (let ((seen (make-hash-table :test 'equal))
+        projects)
+    (dolist (root (project-known-project-roots))
+      (unless (file-remote-p root)
+        (condition-case nil
+            (let* ((directory (file-name-as-directory (file-truename root)))
+                   (marker (expand-file-name ".agent-shell" directory)))
+              (when (and (not (gethash directory seen)) (file-directory-p marker))
+                (puthash directory t seen)
+                (push (cons (secure-hash 'sha256 directory) directory) projects)))
+          (file-error nil))))
+    (nreverse projects)))
+
+(defun loki-assistant-agent-shell-list-projects ()
+  "返回可开启 Agent Shell 会话的项目列表，编码为 JSON 数组。"
+  (json-serialize
+   (vconcat
+    (mapcar (lambda (project)
+              (let* ((path (directory-file-name (cdr project)))
+                     (name (file-name-nondirectory path)))
+                `((id . ,(car project)) (name . ,(if (string-empty-p name) path name)) (path . ,path))))
+            (loki-assistant-agent-shell--projects)))))
+
+(defun loki-assistant-agent-shell-create-session (project-id agent-id &optional history-id)
+  "在 PROJECT-ID 对应项目后台启动 AGENT-ID，可恢复 HISTORY-ID。"
+  (if history-id
+      (loki-assistant-agent-shell-resume-session project-id agent-id history-id)
+    (loki-assistant-agent-shell--start-new-session project-id agent-id)))
+
+(defun loki-assistant-agent-shell--start-new-session (project-id agent-id)
+  "在 PROJECT-ID 中后台新建 AGENT-ID 会话，返回 JSON。"
+  (let* ((root (cdr (assoc project-id (loki-assistant-agent-shell--projects))))
+         (config (and root (cdr (assoc agent-id (loki-assistant-agent-shell--agent-configs))))))
+    (json-serialize
+     (cond
+      ((not root) '((kind . "project_not_found")))
+      ((not config) '((kind . "agent_not_found")))
+      (t
+       (condition-case nil
+           (let* ((default-directory root)
+                  (project-current-directory-override root)
+                  (buffer (agent-shell--start :config config :no-focus t :new-session t
+                                              :session-strategy 'new :cwd root)))
+             (if (buffer-live-p buffer)
+                 `((kind . "created") (session_id . ,(buffer-name buffer)))
+               '((kind . "failed"))))
+         (error '((kind . "failed")))))))))
+
 (defvar-local loki-assistant-agent-shell--status-subscription nil)
 (defvar-local loki-assistant-agent-shell--outcome nil)
 
@@ -362,7 +467,8 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
   (let (entries)
     (dolist (buffer (agent-shell-buffers))
       (with-current-buffer buffer
-        (when agent-shell--state
+        (when (and agent-shell--state
+                   (not (eq agent-shell-session-strategy 'loki-assistant-agent-shell--history-strategy)))
           (loki-assistant-agent-shell--subscribe-status)
           (push (loki-assistant-agent-shell--status-entry) entries))))
     (funcall write "emacs" "agent_shell"
@@ -381,7 +487,7 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
       line)))
 
 (defun loki-assistant-agent-shell--status-entry ()
-  "读取当前会话的标题、执行阶段和最近一次回合结果。"
+  "读取当前会话的 Agent、标题、执行阶段和最近一次回合结果。"
   (let* ((client (map-elt agent-shell--state :client))
          (live (and (process-live-p (get-buffer-process (current-buffer)))
                     (or (not client) (process-live-p (map-elt client :process)))))
@@ -400,9 +506,11 @@ Emacs 未聚焦或当前显示其他缓冲区时始终发送通知；该变量�
                  (t "idle")))
          (reason (and (equal phase (car loki-assistant-agent-shell--outcome))
                       (cdr loki-assistant-agent-shell--outcome)))
-         (title (loki-assistant-agent-shell--status-title)))
+         (title (loki-assistant-agent-shell--status-title))
+         (agent-id (loki-assistant-agent-shell--config-id (map-elt agent-shell--state :agent-config))))
     `((id . ,(buffer-name))
       (phase . ,phase)
+      ,@(when agent-id `((agent_id . ,agent-id)))
       ,@(when title `((title . ,title)))
       ,@(when reason `((stop_reason . ,reason))))))
 

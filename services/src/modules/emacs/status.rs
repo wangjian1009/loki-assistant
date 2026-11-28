@@ -39,7 +39,7 @@ fn emacs_status_metadata() -> StatusModuleMetadata {
             StatusItemMetadata::new(
                 "agent_shell",
                 "Agent Shell 执行状态",
-                "Emacs 当前打开的 Agent Shell 会话、标题及执行阶段。",
+                "Emacs 当前打开的 Agent Shell 会话、所属 Agent、标题及执行阶段。",
                 StatusSchema::Array {
                     items: Box::new(StatusSchema::Object {
                         fields: vec![
@@ -49,6 +49,15 @@ fn emacs_status_metadata() -> StatusModuleMetadata {
                                 "Emacs buffer 的名称，同一实例内唯一。",
                                 StatusSchema::string(),
                             ),
+                            Field {
+                                required: false,
+                                ..Field::new(
+                                    "agent_id",
+                                    "Agent 标识",
+                                    "会话所属 Agent 的配置标识，对应 Agent 列表中的 id。",
+                                    StatusSchema::string(),
+                                )
+                            },
                             Field {
                                 required: false,
                                 ..Field::new(

@@ -533,7 +533,11 @@ fn service_status_metadata() -> StatusModuleMetadata {
 
 ~paired~ 允许本机和已绑定设备调用。绑定设备只能读取 ~remote_access~ 为 ~true~ 的状态项。业务代码通过 Rust 发布状态。~GET /status~ 的 SSE 事件名为 ~status~ ，数据类型为 ~StatusResponse~ 。 [[file:control-center-services.org::*状态中心][状态中心协议]]
 
-Emacs 上报时通过本机 ~POST /emacs/receiver/status~ 调用 ~publish_many_validated~ 。已绑定设备可读取 ~emacs/agent_shell~ 会话状态数组，数组项可包含会话标题 ~title~ 。 [[file:control-center-services.org::*Agent Shell 执行状态][Agent Shell 状态字段与访问范围]]
+Emacs 上报时通过本机 ~POST /emacs/receiver/status~ 调用 ~publish_many_validated~ 。已绑定设备可读取 ~emacs/agent_shell~ 会话状态数组，数组项可包含会话标题 ~title~ 和 Agent 配置标识 ~agent_id~ 。 [[file:control-center-services.org::*Agent Shell 执行状态][Agent Shell 状态字段与访问范围]]
+
+~GET /agent-shell/agents~ 是 Emacs 模块声明的 ~paired~ JSON 接口。响应只列出当前 Emacs 能找到启动命令的 Agent，提供配置标识、显示名称和可选的 HTTPS 图标地址。客户端通过配置标识将列表项与会话状态关联。 [[file:control-center-services.org::*Agent Shell 支持的 Agent][Agent Shell 列表协议]]
+
+Emacs 模块声明 ~paired~ JSON 接口 ~GET /agent-shell/projects~ 、 ~GET /agent-shell/history~ 和 ~POST /agent-shell/sessions~ 。项目列表提供根目录含有 ~.agent-shell~ 目录的项目标识、显示名称及根目录绝对路径，按 Emacs ~project~ 的最近使用顺序返回。历史列表按项目标识与 Agent 配置标识查询。开启会话时可提交 ~resume_session_id~ 继续所选历史会话，HTTP 201 返回可用于会话订阅的 ~session_id~ 。 [[file:control-center-services.org::*Agent Shell 项目与会话创建][Agent Shell 项目与会话创建协议]]
 
 ~GET /agent-shell/sessions/{session_id}/events~ 是 Emacs 模块声明的 ~paired~ SSE 接口。事件名为 ~agent-shell~ ，事件数据通过 ~sse_events~ 公布。设备用状态数组中的原始 buffer 名选择订阅目标，并在请求路径中将名称编码为单一路径段。 ~recent=10~ 覆盖最近十条会话记录，省略 ~recent~ 覆盖完整历史。客户端可用 ~after~ 从同一会话和范围的已应用版本续订，游标失效后接收新快照。 ~snapshot~ 事件可携带 ~snapshot_end_revision~ 标记快照的最后一批。Emacs 通过回环连接向 services 推送快照和增量内容。内容块可携带 ~parent_id~ 和 ~collapsed~ 以传递分组关系与初始展开状态。 [[file:control-center-services.org::*Agent Shell 会话订阅][Agent Shell 会话订阅协议]]
 

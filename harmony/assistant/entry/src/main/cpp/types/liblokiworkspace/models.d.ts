@@ -123,7 +123,10 @@ export interface SlackStatusChanged { generation: number; status: SlackStatus | 
 
 export type AgentShellPhase = 'idle' | 'starting' | 'running' | 'waiting_input' | 'completed' |
   'cancelled' | 'failed' | 'disconnected' | 'unknown'
-export interface AgentShellSession { id: string; title: string | null; phase: AgentShellPhase; stop_reason: string | null }
+export interface AgentShellSession { id: string; agent_id: string | null; title: string | null; phase: AgentShellPhase; stop_reason: string | null }
+export interface AgentShellAgent { id: string; name: string; icon: string | null }
+export interface AgentShellProject { id: string; name: string; path: string | null }
+export interface AgentShellHistorySession { id: string; title: string | null; updated_at: string | null }
 export interface AgentShellBlock {
   id: string
   kind: string

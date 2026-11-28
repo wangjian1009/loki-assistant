@@ -111,6 +111,10 @@ emacs-load: emacs-deps
 	  (require 'loki-assistant-xbloom-service) \
 	  (require 'loki-assistant-devices) \
 	  (require 'loki-assistant-llm-usage) \
+	  (when (featurep 'loki-assistant-agent-shell) \
+	    (load \"$(PROJECT_ROOT)/emacs/loki-assistant-agent-shell.el\" nil t)) \
+	  (when (featurep 'loki-assistant-agent-shell-history) \
+	    (load \"$(PROJECT_ROOT)/emacs/loki-assistant-agent-shell-history.el\" nil t)) \
 	  (when (featurep 'loki-assistant-mail) \
 	    (load \"$(PROJECT_ROOT)/emacs/loki-assistant-mail.el\" nil t)) \
 	  (if (featurep 'loki-assistant-slack-chat) \

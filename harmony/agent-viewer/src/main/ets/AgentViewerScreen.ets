@@ -1,12 +1,21 @@
 import { AnimatorResult } from '@kit.ArkUI'
 import { OrgRenderer } from 'org_renderer'
+import { AgentAvatar } from './AgentAvatar'
 import { AgentShellStatusIcon, agentShellAppearance } from './AgentShellStatusIcon'
+import { ConversationImagePreview } from './ConversationImagePreview'
 import { ConversationRow, ViewerBlock, conversationRows } from './ConversationLayout'
 
 export interface ViewerSession {
   id: string
+  agentId: string
   title: string
   phase: string
+}
+
+export interface ViewerAgent {
+  id: string
+  name: string
+  icon: string
 }
 
 export interface ViewerSessionPreview {
@@ -98,12 +107,29 @@ class MessageRow {
 @Component
 struct ConversationMessage {
   @ObjectLink row: MessageRow
+  @Prop agentName: string = ''
   @Prop imageStatus: boolean | undefined = undefined
   readImage: (source: string) => Promise<string> = () => Promise.reject(new Error('图片不可用'))
   parseDocument: (source: string, format: string) => string = () => ''
   onToggle: (row: ConversationRow) => void = () => {}
   onOpenImage: (rowId: string, source: string) => void = () => {}
   onContentReady: () => void = () => {}
+  @State private inlineImageDownloads: number = 0
+
+  private label(): string {
+    const content = this.row.content
+    if (content.kind === 'assistant' && this.agentName) return this.agentName
+    return content.title || blockLabel(content.kind)
+  }
+
+  private async readInlineImage(source: string): Promise<string> {
+    this.inlineImageDownloads += 1
+    try {
+      return await this.readImage(source)
+    } finally {
+      this.inlineImageDownloads -= 1
+    }
+  }
 
   build() {
     Row() {
@@ -113,16 +139,16 @@ struct ConversationMessage {
             Row({ space: 8 }) {
               SymbolGlyph(this.row.content.collapsed ? $r('sys.symbol.chevron_right') : $r('sys.symbol.chevron_down'))
                 .fontSize(10).fontColor([DETAIL])
-              Text(this.row.content.title || blockLabel(this.row.content.kind)).layoutWeight(1)
+              Text(this.label()).layoutWeight(1)
                 .fontSize(12).fontColor(this.row.content.kind === 'permission' ? AMBER : DETAIL)
                 .maxLines(this.row.content.collapsed ? 1 : 2).textOverflow({ overflow: TextOverflow.Ellipsis })
             }.width('100%')
           }.width('100%').constraintSize({ minHeight: 32 }).padding(0).backgroundColor(Color.Transparent)
             .accessibilityGroup(true)
-            .accessibilityText((this.row.content.title || blockLabel(this.row.content.kind)) + (this.row.content.collapsed ? '，已折叠' : '，已展开'))
+            .accessibilityText(this.label() + (this.row.content.collapsed ? '，已折叠' : '，已展开'))
             .onClick(() => { this.onToggle(this.row.content) })
-        } else if (this.row.content.title || blockLabel(this.row.content.kind)) {
-          Text(this.row.content.title || blockLabel(this.row.content.kind)).width('100%').fontSize(13)
+        } else if (this.label()) {
+          Text(this.label()).width('100%').fontSize(13)
             .fontWeight(FontWeight.Medium).fontColor(this.row.content.kind === 'user' ? ACCENT :
               this.row.content.kind === 'assistant' ? GREEN : this.row.content.kind === 'permission' ? AMBER : SECONDARY)
         }
@@ -131,10 +157,11 @@ struct ConversationMessage {
             this.row.content.kind === 'tool' ||
             (this.row.content.kind === 'user' && this.row.content.text.includes('![图片]('))) {
             OrgRenderer({ source: this.row.content.text, format: this.row.content.kind === 'user' ? 'markdown' : 'auto',
-              subdued: this.row.content.foldable, parse: this.parseDocument, readImage: this.readImage,
+              subdued: this.row.content.foldable, parse: this.parseDocument,
+              readImage: (source: string): Promise<string> => this.readInlineImage(source),
               onOpenImage: (source: string): void => { this.onOpenImage(this.row.content.id, source) },
               onContentReady: (): void => { this.onContentReady() } })
-            if (this.imageStatus === true) {
+            if (this.inlineImageDownloads > 0 || this.imageStatus === true) {
               ImageDownloadProgress()
             } else if (this.imageStatus === false) {
               Text('图片下载失败，重新点击可重试').fontSize(12).fontColor(RED)
@@ -160,9 +187,11 @@ export struct AgentViewerScreen {
   @Prop @Watch('sessionChanged') sessionId: string = ''
   @Prop @Watch('resetConversation') conversationKey: number = 0
   @Prop sessions: ViewerSession[] = []
+  @Prop agents: ViewerAgent[] = []
   @Prop adjacentViews: ViewerSessionPreview[] = []
   @Prop @Watch('refreshRows') blocks: ViewerBlock[] = []
   @Prop notice: string = ''
+  @Prop canRetry: boolean = false
   @Prop connected: boolean = false
   @Prop connectionColor: string = SECONDARY
   @Prop connectionLabel: string = '离线'
@@ -385,11 +414,16 @@ export struct AgentViewerScreen {
         Row({ space: 6 }) {
           Circle().width(6).height(6).fill(this.connectionColor).flexShrink(0)
             .accessibilityText('设备' + this.connectionLabel)
+          if (this.selected(this.headerSession(interactive))?.agentId) {
+            AgentAvatar({ name: this.agent(this.headerSession(interactive))?.name ??
+              this.selected(this.headerSession(interactive))?.agentId ?? '',
+              source: this.agent(this.headerSession(interactive))?.icon ?? '', avatarSize: 20 })
+          }
           Text(this.selected(this.headerSession(interactive))?.title || this.title)
             .fontSize(18).fontWeight(FontWeight.Medium)
             .fontColor(TEXT).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).flexShrink(1)
         }.layoutWeight(1)
-        if (this.headerSession(interactive) && this.sessionActions) {
+        if (this.sessionActions) {
           if (interactive) {
             this.sessionActions()
           } else {
@@ -425,6 +459,11 @@ export struct AgentViewerScreen {
     return this.connected ? this.selected(this.headerSession(interactive))?.phase ?? 'unknown' : 'disconnected'
   }
 
+  private agent(sessionId: string): ViewerAgent | undefined {
+    const id = this.selected(sessionId)?.agentId
+    return this.agents.find(agent => agent.id === id)
+  }
+
   private previewRows(id: string): MessageRow[] {
     const blocks = this.adjacentViews.find(view => view.sessionId === id)?.blocks ?? []
     return conversationRows(blocks, new Map<string, boolean>()).map(row => new MessageRow(id, row, id))
@@ -439,7 +478,8 @@ export struct AgentViewerScreen {
         List({ space: 8 }) {
           ForEach(this.previewRows(this.headerSession(false)), (row: MessageRow) => {
             ListItem() {
-              ConversationMessage({ row: row, parseDocument: this.parseDocument,
+              ConversationMessage({ row: row, agentName: this.agent(this.headerSession(false))?.name ?? '',
+                parseDocument: this.parseDocument,
                 readImage: (source: string): Promise<string> => this.readImage(source, row.previewSessionId) })
             }
           }, (row: MessageRow) => row.key)
@@ -464,7 +504,8 @@ export struct AgentViewerScreen {
     List({ scroller: this.history, space: 8 }) {
       ForEach(this.rows, (row: MessageRow) => {
         ListItem() {
-          ConversationMessage({ row: row, imageStatus: this.imageDownloads.get(row.content.id),
+          ConversationMessage({ row: row, agentName: this.agent(this.sessionId)?.name ?? '',
+            imageStatus: this.imageDownloads.get(row.content.id),
             readImage: this.readImage, parseDocument: this.parseDocument,
             onToggle: (item: ConversationRow): void => { this.toggleFold(item) },
             onOpenImage: (rowId: string, source: string): void => { this.openImage(rowId, source) },
@@ -524,7 +565,7 @@ export struct AgentViewerScreen {
             if (this.notice) {
               Row({ space: 10 }) {
                 Text(this.notice).fontSize(13).fontColor(SECONDARY).layoutWeight(1)
-                if (this.sessionId) {
+                if (this.sessionId && this.canRetry) {
                   Button('重试', { type: ButtonType.Normal }).fontSize(13).fontColor(ACCENT)
                     .height(44).backgroundColor(Color.Transparent).onClick(() => { this.onRetry() })
                 }
@@ -545,20 +586,7 @@ export struct AgentViewerScreen {
         .accessibilityLevel(this.preview ? 'no-hide-descendants' : 'auto')
 
       if (this.preview) {
-        Column() {
-          Row() {
-            Blank()
-            Button('关闭', { type: ButtonType.Normal }).height(44).fontColor(TEXT)
-              .backgroundColor(PANEL).onClick(() => { this.preview = '' })
-          }.width('100%').padding(12)
-          Image('file://' + this.preview).width('100%').layoutWeight(1).objectFit(ImageFit.Contain)
-        }.width('100%').height('100%').backgroundColor('#F0000000')
-          .gesture(PanGesture({ direction: PanDirection.Left })
-            .onActionEnd((event: GestureEvent) => {
-              if (event.offsetX <= -HORIZONTAL_SWIPE_DISTANCE && -event.offsetX >= Math.abs(event.offsetY)) {
-                this.preview = ''
-              }
-            }))
+        ConversationImagePreview({ source: this.preview, onClose: () => { this.preview = '' } })
       }
     }.width('100%').height('100%').backgroundColor(BACKGROUND)
   }

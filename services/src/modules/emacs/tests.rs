@@ -104,6 +104,247 @@ fn assert_conversation_lisp(args: &[String]) {
 }
 
 #[tokio::test]
+async fn agent_shell_agents_return_configured_names_and_https_icons() {
+    let codex = json!({"id": "codex", "name": "Codex", "icon": "https://example.org/openai.png"});
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!([
+            codex,
+            {"id": "claude-code", "name": "Claude", "icon": null},
+            {"id": "local-agent", "name": "本地 Agent", "icon": "file:///private/icon.png"}
+        ])),
+        conversation_reply(json!([])),
+        conversation_reply(json!([{"id": "", "name": "Codex"}])),
+        Ok(wire(json!({"result": "nil"}))),
+    ]);
+    let path = "/agent-shell/agents";
+    let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        reply,
+        json!({"api_version": "1", "agents": [
+            codex,
+            {"id": "claude-code", "name": "Claude"},
+            {"id": "local-agent", "name": "本地 Agent"}
+        ]})
+    );
+    let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply, json!({"api_version": "1", "agents": []}));
+    let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(reply["error"]["code"], "invalid-emacs-response");
+    let (status, reply) = request(emacs, "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply["error"]["code"], "emacs-unavailable");
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert!(args[3].contains("(loki-assistant-agent-shell-list-agents)"));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_projects_return_absolute_paths_in_emacs_order() {
+    let projects = json!([
+        {"id": "recent-project", "name": "Z 项目", "path": "/Users/owner/团队/Z 项目"},
+        {"id": "older-project", "name": "A 项目", "path": "/Users/owner/其他/A 项目"}
+    ]);
+    let invalid_projects = [
+        json!([{"id": "", "name": "无效标识", "path": "/Users/owner/project"}]),
+        json!([{"id": "bad-project", "name": "缺少路径"}]),
+        json!([{"id": "bad-project", "name": "相对路径", "path": "workspace/project"}]),
+    ];
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(projects.clone()),
+        conversation_reply(json!([])),
+        conversation_reply(invalid_projects[0].clone()),
+        conversation_reply(invalid_projects[1].clone()),
+        conversation_reply(invalid_projects[2].clone()),
+        Ok(wire(json!({"result": "nil"}))),
+    ]);
+    let path = "/agent-shell/projects";
+    let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply, json!({"api_version": "1", "projects": projects}));
+    let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply, json!({"api_version": "1", "projects": []}));
+    for _ in invalid_projects {
+        let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(reply["error"]["code"], "invalid-emacs-response");
+    }
+    let (status, reply) = request(emacs, "GET", path, Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply["error"]["code"], "emacs-unavailable");
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert!(args[3].contains("(loki-assistant-agent-shell-list-projects)"));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_history_lists_the_selected_project_and_agent() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let sessions = json!([
+        {"id": "history-2", "title": "恢复历史", "updated_at": "2026-11-28T02:30:00Z"},
+        {"id": "history-1"}
+    ]);
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!({"kind": "listed", "sessions": sessions})),
+        conversation_reply(json!({"kind": "listed", "sessions": []})),
+        conversation_reply(json!({"kind": "project_not_found"})),
+        conversation_reply(json!({"kind": "agent_not_found"})),
+        conversation_reply(json!({"kind": "history_unsupported"})),
+        conversation_reply(json!({"kind": "history_failed"})),
+        conversation_reply(json!({"kind": "listed", "sessions": [{"id": ""}]})),
+        conversation_reply(json!({"kind": "history_timeout"})),
+        Err(EmacsError::Timeout),
+    ]);
+    for path in [
+        "/agent-shell/history?project_id=project",
+        "/agent-shell/history?project_id=project&agent_id=%20",
+        "/agent-shell/history?project_id=project&agent_id=codex&directory=%2Ftmp",
+    ] {
+        let (status, reply) = request(emacs.clone(), "GET", path, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply["error"]["code"], "invalid-request");
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let project_id = "项目/\"选中\"";
+    let agent_id = "codex+local";
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("project_id", project_id)
+        .append_pair("agent_id", agent_id)
+        .finish();
+    let path = format!("/agent-shell/history?{query}");
+    for expected in [sessions, json!([])] {
+        let (status, reply) = request(emacs.clone(), "GET", &path, Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply, json!({"api_version": "1", "sessions": expected}));
+    }
+    for (expected, code) in [
+        (StatusCode::NOT_FOUND, "agent-shell-project-not-found"),
+        (StatusCode::NOT_FOUND, "agent-shell-agent-not-found"),
+        (StatusCode::CONFLICT, "agent-shell-history-unsupported"),
+        (StatusCode::CONFLICT, "agent-shell-history-failed"),
+        (StatusCode::BAD_GATEWAY, "invalid-emacs-response"),
+        (StatusCode::GATEWAY_TIMEOUT, "emacs-timeout"),
+        (StatusCode::GATEWAY_TIMEOUT, "emacs-timeout"),
+    ] {
+        let (status, reply) = request(emacs.clone(), "GET", &path, Value::Null).await;
+        assert_eq!(status, expected);
+        assert_eq!(reply["error"]["code"], code);
+    }
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert!(args[3].contains("(loki-assistant-agent-shell-list-history project_id agent_id)"));
+        assert!(args[3].contains(&STANDARD.encode(project_id)));
+        assert!(args[3].contains(&STANDARD.encode(agent_id)));
+        assert_conversation_lisp(args);
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_creation_forwards_catalog_ids_and_returns_the_new_session() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let session_id = "*示例项目/会话*";
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!({"kind": "created", "session_id": session_id})),
+        conversation_reply(json!({"kind": "project_not_found"})),
+        conversation_reply(json!({"kind": "agent_not_found"})),
+        conversation_reply(json!({"kind": "failed"})),
+        conversation_reply(json!({"kind": "unavailable"})),
+        conversation_reply(json!({"kind": "created", "session_id": ""})),
+    ]);
+    let route = "/agent-shell/sessions";
+    for invalid in [
+        json!({"agent_id": "codex"}),
+        json!({"project_id": "  ", "agent_id": "codex"}),
+        json!({"project_id": "project-1", "agent_id": "codex\n"}),
+        json!({"project_id": "project-1", "agent_id": "codex", "directory": "/tmp"}),
+    ] {
+        let (status, reply) = request(emacs.clone(), "POST", route, invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply["error"]["code"], "invalid-request");
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let project_id = "中文/\"项目\"";
+    let agent_id = "codex (本地)";
+    let body = json!({"project_id": project_id, "agent_id": agent_id});
+    let (status, reply) = request(emacs.clone(), "POST", route, body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(reply, json!({"api_version": "1", "session_id": session_id}));
+    for (status_expected, code) in [
+        (StatusCode::NOT_FOUND, "agent-shell-project-not-found"),
+        (StatusCode::NOT_FOUND, "agent-shell-agent-not-found"),
+        (StatusCode::CONFLICT, "agent-shell-create-failed"),
+        (StatusCode::SERVICE_UNAVAILABLE, "emacs-unavailable"),
+        (StatusCode::BAD_GATEWAY, "invalid-emacs-response"),
+    ] {
+        let (status, reply) = request(emacs.clone(), "POST", route, body.clone()).await;
+        assert_eq!(status, status_expected);
+        assert_eq!(reply["error"]["code"], code);
+    }
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert!(args[3].contains("(loki-assistant-agent-shell-create-session name argument)"));
+        assert!(args[3].contains(&STANDARD.encode(project_id)));
+        assert!(args[3].contains(&STANDARD.encode(agent_id)));
+        assert_conversation_lisp(args);
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_creation_can_resume_selected_history() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let session_id = "*示例项目/已恢复会话*";
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!({"kind": "created", "session_id": session_id})),
+        conversation_reply(json!({"kind": "history_session_not_found"})),
+        conversation_reply(json!({"kind": "history_unsupported"})),
+        conversation_reply(json!({"kind": "history_failed"})),
+        conversation_reply(json!({"kind": "history_timeout"})),
+    ]);
+    let route = "/agent-shell/sessions";
+    for invalid in [json!(""), json!("session\n"), json!(42)] {
+        let body =
+            json!({"project_id": "project", "agent_id": "codex", "resume_session_id": invalid});
+        let (status, reply) = request(emacs.clone(), "POST", route, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply["error"]["code"], "invalid-request");
+    }
+    assert!(runner.calls.lock().unwrap().is_empty());
+
+    let resume_id = "历史/\"会话\"";
+    let body =
+        json!({"project_id": "project", "agent_id": "codex", "resume_session_id": resume_id});
+    let (status, reply) = request(emacs.clone(), "POST", route, body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(reply, json!({"api_version": "1", "session_id": session_id}));
+    for (expected, code) in [
+        (
+            StatusCode::NOT_FOUND,
+            "agent-shell-history-session-not-found",
+        ),
+        (StatusCode::CONFLICT, "agent-shell-history-unsupported"),
+        (StatusCode::CONFLICT, "agent-shell-history-failed"),
+        (StatusCode::GATEWAY_TIMEOUT, "emacs-timeout"),
+    ] {
+        let (status, reply) = request(emacs.clone(), "POST", route, body.clone()).await;
+        assert_eq!(status, expected);
+        assert_eq!(reply["error"]["code"], code);
+    }
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert!(
+            args[3].contains("(loki-assistant-agent-shell-create-session name argument resume_id)")
+        );
+        assert!(args[3].contains(&STANDARD.encode(resume_id)));
+        assert_conversation_lisp(args);
+    }
+}
+
+#[tokio::test]
 async fn agent_shell_stream_sends_snapshot_increment_and_closure() {
     use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -975,7 +1216,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 16);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 20);
             let conversation = body["apis"]
                 .as_array()
                 .unwrap()
@@ -991,6 +1232,14 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
             assert_eq!(conversation["supports_sse"], true);
             assert_eq!(conversation["sse_events"][0]["event"], "agent-shell");
             for (id, method, path) in [
+                ("agent-shell-list-agents", "GET", "/agent-shell/agents"),
+                ("agent-shell-list-projects", "GET", "/agent-shell/projects"),
+                ("agent-shell-list-history", "GET", "/agent-shell/history"),
+                (
+                    "agent-shell-create-session",
+                    "POST",
+                    "/agent-shell/sessions",
+                ),
                 (
                     "agent-shell-submit-message",
                     "POST",
@@ -1741,7 +1990,7 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
         Duration::from_secs(1),
     ));
     let sessions = json!([
-        {"id":"session-1", "title":"整理会话列表", "phase":"running"},
+        {"id":"session-1", "agent_id":"codex", "title":"整理会话列表", "phase":"running"},
         {"id":"session-2", "phase":"completed", "stop_reason":"end_turn"}
     ]);
     let values = json!({"emacs":{
@@ -1765,6 +2014,7 @@ async fn receiver_status_publishes_through_the_injected_rust_status_service() {
         json!({"emacs":{"":1}}),
         json!({"ok":{"value":2},"bad/module":{"value":1}}),
         json!({"emacs":{"agent_shell":[{"id":"session-1", "phase":"busy"}]}}),
+        json!({"emacs":{"agent_shell":[{"id":"session-1", "agent_id":7, "phase":"running"}]}}),
         json!({"emacs":{"agent_shell":[{"id":"session-1", "title":7, "phase":"running"}]}}),
         json!({"emacs":{"agent_shell":[{"id":"session-1", "title":null, "phase":"running"}]}}),
         json!({"emacs":{"agent_shell":[{"id":"session-1", "phase":"running", "prompt":"私有内容"}]}}),
