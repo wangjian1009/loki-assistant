@@ -188,6 +188,31 @@ impl AgentShell {
             .map(|_| ())
     }
 
+    pub async fn restart_session(&self, session_id: &str) -> Result<(), ResponsError> {
+        self.post_session_action(session_id, "restart").await
+    }
+
+    pub async fn clear_buffer(&self, session_id: &str) -> Result<(), ResponsError> {
+        self.post_session_action(session_id, "clear-buffer").await
+    }
+
+    async fn post_session_action(
+        &self,
+        session_id: &str,
+        action: &str,
+    ) -> Result<(), ResponsError> {
+        let request = ServiceRequest::<serde_json::Value> {
+            method: Method::POST,
+            path: format!("{}/{action}", Self::session_path(session_id)?),
+            query: vec![],
+            body: None,
+        };
+        self.proxy
+            .request::<serde_json::Value>(self.proxy.snapshot().generation, request)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn read_image(
         &self,
         generation: u64,

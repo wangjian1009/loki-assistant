@@ -35,6 +35,8 @@
 (autoload 'loki-assistant-agent-shell-stream-subscribe "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-stream-resume "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-send-message "loki-assistant-agent-shell-stream")
+(autoload 'loki-assistant-agent-shell-restart-session "loki-assistant-agent-shell-stream")
+(autoload 'loki-assistant-agent-shell-clear-buffer "loki-assistant-agent-shell-stream")
 (autoload 'loki-assistant-agent-shell-read-image "loki-assistant-agent-shell-stream")
 (require 'subr-x)
 

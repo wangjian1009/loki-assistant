@@ -159,6 +159,7 @@ export struct AgentViewerScreen {
   @Prop connectionColor: string = SECONDARY
   @Prop connectionLabel: string = '离线'
   @Link preview: string
+  @BuilderParam sessionActions?: () => void
   onSelect: (id: string) => void = () => {}
   onRetry: () => void = () => {}
   onSend: (text: string) => Promise<string> = () => Promise.resolve('无法发送消息')
@@ -396,6 +397,9 @@ export struct AgentViewerScreen {
           }
           Text('左右滑动切换').fontSize(11).fontColor(DETAIL)
         }.flexShrink(0)
+      }
+      if (this.sessionId && this.sessionActions) {
+        this.sessionActions()
       }
     }.width('100%').padding({ top: 5, bottom: 10 })
   }

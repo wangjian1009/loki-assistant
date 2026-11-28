@@ -994,6 +994,14 @@ Emacs 接收消息后返回 HTTP 202，响应为 ~{"api_version":"1","accepted":
 
 成功响应包含 ~api_version~ 、 ~mime~ 和使用标准 Base64 编码的 ~data~ ，响应带 ~Cache-Control: no-store~ 。支持 PNG、JPEG、GIF 和 WebP，图片原始数据最多 1 MiB。引用无效返回 400 ~invalid-request~ ，会话中没有可读取的图片返回 404 ~agent-shell-image-not-found~ ，网关错误使用上表中的 502、503 或 504。
 
+** Agent Shell 会话重启与缓冲区清空
+
+本机和已绑定设备可通过 ~POST /agent-shell/sessions/{session_id}/restart~ 请求重启会话。请求无需正文，路径使用与会话订阅相同的 buffer 名称编码。Emacs 调用 ~agent-shell-restart~ 并传入原 Agent 会话 ID，使用 Agent Shell 的历史恢复设置。接收成功返回 HTTP 202，响应为 ~{"api_version":"1","accepted":true}~ 。重启过程中，现有 SSE 连接跟随同名 buffer，并通过普通 ~snapshot~ 事件同步新内容。电脑端清空同一个 buffer 时也会发布新的会话快照。
+
+会话含在途请求、排队消息或桌面草稿时，返回 HTTP 409 ~agent-shell-session-busy~ 。会话缺少可恢复的 Agent ID、Agent 不支持恢复或 Emacs 拒绝重启时，返回 HTTP 409 ~agent-shell-session-not-restartable~ 。路径无效、会话不存在与网关错误沿用消息接口的 400、404、502、503 和 504。
+
+本机和已绑定设备可通过 ~POST /agent-shell/sessions/{session_id}/clear-buffer~ 清空缓冲区的历史显示。请求无需正文，清空后返回 HTTP 202 和 ~{"api_version":"1","accepted":true}~ 。操作调用 Emacs 的 ~agent-shell-clear-buffer~ ，保留 Agent 会话、输入提示符和草稿。现有 SSE 连接通过普通 ~snapshot~ 事件获得清空后的内容，并继续推送后续消息。会话输入区或 shell 进程不可用时返回 HTTP 503 ~emacs-unavailable~ ，其他路径与网关错误沿用消息接口。
+
 ** 打开 Emacs 应用
 
 ~POST /emacs/apps/open~ 接受必填的 ~app~ 查询参数，请求不需要正文；当前支持 ~app=config~ 和 ~app=logs~ 。控制中心“设置”和“日志”都调用此业务接口，客户端不维护 Lisp 脚本或 Emacs 窗口操作。

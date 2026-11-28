@@ -3,9 +3,12 @@ import { AgentViewerScreen, ViewerBlock, ViewerSession } from 'agent_viewer'
 import { AgentShell, AgentShellBlock, AgentShellSession, AgentShellConversationView, ConversationSubscription,
   renderDocument, ResponsError } from 'liblokiworkspace.so'
 import { Application, ComputerDevice } from '../app/Application'
-import { PAGE_BACKGROUND } from '../components/AppPage'
+import { ACCENT, PAGE_BACKGROUND } from '../components/AppPage'
 import { deviceConnectionAppearance } from '../components/DeviceConnection'
+import { PopupMenu } from '../components/PopupMenu'
 import { StatusSubscription as DeviceSubscription } from '../workspace/ServiceStatus'
+
+type SessionAction = 'restart' | 'clear-buffer'
 
 function viewerBlock(block: AgentShellBlock): ViewerBlock {
   return { id: block.id, kind: block.kind, title: block.title ?? '', text: block.text,
@@ -24,6 +27,7 @@ struct AgentViewer {
   @State private conversationKey: number = 0
   @State private deviceStatus: string = 'offline'
   @State private imagePreview: string = ''
+  @State private pendingAction: SessionAction | '' = ''
   private pendingSessionId: string = ''
   private visible: boolean = false
   private active: boolean = false
@@ -192,6 +196,53 @@ struct AgentViewer {
     }
   }
 
+  private async performSessionAction(action: SessionAction): Promise<void> {
+    const shell = this.shell
+    const session = this.selected
+    if (!shell || !session || !this.deviceOnline() || this.pendingAction) return
+    const endpoint = this.endpointId
+    this.pendingAction = action
+    let message = action === 'restart' ? '无法重启会话' : '无法清空缓冲区'
+    try {
+      const error = action === 'restart' ? await shell.restartSession(session) : await shell.clearBuffer(session)
+      message = error?.message ?? (action === 'restart' ? '已请求重启会话' : '已清空缓冲区')
+    } catch (_) {
+      // 保留当前操作的失败提示。
+    } finally {
+      this.pendingAction = ''
+    }
+    if (this.visible && endpoint === this.endpointId && session === this.selected) {
+      try { this.getUIContext().getPromptAction().showToast({ message }) }
+      catch (_) { console.error('无法显示会话操作结果') }
+    }
+  }
+
+  @Builder
+  private sessionMenu() {
+    PopupMenu({
+      accessibilityLabel: '更多',
+      items: [{
+        id: 'restart-session', label: this.pendingAction === 'restart' ? '正在重启…' : '重启会话',
+        icon: $r('sys.symbol.arrow_clockwise'), enabled: this.deviceOnline() && !this.pendingAction,
+        action: () => { this.performSessionAction('restart') }
+      }, {
+        id: 'clear-buffer', label: this.pendingAction === 'clear-buffer' ? '正在清空…' : '清空缓冲区',
+        icon: $r('sys.symbol.trash'), enabled: this.deviceOnline() && !this.pendingAction,
+        action: () => { this.performSessionAction('clear-buffer') }
+      }],
+      trigger: () => { this.moreIcon() }
+    })
+  }
+
+  @Builder
+  private moreIcon() {
+    Row({ space: 3 }) {
+      Circle().width(3).height(3).fill(ACCENT)
+      Circle().width(3).height(3).fill(ACCENT)
+      Circle().width(3).height(3).fill(ACCENT)
+    }.accessibilityLevel('no')
+  }
+
   private readImage(source: string): Promise<string> {
     const directory = AppStorage.get<string>('lokiAgentImageCache')
     const shell = this.shell
@@ -253,6 +304,7 @@ struct AgentViewer {
       AgentViewerScreen({ title: $r('app.string.agent_viewer_title'), sessionId: this.selected,
         sessions: this.sessions, blocks: this.blocks, notice: this.notice, connected: this.deviceOnline(),
         preview: $imagePreview,
+        sessionActions: () => { this.sessionMenu() },
         connectionColor: deviceConnectionAppearance(this.deviceStatus).color,
         connectionLabel: deviceConnectionAppearance(this.deviceStatus).label,
         parseDocument: renderDocument,

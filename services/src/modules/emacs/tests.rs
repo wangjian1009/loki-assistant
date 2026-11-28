@@ -438,6 +438,93 @@ async fn agent_shell_messages_forward_exact_text_and_distinguish_emacs_outcomes(
 }
 
 #[tokio::test]
+async fn agent_shell_restart_forwards_only_the_session_and_preserves_business_errors() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let cases = [
+        ("accepted", StatusCode::ACCEPTED, None),
+        (
+            "busy",
+            StatusCode::CONFLICT,
+            Some("agent-shell-session-busy"),
+        ),
+        (
+            "not_restartable",
+            StatusCode::CONFLICT,
+            Some("agent-shell-session-not-restartable"),
+        ),
+        (
+            "missing",
+            StatusCode::NOT_FOUND,
+            Some("agent-shell-session-not-found"),
+        ),
+    ];
+    let (emacs, runner, _) = service(
+        cases
+            .iter()
+            .map(|(kind, _, _)| conversation_reply(json!({"kind": kind})))
+            .collect(),
+    );
+    let route = "/agent-shell/sessions/%2A%E4%B8%AD%E6%96%87%2F%22quoted%22%2A/restart";
+    for (_, expected, code) in cases {
+        let response = routes::router(emacs.clone())
+            .oneshot(Request::post(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        if let Some(code) = code {
+            assert_eq!(reply["error"]["code"], code);
+        } else {
+            assert_eq!(reply, json!({"api_version": "1", "accepted": true}));
+        }
+    }
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), cases.len());
+    for (_, args) in calls.iter() {
+        assert_conversation_lisp(args);
+        assert!(args[3].contains("loki-assistant-agent-shell-restart-session name)"));
+        assert!(args[3].contains(&STANDARD.encode("*中文/\"quoted\"*")));
+    }
+}
+
+#[tokio::test]
+async fn agent_shell_clear_buffer_calls_the_fixed_emacs_entry() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let (emacs, runner, _) = service(vec![
+        conversation_reply(json!({"kind": "accepted"})),
+        conversation_reply(json!({"kind": "missing"})),
+        conversation_reply(json!({"kind": "unavailable"})),
+    ]);
+    let route = "/agent-shell/sessions/%2A%E4%B8%AD%E6%96%87%2F%22quoted%22%2A/clear-buffer";
+    for (status, code) in [
+        (StatusCode::ACCEPTED, None),
+        (StatusCode::NOT_FOUND, Some("agent-shell-session-not-found")),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("emacs-unavailable")),
+    ] {
+        let response = routes::router(emacs.clone())
+            .oneshot(Request::post(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let reply: Value = serde_json::from_slice(&body).unwrap();
+        if let Some(code) = code {
+            assert_eq!(reply["error"]["code"], code);
+        } else {
+            assert_eq!(reply, json!({"api_version": "1", "accepted": true}));
+        }
+    }
+    for (_, args) in runner.calls.lock().unwrap().iter() {
+        assert_conversation_lisp(args);
+        assert!(args[3].contains("loki-assistant-agent-shell-clear-buffer name)"));
+        assert!(args[3].contains(&STANDARD.encode("*中文/\"quoted\"*")));
+    }
+}
+
+#[tokio::test]
 async fn agent_shell_images_forward_source_and_validate_bridge_data() {
     use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -888,7 +975,7 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         if path == "/discover/modules/emacs" {
-            assert_eq!(body["apis"].as_array().unwrap().len(), 14);
+            assert_eq!(body["apis"].as_array().unwrap().len(), 16);
             let conversation = body["apis"]
                 .as_array()
                 .unwrap()
@@ -908,6 +995,16 @@ async fn composition_registers_emacs_routes_metadata_and_config() {
                     "agent-shell-submit-message",
                     "POST",
                     "/agent-shell/sessions/{session_id}/messages",
+                ),
+                (
+                    "agent-shell-restart",
+                    "POST",
+                    "/agent-shell/sessions/{session_id}/restart",
+                ),
+                (
+                    "agent-shell-clear-buffer",
+                    "POST",
+                    "/agent-shell/sessions/{session_id}/clear-buffer",
                 ),
                 (
                     "agent-shell-read-image",

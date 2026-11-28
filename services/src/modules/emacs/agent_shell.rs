@@ -507,9 +507,21 @@ struct MessageRequest {
 }
 
 #[derive(Serialize)]
-struct MessageResponse {
+struct AcceptedResponse {
     api_version: &'static str,
     accepted: bool,
+}
+
+fn accepted_response() -> Response {
+    (
+        StatusCode::ACCEPTED,
+        [(CACHE_CONTROL, "no-store")],
+        Json(AcceptedResponse {
+            api_version: API_VERSION,
+            accepted: true,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -548,7 +560,7 @@ async fn submit_message(
         &emacs,
         &conversation_call(
             &session_id,
-            &body.text,
+            Some(&body.text),
             "loki-assistant-agent-shell-send-message",
         ),
     )
@@ -560,15 +572,97 @@ async fn submit_message(
     .map_err(ReadError::into_response)?;
 
     match outcome {
-        MessageOutcome::Accepted => Ok((
-            StatusCode::ACCEPTED,
-            [(CACHE_CONTROL, "no-store")],
-            Json(MessageResponse {
-                api_version: API_VERSION,
-                accepted: true,
-            }),
-        )
-            .into_response()),
+        MessageOutcome::Accepted => Ok(accepted_response()),
+        MessageOutcome::Missing => Err(ReadError::Missing.into_response()),
+        MessageOutcome::Unavailable => Err(ReadError::Unavailable.into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RestartOutcome {
+    Accepted,
+    Missing,
+    Busy,
+    NotRestartable,
+    Unavailable,
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
+    id = "agent-shell-restart",
+    method = "POST",
+    path = "/agent-shell/sessions/{session_id}/restart",
+    access = "paired",
+    summary = "重启 Agent Shell 会话",
+    description = "在 Emacs 中重启指定 Agent Shell 会话并恢复已有历史。"
+)]
+async fn restart_session(
+    State(emacs): State<Arc<EmacsService>>,
+    session_id: Result<Path<String>, PathRejection>,
+) -> Result<Response, Response> {
+    let session_id = conversation_session_id(session_id)?;
+    let outcome = conversation_gateway(
+        &emacs,
+        &conversation_call(
+            &session_id,
+            None,
+            "loki-assistant-agent-shell-restart-session",
+        ),
+    )
+    .await
+    .and_then(|reply| reply.ok_or(ReadError::Unavailable))
+    .and_then(|reply| {
+        serde_json::from_slice::<RestartOutcome>(&reply).map_err(|_| ReadError::InvalidResponse)
+    })
+    .map_err(ReadError::into_response)?;
+    match outcome {
+        RestartOutcome::Accepted => Ok(accepted_response()),
+        RestartOutcome::Missing => Err(ReadError::Missing.into_response()),
+        RestartOutcome::Unavailable => Err(ReadError::Unavailable.into_response()),
+        RestartOutcome::Busy => Err(error_response(
+            StatusCode::CONFLICT,
+            ErrorSource::Business,
+            "agent-shell-session-busy",
+            "当前会话仍在处理请求，或含有待发送的消息。",
+        )),
+        RestartOutcome::NotRestartable => Err(error_response(
+            StatusCode::CONFLICT,
+            ErrorSource::Business,
+            "agent-shell-session-not-restartable",
+            "当前会话无法重启并恢复历史。",
+        )),
+    }
+}
+
+#[loki_api(
+    module = "emacs",
+    mount = "Arc<EmacsService>",
+    id = "agent-shell-clear-buffer",
+    method = "POST",
+    path = "/agent-shell/sessions/{session_id}/clear-buffer",
+    access = "paired",
+    summary = "清空 Agent Shell 会话缓冲区",
+    description = "清空 Emacs 中指定会话的显示内容，保留当前会话和输入草稿。"
+)]
+async fn clear_buffer(
+    State(emacs): State<Arc<EmacsService>>,
+    session_id: Result<Path<String>, PathRejection>,
+) -> Result<Response, Response> {
+    let session_id = conversation_session_id(session_id)?;
+    let outcome = conversation_gateway(
+        &emacs,
+        &conversation_call(&session_id, None, "loki-assistant-agent-shell-clear-buffer"),
+    )
+    .await
+    .and_then(|reply| reply.ok_or(ReadError::Unavailable))
+    .and_then(|reply| {
+        serde_json::from_slice::<MessageOutcome>(&reply).map_err(|_| ReadError::InvalidResponse)
+    })
+    .map_err(ReadError::into_response)?;
+    match outcome {
+        MessageOutcome::Accepted => Ok(accepted_response()),
         MessageOutcome::Missing => Err(ReadError::Missing.into_response()),
         MessageOutcome::Unavailable => Err(ReadError::Unavailable.into_response()),
     }
@@ -621,7 +715,7 @@ async fn read_image(
         &emacs,
         &conversation_call(
             &session_id,
-            &query.source,
+            Some(&query.source),
             "loki-assistant-agent-shell-read-image",
         ),
     )
@@ -677,15 +771,25 @@ fn conversation_input_error(message: &'static str) -> Response {
     )
 }
 
-fn conversation_call(session_id: &str, argument: &str, function: &'static str) -> String {
+fn conversation_call(session_id: &str, argument: Option<&str>, function: &'static str) -> String {
     let name = STANDARD.encode(session_id);
-    let argument = STANDARD.encode(argument);
+    let (binding, argument) = argument.map_or_else(
+        || (String::new(), ""),
+        |value| {
+            let value = STANDARD.encode(value);
+            (
+                format!(
+                    "(argument (decode-coding-string (base64-decode-string \"{value}\") 'utf-8))"
+                ),
+                " argument",
+            )
+        },
+    );
     format!(
         "(when (require 'loki-assistant-agent-shell nil t) \
            (when (fboundp '{function}) \
              (let* ((name (decode-coding-string (base64-decode-string \"{name}\") 'utf-8)) \
-                    (argument (decode-coding-string (base64-decode-string \"{argument}\") 'utf-8)) \
-                    (reply ({function} name argument))) \
+                    {binding} (reply ({function} name{argument}))) \
                (base64-encode-string (encode-coding-string (or reply \"null\") 'utf-8) t))))"
     )
 }

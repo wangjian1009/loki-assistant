@@ -539,6 +539,8 @@ Emacs 上报时通过本机 ~POST /emacs/receiver/status~ 调用 ~publish_many_v
 
 Emacs 模块通过 ~POST /agent-shell/sessions/{session_id}/messages~ 接收会话消息，通过 ~GET /agent-shell/sessions/{session_id}/image~ 读取会话引用的图片。两个接口的访问范围均为 ~paired~ ，会话标识与订阅接口一致。services 通过固定的 Emacs 入口处理这两种操作。消息接口的 HTTP 202 表示 Emacs 已接收消息，由 Agent Shell 按会话状态提交、引导或排队。 [[file:control-center-services.org::*Agent Shell 消息与图片][Agent Shell 消息与图片协议]]
 
+Emacs 模块声明 ~paired~ 会话操作 ~POST /agent-shell/sessions/{session_id}/restart~ 和 ~POST /agent-shell/sessions/{session_id}/clear-buffer~ 。路径使用相同的 buffer 名称，HTTP 202 表示 Emacs 已启动重启或完成缓冲区清空。现有订阅继续接收普通快照。 [[file:control-center-services.org::*Agent Shell 会话重启与缓冲区清空][Agent Shell 会话操作协议]]
+
 *** 响应示例
 ~GET /stats/meta~ 的响应节选，展示 ~service~ 模块。
 

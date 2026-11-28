@@ -203,6 +203,8 @@ export class AgentShell {
   watchStatus(changed: (sessions: AgentShellSession[] | null) => void): StatusSubscription
   observeConversation(sessionId: string, changed: (view: AgentShellConversationView) => void): ConversationSubscription
   sendMessage(sessionId: string, text: string): Promise<ResponsError | null>
+  restartSession(sessionId: string): Promise<ResponsError | null>
+  clearBuffer(sessionId: string): Promise<ResponsError | null>
   cacheImage(cacheDir: string, sessionId: string, source: string): Promise<string>
   clearSessionImages(cacheDir: string, endpointId: string, sessionId: string): Promise<void>
 }

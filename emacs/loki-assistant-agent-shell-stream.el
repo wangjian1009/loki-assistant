@@ -11,19 +11,27 @@
 
 (declare-function agent-shell-buffers "agent-shell")
 (declare-function agent-shell-busy-submit-steer "agent-shell-prompt-queue")
+(declare-function agent-shell-clear-buffer "agent-shell")
 (declare-function agent-shell-initialized-p "agent-shell")
 (declare-function agent-shell-insert "agent-shell")
+(declare-function agent-shell-restart "agent-shell")
 (declare-function agent-shell-session-id "agent-shell")
 (declare-function agent-shell-status "agent-shell")
 (declare-function agent-shell-subscribe-to "agent-shell")
 (declare-function agent-shell-unsubscribe "agent-shell")
 (declare-function agent-shell--live-prompt-start "agent-shell-prompt")
+(declare-function agent-shell--active-requests-p "agent-shell")
+(declare-function agent-shell--current-shell "agent-shell")
+(declare-function agent-shell--display-buffer "agent-shell")
 (declare-function agent-shell--prompt-input-start "agent-shell-prompt")
 (declare-function agent-shell--prompt-queue-enqueue "agent-shell-prompt-queue")
 (declare-function agent-shell--prompt-queue-process-next "agent-shell-prompt-queue")
 (declare-function agent-shell-markdown-reconstruct "agent-shell-markdown")
+(declare-function agent-shell-viewport--buffer "agent-shell-viewport")
+(declare-function agent-shell-viewport--prompt "agent-shell-viewport")
 
 (defvar agent-shell--state)
+(defvar agent-shell-prefer-viewport-interaction)
 
 ;; 块和批次大小按字符数计算，留出 UTF-8 与 JSON 转义空间。
 (defconst loki-assistant-agent-shell-stream--block-size 2048)
@@ -404,6 +412,38 @@
             (loki-assistant-agent-shell-stream--schedule-flush))
         (delete-process client)))))
 
+(defun loki-assistant-agent-shell-stream--attach-client (client)
+  "将 CLIENT 转接到当前 Agent Shell buffer。"
+  (process-put client :shell-buffer (current-buffer))
+  (push client loki-assistant-agent-shell-stream--clients)
+  (add-hook 'after-change-functions #'loki-assistant-agent-shell-stream--schedule-flush nil t)
+  (add-hook 'kill-buffer-hook #'loki-assistant-agent-shell-stream--close-buffer nil t)
+  (add-hook 'change-major-mode-hook #'loki-assistant-agent-shell-stream--close-buffer nil t)
+  (add-hook 'buffer-list-update-hook #'loki-assistant-agent-shell-stream--buffer-list-change nil t))
+
+(defun loki-assistant-agent-shell-stream--follow-restart (restart &rest arguments)
+  "在 RESTART 使用相同名称替换 buffer 后继续原会话推送。"
+  (let* ((buffer (agent-shell--current-shell))
+         (name (buffer-name buffer))
+         (clients (and buffer (buffer-local-value 'loki-assistant-agent-shell-stream--clients buffer))))
+    (when clients
+      (with-current-buffer buffer
+        (setq loki-assistant-agent-shell-stream--clients nil)))
+    (unwind-protect
+        (apply restart arguments)
+      (when clients
+        (let ((target (loki-assistant-agent-shell-stream--session-buffer name)))
+          (dolist (client clients)
+            (when (process-live-p client)
+              (if target
+                  (with-current-buffer target
+                    (unless (eq target buffer)
+                      (process-put client :revision nil)
+                      (process-put client :replay nil))
+                    (loki-assistant-agent-shell-stream--attach-client client)
+                    (loki-assistant-agent-shell-stream--schedule-flush))
+                (loki-assistant-agent-shell-stream--close-client client)))))))))
+
 (defun loki-assistant-agent-shell-stream-subscribe (session-id port token &optional recent)
   "向回环 PORT 的一次性 TOKEN 连接推送 SESSION-ID 的内容，可用 RECENT 限制初始范围。"
   (loki-assistant-agent-shell-stream-resume session-id port token recent nil))
@@ -418,18 +458,16 @@ RECENT 可限制会话范围。AFTER 为空或已失效时推送完整快照。"
                                           :family 'ipv4 :nowait t :noquery t :coding 'utf-8-unix
                                           :filter #'loki-assistant-agent-shell-stream--client-input
                                           :sentinel #'loki-assistant-agent-shell-stream--client-status)))
-        (process-put client :shell-buffer buffer)
         (process-put client :session session-id)
         (process-put client :token token)
         (process-put client :recent recent)
         (process-put client :revision after)
-        (push client loki-assistant-agent-shell-stream--clients)
-        (add-hook 'after-change-functions #'loki-assistant-agent-shell-stream--schedule-flush nil t)
-        (add-hook 'kill-buffer-hook #'loki-assistant-agent-shell-stream--close-buffer nil t)
-        (add-hook 'change-major-mode-hook #'loki-assistant-agent-shell-stream--close-buffer nil t)
-        (add-hook 'buffer-list-update-hook #'loki-assistant-agent-shell-stream--buffer-list-change nil t)
+        (loki-assistant-agent-shell-stream--attach-client client)
         (loki-assistant-agent-shell-stream--client-status client nil)
         t))))
+
+(with-eval-after-load 'agent-shell
+  (advice-add 'agent-shell-restart :around #'loki-assistant-agent-shell-stream--follow-restart))
 
 (defun loki-assistant-agent-shell-stream--submit-with-draft (submit)
   "执行 SUBMIT 并将桌面草稿恢复到提交后的输入区。"
@@ -498,6 +536,68 @@ RECENT 可限制会话范围。AFTER 为空或已失效时推送完整快照。"
                                                     :shell-buffer buffer)))
                   (agent-shell-busy-submit-steer text))
                 "accepted")))))))
+    (json-encode (list (cons 'kind kind)))))
+
+(defun loki-assistant-agent-shell-restart-session (session-id)
+  "在 Emacs 中重启 SESSION-ID 对应的 Agent Shell，沿用原有会话。"
+  (let* ((buffer (loki-assistant-agent-shell-stream--session-buffer session-id))
+         (kind
+          (if (not buffer)
+              "missing"
+            (with-current-buffer buffer
+              (let ((provider-id (agent-shell-session-id)))
+                (cond
+                 ((or (not (eq (agent-shell-status) 'ready))
+                      (agent-shell--active-requests-p agent-shell--state)
+                      (map-elt agent-shell--state :pending-prompts)
+                      (when-let* ((start (agent-shell--prompt-input-start))) (< start (point-max)))
+                      (when-let* ((viewport (agent-shell-viewport--buffer :shell-buffer buffer :existing-only t)))
+                        (with-current-buffer viewport
+                          (and (derived-mode-p 'agent-shell-viewport-edit-mode)
+                               (not (string-empty-p (or (agent-shell-viewport--prompt) "")))))))
+                  "busy")
+                 ((not (and provider-id
+                            (or (map-elt agent-shell--state :supports-session-load)
+                                (map-elt agent-shell--state :supports-session-resume))))
+                  "not_restartable")
+                 (t
+                  (condition-case nil
+                      (save-selected-window
+                        (let ((agent-shell-prefer-viewport-interaction nil))
+                          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+                                    ((symbol-function 'yes-or-no-p) (lambda (&rest _) nil))
+                                    ((symbol-function 'agent-shell--display-buffer) #'identity))
+                            (agent-shell-restart :session-id provider-id)))
+                        "accepted")
+                    (user-error "not_restartable")
+                    (error "unavailable")))))))))
+    (json-encode (list (cons 'kind kind)))))
+
+(defun loki-assistant-agent-shell-clear-buffer (session-id)
+  "清空 SESSION-ID 对应的 Agent Shell 历史显示，保留输入区。"
+  (let* ((buffer (loki-assistant-agent-shell-stream--session-buffer session-id))
+         (kind
+          (if (not buffer)
+              "missing"
+            (with-current-buffer buffer
+              (save-restriction
+                (widen)
+                (if-let* ((process (get-buffer-process buffer))
+                          ((process-live-p process))
+                          (prompt (ignore-errors (agent-shell--live-prompt-start))))
+                    (let* ((process-position (process-mark process))
+                           (original-position (copy-marker process-position)))
+                      (unwind-protect
+                          (condition-case nil
+                              (progn
+                                ;; 原生清屏按进程标记所在行截断。将边界移到提示符首行。
+                                (set-marker process-position prompt)
+                                (agent-shell-clear-buffer)
+                                "accepted")
+                            (error "unavailable"))
+                        (set-marker process-position original-position)
+                        (set-marker original-position nil)))
+                  "unavailable"))))))
     (json-encode (list (cons 'kind kind)))))
 
 (defun loki-assistant-agent-shell-stream--image-reference-p (source)

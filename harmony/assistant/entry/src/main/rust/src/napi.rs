@@ -405,6 +405,16 @@ impl AgentShell {
         js_value(self.inner.send_message(&session_id, text).await.err())
     }
 
+    #[napi(ts_return_type = "Promise<ResponsError | null>")]
+    pub async fn restart_session(&self, session_id: String) -> Result<Value> {
+        js_value(self.inner.restart_session(&session_id).await.err())
+    }
+
+    #[napi(ts_return_type = "Promise<ResponsError | null>")]
+    pub async fn clear_buffer(&self, session_id: String) -> Result<Value> {
+        js_value(self.inner.clear_buffer(&session_id).await.err())
+    }
+
     #[napi]
     pub async fn cache_image(
         &self,
